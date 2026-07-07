@@ -11,11 +11,13 @@ Changelog
 ### Changed
 - 这里记录变更的内容
 
-0.1.0 - 2026-06-03
+0.1.0 - 2026-07-07
 ---
 ### Added
 - 创建项目
 
+
+[Unreleased]: http://icode.baidu.com/repos/baidu/aicapx/sglang-kunlun/merge/0.1.0...master
 
 [Keep a Changelog]: https://keepachangelog.com/zh-CN/1.0.0/
 [Semantic Versioning]: https://semver.org/lang/zh-CN/

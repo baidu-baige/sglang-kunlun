@@ -1,0 +1,27 @@
+Global:
+  version: "2.0"
+  group_email: fangzhou07@baidu.com
+
+Default:
+  profile: [publish]
+
+Profiles:
+  - profile:
+    name: dev
+    mode: AGENT
+    environment:
+      image: DECK_STD_CENTOS7
+      tools:
+        - python: 3.12.0
+    build:
+      command: pip3 install -r requirements.txt && python3 -m build
+
+  - profile:
+    name: publish
+    mode: AGENT
+    environment:
+      image: DECK_STD_CENTOS7
+      tools:
+        - python: 3.12.0
+    build:
+      command: pip3 install -r requirements.txt && python3 -m build
