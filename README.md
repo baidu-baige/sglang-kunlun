@@ -1,34 +1,32 @@
-Sglang Kunlun
-===
-sglangplugin代码
+pip install -e /${YOUR_PATH}/sglang-kunlun
 
-快速开始
----
-如何构建、安装、运行
+unset XPU_DUMMY_EVENT
+export SGLANG_IS_FLASHINFER_AVAILABLE=False
+export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
+export SGLANG_SET_CPU_AFFINITY=1
+export XMLIR_FORCE_USE_XPU_GRAPH=1
+export XPU_USE_FAST_SWIGLU=1
+export XPU_USE_DEFAULT_CTX=1
+export XMLIR_ENABLE_FAST_FC=1
+export XMLIR_CUDNN_ENABLED=1
+export CUDA_GRAPH_OPTIMIZE_STREAM=1
 
-测试
----
-如何执行自动化测试
+export SGLANG_PLATFORM=kunlun
 
-如何贡献
----
-贡献patch流程及质量要求
-
-版本信息
----
-本项目的各版本信息和变更历史可以在[这里][changelog]查看。
-
-维护者
----
-### owners
-* fangzhou07(fangzhou07@baidu.com)
-
-### committers
-* fangzhou07(fangzhou07@baidu.com)
-
-讨论
----
-百度Hi交流群：群号
-
-
-[changelog]: http://icode.baidu.com/repos/baidu/aicapx/sglang-kunlun/blob/master:CHANGELOG.md
+SGLANG_ENABLE_SPEC_V2=1 
+sglang serve \
+    --model-path /home/models/MiMo-V2-Flash-W8A8-INT8-Dynamic-official \
+    --speculative-algorithm EAGLE \
+    --quantization w8a8_int8 \
+    --max-total-tokens 131072 \
+    --disable-radix-cache \
+    --decode-log-interval 1 \
+    --host 0.0.0.0 \
+    --port 8806 \
+    --trust-remote-code \
+    --tp-size 8 \
+    --max-running-requests 64 \
+    --disable-overlap-schedule \
+    --attention-backend kunlun \
+    --disable-cuda-graph \
+    --mem-fraction-static 0.85

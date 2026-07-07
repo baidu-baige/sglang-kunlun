@@ -1,0 +1,43 @@
+"""General plugin entry point for Kunlun hooks.
+
+``register_all()`` imports each module that owns ``@plugin_hook(...)``
+registrations. The order is intentional: foundational hooks and attention
+module redirects must be registered before higher-level subsystem hooks.
+"""
+
+from __future__ import annotations
+
+import importlib
+import logging
+
+logger = logging.getLogger(__name__)
+
+HOOK_MODULES = (
+    "sglang_kunlun.hooks.utils.common",
+    "sglang_kunlun.hooks.layers",
+    "sglang_kunlun.hooks.mem_cache",
+    "sglang_kunlun.hooks.model_executor",
+    "sglang_kunlun.hooks.distributed",
+    "sglang_kunlun.hooks.constrained",
+    "sglang_kunlun.hooks.disaggregation",
+    "sglang_kunlun.models",
+    "sglang_kunlun.hooks.speculative",
+
+)
+
+
+def register_all() -> None:
+    """Import every hook module so decorators register with ``HookRegistry``."""
+    from sglang_kunlun.kernels import deep_geem_hook as _deep_geem_hook  # noqa: F401
+    from sglang_kunlun.kernels import flashinfer_hook as _flashinfer_hook  # noqa: F401
+    from sglang_kunlun.kernels import kernel_ops
+
+    kernel_ops.install()
+    for module_name in HOOK_MODULES:
+        importlib.import_module(module_name)
+    logger.info(
+        "sglang-kunlun: %d hook modules registered, %d triton ops and %d jit ops installed",
+        len(HOOK_MODULES),
+        len(kernel_ops.registered_triton_ops()),
+        len(kernel_ops.registered_jit_ops()),
+    )
