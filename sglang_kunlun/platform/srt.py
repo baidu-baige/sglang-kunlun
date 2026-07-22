@@ -25,9 +25,25 @@ from .device import KunlunDeviceMixin
 
 
 class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
-    supported_quantization = ["int8"]
+    """Provide Kunlun-specific SGLang runtime platform integration."""
+
+    supported_quantization = [
+        "w8a8_int8",
+        "compressed-tensors",
+    ]
+
+    def get_quantization_config(self, quantization: str):
+        """Return the Kunlun configuration class for a quantization method."""
+        if quantization == "compressed-tensors":
+            from sglang_kunlun.hooks.layers.quantization.compressed_tensors import (
+                KunlunCompressedTensorsConfig,
+            )
+
+            return KunlunCompressedTensorsConfig
+        return None
 
     def __init__(self) -> None:
+        """Initialize the platform and register Kunlun compatibility shims."""
         super().__init__()
         # Must run before any sglang.srt.layers.attention.fla import.
         from sglang_kunlun.bootstrap import _kunlun_pre_shim
@@ -95,6 +111,7 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
     # ------------------------------------------------------------------
 
     def get_default_attention_backend(self) -> str:
+        """Return the default Kunlun attention backend name."""
         return "kunlun"
 
     def get_draft_prefill_attention_backend_cls(self) -> type | None:
@@ -112,21 +129,25 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
         return KunlunFlashAttentionMultiStepBackend
 
     def get_mha_kv_pool_cls(self) -> type:
+        """Return the Kunlun MHA KV pool class."""
         from sglang_kunlun.hooks.mem_cache.kunlun_pools import KunlunMHATokenToKVPool
 
         return KunlunMHATokenToKVPool
 
     def get_mla_kv_pool_cls(self) -> type:
+        """Return the Kunlun MLA KV pool class."""
         from sglang_kunlun.hooks.mem_cache.kunlun_pools import KunlunMLATokenToKVPool
 
         return KunlunMLATokenToKVPool
 
     def get_dsa_kv_pool_cls(self) -> type:
+        """Return the Kunlun DSA KV pool class."""
         from sglang_kunlun.hooks.mem_cache.kunlun_pools import KunlunNSATokenToKVPool
 
         return KunlunNSATokenToKVPool
 
     def get_graph_runner_cls(self) -> type:
+        """Return the CUDA graph runner class used by Kunlun."""
         from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
             DecodeCudaGraphRunner,
         )
@@ -134,11 +155,13 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
         return DecodeCudaGraphRunner
 
     def get_paged_allocator_cls(self) -> type:
+        """Return the Kunlun paged KV pool allocator class."""
         from sglang_kunlun.hooks.mem_cache.kunlun_allocator import KunlunPagedTokenToKVPoolAllocator
 
         return KunlunPagedTokenToKVPoolAllocator
 
     def get_piecewise_backend_cls(self) -> type:
+        """Return the compilation backend class for piecewise execution."""
         from sglang.srt.compilation.backend import SGLangBackend
 
         return SGLangBackend
