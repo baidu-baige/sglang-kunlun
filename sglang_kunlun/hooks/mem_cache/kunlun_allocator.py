@@ -13,6 +13,30 @@ from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
 from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
 
 
+def _alloc_decode_torch_native(
+    page_size,
+    free_pages,
+    seq_lens,
+    last_loc,
+    bs,
+):
+    """Pure-torch alloc_decode, ported from the pre-refactor allocator patch.
+
+    Kept as an A/B reference for the xspeedgate_ops kernel: slicing free_pages
+    cannot read out of bounds, so a crash here would rule the kernel out.
+    """
+    pre_lens = seq_lens - 1
+    num_pages_after = (seq_lens + page_size - 1) // page_size
+    num_pages_before = (pre_lens + page_size - 1) // page_size
+    mask = (num_pages_after - num_pages_before) > 0
+    sum_new_pages = mask.sum()
+
+    out_indices = last_loc + 1
+    if sum_new_pages > 0:
+        out_indices[mask] = free_pages[:sum_new_pages] * page_size
+    return out_indices.to(torch.int64)
+
+
 def _alloc_extend_kunlun_xdnn(
     page_size,
     free_pages,
@@ -164,15 +188,32 @@ class KunlunPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             out_indices.copy_(last_loc + 1)
             return out_indices
 
-        torch.ops.xspeedgate_ops.alloc_decode_kernel(
-            seq_lens,
-            last_loc,
-            self.free_pages,
-            out_indices,
-            next_power_of_2(bs),
-            self.page_size,
-            bs,
-        )
+        # The kernel indexes free_pages over the padded range [0, bs_upper), so it
+        # needs bs_upper entries available even when num_new_pages is smaller.
+        bs_upper = next_power_of_2(bs)
+        if len(self.free_pages) < bs_upper:
+            self.merge_and_sort_free()
+        if len(self.free_pages) < bs_upper:
+            return None
+
+        if get_bool_env_var("USE_TORCH_ALLOC_DECODE_KUNLUN", "false"):
+            out_indices = _alloc_decode_torch_native(
+                self.page_size,
+                self.free_pages,
+                seq_lens,
+                last_loc,
+                bs,
+            )
+        else:
+            torch.ops.xspeedgate_ops.alloc_decode_kernel(
+                seq_lens,
+                last_loc.contiguous(),
+                self.free_pages,
+                out_indices.contiguous(),
+                bs_upper,
+                self.page_size,
+                bs,
+            )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
