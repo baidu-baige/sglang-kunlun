@@ -55,6 +55,7 @@ def _dsv4_probe(group: str, tensors: Mapping[str, object], **meta) -> None:
     torch.save(payload, os.path.join(output_dir, f"rank{rank}_{group}_{index:04d}.pt"))
 
 def _debug_tensor_meta(name: str, value: object) -> str:
+    """Format tensor metadata or a generic value for debug logging."""
     if isinstance(value, torch.Tensor):
         return f"{name}: shape={tuple(value.shape)}, dtype={value.dtype}, device={value.device}"
     return f"{name}: value={value!r}, type={type(value).__name__}"
@@ -1155,11 +1156,22 @@ def alloc_decode_kernel(
 ) -> None:
     """Allocate KV cache pages for decode batches."""
 
+    # The Kunlun kernel indexes free_pages over the whole padded range
+    # [0, bs_upper) without masking, so a shorter tensor is read out of bounds
+    # It only ever consumes the first num_new_pages (<= bs) entries, 
+    # so padding the tail with zeros is safe: those slots are
+    # never written into out_indices. self.free_pages itself is untouched, which
+    # keeps the allocator's page accounting intact.
+    if free_pages.numel() < bs_upper:
+        free_pages = torch.cat(
+            [free_pages, free_pages.new_zeros(bs_upper - free_pages.numel())]
+        )
+
     torch.ops.xspeedgate_ops.alloc_decode_kernel(
         seq_lens,
         last_loc.to(torch.int32).contiguous(),
         free_pages,
-        out_indices,
+        out_indices.contiguous(),
         bs_upper,
         page_size,
         seq_lens.shape[0],

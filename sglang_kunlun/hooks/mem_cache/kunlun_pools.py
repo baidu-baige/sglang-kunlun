@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
+    unwrap_write_loc,
 )
 
 
@@ -27,6 +28,7 @@ class KunlunMHATokenToKVPool(MHATokenToKVPool):
     """Kunlun MHA KV pool with custom buffer creation and reshape-and-cache support."""
 
     def _create_buffers(self):
+        """Create Kunlun-compatible key and value cache buffers."""
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -78,7 +80,7 @@ class KunlunMHATokenToKVPool(MHATokenToKVPool):
     def set_kv_buffer(
         self,
         layer: RadixAttention,
-        loc: torch.Tensor,
+        loc_info, # KVWriteLoc
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
         k_scale: Optional[float] = None,
@@ -87,6 +89,8 @@ class KunlunMHATokenToKVPool(MHATokenToKVPool):
     ):
         """Set KV cache buffer using the kunlun_ops reshape_and_cache kernel."""
         from kunlun_ops import reshape_and_cache
+
+        loc, _ = unwrap_write_loc(loc_info)
 
         if self.head_dim != self.v_head_dim:
             cache_v = F.pad(cache_v, pad=(0, 64), mode="constant", value=0)

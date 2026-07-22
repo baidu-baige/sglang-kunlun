@@ -9,7 +9,6 @@ from contextlib import nullcontext
 import torch
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
-from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
 
 logger = logging.getLogger(__name__)
