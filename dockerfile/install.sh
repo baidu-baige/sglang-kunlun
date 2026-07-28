@@ -144,7 +144,7 @@ function install_dep() {
     project="$1"
 
     # 允许的项目名列表
-    allow_projects="xpytorch kunlun_ops xspeedgate_ops xmooncake runtime lib_tmp"
+    allow_projects="xpytorch kunlun_ops xspeedgate_ops xmooncake runtime lib_tmp xtriton xsgl_kernel"
 
     # 公共下载前缀
     # BASE_URL="https://su.bcebos.com/v1/klx-sdk-release-public/DS_PD/${project}/${version}"
@@ -266,12 +266,35 @@ function install_dep() {
         pip3 install "$whl_file" --force-reinstall
         rm -rf output*
         echo "${project}_addr=${url}" >> /versions
+    
+    #依赖
+    elif [[ "$project" == "xtriton" ]]; then
+        url="https://su.bcebos.com/v1/klx-sdk-release-public/DS_PD/xtriton/20250624/output.tar.gz"
+        echo "Downloading $url"
+        curl -O "$url" || wget "$url"
+        tar -xzvf output.tar.gz
+        whl_file=$(find output -name "*.whl" | head -n 1)
+        if [[ -z "$whl_file" ]]; then
+            echo "No .whl file found in output directory"
+            return 3
+        fi
+        pip3 install "$whl_file" --force-reinstall
+        rm -rf output*
+        echo "${project}_addr=${url}" >> /versions
+
+    elif [[ "$project" == "xsgl_kernel" ]]; then
+        url="https://aihc-private-hcd.bj.bcebos.com/LLM/inferenceKit/sgl_kernel-0.3.21-cp39-abi3-linux_x86_64.whl"
+        echo "Downloading $url"
+        curl -O "$url" || wget "$url"
+        whl_file="sgl_kernel-0.3.21-cp39-abi3-linux_x86_64.whl"
+        pip3 install "$whl_file" --force-reinstall
+        rm -rf sgl_kernel-0.3.21-cp39-abi3*
+        echo "${project}_addr=${url}" >> /versions
 
     else
         echo "Error: project must be one of: $allow_projects"
     fi
 }
-
 
 function install_sglang_kunlun() {
     cd ${sglang_kunlun_dir}
@@ -328,13 +351,17 @@ install_dep xpytorch
 #install_dep flash_mla ${XFLASH_MLA_VERSION}
 install_dep kunlun_ops
 install_dep xspeedgate_ops
-# install_dep xsgl_kernel ${SGL_KERNEL_VERSION}
 install_dep runtime
 install_dep lib_tmp
 install_dep xmooncake
-#install_dep xtriton ${XTRITON_VERSION}
+# import依赖
+install_dep xtriton
 #install_dep attentionstore ${ATTENTION_STORE_VERSION}
 file_soft_chain
-install_sglang_kunlun
+
+####框架相关的
+install_dep xsgl_kernel
+# install_sglang
+# install_sglang_kunlun
 
 ############################################################# 基础环境结束 ###########################################################

@@ -23,7 +23,7 @@
 
 ```bash
 # 在 sglang-kunlun 的父目录执行
-docker build -f sglang-kunlun/dockerfile/Dockerfile -t aicapx_sglang_kunlun:dev .
+docker build -f sglang-kunlun/dockerfile/Dockerfile -t iregistry.baidu-int.com/aicapx/sglang-kunlun:dev .
 ```
 
 三个物料地址可通过 `--build-arg` 覆盖，不传则使用 `Dockerfile` 中的默认值：
@@ -33,7 +33,7 @@ docker build -f sglang-kunlun/dockerfile/Dockerfile \
   --build-arg XPYTORCH_DOWNLOAD_ADDR=<xpytorch .run 地址> \
   --build-arg KUNLUN_OPS_DOWNLOAD_ADDR=<kunlun_ops .whl 地址> \
   --build-arg XSPEEDGATE_OPS_DOWNLOAD_ADDR=<xspeedgate_ops .whl 地址> \
-  -t aicapx_sglang_kunlun:dev .
+  -t iregistry.baidu-int.com/aicapx/sglang-kunlun:dev .
 ```
 
 其余组件（xre、xccl、deep_ep、xmooncake、cocopod）的地址目前硬编码在 `install.sh` 的 `install_dep` 中，升级需直接改脚本。
@@ -60,3 +60,6 @@ docker build -f sglang-kunlun/dockerfile/Dockerfile \
 - `LD_LIBRARY_PATH` 已包含 `/usr/local/xre/so`、`/usr/local/xccl/so`、`/usr/local/lib/`。
 - 镜像内 `/versions` 记录本次构建实际使用的各组件下载地址，排查版本问题时优先查看该文件。
 - 启动服务的环境变量与命令行参考仓库根目录 `README.md` 的「启动」章节。
+
+## 镜像仓库
+iregistry.baidu-int.com/aicapx/sglang-kunlun:dev
