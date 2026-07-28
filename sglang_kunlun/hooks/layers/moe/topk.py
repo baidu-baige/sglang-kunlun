@@ -22,6 +22,7 @@ from sglang.srt.layers.moe.topk import (
     TopKConfig,
     TopKOutputFormat,
     biased_grouped_topk,
+    biased_topk_impl,
     _use_aiter,
     _post_process_topk_ids,
     grouped_topk,
@@ -142,13 +143,26 @@ def select_experts_kunlun(
             scoring_func=scoring_func,
         )
     elif custom_routing_function is None:
-        assert not apply_routed_scaling_factor_on_output, "Not implemented"
-        if (
+        if scoring_func == "sqrtsoftplus":
+            from sglang.jit_kernel.moe_fused_gate import moe_fused_gate
+
+            topk_weights, topk_ids = moe_fused_gate(
+                router_logits,
+                correction_bias,
+                topk=num_routed_topk if _use_aiter else top_k,
+                scoring_func=scoring_func,
+                num_fused_shared_experts=num_fused_shared_experts,
+                renormalize=renormalize,
+                routed_scaling_factor=routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            )
+        elif (
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
             and scoring_func == "softmax"
             and correction_bias is None
         ):
             # flashinfer_trtllm_routed uses raw-logits topk
+            assert not apply_routed_scaling_factor_on_output, "Not implemented"
             topk_weights, topk_ids = fused_topk_softmax_torch_raw_logits(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -156,6 +170,7 @@ def select_experts_kunlun(
                 renormalize=renormalize,
             )
         else:
+            assert not apply_routed_scaling_factor_on_output, "Not implemented"
             # Qwen3MOE uses fused_topk
             topk_weights, topk_ids = fused_topk(
                 hidden_states=hidden_states,

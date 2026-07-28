@@ -1,10 +1,62 @@
-"""Hooks for ``sglang.srt.mem_cache.common``.
+"""Kunlun memory-cache hooks."""
 
-Patches:
-  - get_last_loc → xspeedgate_ops.get_last_loc (both call-site local bindings)
-  - write_cache_indices → xspeedgate_ops.write_req_to_token_pool
-    (called from within common.py, so the module-level attribute is patched)
-"""
+from __future__ import annotations
+
+import logging
+import os
+
+import torch
+
+from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+
+
+logger = logging.getLogger(__name__)
+
+
+@plugin_hook(
+    "sglang.srt.mem_cache.deepseek_v4_memory_pool.DeepSeekV4SingleKVPool.get_bytes_per_token",
+    type=HookType.AROUND,
+)
+def dsv4_get_bytes_per_token_kunlun(original_fn, self):
+    if self.store_dtype in (torch.bfloat16, torch.float16):
+        return (self.qk_nope_head_dim + self.qk_rope_head_dim) * self.store_dtype.itemsize
+    return original_fn(self)
+
+
+@plugin_hook(
+    "sglang.srt.mem_cache.deepseek_v4_memory_pool.DeepSeekV4SingleKVPool.create_buffer",
+    type=HookType.AROUND,
+)
+def dsv4_create_buffer_kunlun(original_fn, self, *, num_pages: int):
+    if self.store_dtype not in (torch.bfloat16, torch.float16):
+        return original_fn(self, num_pages=num_pages)
+
+    dim_per_token = self.qk_nope_head_dim + self.qk_rope_head_dim
+    self.kv_cache_total_dim = dim_per_token
+    self.bytes_per_page_padded = (
+        self.page_size * dim_per_token * self.store_dtype.itemsize
+    )
+    if (
+        os.environ.get("DSV4_MTP_PROBE") == "1"
+        and os.environ.get("RANK", "0") == "0"
+        and not getattr(dsv4_create_buffer_kunlun, "_probe_logged", False)
+    ):
+        logger.warning(
+            "[DSV4_CALLSTACK] half-cache pool buffer store_dtype=%s "
+            "shape=(%d, %d) page_size=%d dim_per_token=%d",
+            self.store_dtype,
+            num_pages,
+            self.page_size * dim_per_token,
+            self.page_size,
+            dim_per_token,
+        )
+        dsv4_create_buffer_kunlun._probe_logged = True
+    return torch.zeros(
+        num_pages,
+        self.page_size * dim_per_token,
+        dtype=self.store_dtype,
+        device=self.device,
+    )
 
 # from __future__ import annotations
 
