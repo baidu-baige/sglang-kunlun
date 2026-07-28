@@ -17,7 +17,20 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 
 @plugin_hook(
-    "sglang.srt.model_executor.model_runner_kv_cache_mixin.ModelRunnerKVCacheMixin._init_pools",
+    "sglang.srt.model_executor.model_runner.ModelRunner.configure_kv_cache_dtype",
+    type=HookType.AROUND,
+)
+def _configure_fp16_kv_cache(original_fn, self):
+    if self.server_args.kv_cache_dtype == "fp16":
+        import torch
+
+        self.kv_cache_dtype = torch.float16
+        return None
+    return original_fn(self)
+
+
+@plugin_hook(
+    "sglang.srt.model_executor.model_runner.ModelRunner._init_pools",
     type=HookType.AFTER,
 )
 def _fix_swa_pools(result, self):
@@ -36,6 +49,27 @@ def _fix_swa_pools(result, self):
     from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
     if not getattr(self, "is_hybrid_swa", False):
+        return
+
+    # DeepSeek-V4 owns a dedicated composite SWA/compressed pool and allocator.
+    # Rebuilding it as generic SWAKVPool discards its c4/c128 state.
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    if isinstance(getattr(self, "token_to_kv_pool", None), DeepSeekV4TokenToKVPool):
+        if not isinstance(
+            getattr(self, "token_to_kv_pool_allocator", None),
+            SWATokenToKVPoolAllocator,
+        ):
+            need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
+            self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                self.full_max_total_num_tokens,
+                self.swa_max_total_num_tokens,
+                page_size=self.page_size,
+                dtype=self.kv_cache_dtype,
+                device=self.device,
+                kvcache=self.token_to_kv_pool,
+                need_sort=need_sort,
+            )
         return
 
     pool_ok = isinstance(getattr(self, "token_to_kv_pool", None), SWAKVPool)

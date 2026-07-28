@@ -41,16 +41,15 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
 
     @staticmethod
     def _extend_attention_backend_choices() -> None:
-        """Register the ``"kunlun"`` attention backend choice.
-
-        Mirrors mimo: ``ATTENTION_BACKEND_CHOICES += ["kunlun"]``.
-        """
+        """Register the public Kunlun attention backend choices."""
         try:
             import sglang.srt.server_args as server_args
 
             choices = getattr(server_args, "ATTENTION_BACKEND_CHOICES", None)
-            if choices is not None and "kunlun" not in choices:
-                choices.append("kunlun")
+            if choices is not None:
+                for backend in ("kunlun", "kunlun_compressed"):
+                    if backend not in choices:
+                        choices.append(backend)
         except Exception:
             pass
 
@@ -65,6 +64,31 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
         """
         if getattr(server_args, "page_size", None) is None:
             server_args.page_size = 128
+
+        # DeepSeek-V4's upstream defaults run after this hook and select
+        # ``dsv4`` unconditionally. Preserve the user's public Kunlun name
+        # through that later model-specific adjustment.
+        if getattr(server_args, "attention_backend", None) == "kunlun_compressed":
+            from sglang.srt.arg_groups import deepseek_v4_hook
+
+            original = deepseek_v4_hook.apply_deepseek_v4_defaults
+            if not getattr(original, "_kunlun_compressed", False):
+                def apply_deepseek_v4_defaults(args, model_arch):
+                    requested = args.attention_backend
+                    requested_kv_dtype = args.kv_cache_dtype
+                    if requested == "kunlun_compressed" and requested_kv_dtype == "fp16":
+                        args.kv_cache_dtype = "bfloat16"
+                    original(args, model_arch)
+                    if requested == "kunlun_compressed":
+                        args.attention_backend = requested
+                        args.kv_cache_dtype = requested_kv_dtype
+                        if args.prefill_attention_backend in (None, "dsv4"):
+                            args.prefill_attention_backend = requested
+                        if args.decode_attention_backend in (None, "dsv4"):
+                            args.decode_attention_backend = requested
+
+                apply_deepseek_v4_defaults._kunlun_compressed = True
+                deepseek_v4_hook.apply_deepseek_v4_defaults = apply_deepseek_v4_defaults
 
     # ------------------------------------------------------------------
     # Subsystem factory methods

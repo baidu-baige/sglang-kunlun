@@ -10,8 +10,50 @@ import sys
 
 def _enable_kunlun_attention_choice(module) -> None:
     choices = getattr(module, "ATTENTION_BACKEND_CHOICES", None)
-    if choices is not None and "kunlun" not in choices:
-        choices.append("kunlun")
+    if choices is not None:
+        for backend in ("kunlun", "kunlun_compressed"):
+            if backend not in choices:
+                choices.append(backend)
+
+    try:
+        annotations = module.ServerArgs.__annotations__
+        raw_annotation = annotations["kv_cache_dtype"]
+        if isinstance(raw_annotation, str) and "'fp16'" not in raw_annotation:
+            annotations["kv_cache_dtype"] = raw_annotation.replace(
+                "'fp4_e2m1']", "'fp4_e2m1', 'fp16']"
+            )
+    except Exception:
+        pass
+
+
+def _enable_transformers_compatibility() -> None:
+    import transformers
+    from huggingface_hub import dataclasses as hub_dataclasses
+    from huggingface_hub.errors import StrictDataclassDefinitionError
+    from transformers import configuration_utils
+
+    config_type = getattr(configuration_utils, "PretrainedConfig", None)
+    if config_type is not None:
+        if not hasattr(configuration_utils, "PreTrainedConfig"):
+            configuration_utils.PreTrainedConfig = config_type
+        if not hasattr(transformers, "PreTrainedConfig"):
+            transformers.PreTrainedConfig = config_type
+
+    original_strict = hub_dataclasses.strict
+    if getattr(original_strict, "_sglang_kunlun_compatible", False):
+        return
+
+    def compatible_strict(cls=None, **kwargs):
+        def decorate(target):
+            try:
+                return original_strict(target, **kwargs)
+            except StrictDataclassDefinitionError:
+                return target
+
+        return decorate(cls) if cls is not None else decorate
+
+    compatible_strict._sglang_kunlun_compatible = True
+    hub_dataclasses.strict = compatible_strict
 
 
 class _ServerArgsLoader(importlib.abc.Loader):
@@ -46,8 +88,27 @@ class _ServerArgsFinder(importlib.abc.MetaPathFinder):
         return None
 
 
-if os.environ.get("SGLANG_PLATFORM") == "kunlun" or os.environ.get("SGLANG_USE_XPU") == "1":
+_startup_args = [*getattr(sys, "orig_argv", ()), *sys.argv]
+_is_package_tool = any(
+    arg == "pip"
+    or arg.endswith("/pip")
+    or arg.endswith("/pip3")
+    or arg.endswith("/pip3.10")
+    for arg in _startup_args
+)
+
+if (
+    not _is_package_tool
+    and (
+        os.environ.get("SGLANG_PLATFORM") == "kunlun"
+        or os.environ.get("SGLANG_USE_XPU") == "1"
+    )
+):
     try:
+        _enable_transformers_compatibility()
+        os.environ.setdefault("SGLANG_OPT_USE_TOPK_V2", "0")
+        os.environ.setdefault("SGLANG_OPT_USE_COMPRESSOR_V2", "0")
+
         from sglang_kunlun import _kunlun_pre_shim
 
         _kunlun_pre_shim()

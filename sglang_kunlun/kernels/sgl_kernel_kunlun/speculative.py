@@ -28,12 +28,6 @@ def build_tree_kernel_efficient(
     batch_size = seq_lens.numel()
     seq_lens_sum = -1
     parent_list_for_kernel = parent_list.to(torch.long)
-    if parent_list_for_kernel.numel() == 0 and spec_steps == 1:
-        parent_list_for_kernel = torch.zeros(
-            (batch_size, 1),
-            dtype=torch.long,
-            device=parent_list.device,
-        )
     seq_lens_for_kernel = seq_lens.to(torch.int32)
     retrive_index_for_kernel = retrive_index.to(torch.long)
     retrive_next_token_for_kernel = retrive_next_token.to(torch.long)
