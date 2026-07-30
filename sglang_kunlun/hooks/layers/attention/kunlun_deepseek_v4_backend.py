@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import List, Literal, Optional
 
+import hashlib
 import json
 import logging
 import os
@@ -44,6 +45,54 @@ if os.environ.get("DSV4_C4_ATTN_METADATA_LOG") == "1":
 _ENABLE_DSV4_ACCURACY_DUMPS = False
 
 
+def _dsv4_ifeval_diag_rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return int(os.environ.get("RANK", "0"))
+
+
+def _dsv4_ifeval_tensor_summary(tensor: Optional[torch.Tensor]) -> Optional[dict]:
+    if not isinstance(tensor, torch.Tensor):
+        return None
+    flat = tensor.detach().reshape(-1)
+    cpu = flat.contiguous().cpu()
+    byte_view = cpu.view(torch.uint8)
+    return {
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "stride": list(tensor.stride()),
+        "storage_offset": tensor.storage_offset(),
+        "is_contiguous": tensor.is_contiguous(),
+        "data_ptr": tensor.data_ptr(),
+        "numel": flat.numel(),
+        "head": cpu[:16].tolist(),
+        "tail": cpu[-16:].tolist() if cpu.numel() else [],
+        "sha256": hashlib.sha256(byte_view.numpy().tobytes()).hexdigest(),
+    }
+
+
+def _append_dsv4_ifeval_backend_event(owner, event: dict) -> None:
+    dump_dir = os.environ.get("DSV4_IFEVAL_MTP_DIAG_DIR")
+    if not dump_dir or _dsv4_ifeval_diag_rank() != 0:
+        return
+    event_count = getattr(owner, "_dsv4_ifeval_diag_event_count", 0)
+    max_events = int(os.environ.get("DSV4_IFEVAL_MTP_DIAG_MAX_EVENTS", "20000"))
+    if event_count >= max_events:
+        return
+    os.makedirs(dump_dir, exist_ok=True)
+    event["event_index"] = event_count
+    event["pid"] = os.getpid()
+    step_id = getattr(owner, "speculative_step_id", -1)
+    event["speculative_step_id"] = int(step_id) if step_id is not None else -1
+    with open(
+        os.path.join(dump_dir, "backend_events_rank0.jsonl"),
+        "a",
+        encoding="utf-8",
+    ) as output:
+        output.write(json.dumps(event, separators=(",", ":")) + "\n")
+    owner._dsv4_ifeval_diag_event_count = event_count + 1
+
+
 def _summarize_c4_metadata_tensor(value):
     if value is None:
         return None
@@ -74,7 +123,7 @@ def _clamp_c128_prefill_topk(
 
 def _mtp_tensor_probe_enabled(layer_id: int, num_queries: int) -> bool:
     dump_dir = os.environ.get("DSV4_MTP_TENSOR_DUMP_DIR")
-    if not dump_dir:
+    if not dump_dir or os.environ.get("DSV4_MTP_PROBE_SEQ_LEN"):
         return False
     if (
         num_queries != 1
@@ -129,6 +178,31 @@ def _mtp_tensor_stats(tensor: torch.Tensor) -> dict:
     return stats
 
 
+def _mtp_probe_matches_seq_lens(seq_lens_cpu, batch_size: int) -> bool:
+    if seq_lens_cpu is None:
+        return False
+    values = torch.as_tensor(seq_lens_cpu)[:batch_size].reshape(-1)
+    if not values.numel():
+        return False
+    expected = int(os.environ.get("DSV4_MTP_PROBE_SEQ_LEN", "-1"))
+    if expected < 0:
+        return int(values.max()) > 10000
+    radius = int(os.environ.get("DSV4_MTP_PROBE_RADIUS", "8"))
+    return bool((values - expected).abs().le(radius).any())
+
+
+def _mtp_probe_layout(tensor: torch.Tensor) -> dict:
+    return {
+        "shape": tuple(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "stride": tuple(tensor.stride()),
+        "storage_offset": tensor.storage_offset(),
+        "is_contiguous": tensor.is_contiguous(),
+        "device": str(tensor.device),
+        "data_ptr": tensor.data_ptr(),
+    }
+
+
 def _dump_previous_mtp_tensor_probe(multistep_backend, forward_batch) -> None:
     dump_dir = os.environ.get("DSV4_MTP_TENSOR_DUMP_DIR")
     rank = (
@@ -139,14 +213,12 @@ def _dump_previous_mtp_tensor_probe(multistep_backend, forward_batch) -> None:
     if (
         not dump_dir
         or rank != 0
-        or forward_batch.seq_lens_cpu is None
-        or int(forward_batch.seq_lens_cpu[: forward_batch.batch_size].max()) <= 10000
+        or not _mtp_probe_matches_seq_lens(
+            forward_batch.seq_lens_cpu, forward_batch.batch_size
+        )
     ):
         return
 
-    if not getattr(multistep_backend, "_mtp_tensor_probe_primed", False):
-        multistep_backend._mtp_tensor_probe_primed = True
-        return
     cycle = getattr(multistep_backend, "_mtp_tensor_dump_cycle", 0)
     max_cycles = int(os.environ.get("DSV4_MTP_TENSOR_DUMP_CYCLES", "3"))
     if cycle >= max_cycles:
@@ -154,25 +226,47 @@ def _dump_previous_mtp_tensor_probe(multistep_backend, forward_batch) -> None:
 
     tensors = {}
     tensor_metadata = {}
-    tensor_stats = {}
-    operator_contracts = {}
-    for backend in multistep_backend.attn_backends:
-        operator_contracts.update(getattr(backend, "_mtp_tensor_probe_contracts", {}))
-        for name, tensor in getattr(backend, "_mtp_tensor_probe", {}).items():
-            if not isinstance(tensor, torch.Tensor):
-                continue
-            cpu_tensor = tensor.detach().cpu()
-            tensors[name] = cpu_tensor
-            tensor_metadata[name] = {
-                "shape": tuple(tensor.shape),
-                "dtype": str(tensor.dtype),
-                "stride": tuple(tensor.stride()),
-                "device": str(tensor.device),
-                "data_ptr": tensor.data_ptr(),
-            }
-            tensor_stats[name] = _mtp_tensor_stats(cpu_tensor)
+    bs = forward_batch.batch_size
+
+    def record(step: int, name: str, tensor) -> None:
+        if not isinstance(tensor, torch.Tensor):
+            return
+        key = f"step{step}.{name}"
+        tensors[key] = tensor.detach().cpu()
+        tensor_metadata[key] = _mtp_probe_layout(tensor)
+
+    for step, backend in enumerate(multistep_backend.attn_backends):
+        metadata = getattr(backend, "forward_metadata", None)
+        core = getattr(metadata, "core_attn_metadata", None)
+        if core is None:
+            core = getattr(metadata, "core_metadata", None)
+        indexer = getattr(metadata, "indexer_metadata", None)
+
+        attention_aux = backend._attention_decode_aux.get(bs)
+        if attention_aux is not None:
+            _, q_lod, _, kv_lens = attention_aux
+            record(step, "q_lod", q_lod)
+            record(step, "kv_lens", kv_lens)
+
+        page_table = getattr(core, "page_table", None)
+        record(step, "page_table", page_table)
+        if isinstance(page_table, torch.Tensor) and indexer is not None:
+            max_seq_len = int(getattr(indexer, "max_c4_seq_len", 0))
+            num_pages = min(
+                (max_seq_len + 63) // 64,
+                page_table.shape[1],
+            )
+            record(step, "block_table", page_table[:, :num_pages].to(torch.int32))
+        record(step, "c4_seq_lens", getattr(indexer, "c4_seq_lens", None))
+        record(
+            step,
+            "c4_sparse_page_indices",
+            getattr(core, "c4_sparse_page_indices", None),
+        )
+        record(step, "c128_page_indices", getattr(core, "c128_page_indices", None))
+
     if not tensors:
-        logger.warning("[DSV4_MTP_PROBE] no target tensor probe buffers captured")
+        logger.warning("[DSV4_MTP_PROBE] no target replay metadata captured")
         return
 
     os.makedirs(dump_dir, exist_ok=True)
@@ -182,10 +276,15 @@ def _dump_previous_mtp_tensor_probe(multistep_backend, forward_batch) -> None:
         {
             "version": version,
             "cycle": cycle,
+            "probe_seq_len": int(os.environ.get("DSV4_MTP_PROBE_SEQ_LEN", "-1")),
+            "seq_lens": list(
+                map(
+                    int,
+                    forward_batch.seq_lens_cpu[: forward_batch.batch_size],
+                )
+            ),
             "tensors": tensors,
             "tensor_metadata": tensor_metadata,
-            "tensor_stats": tensor_stats,
-            "operator_contracts": operator_contracts,
         },
         path,
     )
@@ -301,6 +400,7 @@ class KunlunDSV4AttnMetadata(DSV4AttnMetadata):
     """DSV4 metadata without CUDA FlashMLA scheduler objects."""
 
     def init_flashmla_related(self, is_prefill: bool = False) -> None:
+        """Initialize Kunlun sparse metadata without FlashMLA schedulers."""
         if self.c4_sparse_topk not in (512, 1024):
             raise ValueError(f"unsupported Kunlun C4 top-k: {self.c4_sparse_topk}")
         self.c4_sparse_topk_lengths = torch.clamp(
@@ -419,6 +519,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         self._c4_decode_aux = {}
 
     def get_swa_page_indices(self, seq_lens_casual, req_pool_indices_repeated):
+        """Translate request token offsets into Kunlun SWA page indices."""
         # Match the 0.5.8 contract: invalid history offsets are clamped to the
         # first physical row and remain valid indices; the length tensor masks
         # those rows. Upstream 0.5.14 writes -1 here, which changes graph replay
@@ -439,6 +540,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         ).to(torch.int32)
 
     def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
+        """Initialize out-of-graph metadata and refresh replay lengths."""
         if in_capture and _is_graph_extend_mode(forward_batch.forward_mode):
             _get_graph_extend_aux(
                 self._attention_graph_extend_aux,
@@ -465,47 +567,216 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         q_lora_ready=None,
         skip_compressor=False,
     ):
-        layer_id = c4_indexer.layer_id
-        capture_probe = (
-            isinstance(x, torch.Tensor)
-            and forward_batch.forward_mode.is_extend()
-            and not torch.cuda.is_current_stream_capturing()
-            and _mtp_tensor_probe_enabled(layer_id, x.shape[0])
-        )
-        if capture_probe:
-            prefix = f"step{self.speculative_step_id}_layer{layer_id}"
-            probe = getattr(self, "_mtp_tensor_probe", {})
-            probe[f"{prefix}.indexer.x"] = x.clone()
-            if isinstance(q_lora, torch.Tensor):
-                probe[f"{prefix}.indexer.q_lora"] = q_lora.clone()
-            self._mtp_tensor_probe = probe
+        """Run the version-pinned C4 flow with explicit Kunlun request state."""
+        import torch.nn.functional as F
 
-        result = super().forward_c4_indexer(
-            x=x,
-            q_lora=q_lora,
-            c4_indexer=c4_indexer,
+        from sglang.srt.layers.attention.dsv4 import indexer as upstream_indexer
+
+        if forward_batch.forward_mode.is_idle():
+            return
+
+        token_to_kv_pool = self.token_to_kv_pool
+        metadata = self.forward_metadata
+        indexer_metadata = metadata.indexer_metadata
+        core_metadata = metadata.core_metadata
+        assert isinstance(indexer_metadata, upstream_indexer.PagedIndexerMetadata)
+
+        positions = core_metadata.positions
+        num_queries = min(x.shape[0], q_lora.shape[0], positions.shape[0])
+        if x.shape[0] != num_queries:
+            x = x[:num_queries]
+        if q_lora.shape[0] != num_queries:
+            q_lora = q_lora[:num_queries]
+        if positions.shape[0] != num_queries:
+            positions = positions[:num_queries]
+
+        if enable_multi_stream:
+            q_indexer, weights, c4_indexer_kv_cache = (
+                self._forward_prepare_multi_stream(
+                    x=x,
+                    q_lora=q_lora,
+                    c4_indexer=c4_indexer,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    token_to_kv_pool=token_to_kv_pool,
+                    alt_streams=alt_streams,
+                    q_lora_ready=q_lora_ready,
+                )
+            )
+        else:
+            assert q_lora_ready is None
+            q_indexer, weights, c4_indexer_kv_cache = self._forward_prepare_normal(
+                x=x,
+                q_lora=q_lora,
+                c4_indexer=c4_indexer,
+                positions=positions,
+                forward_batch=forward_batch,
+                token_to_kv_pool=token_to_kv_pool,
+                skip_compressor=skip_compressor,
+            )
+
+        assert len(c4_indexer_kv_cache.shape) == 2
+        block_kv = 64
+        num_heads_kv = 1
+        use_fp4_indexer = c4_indexer.use_fp4_indexer
+        head_dim_with_sf = 68 if use_fp4_indexer else 132
+
+        if use_fp4_indexer:
+            q_fp4, q_sf = q_indexer
+            assert len(q_fp4.shape) == 3
+            assert len(q_sf.shape) == 2
+            q = (q_fp4.unsqueeze(1), q_sf.unsqueeze(1))
+        else:
+            assert len(q_indexer.shape) == 3
+            q = q_indexer.unsqueeze(1)
+
+        c4_indexer_kv_cache = c4_indexer_kv_cache.view(
+            c4_indexer_kv_cache.shape[0],
+            block_kv,
+            num_heads_kv,
+            head_dim_with_sf,
+        )
+        assert len(weights.shape) == 3
+        weights = weights.squeeze(2)
+        if use_fp4_indexer:
+            weights = weights.float()
+            if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+                raise RuntimeError("DeepSeek V4 FP4 indexer requires DeepGEMM indexer.")
+            from deep_gemm import fp8_fp4_paged_mqa_logits as fn
+        elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+            from sglang.srt.layers.attention.dsa.tilelang_kernel import (
+                tilelang_fp8_paged_mqa_logits as fn,
+            )
+        elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
+            fn = upstream_indexer._aiter_fp8_paged_mqa_logits
+        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+            if upstream_indexer.is_sm120_supported():
+                fn = upstream_indexer.fp8_paged_mqa_logits_torch_sm120
+            else:
+                fn = upstream_indexer.fp8_paged_mqa_logits_torch
+        else:
+            from deep_gemm import fp8_paged_mqa_logits as fn
+
+        query_rows = (
+            q_indexer[0].shape[0] if use_fp4_indexer else q_indexer.shape[0]
+        )
+
+        def match_num_queries(tensor, value):
+            if tensor.shape[0] == query_rows:
+                return tensor
+            if tensor.shape[0] > query_rows:
+                return tensor[:query_rows]
+            pad = (0, 0) * (tensor.dim() - 1) + (
+                0,
+                query_rows - tensor.shape[0],
+            )
+            return F.pad(tensor, pad, value=value)
+
+        c4_seq_lens = match_num_queries(indexer_metadata.c4_seq_lens, value=1)
+        c4_seq_lens_for_logits = c4_seq_lens
+        page_table = match_num_queries(indexer_metadata.page_table, value=0)
+        c4_sparse_page_indices = match_num_queries(
+            core_metadata.c4_sparse_page_indices, value=-1
+        )
+        use_tilelang = (
+            envs.SGLANG_OPT_USE_TILELANG_INDEXER.get() and not use_fp4_indexer
+        )
+        use_aiter = envs.SGLANG_OPT_USE_AITER_INDEXER.get() and not use_fp4_indexer
+        if (
+            c4_seq_lens_for_logits.dim() == 1
+            and not use_tilelang
+            and not use_aiter
+        ):
+            c4_seq_lens_for_logits = c4_seq_lens_for_logits.unsqueeze(-1)
+
+        logits = self._compute_c4_indexer_logits(
+            fn=fn,
+            q=q,
+            c4_indexer_kv_cache=c4_indexer_kv_cache,
+            weights=weights,
+            c4_seq_lens=c4_seq_lens_for_logits,
+            page_table=page_table,
+            indexer_metadata=indexer_metadata,
+            core_metadata=core_metadata,
             forward_batch=forward_batch,
-            alt_streams=alt_streams,
-            enable_multi_stream=enable_multi_stream,
-            q_lora_ready=q_lora_ready,
-            skip_compressor=skip_compressor,
+            c4_indexer=c4_indexer,
         )
 
-        if capture_probe:
-            metadata = self.forward_metadata
-            core = metadata.core_metadata
-            indexer = metadata.indexer_metadata
-            for name, tensor in (
-                ("c4_seq_lens", indexer.c4_seq_lens),
-                ("page_table", indexer.page_table),
-                ("topk_metadata", indexer.topk_metadata),
-                ("deep_gemm_metadata", indexer.deep_gemm_metadata),
-                ("c4_sparse_page_indices", core.c4_sparse_page_indices),
-                ("c4_sparse_raw_indices", core.c4_sparse_raw_indices),
-            ):
-                if isinstance(tensor, torch.Tensor):
-                    probe[f"{prefix}.indexer.{name}"] = tensor.clone()
-        return result
+        assert indexer_metadata.page_table is core_metadata.page_table
+        if self.debug_use_external_c4_sparse_indices:
+            return
+
+        indexer_capturer = upstream_indexer.get_global_indexer_capturer()
+        capture_enabled = indexer_capturer is not None
+        hisparse_coordinator = self.hisparse_coordinator
+        hisparse_decode = (
+            hisparse_coordinator is not None
+            and forward_batch.forward_mode.is_decode()
+        )
+
+        raw_indices = None
+        if capture_enabled:
+            raw_indices = torch.empty_like(c4_sparse_page_indices)
+        elif hisparse_decode:
+            raw_indices = hisparse_coordinator.raw_indices_buffer[
+                : c4_sparse_page_indices.size(0)
+            ]
+        elif core_metadata.c4_sparse_raw_indices is not None:
+            raw_indices = core_metadata.c4_sparse_raw_indices
+
+        if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
+            upstream_indexer.topk_transform_512_pytorch_vectorized(
+                logits,
+                c4_seq_lens,
+                page_table,
+                c4_sparse_page_indices,
+                indexer_metadata.c4_page_size,
+                raw_indices,
+            )
+        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
+            upstream_indexer.topk_transform_512_v2(
+                logits,
+                c4_seq_lens,
+                page_table,
+                c4_sparse_page_indices,
+                indexer_metadata.c4_page_size,
+                indexer_metadata.topk_metadata,
+            )
+        else:
+            upstream_indexer.topk_transform_512(
+                logits,
+                c4_seq_lens,
+                page_table,
+                c4_sparse_page_indices,
+                indexer_metadata.c4_page_size,
+                raw_indices,
+            )
+
+        if hisparse_coordinator is not None:
+            if hisparse_decode:
+                compress_layer_id = token_to_kv_pool.layer_mapping[
+                    c4_indexer.layer_id
+                ].compress_layer_id
+                core_metadata.c4_sparse_page_indices = (
+                    hisparse_coordinator.swap_in_selected_pages(
+                        req_pool_indices=forward_batch.req_pool_indices,
+                        compressed_seq_lens=indexer_metadata.c4_seq_lens,
+                        top_k_result=raw_indices,
+                        layer_id=compress_layer_id,
+                    )
+                )
+            else:
+                core_metadata.c4_sparse_page_indices = (
+                    token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(
+                        core_metadata.c4_sparse_page_indices
+                    ).to(torch.int32)
+                )
+
+        if capture_enabled:
+            compress_layer_id = token_to_kv_pool.layer_mapping[
+                c4_indexer.layer_id
+            ].compress_layer_id
+            indexer_capturer.capture(compress_layer_id, raw_indices)
 
     def _compute_c4_indexer_logits(
         self,
@@ -559,6 +830,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         need_compress: bool = True,
         is_prefill: bool = False,
     ) -> KunlunDSV4AttnMetadata:
+        """Build Kunlun core attention metadata for the current request."""
         assert self.swa_page_size == upstream.SWA_WINDOW
         seq_lens_casual = seq_lens_casual.to(torch.int32)
         swa_page_indices = self.get_swa_page_indices(
@@ -646,7 +918,9 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             kv_lens.copy_(forward_batch.seq_lens[:batch_size].to(torch.int32))
             return q_lod_cpu, q_lod, kv_lens_cpu, kv_lens
 
-        if _is_graph_extend_mode(forward_batch.forward_mode):
+        if _is_graph_extend_mode(forward_batch.forward_mode) and not getattr(
+            forward_batch, "_kunlun_ragged_draft_extend", False
+        ):
             batch_size = forward_batch.batch_size
             aux = _get_graph_extend_aux(
                 self._attention_graph_extend_aux, batch_size, num_queries, device
@@ -701,9 +975,16 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         cache = swa_pool.kv_buffer[local_layer_id].reshape(-1, 512)
         pack = dsv4_quant_k_cache_kunlun(swa_k)
         capture_probe = _mtp_writer_probe_enabled(layer_id)
+        capture_ifeval_diag = bool(
+            os.environ.get("DSV4_IFEVAL_MTP_DIAG_DIR")
+            and _dsv4_ifeval_diag_rank() == 0
+            and layer_id == 0
+        )
+        mapped_loc = None
+        if capture_probe or capture_ifeval_diag:
+            mapped_loc = mapping.index_select(0, raw_loc.long())
         if capture_probe:
             prefix = f"step{self.speculative_step_id}_layer{layer_id}"
-            mapped_loc = mapping.index_select(0, raw_loc.long())
             probe = getattr(self, "_mtp_tensor_probe", {})
             probe.update(
                 {
@@ -734,10 +1015,31 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             pack,
             swa_pool.page_size,
         )
+        if capture_probe or capture_ifeval_diag:
+            cache_rows = _mtp_gather_cache_rows(cache, mapped_loc).clone()
         if capture_probe:
-            probe[f"{prefix}.store.cache_rows"] = _mtp_gather_cache_rows(
-                cache, mapped_loc
-            ).clone()
+            probe[f"{prefix}.store.cache_rows"] = cache_rows
+        if capture_ifeval_diag:
+            packed = pack.k_nope_fp8
+            write_matches_readback = bool(
+                packed.numel() == cache_rows.numel()
+                and torch.equal(packed.reshape(-1), cache_rows.reshape(-1))
+            )
+            _append_dsv4_ifeval_backend_event(
+                self,
+                {
+                    "kind": "swa_store",
+                    "layer_id": layer_id,
+                    "write_matches_readback": write_matches_readback,
+                    "scheduler_raw_loc": _dsv4_ifeval_tensor_summary(
+                        scheduler_raw_loc
+                    ),
+                    "operator_raw_loc": _dsv4_ifeval_tensor_summary(raw_loc),
+                    "mapped_loc": _dsv4_ifeval_tensor_summary(mapped_loc),
+                    "packed_k": _dsv4_ifeval_tensor_summary(packed),
+                    "cache_rows": _dsv4_ifeval_tensor_summary(cache_rows),
+                },
+            )
 
     def forward(
         self,
@@ -751,6 +1053,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         attn_sink: Optional[torch.Tensor] = None,
         **_,
     ) -> torch.Tensor:
+        """Run Kunlun attention for the requested compression ratio."""
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
             return q.new_empty(q.shape[0], q.shape[1], layer.v_head_dim)
         assert k is v, "DeepseekV4 shares k and v"
@@ -806,6 +1109,74 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         q_lod_cpu, q_lod, kv_lens_cpu, kv_lens = self._make_lod(
             forward_batch, q_3d.shape[0], q_3d.device
         )
+        if (
+            os.environ.get("DSV4_IFEVAL_MTP_DIAG_DIR")
+            and _dsv4_ifeval_diag_rank() == 0
+            and layer.layer_id == 0
+        ):
+            def sample_page_indices(indices):
+                if not isinstance(indices, torch.Tensor) or indices.ndim < 2:
+                    return indices
+                if indices.shape[-1] <= 8:
+                    return indices
+                return torch.cat((indices[..., :4], indices[..., -4:]), dim=-1)
+
+            sampled_win_indices = sample_page_indices(win_indices)
+            sampled_win_cache_rows = _mtp_gather_cache_rows(
+                win_cache, sampled_win_indices
+            )
+            sampled_extra_indices = sample_page_indices(extra_indices)
+            sampled_extra_cache_rows = (
+                _mtp_gather_cache_rows(extra_cache, sampled_extra_indices)
+                if isinstance(extra_cache, torch.Tensor)
+                and isinstance(sampled_extra_indices, torch.Tensor)
+                else None
+            )
+            _append_dsv4_ifeval_backend_event(
+                self,
+                {
+                    "kind": "attention_consume",
+                    "layer_id": int(layer.layer_id),
+                    "compress_ratio": int(compress_ratio),
+                    "input_ids": _dsv4_ifeval_tensor_summary(
+                        getattr(forward_batch, "input_ids", None)
+                    ),
+                    "positions": _dsv4_ifeval_tensor_summary(
+                        getattr(forward_batch, "positions", None)
+                    ),
+                    "seq_lens": _dsv4_ifeval_tensor_summary(
+                        getattr(forward_batch, "seq_lens", None)
+                    ),
+                    "req_pool_indices": _dsv4_ifeval_tensor_summary(
+                        getattr(forward_batch, "req_pool_indices", None)
+                    ),
+                    "scheduler_out_cache_loc": _dsv4_ifeval_tensor_summary(
+                        getattr(forward_batch, "out_cache_loc", None)
+                    ),
+                    "raw_out_loc": _dsv4_ifeval_tensor_summary(
+                        getattr(core, "raw_out_loc", None)
+                    ),
+                    "page_table": _dsv4_ifeval_tensor_summary(
+                        getattr(core, "page_table", None)
+                    ),
+                    "win_indices": _dsv4_ifeval_tensor_summary(win_indices),
+                    "sampled_win_indices": _dsv4_ifeval_tensor_summary(
+                        sampled_win_indices
+                    ),
+                    "sampled_win_cache_rows": _dsv4_ifeval_tensor_summary(
+                        sampled_win_cache_rows
+                    ),
+                    "extra_indices": _dsv4_ifeval_tensor_summary(extra_indices),
+                    "sampled_extra_indices": _dsv4_ifeval_tensor_summary(
+                        sampled_extra_indices
+                    ),
+                    "sampled_extra_cache_rows": _dsv4_ifeval_tensor_summary(
+                        sampled_extra_cache_rows
+                    ),
+                    "q_lod": _dsv4_ifeval_tensor_summary(q_lod),
+                    "kv_lens": _dsv4_ifeval_tensor_summary(kv_lens),
+                },
+            )
         if (
             os.environ.get("DSV4_C4_ATTN_METADATA_LOG") == "1"
             and forward_batch.batch_size > 1
@@ -1080,39 +1451,66 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         )
         alias_layer = int(os.environ.get("DSV4_DECODE_ATTENTION_ALIAS_LAYER", "2"))
         if attention_aliases is not None and layer.layer_id == alias_layer:
+            operator_only_alias = (
+                os.environ.get("DSV4_DECODE_ATTENTION_ALIAS_OPERATOR_ONLY") == "1"
+            )
             attention_aliases.update(
                 {
-                    "attention_q": q_op,
+                    "attention_q": q_op.clone() if operator_only_alias else q_op,
                     "attention_win_cache": win_cache_op,
-                    "attention_win_indices": win_indices_op,
+                    "attention_win_indices": (
+                        win_indices_op.clone() if operator_only_alias else win_indices_op
+                    ),
                     "attention_extra_cache": extra_cache_op,
-                    "attention_extra_indices": extra_indices_op,
+                    "attention_extra_indices": (
+                        extra_indices_op.clone()
+                        if operator_only_alias
+                        else extra_indices_op
+                    ),
                     "attention_q_lod_cpu": q_lod_cpu_op,
-                    "attention_q_lod": q_lod_op,
+                    "attention_q_lod": (
+                        q_lod_op.clone() if operator_only_alias else q_lod_op
+                    ),
                     "attention_kv_lens_cpu": kv_lens_cpu_op,
-                    "attention_kv_lens": kv_lens_op,
+                    "attention_kv_lens": (
+                        kv_lens_op.clone() if operator_only_alias else kv_lens_op
+                    ),
+                    "attention_softmax_scale": torch.tensor(
+                        self.softmax_scale, dtype=torch.float64
+                    ),
+                    "attention_causal": torch.tensor(True),
+                    "attention_max_window_size": torch.tensor(
+                        win_indices_op.shape[1], dtype=torch.int64
+                    ),
+                    "attention_compress_ratio": torch.tensor(
+                        effective_ratio, dtype=torch.int64
+                    ),
+                    "attention_compressed_topk": torch.tensor(
+                        compressed_topk, dtype=torch.int64
+                    ),
                 }
             )
             if attn_sink_op is not None:
                 attention_aliases["attention_sink"] = attn_sink_op
-            for name in (
-                "raw_out_loc",
-                "swa_out_cache_loc",
-                "c4_out_loc",
-                "page_table",
-                "swa_page_indices",
-                "swa_topk_lengths",
-                "c4_sparse_topk_lengths",
-            ):
-                value = getattr(core, name, None)
-                if isinstance(value, torch.Tensor):
-                    attention_aliases[f"metadata_{name}"] = value
-            attention_aliases.update(
-                {
-                    "metadata_req_pool_indices": forward_batch.req_pool_indices,
-                    "metadata_req_to_token": self.req_to_token,
-                }
-            )
+            if not operator_only_alias:
+                for name in (
+                    "raw_out_loc",
+                    "swa_out_cache_loc",
+                    "c4_out_loc",
+                    "page_table",
+                    "swa_page_indices",
+                    "swa_topk_lengths",
+                    "c4_sparse_topk_lengths",
+                ):
+                    value = getattr(core, name, None)
+                    if isinstance(value, torch.Tensor):
+                        attention_aliases[f"metadata_{name}"] = value
+                attention_aliases.update(
+                    {
+                        "metadata_req_pool_indices": forward_batch.req_pool_indices,
+                        "metadata_req_to_token": self.req_to_token,
+                    }
+                )
         capture_mtp_probe = (
             forward_batch.forward_mode.is_extend()
             and not torch.cuda.is_current_stream_capturing()
@@ -1299,9 +1697,17 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         if attention_aliases is not None and layer.layer_id == alias_layer:
             attention_aliases.update(
                 {
-                    "attention_output": out_op,
-                    "attention_max_logits": max_logits_op,
-                    "attention_lse": lse_op,
+                    "attention_output": (
+                        out_op.clone() if operator_only_alias else out_op
+                    ),
+                    "attention_max_logits": (
+                        max_logits_op.clone()
+                        if operator_only_alias
+                        else max_logits_op
+                    ),
+                    "attention_lse": (
+                        lse_op.clone() if operator_only_alias else lse_op
+                    ),
                 }
             )
         if (
@@ -1389,7 +1795,11 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                     else value
                     for key, value in prefill_backend_device_probe.items()
                 },
-                f"/home/zx/debug_dumps/prefill_backend_device_0514_layer{getattr(layer, 'layer_id', -1)}_prefix{prefill_backend_probe_prefix_len}_rank0.pt",
+                (
+                    "/home/zx/debug_dumps/prefill_backend_device_0514_layer"
+                    f"{getattr(layer, 'layer_id', -1)}_prefix"
+                    f"{prefill_backend_probe_prefix_len}_rank0.pt"
+                ),
             )
         if capture_prefill_backend_probe:
             tail = slice(7680, 8192)
@@ -1849,8 +2259,6 @@ class KunlunDeepseekV4MultiStepBackend(DeepseekV4MultiStepBackend):
         self._mtp_probe_replay_calls = 0
 
     def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
-        if not in_capture:
-            _dump_previous_mtp_tensor_probe(self, forward_batch)
         # Seed replay from step 0, then copy its live metadata into every
         # later draft step that participates in this captured decode.
         from types import SimpleNamespace
@@ -1889,6 +2297,8 @@ class KunlunDeepseekV4MultiStepBackend(DeepseekV4MultiStepBackend):
                     temp_metadata=temp_metadata,
                     bucket=upstream._GraphBucket.DECODE_OR_IDLE,
                 )
+        if not in_capture:
+            _dump_previous_mtp_tensor_probe(self, forward_batch)
         if (
             in_capture
             or os.environ.get("DSV4_MTP_PROBE") != "1"
@@ -1948,34 +2358,6 @@ class KunlunDeepseekV4MultiStepBackend(DeepseekV4MultiStepBackend):
                 _ptr(getattr(core, "swa_page_indices", None)),
                 _ptr(getattr(core, "c4_out_loc", None)),
             )
-
-
-from sglang.srt.models.deepseek_v4 import MQALayer
-
-_original_mqa_forward = MQALayer.forward
-
-
-def _mqa_forward_with_full_sink_kunlun(self, *args, **kwargs):
-    """Match the 0.5.8 attention-sink and wo_a contracts during MQA forward."""
-
-    import sys
-
-    from sglang_kunlun.models.deepseek_v4 import _TorchWoAProxy
-
-    model_module = sys.modules[_original_mqa_forward.__module__]
-    original_torch = model_module.torch
-    original_local_sink = self._attn_sink_local
-    if self.tp_size > 1:
-        self._attn_sink_local = self.attn_sink
-    model_module.torch = _TorchWoAProxy(original_torch)
-    try:
-        return _original_mqa_forward(self, *args, **kwargs)
-    finally:
-        model_module.torch = original_torch
-        self._attn_sink_local = original_local_sink
-
-
-MQALayer.forward = _mqa_forward_with_full_sink_kunlun
 
 
 # Temporary single-token boundary probes used to localize MTP drift without

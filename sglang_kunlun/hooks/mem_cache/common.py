@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
     type=HookType.AROUND,
 )
 def dsv4_get_bytes_per_token_kunlun(original_fn, self):
+    """Return the Kunlun half-cache byte footprint for one token."""
     if self.store_dtype in (torch.bfloat16, torch.float16):
         return (self.qk_nope_head_dim + self.qk_rope_head_dim) * self.store_dtype.itemsize
     return original_fn(self)
@@ -28,6 +29,7 @@ def dsv4_get_bytes_per_token_kunlun(original_fn, self):
     type=HookType.AROUND,
 )
 def dsv4_create_buffer_kunlun(original_fn, self, *, num_pages: int):
+    """Allocate the Kunlun half-precision KV cache buffer."""
     if self.store_dtype not in (torch.bfloat16, torch.float16):
         return original_fn(self, num_pages=num_pages)
 

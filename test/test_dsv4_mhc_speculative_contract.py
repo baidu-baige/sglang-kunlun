@@ -68,6 +68,33 @@ class DSV4MHCSpeculativeContractTest(unittest.TestCase):
         actual = hc_head_kunlun(model, x, hc_fn, hc_scale, hc_base)
         self.assertTrue(torch.equal(actual, expected))
 
+    def test_nextn_hc_head_matches_058_fp32_sequence(self):
+        from sglang_kunlun.models.deepseek_v4_nextn import hc_head_kunlun
+
+        model = types.SimpleNamespace(rms_norm_eps=1e-6, hc_eps=1e-4)
+        x = torch.arange(2 * 4 * 8, dtype=torch.float32).reshape(2, 4, 8)
+        x = (x / 29).to(torch.bfloat16)
+        hc_fn = torch.linspace(-0.3, 0.2, 4 * 32).reshape(4, 32)
+        hc_scale = torch.linspace(0.4, 1.1, 4)
+        hc_base = torch.linspace(-0.2, 0.15, 4)
+
+        flattened = x.flatten(1).float()
+        rsqrt = torch.rsqrt(
+            flattened.square().mean(-1, keepdim=True) + model.rms_norm_eps
+        )
+        mixes = torch.nn.functional.linear(flattened, hc_fn) * rsqrt
+        pre = torch.sigmoid(mixes * hc_scale + hc_base) + model.hc_eps
+        expected = torch.sum(
+            pre.unsqueeze(-1) * flattened.view(x.shape), dim=1
+        ).to(x.dtype)
+
+        actual = hc_head_kunlun(model, x, hc_fn, hc_scale, hc_base)
+        self.assertTrue(torch.equal(actual, expected))
+        empty = hc_head_kunlun(
+            model, x[:0], hc_fn, hc_scale, hc_base
+        )
+        self.assertEqual(empty.shape, (0, x.shape[-1]))
+
     def test_mhc_sinkhorn_hook_preserves_shapes_dtype_and_empty(self):
         fake_kunlun = types.ModuleType("kunlun_ops")
         fake_kunlun.mhc_split_sinkhorn = mock.Mock()
