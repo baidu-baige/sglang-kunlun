@@ -4,9 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
-import json
 import logging
-import os
 import numpy as np
 import torch
 import triton
@@ -21,6 +19,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_compiler_backend
+from sglang_kunlun.debug_bridge import DEBUG_ENABLED as _DEBUG
+from sglang_kunlun.debug_bridge import attention as debug_attention
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -43,16 +43,8 @@ from sglang.jit_kernel.flash_attention_v4 import (
 import kunlun_ops
 
 logger = logging.getLogger(__name__)
-if os.environ.get("DSV4_C4_ATTN_METADATA_LOG") == "1":
-    print(
-        "[DSV4_C4_ATTN_BACKEND_IMPORT] "
-        f"file={__file__} pid={os.getpid()} "
-        f"TP_RANK={os.environ.get('TP_RANK')} "
-        f"LOCAL_RANK={os.environ.get('LOCAL_RANK')} "
-        f"RANK={os.environ.get('RANK')} "
-        f"flag={os.environ.get('DSV4_C4_ATTN_METADATA_LOG')}",
-        flush=True,
-    )
+if _DEBUG:
+    debug_attention.capture("backend.import", locals())
 
 
 @dataclass
@@ -914,65 +906,8 @@ class KunlunAttentionBackend(AttentionBackend):
                 )
                 self.forward_metadata_spec_decode_expand.page_table = expand_page_table
 
-        if (
-            os.environ.get("DSV4_C4_ATTN_METADATA_LOG") == "1"
-            and batch_size > 1
-            and forward_batch.forward_mode.is_extend()
-        ):
-            def summarize_tensor(value):
-                if value is None:
-                    return None
-                if not isinstance(value, torch.Tensor):
-                    return repr(value)
-                flat = value.detach().cpu().reshape(-1)
-                return {
-                    "shape": list(value.shape),
-                    "dtype": str(value.dtype),
-                    "head": flat[:8].tolist(),
-                    "tail": flat[-8:].tolist() if flat.numel() else [],
-                }
-
-            logger.warning(
-                "[DSV4_C4_ATTN_METADATA] %s",
-                json.dumps(
-                    {
-                        "forward_mode": str(forward_batch.forward_mode),
-                        "batch_size": batch_size,
-                        "input_ids": summarize_tensor(forward_batch.input_ids),
-                        "positions": summarize_tensor(forward_batch.positions),
-                        "req_pool_indices": summarize_tensor(
-                            forward_batch.req_pool_indices
-                        ),
-                        "seq_lens": summarize_tensor(forward_batch.seq_lens),
-                        "seq_lens_cpu": summarize_tensor(forward_batch.seq_lens_cpu),
-                        "extend_seq_lens_cpu": repr(
-                            forward_batch.extend_seq_lens_cpu
-                        ),
-                        "extend_prefix_lens_cpu": repr(
-                            forward_batch.extend_prefix_lens_cpu
-                        ),
-                        "out_cache_loc": summarize_tensor(
-                            forward_batch.out_cache_loc
-                        ),
-                        "page_table": summarize_tensor(metadata.page_table),
-                        "cu_seqlens_q": summarize_tensor(metadata.cu_seqlens_q),
-                        "cu_seqlens_k": summarize_tensor(metadata.cu_seqlens_k),
-                        "cu_seqlens_q_cpu": summarize_tensor(
-                            metadata.extra_attn_metadata.cu_seqlens_q_cpu
-                        ),
-                        "kv_lod_cpu": summarize_tensor(
-                            metadata.extra_attn_metadata.kv_lod_cpu
-                        ),
-                        "cum_q_lod_cpu": summarize_tensor(
-                            getattr(self, "cum_q_lod_cpu", None)
-                        ),
-                        "cum_kv_lod_cpu": summarize_tensor(
-                            getattr(self, "cum_kv_lod_cpu", None)
-                        ),
-                    },
-                    ensure_ascii=True,
-                ),
-            )
+        if _DEBUG:
+            debug_attention.capture("kunlun_backend.metadata", locals())
 
         self.forward_metadata = metadata
 

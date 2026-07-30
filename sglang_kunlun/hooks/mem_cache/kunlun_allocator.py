@@ -7,16 +7,12 @@ customization can be expressed as a subclass instead of REPLACE hooks.
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
 import torch
 
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
 from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
-
-
-_ALLOC_EXTEND_PROBE_CALL = 0
+from sglang_kunlun.debug_bridge import DEBUG_ENABLED as _DEBUG
+from sglang_kunlun.debug_bridge import allocator as debug_allocator
 
 
 def _alloc_extend_kunlun_xdnn(
@@ -115,35 +111,8 @@ class KunlunPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             self.merge_and_sort_free()
 
         alloc_fn = _select_alloc_extend_func()
-        probe_dir = os.environ.get("DSV4_ALLOC_EXTEND_PROBE_DIR")
-        capture_probe = (
-            probe_dir is not None
-            and torch.distributed.is_initialized()
-            and torch.distributed.get_rank() == 0
-        )
-        probe = None
-        if capture_probe:
-            probe = {
-                "version": "0514",
-                "allocator_id": id(self),
-                "alloc_fn": alloc_fn.__name__,
-                "page_size": self.page_size,
-                "extend_num_tokens": extend_num_tokens,
-                "prefix_lens": prefix_lens.detach().cpu(),
-                "prefix_lens_cpu": prefix_lens_cpu.detach().cpu(),
-                "prefix_lens_dtype": str(prefix_lens.dtype),
-                "prefix_lens_stride": tuple(prefix_lens.stride()),
-                "seq_lens": seq_lens.detach().cpu(),
-                "seq_lens_cpu": seq_lens_cpu.detach().cpu(),
-                "seq_lens_dtype": str(seq_lens.dtype),
-                "seq_lens_stride": tuple(seq_lens.stride()),
-                "last_loc": last_loc.detach().cpu(),
-                "last_loc_dtype": str(last_loc.dtype),
-                "last_loc_shape": tuple(last_loc.shape),
-                "last_loc_stride": tuple(last_loc.stride()),
-                "last_loc_is_contiguous": last_loc.is_contiguous(),
-                "free_pages_before": self.free_pages[:256].detach().cpu(),
-            }
+        if _DEBUG:
+            debug_allocator.capture("alloc_extend.begin", locals())
         out_indices, origin_num_new_pages = alloc_fn(
             self.page_size,
             self.free_pages,
@@ -158,20 +127,8 @@ class KunlunPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
         merged_value = origin_num_new_pages.item()
         num_new_pages = merged_value >> 32
-        if probe is not None:
-            global _ALLOC_EXTEND_PROBE_CALL
-            probe.update(
-                {
-                    "out_indices": out_indices.detach().cpu(),
-                    "merged_value": merged_value,
-                    "num_new_pages": num_new_pages,
-                }
-            )
-            torch.save(
-                probe,
-                Path(probe_dir) / f"0514-call{_ALLOC_EXTEND_PROBE_CALL:04d}.pt",
-            )
-            _ALLOC_EXTEND_PROBE_CALL += 1
+        if _DEBUG:
+            debug_allocator.capture("alloc_extend.end", locals())
         if num_new_pages > len(self.free_pages):
             return None
 
