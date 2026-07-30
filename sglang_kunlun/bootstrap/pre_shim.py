@@ -87,6 +87,30 @@ def _patch_torch_cuda_symm_mem_apis() -> None:
                 setattr(_C, name, _unsupported_c)
 
 
+def _patch_optional_tilelang_import() -> None:
+    """Convert missing TileLang shared-library failures into optional imports."""
+    import builtins
+    import functools
+
+    current_import = builtins.__import__
+    if getattr(current_import, "_kunlun_optional_tilelang", False):
+        return
+
+    @functools.wraps(current_import)
+    def optional_tilelang_import(name, globals=None, locals=None, fromlist=(), level=0):
+        try:
+            return current_import(name, globals, locals, fromlist, level)
+        except OSError as error:
+            if name == "tilelang" or name.startswith("tilelang."):
+                raise ModuleNotFoundError(
+                    f"Optional TileLang runtime is unavailable: {error}"
+                ) from error
+            raise
+
+    optional_tilelang_import._kunlun_optional_tilelang = True
+    builtins.__import__ = optional_tilelang_import
+
+
 def _patch_flashinfer_optional_symbols() -> None:
     """Inject stubs for optional flashinfer symbols imported at sglang import time.
 
@@ -135,6 +159,11 @@ def _kunlun_pre_shim() -> None:
     )
     if not is_kunlun:
         return
+
+    try:
+        _patch_optional_tilelang_import()
+    except Exception:
+        pass
 
     try:
         _patch_torch_cuda_symm_mem_apis()

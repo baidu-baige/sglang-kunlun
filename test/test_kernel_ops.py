@@ -14,6 +14,63 @@ class KernelOpsTest(unittest.TestCase):
         sys.modules.pop("sglang.fake_dsv4_source", None)
         sys.modules.pop("sglang.fake_dsv4_user", None)
 
+    def test_dsv4_compress_state_initializes_all_non_online_slots(self):
+        from sglang.srt.mem_cache.deepseek_v4_compress_state import (
+            CompressStatePool,
+            KVAndScore,
+        )
+        from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+        from sglang_kunlun.hooks import production_precision as runtime_precision
+
+        target = (
+            "sglang.srt.mem_cache.deepseek_v4_compress_state."
+            "CompressStatePool.__init__"
+        )
+        self.assertTrue(
+            any(
+                hook_type == HookType.AFTER
+                and hook is runtime_precision.initialize_non_online_compress_state_kunlun
+                for hook_type, hook, _source in HookRegistry._hooks[target]
+            )
+        )
+
+        def fake_alloc(pool, *, dtype, device, enable_memory_saver):
+            pool.kv_score_buffer = KVAndScore(
+                torch.full((pool._size, pool.last_dim), 7, dtype=dtype)
+            )
+
+        init_kwargs = dict(
+            size=5,
+            ring_size=128,
+            overlap=False,
+            head_dim=4,
+            dtype=torch.float32,
+            device="cpu",
+            enable_memory_saver=False,
+            ratio=128,
+            swa_page_size=256,
+        )
+        with mock.patch.object(
+            CompressStatePool, "_alloc_kv_score_buffer", fake_alloc
+        ):
+            pool = CompressStatePool(**init_kwargs)
+
+        self.assertTrue((pool.kv_score_buffer.kv[:-1] == 7).all())
+        self.assertTrue((pool.kv_score_buffer.score[:-1] == 7).all())
+        runtime_precision.initialize_non_online_compress_state_kunlun(
+            None,
+            pool,
+            **init_kwargs,
+            online=False,
+        )
+
+        self.assertTrue(
+            torch.equal(
+                pool.kv_score_buffer.kv, torch.zeros_like(pool.kv_score_buffer.kv)
+            )
+        )
+        self.assertTrue(torch.isneginf(pool.kv_score_buffer.score).all())
+
     def test_install_patches_imported_bindings_automatically(self):
         from sglang_kunlun.kernels import kernel_ops
 
@@ -544,7 +601,7 @@ class KernelOpsTest(unittest.TestCase):
         self.assertIs(actual, expected)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
-    def test_dsv4_mqa_forward_uses_full_058_attention_sink(self):
+    def test_dsv4_model_hooks_cover_moe_gate_and_kv_store(self):
         from sglang_kunlun.kernels import kernel_ops
 
         hook_registry = types.ModuleType("sglang.srt.plugins.hook_registry")
@@ -575,30 +632,6 @@ class KernelOpsTest(unittest.TestCase):
                 else:
                     sys.modules[name] = old_module
 
-        original_torch = types.SimpleNamespace(einsum=lambda *_args: None)
-        owner_module = types.ModuleType("sglang.fake_dsv4_model")
-        owner_module.torch = original_torch
-        sys.modules[owner_module.__name__] = owner_module
-        self.addCleanup(sys.modules.pop, owner_module.__name__, None)
-
-        local_sink = torch.zeros(64, dtype=torch.float32)
-        full_sink = torch.arange(64, dtype=torch.float32)
-        mqa = types.SimpleNamespace(
-            tp_size=8,
-            _attn_sink_local=local_sink,
-            attn_sink=full_sink,
-        )
-
-        def original_forward(instance):
-            self.assertIs(instance._attn_sink_local, full_sink)
-            return "result"
-
-        original_forward.__module__ = owner_module.__name__
-        actual = module.mqa_forward_with_kunlun_wo_a(original_forward, mqa)
-
-        self.assertEqual(actual, "result")
-        self.assertIs(mqa._attn_sink_local, local_sink)
-        self.assertIs(owner_module.torch, original_torch)
 
         gate = types.SimpleNamespace(
             weight=torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16)
@@ -615,7 +648,20 @@ class KernelOpsTest(unittest.TestCase):
         fused_rope = mock.Mock()
         upstream_model = types.ModuleType("sglang.srt.models.deepseek_v4")
         upstream_model.fused_rope_inplace = fused_rope
-        backend = types.SimpleNamespace(store_cache=mock.Mock())
+        cache = torch.full((2, 3, 4), -777.0, dtype=torch.float16)
+        pool = types.SimpleNamespace(
+            swa_kv_pool=types.SimpleNamespace(kv_buffer=[cache]),
+            _swa_local_layer_id=mock.Mock(return_value=0),
+        )
+        forward_context = types.ModuleType(
+            "sglang.srt.model_executor.forward_context"
+        )
+        forward_context.get_token_to_kv_pool = lambda: pool
+        backend = types.SimpleNamespace(
+            get_swa_out_cache_loc=mock.Mock(
+                return_value=torch.tensor([-3, 9], dtype=torch.int32)
+            )
+        )
         mqa_layer = types.SimpleNamespace(
             q_lora_rank=2,
             kv_norm=lambda value: value + 1,
@@ -627,7 +673,10 @@ class KernelOpsTest(unittest.TestCase):
         positions = torch.tensor([3, 4], dtype=torch.int64)
         with mock.patch.dict(
             sys.modules,
-            {"sglang.srt.models.deepseek_v4": upstream_model},
+            {
+                "sglang.srt.models.deepseek_v4": upstream_model,
+                forward_context.__name__: forward_context,
+            },
         ):
             module.compute_kv_to_cache_kunlun(
                 mqa_layer,
@@ -643,11 +692,14 @@ class KernelOpsTest(unittest.TestCase):
         self.assertTrue(torch.equal(rope_args[0], expected_kv[..., -2:].unsqueeze(1)))
         self.assertIs(rope_args[2], mqa_layer.freqs_cis)
         self.assertIs(rope_args[3], positions)
-        backend.store_cache.assert_called_once()
-        store_kwargs = backend.store_cache.call_args.kwargs
-        self.assertEqual(store_kwargs["layer_id"], 7)
-        self.assertTrue(torch.equal(store_kwargs["swa_k"], expected_kv))
-        self.assertIs(store_kwargs["forward_batch"], forward_batch)
+        backend.get_swa_out_cache_loc.assert_called_once_with(forward_batch)
+        pool._swa_local_layer_id.assert_called_once_with(7)
+        torch.testing.assert_close(cache.view(-1, 4)[0], expected_kv[0].half())
+        torch.testing.assert_close(cache.view(-1, 4)[-1], expected_kv[1].half())
+        torch.testing.assert_close(
+            cache.view(-1, 4)[1:-1],
+            torch.full((4, 4), -777.0, dtype=torch.float16),
+        )
 
         events = []
         fused_qk_rope = mock.Mock()
@@ -659,9 +711,16 @@ class KernelOpsTest(unittest.TestCase):
 
         fused_qk_rope.side_effect = apply_fused_qk_rope
         upstream_model.fused_rope_inplace = fused_qk_rope
+        cache.fill_(-777.0)
+        pool._swa_local_layer_id.reset_mock()
         indexer = mock.Mock(side_effect=lambda **_kwargs: events.append("indexer"))
+
+        def get_swa_out_cache_loc(_forward_batch):
+            events.append("store")
+            return torch.tensor([1, 4], dtype=torch.int32)
+
         backend = types.SimpleNamespace(
-            store_cache=mock.Mock(side_effect=lambda **_kwargs: events.append("store")),
+            get_swa_out_cache_loc=mock.Mock(side_effect=get_swa_out_cache_loc),
             forward_core_compressor=mock.Mock(
                 side_effect=lambda *_args: events.append("compressor")
             ),
@@ -702,6 +761,7 @@ class KernelOpsTest(unittest.TestCase):
             sys.modules,
             {
                 "sglang.srt.models.deepseek_v4": upstream_model,
+                "sglang.srt.model_executor.forward_context": forward_context,
                 env_gate.__name__: env_gate,
             },
         ):
@@ -724,15 +784,15 @@ class KernelOpsTest(unittest.TestCase):
         torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=0)
         self.assertIsNone(actual_kv)
         torch.testing.assert_close(
-            backend.store_cache.call_args.kwargs["swa_k"],
-            expected_kv,
+            cache.view(-1, 4)[torch.tensor([1, 4])],
+            expected_kv.half(),
             rtol=0,
             atol=0,
         )
 
         events.clear()
         fused_qk_rope.reset_mock()
-        backend.store_cache.reset_mock()
+        backend.get_swa_out_cache_loc.reset_mock()
         backend.forward_core_compressor.reset_mock()
         indexer.reset_mock()
         original_prepare = mock.Mock(
@@ -754,6 +814,7 @@ class KernelOpsTest(unittest.TestCase):
             sys.modules,
             {
                 "sglang.srt.models.deepseek_v4": upstream_model,
+                "sglang.srt.model_executor.forward_context": forward_context,
                 env_gate.__name__: env_gate,
             },
         ):
@@ -786,8 +847,8 @@ class KernelOpsTest(unittest.TestCase):
             atol=0,
         )
         torch.testing.assert_close(
-            backend.store_cache.call_args.kwargs["swa_k"],
-            expected_kv,
+            cache.view(-1, 4)[torch.tensor([1, 4])],
+            expected_kv.half(),
             rtol=0,
             atol=0,
         )

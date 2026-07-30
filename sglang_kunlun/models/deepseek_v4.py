@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Optional
 
-import sys
 import torch
 import torch.nn.functional as F
 import kunlun_ops
@@ -14,6 +13,23 @@ from torch import nn
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 from sglang_kunlun.kernels.kernel_ops import dsv4_mqa_wo_a_einsum_kunlun
+
+
+def _store_kv_to_swa_cache_direct(self, kv, forward_batch, attn_backend) -> None:
+    """Match the dirty 0.5.14 SWA cache writer exactly."""
+    from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+
+    token_to_kv_pool = get_token_to_kv_pool()
+    swa_loc = attn_backend.get_swa_out_cache_loc(forward_batch)
+    cache = token_to_kv_pool.swa_kv_pool.kv_buffer[
+        token_to_kv_pool._swa_local_layer_id(self.layer_id)
+    ]
+    cache_tokens = cache.view(-1, kv.shape[-1])
+    loc = swa_loc.contiguous().clamp(
+        min=0, max=cache_tokens.shape[0] - 1
+    ).long()
+    cache_value = kv.reshape(kv.shape[0], -1).to(cache.dtype)
+    cache_tokens.index_copy_(0, loc, cache_value)
 
 
 @plugin_hook(
@@ -28,7 +44,7 @@ def compute_kv_to_cache_kunlun(
     attn_backend,
     qkv_a: Optional[torch.Tensor] = None,
 ) -> None:
-    """Route DSV4 KV writes through the 0.5.8 mapping-writer contract."""
+    """Normalize and rotate KV, then use the dirty 0.5.14 direct writer."""
     if qkv_a is not None:
         kv = qkv_a[..., self.q_lora_rank :]
     else:
@@ -43,11 +59,7 @@ def compute_kv_to_cache_kunlun(
         self.freqs_cis,
         positions,
     )
-    attn_backend.store_cache(
-        layer_id=self.layer_id,
-        swa_k=kv,
-        forward_batch=forward_batch,
-    )
+    _store_kv_to_swa_cache_direct(self, kv, forward_batch, attn_backend)
 
 
 @plugin_hook(
@@ -128,11 +140,7 @@ def mqa_forward_prepare_058_kunlun(
         self.freqs_cis,
         positions,
     )
-    attn_backend.store_cache(
-        layer_id=self.layer_id,
-        swa_k=kv,
-        forward_batch=forward_batch,
-    )
+    _store_kv_to_swa_cache_direct(self, kv, forward_batch, attn_backend)
 
     if self.indexer is not None:
         self.indexer(
@@ -274,33 +282,3 @@ def hc_post_kunlun(
     )
     return out
 
-
-class _TorchWoAProxy:
-    def __init__(self, original_torch):
-        self._original_torch = original_torch
-
-    def __getattr__(self, name):
-        return getattr(self._original_torch, name)
-
-    def einsum(self, equation, *operands):
-        if equation == "tgd,grd->tgr" and len(operands) == 2:
-            return dsv4_mqa_wo_a_einsum_kunlun(operands[0], operands[1])
-        return self._original_torch.einsum(equation, *operands)
-
-
-@plugin_hook(
-    "sglang.srt.models.deepseek_v4.MQALayer.forward",
-    type=HookType.AROUND,
-)
-def mqa_forward_with_kunlun_wo_a(original_fn, self, *args, **kwargs):
-    module = sys.modules[original_fn.__module__]
-    original_torch = module.torch
-    original_local_sink = self._attn_sink_local
-    if self.tp_size > 1:
-        self._attn_sink_local = self.attn_sink
-    module.torch = _TorchWoAProxy(original_torch)
-    try:
-        return original_fn(self, *args, **kwargs)
-    finally:
-        module.torch = original_torch
-        self._attn_sink_local = original_local_sink

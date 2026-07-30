@@ -57,18 +57,90 @@ class _ForwardMode:
 
 class KunlunDSV4BackendContractTest(unittest.TestCase):
     def test_req_to_token_prefix_pointers_are_created_on_device(self):
-        source = SGLANG_MEM_CACHE_COMMON.read_text()
-        tree = ast.parse(source, filename=str(SGLANG_MEM_CACHE_COMMON))
-        write_cache_indices = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == "write_cache_indices"
-        )
-        function_source = ast.get_source_segment(source, write_cache_indices)
+        from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+        from sglang_kunlun.hooks import production_precision as runtime_precision
 
-        self.assertIn("device=req_to_token_pool.device", function_source)
-        self.assertNotIn("pin_memory=", function_source)
-        self.assertNotIn("non_blocking=True", function_source)
+        target = "sglang.srt.mem_cache.common.write_cache_indices"
+        self.assertTrue(
+            any(
+                hook_type == HookType.REPLACE
+                and hook is runtime_precision.write_cache_indices_kunlun
+                for hook_type, hook, _source in HookRegistry._hooks[target]
+            )
+        )
+
+        launches = []
+
+        class Launcher:
+            def __getitem__(self, grid):
+                self.grid = grid
+                return self.launch
+
+            def launch(self, *args):
+                launches.append((self.grid, args))
+
+        prefix_tensors = [
+            torch.tensor([11, 12], dtype=torch.int64),
+            torch.tensor([21], dtype=torch.int64),
+        ]
+        req_to_token_pool = types.SimpleNamespace(
+            device=torch.device("cpu"),
+            req_to_token=torch.zeros((2, 8), dtype=torch.int64),
+        )
+        inputs = {
+            "out_cache_loc": torch.tensor([31, 32, 41], dtype=torch.int64),
+            "req_pool_indices_tensor": torch.tensor([0, 1], dtype=torch.int32),
+            "req_pool_indices_cpu": torch.tensor([0, 1], dtype=torch.int32),
+            "prefix_lens_tensor": torch.tensor([2, 1], dtype=torch.int32),
+            "prefix_lens_cpu": torch.tensor([2, 1], dtype=torch.int32),
+            "seq_lens_tensor": torch.tensor([4, 2], dtype=torch.int32),
+            "seq_lens_cpu": torch.tensor([4, 2], dtype=torch.int32),
+            "extend_lens_tensor": torch.tensor([2, 1], dtype=torch.int32),
+            "extend_lens_cpu": torch.tensor([2, 1], dtype=torch.int32),
+        }
+        tensor_factory = torch.tensor
+        launcher = Launcher()
+        common_module = types.ModuleType("sglang.srt.mem_cache.common")
+        common_module.support_triton = lambda _backend: True
+        common_module.get_global_server_args = lambda: types.SimpleNamespace(
+            attention_backend="triton"
+        )
+        common_module.write_req_to_token_pool_triton = launcher
+        mem_cache_package = types.ModuleType("sglang.srt.mem_cache")
+        mem_cache_package.__path__ = []
+        mem_cache_package.common = common_module
+        with mock.patch.dict(
+            sys.modules,
+            {
+                mem_cache_package.__name__: mem_cache_package,
+                common_module.__name__: common_module,
+            },
+        ), mock.patch.object(
+            runtime_precision.torch, "tensor", wraps=tensor_factory
+        ) as make_tensor:
+            runtime_precision.write_cache_indices_kunlun(
+                **inputs,
+                prefix_tensors=prefix_tensors,
+                req_to_token_pool=req_to_token_pool,
+            )
+
+        self.assertEqual(len(launches), 1)
+        self.assertEqual(launches[0][0], (2,))
+        prefix_pointers = launches[0][1][2]
+        self.assertEqual(prefix_pointers.dtype, torch.uint64)
+        self.assertEqual(prefix_pointers.device, req_to_token_pool.device)
+        self.assertEqual(
+            prefix_pointers.tolist(),
+            [tensor.data_ptr() for tensor in prefix_tensors],
+        )
+        pointer_call = next(
+            call
+            for call in make_tensor.call_args_list
+            if call.kwargs.get("dtype") == torch.uint64
+        )
+        self.assertEqual(pointer_call.kwargs["device"], req_to_token_pool.device)
+        self.assertNotIn("pin_memory", pointer_call.kwargs)
+        self.assertNotIn("non_blocking", pointer_call.kwargs)
 
     def test_decode_replay_metadata_uses_runtime_out_cache_loc(self):
         source = SGLANG_DECODE_GRAPH_RUNNER.read_text()
@@ -270,33 +342,106 @@ class KunlunDSV4BackendContractTest(unittest.TestCase):
         self.assertIn("forward_batch=forward_batch", compute_source)
         self.assertIn("c4_indexer=c4_indexer", compute_source)
 
-        indexer_path = (
-            ROOT.parent
-            / "sglang"
-            / "python"
-            / "sglang"
-            / "srt"
-            / "layers"
-            / "attention"
-            / "dsv4"
-            / "indexer.py"
-        )
-        indexer_source = indexer_path.read_text()
-        indexer_tree = ast.parse(indexer_source, filename=str(indexer_path))
-        mixin = next(
-            node
-            for node in indexer_tree.body
-            if isinstance(node, ast.ClassDef) and node.name == "C4IndexerBackendMixin"
-        )
         forward = next(
             node
-            for node in mixin.body
+            for node in backend_class.body
             if isinstance(node, ast.FunctionDef) and node.name == "forward_c4_indexer"
         )
-        forward_source = ast.get_source_segment(indexer_source, forward)
+        forward_source = ast.get_source_segment(backend_source, forward)
         self.assertIn("self._compute_c4_indexer_logits(", forward_source)
         self.assertIn("forward_batch=forward_batch", forward_source)
         self.assertIn("c4_indexer=c4_indexer", forward_source)
+        self.assertNotIn("super().forward_c4_indexer", forward_source)
+        self.assertNotIn("capture_probe", forward_source)
+        self.assertNotIn("_mtp_tensor_probe", forward_source)
+
+        flag = types.SimpleNamespace(get=lambda: False)
+        envs = types.SimpleNamespace(
+            SGLANG_OPT_USE_TILELANG_INDEXER=flag,
+            SGLANG_OPT_USE_AITER_INDEXER=flag,
+            SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=types.SimpleNamespace(
+                get=lambda: True
+            ),
+            SGLANG_TOPK_TRANSFORM_512_TORCH=flag,
+            SGLANG_OPT_USE_TOPK_V2=flag,
+        )
+        namespace = {"torch": torch, "envs": envs}
+        exec(
+            compile(
+                ast.Module(body=[forward], type_ignores=[]),
+                str(backend_path),
+                "exec",
+            ),
+            namespace,
+        )
+
+        class IndexerMetadata:
+            pass
+
+        indexer_module_name = "sglang.srt.layers.attention.dsv4.indexer"
+        upstream_indexer = types.ModuleType(indexer_module_name)
+        upstream_indexer.PagedIndexerMetadata = IndexerMetadata
+        upstream_indexer.is_sm120_supported = lambda: False
+        upstream_indexer.fp8_paged_mqa_logits_torch = object()
+        upstream_indexer.fp8_paged_mqa_logits_torch_sm120 = object()
+        dsv4_package = types.ModuleType("sglang.srt.layers.attention.dsv4")
+        dsv4_package.__path__ = []
+        dsv4_package.indexer = upstream_indexer
+
+        page_table = torch.zeros((2, 1), dtype=torch.int32)
+        indexer_metadata = IndexerMetadata()
+        indexer_metadata.c4_seq_lens = torch.tensor([4, 8], dtype=torch.int32)
+        indexer_metadata.page_table = page_table
+        indexer_metadata.max_c4_seq_len = 64
+        indexer_metadata.c4_page_size = 64
+        indexer_metadata.topk_metadata = None
+        core_metadata = types.SimpleNamespace(
+            positions=torch.tensor([0, 1], dtype=torch.int64),
+            page_table=page_table,
+            c4_sparse_page_indices=torch.full((2, 4), -1, dtype=torch.int32),
+            c4_sparse_raw_indices=None,
+        )
+        q_indexer = torch.zeros((2, 64, 128), dtype=torch.int8)
+        weights = torch.zeros((2, 64, 1), dtype=torch.float32)
+        cache = torch.zeros((1, 64 * 132), dtype=torch.uint8)
+        compute_logits = mock.Mock(return_value=torch.zeros((2, 64)))
+        owner = types.SimpleNamespace(
+            token_to_kv_pool=object(),
+            forward_metadata=types.SimpleNamespace(
+                indexer_metadata=indexer_metadata,
+                core_metadata=core_metadata,
+            ),
+            _forward_prepare_normal=mock.Mock(
+                return_value=(q_indexer, weights, cache)
+            ),
+            _compute_c4_indexer_logits=compute_logits,
+            debug_use_external_c4_sparse_indices=True,
+        )
+        c4_indexer = types.SimpleNamespace(use_fp4_indexer=False, layer_id=2)
+        forward_batch = types.SimpleNamespace(
+            forward_mode=types.SimpleNamespace(is_idle=lambda: False)
+        )
+        with mock.patch.dict(
+            sys.modules,
+            {
+                dsv4_package.__name__: dsv4_package,
+                indexer_module_name: upstream_indexer,
+            },
+        ):
+            namespace["forward_c4_indexer"](
+                owner,
+                torch.zeros((2, 8)),
+                torch.zeros((2, 8)),
+                c4_indexer,
+                forward_batch,
+            )
+
+        compute_logits.assert_called_once()
+        kwargs = compute_logits.call_args.kwargs
+        self.assertIs(kwargs["forward_batch"], forward_batch)
+        self.assertIs(kwargs["c4_indexer"], c4_indexer)
+        self.assertIs(kwargs["indexer_metadata"], indexer_metadata)
+        self.assertIs(kwargs["core_metadata"], core_metadata)
 
     def test_graph_capture_verify_uses_full_compressed_stride(self):
         path = ATTENTION_DIR / "kunlun_deepseek_v4_backend.py"
