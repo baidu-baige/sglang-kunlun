@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import logging
-import os
 
 import torch
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+from sglang_kunlun.debug_bridge import DEBUG_ENABLED as _DEBUG
+from sglang_kunlun.debug_bridge import mem_cache as debug_mem_cache
 
 
 logger = logging.getLogger(__name__)
@@ -38,21 +39,8 @@ def dsv4_create_buffer_kunlun(original_fn, self, *, num_pages: int):
     self.bytes_per_page_padded = (
         self.page_size * dim_per_token * self.store_dtype.itemsize
     )
-    if (
-        os.environ.get("DSV4_MTP_PROBE") == "1"
-        and os.environ.get("RANK", "0") == "0"
-        and not getattr(dsv4_create_buffer_kunlun, "_probe_logged", False)
-    ):
-        logger.warning(
-            "[DSV4_CALLSTACK] half-cache pool buffer store_dtype=%s "
-            "shape=(%d, %d) page_size=%d dim_per_token=%d",
-            self.store_dtype,
-            num_pages,
-            self.page_size * dim_per_token,
-            self.page_size,
-            dim_per_token,
-        )
-        dsv4_create_buffer_kunlun._probe_logged = True
+    if _DEBUG:
+        debug_mem_cache.capture("half_cache_buffer", locals())
     return torch.zeros(
         num_pages,
         self.page_size * dim_per_token,

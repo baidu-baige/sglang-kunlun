@@ -12,52 +12,13 @@ from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 import torch
 
+from sglang_kunlun.debug_bridge import DEBUG_ENABLED as _DEBUG
+from sglang_kunlun.debug_bridge import kernels as debug_kernels
+
 logger = logging.getLogger(__name__)
-_ENABLE_DSV4_ACCURACY_DUMPS = False
-_DSV4_PROBE_COUNTERS: Dict[str, int] = {}
 
 import xspeedgate_ops
 
-
-def _dsv4_probe(group: str, tensors: Mapping[str, object], **meta) -> None:
-    """Persist opt-in DSV4 intermediate tensors without affecting the hot path."""
-    output_dir = os.environ.get("DSV4_ACCURACY_DUMP_DIR")
-    tensor_values = [value for value in tensors.values() if isinstance(value, torch.Tensor)]
-    if not output_dir or not tensor_values:
-        return
-    expected_tokens = int(os.environ.get("DSV4_ACCURACY_DUMP_TOKENS", "0"))
-    if expected_tokens and tensor_values[0].shape[0] != expected_tokens:
-        return
-    rank = 0
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        rank = torch.distributed.get_rank()
-    if rank != int(os.environ.get("DSV4_ACCURACY_DUMP_RANK", "0")):
-        return
-    sample_tokens = int(os.environ.get("DSV4_ACCURACY_DUMP_SAMPLE_TOKENS", "8"))
-    tensors = {
-        name: value[:sample_tokens] if isinstance(value, torch.Tensor) and value.ndim else value
-        for name, value in tensors.items()
-    }
-    key = f"{rank}:{group}"
-    index = _DSV4_PROBE_COUNTERS.get(key, 0)
-    _DSV4_PROBE_COUNTERS[key] = index + 1
-    if index >= int(os.environ.get("DSV4_ACCURACY_DUMP_LIMIT", "16")):
-        return
-    payload = {
-        "meta": {"rank": rank, "group": group, "call": index, **meta},
-        "tensors": {
-            name: value.detach().cpu()
-            for name, value in tensors.items()
-            if isinstance(value, torch.Tensor)
-        },
-    }
-    os.makedirs(output_dir, exist_ok=True)
-    torch.save(payload, os.path.join(output_dir, f"rank{rank}_{group}_{index:04d}.pt"))
-
-def _debug_tensor_meta(name: str, value: object) -> str:
-    if isinstance(value, torch.Tensor):
-        return f"{name}: shape={tuple(value.shape)}, dtype={value.dtype}, device={value.device}"
-    return f"{name}: value={value!r}, type={type(value).__name__}"
 
 
 KernelKey = Tuple[str, str]
@@ -432,21 +393,15 @@ def dsv4_topk_transform_512_kunlun(
             page_size,
             out_raw_indices,
         )
-        _dsv4_probe(
-            "topk",
-            {"scores": scores, "raw_indices": out_raw_indices, "page_indices": out_page_indices},
-            page_size=page_size,
-        )
+        if _DEBUG:
+            debug_kernels.capture("topk.raw", locals())
         return
     _dsv4_topk_transform_graph_safe(
         scores, seq_lens, page_tables, out_page_indices, page_size
     )
     _canonicalize_dsv4_page_indices_(out_page_indices)
-    _dsv4_probe(
-        "topk",
-        {"scores": scores, "page_indices": out_page_indices},
-        page_size=page_size,
-    )
+    if _DEBUG:
+        debug_kernels.capture("topk.graph_safe", locals())
 
 
 @register_jit_op("sglang.jit_kernel.dsv4.topk", "topk_transform_512_v2")
@@ -524,17 +479,8 @@ def dsv4_quant_k_cache_kunlun(k_bf16: torch.Tensor):
     from types import SimpleNamespace
 
     assert k_bf16.shape[-1] == 512
-    if (
-        os.environ.get("DSV4_MTP_PROBE") == "1"
-        and os.environ.get("RANK", "0") == "0"
-        and not getattr(dsv4_quant_k_cache_kunlun, "_probe_logged", False)
-    ):
-        logger.warning(
-            "[DSV4_CALLSTACK] quant_k_cache replacement input dtype=%s shape=%s",
-            k_bf16.dtype,
-            tuple(k_bf16.shape),
-        )
-        dsv4_quant_k_cache_kunlun._probe_logged = True
+    if _DEBUG:
+        debug_kernels.capture("quant_k_cache.callstack", locals())
     # Kunlun performs the cache conversion while storing. The upstream pack
     # validates the CUDA FP8 representation in __post_init__, so use the same
     # attribute contract without constructing that CUDA-only representation.
@@ -562,22 +508,8 @@ def dsv4_set_k_and_s_kunlun(
 
     max_valid_loc = buf.shape[0] * page_size - 1
     loc_safe = loc.clamp(min=0, max=max_valid_loc) if loc.numel() else loc
-    if (
-        os.environ.get("DSV4_MTP_PROBE") == "1"
-        and os.environ.get("RANK", "0") == "0"
-        and not getattr(dsv4_set_k_and_s_kunlun, "_probe_logged", False)
-    ):
-        logger.warning(
-            "[DSV4_CALLSTACK] set_k_and_s_v4 replacement buf_dtype=%s "
-            "buf_shape=%s loc_dtype=%s k_dtype=%s k_shape=%s page_size=%d",
-            buf.dtype,
-            tuple(buf.shape),
-            loc_safe.dtype,
-            nope_fp8_rope_bf16_pack.k_nope_fp8.dtype,
-            tuple(nope_fp8_rope_bf16_pack.k_nope_fp8.shape),
-            page_size,
-        )
-        dsv4_set_k_and_s_kunlun._probe_logged = True
+    if _DEBUG:
+        debug_kernels.capture("set_k_and_s.callstack", locals())
     torch.ops.xspeedgate_ops.set_k_and_s_v4(
         buf, loc_safe, nope_fp8_rope_bf16_pack.k_nope_fp8, page_size
     )
@@ -623,31 +555,8 @@ def write_req_to_token_pool_triton(
 ) -> None:
     """Write request token mappings into the request-to-token pool."""
 
-    _dsv4_probe(
-        "write_req_to_token_input",
-        {
-            "req_pool_indices": req_pool_indices,
-            "prefix_tensors": prefix_tensors,
-            "pre_lens": pre_lens,
-            "seq_lens": seq_lens,
-            "extend_lens": extend_lens,
-            "out_cache_loc": out_cache_loc,
-        },
-        req_to_token_stride=tuple(req_to_token_ptr.stride()),
-        req_to_token_is_contiguous=req_to_token_ptr.is_contiguous(),
-        req_pool_indices_stride=tuple(req_pool_indices.stride()),
-        req_pool_indices_is_contiguous=req_pool_indices.is_contiguous(),
-        prefix_tensors_stride=tuple(prefix_tensors.stride()),
-        prefix_tensors_is_contiguous=prefix_tensors.is_contiguous(),
-        pre_lens_stride=tuple(pre_lens.stride()),
-        pre_lens_is_contiguous=pre_lens.is_contiguous(),
-        seq_lens_stride=tuple(seq_lens.stride()),
-        seq_lens_is_contiguous=seq_lens.is_contiguous(),
-        extend_lens_stride=tuple(extend_lens.stride()),
-        extend_lens_is_contiguous=extend_lens.is_contiguous(),
-        out_cache_loc_stride=tuple(out_cache_loc.stride()),
-        out_cache_loc_is_contiguous=out_cache_loc.is_contiguous(),
-    )
+    if _DEBUG:
+        debug_kernels.capture("write_req_to_token.input", locals())
     torch.ops.xspeedgate_ops.write_req_to_token_pool(
         req_to_token_ptr,
         req_pool_indices.to(torch.int32),
@@ -657,14 +566,8 @@ def write_req_to_token_pool_triton(
         extend_lens,
         out_cache_loc.to(torch.int64),
     )
-    if os.environ.get("DSV4_ACCURACY_DUMP_DIR"):
-        written_rows = req_to_token_ptr.index_select(
-            0, req_pool_indices.to(torch.long)
-        )[:, :35328]
-        _dsv4_probe(
-            "write_req_to_token_output",
-            {"written_rows": written_rows},
-        )
+    if _DEBUG:
+        debug_kernels.capture("write_req_to_token.output", locals())
 
 
 @register_triton_op("sglang.srt.mem_cache.common", "get_last_loc_kernel")
@@ -1047,24 +950,8 @@ def alloc_extend_kernel(
 ) -> None:
     """Allocate KV cache pages for extend batches."""
 
-    _dsv4_probe(
-        "alloc_extend_input",
-        {
-            "prefix_lens": prefix_lens,
-            "seq_lens": seq_lens,
-            "last_loc": last_loc,
-            "free_pages": free_pages,
-        },
-        bs_upper=bs_upper,
-        page_size=page_size,
-        prefix_lens_dtype=str(prefix_lens.dtype),
-        seq_lens_dtype=str(seq_lens.dtype),
-        last_loc_dtype=str(last_loc.dtype),
-        prefix_lens_stride=tuple(prefix_lens.stride()),
-        seq_lens_stride=tuple(seq_lens.stride()),
-        last_loc_stride=tuple(last_loc.stride()),
-        last_loc_is_contiguous=last_loc.is_contiguous(),
-    )
+    if _DEBUG:
+        debug_kernels.capture("alloc_extend.input", locals())
     if prefix_lens.dtype != torch.int64:
         prefix_lens = prefix_lens.to(torch.int64)
     if seq_lens.dtype != torch.int64:
@@ -1109,15 +996,8 @@ def alloc_extend_kernel(
         out_indices,
         ret_value,
     )
-    _dsv4_probe(
-        "alloc_extend_output",
-        {
-            "out_indices": out_indices,
-            "ret_value": ret_value,
-        },
-        bs_upper=bs_upper,
-        page_size=page_size,
-    )
+    if _DEBUG:
+        debug_kernels.capture("alloc_extend.output", locals())
 
 
 @register_triton_op("sglang.srt.mem_cache.triton_ops.allocator", "alloc_decode_kernel")
@@ -2112,11 +1992,8 @@ def dsv4_fused_q_indexer_rope_hadamard_quant_kunlun(
     q_rope_2d = q_rope.view(-1, hidden_size) if q_rope.ndim > 2 else q_rope
     q_hadamard_2d = q_hadamard.view(-1, hidden_size) if q_hadamard.ndim > 2 else q_hadamard
     kunlun_ops.matmul(q_rope_2d, hadamard_matrix, q_hadamard_2d, False, True, 1.0, 0.0)
-    _dsv4_probe(
-        "q_fused",
-        {"q_wq_b": q_wq_b, "q_rope": q_rope, "q_hadamard": q_hadamard},
-        positions_shape=tuple(positions.shape),
-    )
+    if _DEBUG:
+        debug_kernels.capture("q_fused.hadamard", locals())
     q = q_hadamard
     q_shape = q.shape
     q_2d = q.contiguous().view(-1, q_shape[-1])
@@ -2128,16 +2005,8 @@ def dsv4_fused_q_indexer_rope_hadamard_quant_kunlun(
     q_int8 = q_int8.view(q_shape)
     q_scale = q_scale.view(q_shape[0], -1)
     weights = dsv4_fused_scale_kunlun(weight, weight_scale, q_scale)
-    _dsv4_probe(
-        "q_fused_quant",
-        {
-            "q_int8": q_int8,
-            "q_scale": q_scale,
-            "weights_raw": weight,
-            "weights_scaled": weights,
-        },
-        weight_scale=float(weight_scale),
-    )
+    if _DEBUG:
+        debug_kernels.capture("q_fused.quant", locals())
     return q_int8, weights
 
 
@@ -2168,18 +2037,8 @@ def dsv4_fused_q_norm_rope_kunlun(
         None,
         None,
     )
-    if (
-        _ENABLE_DSV4_ACCURACY_DUMPS
-        and q_input.shape[0] == 8192
-        and torch.distributed.is_initialized()
-        and torch.distributed.get_rank() == 0
-        and not getattr(dsv4_fused_q_norm_rope_kunlun, "_accuracy_dumped", False)
-    ):
-        torch._dsv4_accuracy_q_stages = {
-            "q.wq_b_reshaped": q_input.detach().cpu(),
-            "q.rmsnorm_output": normalized.detach().cpu(),
-        }
-        dsv4_fused_q_norm_rope_kunlun._accuracy_dumped = True
+    if _DEBUG:
+        debug_kernels.capture("q_norm_rope.rmsnorm", locals())
 
     q_output.copy_(normalized)
     rope = q_output[..., -64:]
@@ -2196,23 +2055,8 @@ def dsv4_fused_q_norm_rope_kunlun(
         inverse=False,
     )
     rope.copy_(rotated)
-    if (
-        _ENABLE_DSV4_ACCURACY_DUMPS
-        and q_input.shape[0] == 8192
-        and torch.distributed.is_initialized()
-        and torch.distributed.get_rank() == 0
-        and not getattr(dsv4_fused_q_norm_rope_kunlun, "_rope_dumped", False)
-    ):
-        stages = getattr(torch, "_dsv4_accuracy_q_stages", {})
-        stages.update(
-            {
-                "q.rope_positions": positions.detach().cpu(),
-                "q.rope_freqs": _dsv4_cos_sin_cache(freqs_cis).detach().cpu(),
-                "q.rope_output": rope.detach().cpu(),
-            }
-        )
-        torch._dsv4_accuracy_q_stages = stages
-        dsv4_fused_q_norm_rope_kunlun._rope_dumped = True
+    if _DEBUG:
+        debug_kernels.capture("q_norm_rope.rope", locals())
 
 
 @register_jit_op("sglang.jit_kernel.dsv4.elementwise", "fused_k_norm_rope_flashmla")
@@ -2243,15 +2087,6 @@ def dsv4_fused_k_norm_rope_flashmla_kunlun(
     rotated = _dsv4_rotate_gptj_tail(normalized, freqs_cis, positions)
     max_valid_loc = kvcache.shape[0] * page_size - 1
     loc = out_loc.contiguous().clamp(min=0, max=max_valid_loc)
-    dump_layer0_k = (
-        _ENABLE_DSV4_ACCURACY_DUMPS
-        and kv.shape[0] == 8192
-        and positions.numel() == 8192
-        and int(positions[0]) == 8192
-        and torch.distributed.is_initialized()
-        and torch.distributed.get_rank() == 0
-        and not getattr(dsv4_fused_k_norm_rope_flashmla_kunlun, "_dumped", False)
-    )
     identity_key = (kvcache.device, max_valid_loc + 1)
     identity_mapping = _DSV4_IDENTITY_MAPPING_CACHE.get(identity_key)
     if identity_mapping is None:
@@ -2266,23 +2101,8 @@ def dsv4_fused_k_norm_rope_flashmla_kunlun(
         rotated.reshape(rotated.shape[0], -1).contiguous(),
         page_size,
     )
-    if dump_layer0_k:
-        cache_rows = kvcache.view(-1, rotated.shape[-1])[loc.long()]
-        torch.save(
-            {
-                "kv.raw": kv.detach().cpu(),
-                "kv.rmsnorm": normalized.detach().cpu(),
-                "kv.rope": rotated.detach().cpu(),
-                "positions": positions.detach().cpu(),
-                "swa_loc": out_loc.detach().cpu(),
-                "effective_loc": loc.detach().cpu(),
-                "cache_rows": cache_rows.detach().cpu(),
-                "page_size": page_size,
-                "cache_shape": tuple(kvcache.shape),
-            },
-            f"/home/zx/debug_dumps/layer0_k_stages_0514_pid{os.getpid()}.pt",
-        )
-        dsv4_fused_k_norm_rope_flashmla_kunlun._dumped = True
+    if _DEBUG:
+        debug_kernels.capture("k_norm_rope.layer0", locals())
 
 
 @register_jit_op("sglang.jit_kernel.rope", "apply_rope_with_cos_sin_cache_inplace")
