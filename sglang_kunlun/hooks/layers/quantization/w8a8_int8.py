@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+import os
 import torch
 from torch.nn.parameter import Parameter
 
@@ -55,6 +56,18 @@ def linear_apply_kunlun(
     import kunlun_ops  # local-only dep
 
     w_shape = layer.weight.shape
+    dsv4_layer_id = getattr(layer, "_dsv4_layer_id", None)
+    if dsv4_layer_id is not None and not isinstance(x, tuple):
+        from sglang.srt.models.deepseek_v4 import (
+            _record_dsv4_decode_stage,
+            _record_dsv4_decode_static,
+        )
+
+        _record_dsv4_decode_stage(dsv4_layer_id, "wo_b_input", x)
+        _record_dsv4_decode_static(dsv4_layer_id, "wo_b_weight", layer.weight.data)
+        _record_dsv4_decode_static(
+            dsv4_layer_id, "wo_b_weight_scale", layer.weight_scale.data
+        )
     if isinstance(x, tuple):
         x_q, x_scale = x
         out = torch.empty(
@@ -70,6 +83,9 @@ def linear_apply_kunlun(
             (x_shape[0], w_shape[0]), dtype=x.dtype, device=x.device
         )
         kunlun_ops.quant2d(x, x_q, x_scale, force_sdnn=True)
+    if dsv4_layer_id is not None:
+        _record_dsv4_decode_stage(dsv4_layer_id, "wo_b_x_q", x_q)
+        _record_dsv4_decode_stage(dsv4_layer_id, "wo_b_x_scale", x_scale)
 
     kunlun_ops.matmul(
         x_q,
@@ -79,6 +95,8 @@ def linear_apply_kunlun(
         x_pc_max=x_scale,
         w_pc_max=layer.weight_scale.data,
     )
+    if dsv4_layer_id is not None:
+        _record_dsv4_decode_stage(dsv4_layer_id, "wo_b_matmul_output", out)
     return out
 
 
@@ -119,110 +137,125 @@ def moe_apply_kunlun(
     import kunlun_ops  # local-only dep
     from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-    x = dispatch_output.hidden_states
+    hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
     topk_weights = topk_output.topk_weights
     topk_ids = topk_output.topk_ids
-    _router_logits = topk_output.router_logits
     top_k = self.moe_runner_config.top_k
     num_experts = self.moe_runner_config.num_experts
-    gateup_output_n = layer.w13_weight.shape[1]
-    hidden_size = layer.w2_weight.shape[1]
-    num_tokens = x.shape[0]
-    device = x.device
-
-    cache: Any = torch.empty(
-        num_tokens * top_k * max(gateup_output_n, hidden_size),
+    num_tokens, hidden_size = hidden_states.shape
+    hidden_dim = layer.w2_weight.shape[1]
+    device = hidden_states.device
+    # Keep the exact 0.5.8 preprocessing contract: expand token rows first,
+    # then quantize the M * top_k matrix consumed by both grouped GEMMs.
+    block_statistic = torch.zeros(
+        12, num_experts, dtype=torch.int32, device=device
+    )
+    kunlun_ops.gen_block_statistic(topk_ids, block_statistic)
+    moe_expand = torch.empty(
+        num_tokens * top_k,
+        hidden_size,
+        dtype=hidden_states.dtype,
         device=device,
-        dtype=torch.bfloat16,
     )
-
-    sorted_tokens_num_lod = torch.empty(
-        [num_experts + 1], dtype=torch.int32, device=device
+    expert_m = torch.zeros(num_experts, dtype=torch.int32, device=device)
+    sorted_tokens_num_lod = torch.zeros(
+        num_experts + 1, dtype=torch.int32, device=device
     )
-    sorted_tokens_idx = torch.empty(
-        topk_ids.shape, dtype=torch.int32, device=device
+    sorted_tokens_idx = torch.zeros(
+        num_tokens * top_k, dtype=torch.int32, device=device
     )
-    kunlun_ops.moe_sorted_topk_idx(
+    kunlun_ops.moe_pre_sorted(
+        hidden_states,
         topk_ids,
-        topk_ids.shape[0],
-        top_k,
-        num_experts,
-        sorted_tokens_num_lod,
+        block_statistic,
+        moe_expand,
         sorted_tokens_idx,
+        expert_m,
+        sorted_tokens_num_lod,
     )
-
-    # quant input
-    x_q = torch.empty_like(x, dtype=torch.int8, device=device)
-    x_scale = torch.empty(x.shape[0], dtype=torch.float32, device=device)
-    kunlun_ops.quant2d(x, x_q, x_scale, force_sdnn=False)
-
-    # up
-    intermediate_cache1 = cache[: num_tokens * top_k * gateup_output_n].view(
-        (num_tokens, top_k, gateup_output_n),
+    x_q = torch.empty_like(moe_expand, dtype=torch.int8)
+    x_scale = torch.empty(
+        (num_tokens * top_k, 1), dtype=torch.float32, device=device
+    )
+    kunlun_ops.quant2d(moe_expand, x_q, x_scale, force_sdnn=True)
+    gate_up = torch.empty(
+        num_tokens,
+        top_k,
+        layer.w13_weight.shape[1],
+        dtype=hidden_states.dtype,
+        device=device,
     )
     kunlun_ops.moe_fc(
         x=x_q,
+        x_perchannel_max=x_scale,
         weight=layer.w13_weight,
+        w_perchannel_max=layer.w13_weight_scale,
         sorted_tokens_num_lod=sorted_tokens_num_lod,
         sorted_tokens_idx=sorted_tokens_idx,
         moe_topk=top_k,
-        y=intermediate_cache1,
-        act=None,
-        x_perchannel_max=x_scale,
-        w_perchannel_max=layer.w13_weight_scale,
+        y=gate_up,
         topk_ids=topk_ids,
-        sort_mode=False,
+        act=None,
     )
-
-    # act
-    intermediate_cache2 = torch.empty(
-        (num_tokens, top_k, gateup_output_n // 2),
-        dtype=torch.bfloat16,
+    swiglu_limit = self.moe_runner_config.swiglu_limit
+    if swiglu_limit is not None:
+        half = gate_up.shape[-1] // 2
+        gate_up[..., :half].clamp_(max=float(swiglu_limit))
+        gate_up[..., half:].clamp_(
+            min=-float(swiglu_limit), max=float(swiglu_limit)
+        )
+    activated = torch.empty(
+        *gate_up.shape[:-1],
+        gate_up.shape[-1] // 2,
+        dtype=gate_up.dtype,
         device=device,
     )
-    kunlun_ops.swiglu(intermediate_cache1, intermediate_cache2)
-
-    # quant intermediate
-    intermediate_cache2_q = torch.empty(
-        (num_tokens * top_k, gateup_output_n // 2),
-        dtype=torch.int8,
-        device=device,
-    )
-    intermediate_cache2_scale = torch.empty(
-        num_tokens * top_k, dtype=torch.float32, device=device
+    kunlun_ops.swiglu(gate_up, activated)
+    activated = activated.reshape(num_tokens * top_k, -1)
+    activated_q = torch.empty_like(activated, dtype=torch.int8)
+    activated_scale = torch.empty(
+        (num_tokens * top_k, 1), dtype=torch.float32, device=device
     )
     kunlun_ops.quant2d(
-        intermediate_cache2,
-        intermediate_cache2_q,
-        intermediate_cache2_scale,
-        force_sdnn=False,
+        activated, activated_q, activated_scale, force_sdnn=True
     )
-
-    # down
-    intermediate_cache3 = cache[: num_tokens * top_k * hidden_size].view(
-        (num_tokens, top_k, hidden_size),
+    expert_output = torch.empty(
+        num_tokens,
+        top_k,
+        hidden_dim,
+        dtype=hidden_states.dtype,
+        device=device,
     )
     kunlun_ops.moe_fc(
-        x=intermediate_cache2_q,
+        x=activated_q,
+        x_perchannel_max=activated_scale,
         weight=layer.w2_weight,
+        w_perchannel_max=layer.w2_weight_scale,
         sorted_tokens_num_lod=sorted_tokens_num_lod,
         sorted_tokens_idx=sorted_tokens_idx,
-        moe_topk=1,
-        y=intermediate_cache3,
-        act=None,
-        x_perchannel_max=intermediate_cache2_scale,
-        w_perchannel_max=layer.w2_weight_scale,
+        moe_topk=top_k,
+        y=expert_output,
         topk_ids=topk_ids,
-        topk_w=topk_weights,
-        sort_mode=False,
+        act=None,
     )
-
-    out = torch.empty(
-        (num_tokens, hidden_size), dtype=torch.bfloat16, device=device
+    dequant_scale = torch.ones(
+        (num_tokens, top_k), dtype=torch.float32, device=device
     )
-    kunlun_ops.reduce_sum(intermediate_cache3, 1, out)
-    return StandardCombineInput(hidden_states=out)
+    output = torch.empty(
+        (num_tokens, hidden_dim), dtype=hidden_states.dtype, device=device
+    )
+    kunlun_ops.moe_post(
+        expert_output,
+        sorted_tokens_idx.view(num_tokens, top_k),
+        topk_weights,
+        dequant_scale,
+        output,
+    )
+    routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
+    if routed_scaling_factor not in (None, 1.0):
+        output.mul_(routed_scaling_factor)
+    return StandardCombineInput(hidden_states=output)
 
 
 # ---------------------------------------------------------------------------
