@@ -6,6 +6,10 @@ import logging
 
 from sglang.srt.environ import envs
 
+from . import deepseek_v4  # noqa: F401
+from . import deepseek_v4_nextn  # noqa: F401
+from . import deepseek_v4_precision  # noqa: F401
+
 logger = logging.getLogger(__name__)
 
 

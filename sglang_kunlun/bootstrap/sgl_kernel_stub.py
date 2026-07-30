@@ -129,6 +129,7 @@ def install() -> None:
         "scalar_type",
         "test_utils",
         "version",
+        "utils",
         "elementwise",
         "attention",
         "allreduce",
@@ -154,6 +155,7 @@ def install() -> None:
     # ``version.__version__`` is read at top-level of community
     # sglang_router or similar — provide a benign value.
     sys.modules["sgl_kernel.version"].__version__ = "0.0.0+kunlun-stub"  # type: ignore[attr-defined]
+    sys.modules["sgl_kernel.utils"].is_arch_support_pdl = lambda: False  # type: ignore[attr-defined]
 
     # Bind real Kunlun implementations for sgl_kernel top-k APIs.
     # fast_topk: pure-Python fallback (no XPU kernel needed), identical to

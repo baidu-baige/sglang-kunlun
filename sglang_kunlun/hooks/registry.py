@@ -22,12 +22,18 @@ HOOK_MODULES = (
     "sglang_kunlun.hooks.disaggregation",
     "sglang_kunlun.models",
     "sglang_kunlun.hooks.speculative",
+    "sglang_kunlun.hooks.production_precision",
+    "sglang_kunlun.hooks.mtp_production",
+    "sglang_kunlun.hooks.ragged_draft_extend",
 
 )
 
 
 def register_all() -> None:
     """Import every hook module so decorators register with ``HookRegistry``."""
+    from sglang_kunlun.bootstrap import _kunlun_pre_shim
+
+    _kunlun_pre_shim()
     from sglang_kunlun.kernels import deep_geem_hook as _deep_geem_hook  # noqa: F401
     from sglang_kunlun.kernels import flashinfer_hook as _flashinfer_hook  # noqa: F401
     from sglang_kunlun.kernels import kernel_ops

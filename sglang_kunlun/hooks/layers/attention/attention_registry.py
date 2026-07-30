@@ -19,9 +19,16 @@ except Exception as e:  # pragma: no cover - upstream layout drift
 if register_attention_backend is not None:
     @register_attention_backend("kunlun")
     def create_kunlun_attention_backend(runner):
-        """Lazy-construct the Kunlun attention backend."""
+        """Lazy-construct the generic Kunlun attention backend."""
         from .kunlun_backend import KunlunAttentionBackend
 
         return KunlunAttentionBackend(runner)
 
-    logger.info("Registered 'kunlun' attention backend factory")
+    @register_attention_backend("kunlun_compressed")
+    def create_kunlun_compressed_attention_backend(runner):
+        """Lazy-construct the Kunlun DeepSeek-V4 attention backend."""
+        from .kunlun_deepseek_v4_backend import KunlunDeepseekV4AttnBackend
+
+        return KunlunDeepseekV4AttnBackend(runner)
+
+    logger.info("Registered 'kunlun' and 'kunlun_compressed' attention backends")

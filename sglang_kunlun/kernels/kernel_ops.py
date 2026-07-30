@@ -5,20 +5,20 @@ from __future__ import annotations
 import importlib
 import inspect
 import logging
+import os
 import sys
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 import torch
 
+from sglang_kunlun.debug_bridge import DEBUG_ENABLED as _DEBUG
+from sglang_kunlun.debug_bridge import kernels as debug_kernels
+
 logger = logging.getLogger(__name__)
 
 import xspeedgate_ops
 
-def _debug_tensor_meta(name: str, value: object) -> str:
-    if isinstance(value, torch.Tensor):
-        return f"{name}: shape={tuple(value.shape)}, dtype={value.dtype}, device={value.device}"
-    return f"{name}: value={value!r}, type={type(value).__name__}"
 
 
 KernelKey = Tuple[str, str]
@@ -150,6 +150,26 @@ def _patch_symbol(spec: KernelSpec, replacement: object) -> None:
     logger.info("kernel_ops: patched %s.%s", *key)
 
 
+def dsv4_mqa_wo_a_einsum_kunlun(
+    o: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    """Run the 0.5.8 Kunlun wo_a reduction contract."""
+
+    return torch.ops.xspeedgate_ops.einsum_tgd_grd_tgr(o.contiguous(), weight)
+
+
+def dsv4_mqa_forward_with_full_sink_kunlun(original_fn, self, *args, **kwargs):
+    """Expose the full 0.5.8 attention sink while MQALayer.forward runs."""
+
+    original_local_sink = self._attn_sink_local
+    if self.tp_size > 1:
+        self._attn_sink_local = self.attn_sink
+    try:
+        return original_fn(self, *args, **kwargs)
+    finally:
+        self._attn_sink_local = original_local_sink
+
+
 def install() -> None:
     """Install all registered Kunlun kernel replacements into upstream modules."""
 
@@ -162,6 +182,364 @@ def install() -> None:
         _patch_symbol(spec, replacement)
     for spec in _JIT_OPS.values():
         _patch_symbol(spec, spec.impl)
+
+
+def _dsv4_plan_payload(plan):
+    """Return the compressor-v1 payload expected by the Kunlun kernels."""
+
+    if getattr(plan, "is_decode", False):
+        return plan.seq_lens, None, 1
+    return plan.compress_plan, plan.write_plan, 0
+
+
+@register_jit_op("sglang.jit_kernel.dsv4.compress_old", "compress_forward")
+def dsv4_compress_forward_kunlun(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    ape: torch.Tensor,
+    indices: torch.Tensor,
+    plan=None,
+    extra_data: Optional[torch.Tensor] = None,
+    *,
+    head_dim: int,
+    compress_ratio: int,
+    out: Optional[torch.Tensor] = None,
+    seq_lens: Optional[torch.Tensor] = None,
+    extend_lens: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run the compressor-v1 C4/C128 forward kernel on Kunlun."""
+
+    if plan is None:
+        from sglang.jit_kernel.dsv4.compress_old import compress_plan
+
+        assert seq_lens is not None
+        plan = compress_plan(
+            compress_ratio,
+            kv_score_input.shape[0],
+            seq_lens,
+            extend_lens,
+            kv_score_input.device,
+        )
+    assert head_dim % 128 == 0
+    assert plan.compress_ratio == compress_ratio
+    if out is None:
+        out = kv_score_input.new_empty((kv_score_input.shape[0], head_dim))
+    payload, write_plan, _ = _dsv4_plan_payload(plan)
+    torch.ops.xspeedgate_ops.compress_forward_fast(
+        kv_score_buffer,
+        kv_score_input,
+        out,
+        ape,
+        indices,
+        payload,
+        write_plan,
+        extra_data,
+    )
+    return out
+
+
+@register_jit_op(
+    "sglang.jit_kernel.dsv4.compress_old", "compress_fused_norm_rope_inplace"
+)
+def dsv4_compress_fused_norm_rope_inplace_kunlun(
+    kv: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    freq_cis: torch.Tensor,
+    plan,
+) -> None:
+    """Apply compressor-v1 RMSNorm and GPT-J RoPE in place on Kunlun."""
+
+    import kunlun_ops
+
+    payload, _, mode = _dsv4_plan_payload(plan)
+    if payload.numel() == 0:
+        return
+    handle = payload.view(torch.int32) if not mode else payload
+    kunlun_ops.dpsk_v4_norm_rope_gptj(
+        kv,
+        weight,
+        handle,
+        freq_cis,
+        mode,
+        plan.compress_ratio,
+        eps,
+    )
+
+
+@register_jit_op("sglang.jit_kernel.dsv4.attn", "triton_create_paged_compress_data")
+def dsv4_create_paged_compress_data_kunlun(
+    *,
+    compress_ratio: int,
+    is_overlap: bool,
+    swa_page_size: int,
+    ring_size: int,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    req_to_token: torch.Tensor,
+    full_to_swa_index_mapping: torch.Tensor,
+    block: int = 128,
+):
+    """Create compressor-v1 paged indices using the Kunlun fused op."""
+
+    del block
+    return torch.ops.xspeedgate_ops.create_paged_compress_data(
+        req_pool_indices=req_pool_indices.to(torch.int64),
+        seq_lens=seq_lens.to(torch.int32).contiguous(),
+        extend_seq_lens=extend_seq_lens.to(torch.int32).contiguous(),
+        req_to_token=req_to_token,
+        full_to_swa_index_mapping=full_to_swa_index_mapping.to(torch.int64),
+        swa_page_size=swa_page_size,
+        ring_size=ring_size,
+        compress_ratio=compress_ratio,
+        is_overlap=is_overlap,
+    )
+
+
+def _dsv4_topk_torch_fallback(*args, **kwargs) -> None:
+    from sglang.srt.layers.attention.dsv4.indexer import (
+        topk_transform_512_pytorch_vectorized,
+    )
+
+    topk_transform_512_pytorch_vectorized(*args, **kwargs)
+
+
+def _canonicalize_dsv4_page_indices_(page_indices: torch.Tensor) -> None:
+    """Use a deterministic physical-page order while keeping sentinels last."""
+    sentinel = torch.iinfo(page_indices.dtype).max
+    sortable = torch.where(page_indices < 0, sentinel, page_indices)
+    ordered = torch.sort(sortable, dim=-1).values
+    ordered.masked_fill_(ordered == sentinel, -1)
+    page_indices.copy_(ordered)
+
+
+def _dsv4_topk_transform_graph_safe(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Select the exact top-k set without graph-hostile advanced indexing."""
+    batch_size, max_seq_len = scores.shape
+    topk = out_page_indices.shape[1]
+    actual_k = min(topk, max_seq_len)
+    cache = getattr(_dsv4_topk_transform_graph_safe, "_arange_cache", None)
+    if cache is None:
+        cache = {}
+        _dsv4_topk_transform_graph_safe._arange_cache = cache
+
+    seq_key = (max_seq_len, scores.device, torch.int64)
+    positions = cache.get(seq_key)
+    if positions is None:
+        positions = torch.arange(max_seq_len, device=scores.device)
+        cache[seq_key] = positions
+    valid_mask = positions.unsqueeze(0) < seq_lens.unsqueeze(1)
+    masked_scores = scores.masked_fill(~valid_mask, float("-inf"))
+    raw_indices = torch.topk(
+        masked_scores, k=actual_k, dim=1, largest=True, sorted=False
+    ).indices
+    if actual_k < topk:
+        raw_indices = torch.nn.functional.pad(
+            raw_indices, (0, topk - actual_k), value=0
+        )
+
+    selected_scores = torch.gather(scores, 1, raw_indices.clamp(min=0))
+    valid_topk = selected_scores != float("-inf")
+    topk_key = (topk, scores.device, raw_indices.dtype)
+    topk_positions = cache.get(topk_key)
+    if topk_positions is None:
+        topk_positions = torch.arange(
+            topk, device=scores.device, dtype=raw_indices.dtype
+        )
+        cache[topk_key] = topk_positions
+    if actual_k < topk:
+        valid_topk &= topk_positions.unsqueeze(0) < actual_k
+
+    sequential = topk_positions.unsqueeze(0).expand(batch_size, -1)
+    sequential_valid = sequential < seq_lens.unsqueeze(1)
+    needs_sequential = (seq_lens <= topk).unsqueeze(1)
+    raw_indices = torch.where(needs_sequential, sequential, raw_indices)
+    valid_topk = torch.where(needs_sequential, sequential_valid, valid_topk)
+
+    page_bits = (page_size - 1).bit_length() if page_size > 1 else 0
+    page_mask = page_size - 1
+    page_idx = raw_indices >> page_bits
+    offset_in_page = raw_indices & page_mask
+    physical_pages = torch.gather(page_tables, 1, page_idx.clamp(min=0).long())
+    page_indices = (physical_pages << page_bits) | offset_in_page
+    page_indices.masked_fill_(~valid_topk, -1)
+    out_page_indices.copy_(page_indices.to(torch.int32))
+
+
+@register_jit_op("sglang.jit_kernel.dsv4.topk", "topk_transform_512")
+def dsv4_topk_transform_512_kunlun(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """Transform DSV4 top-k indices to paged locations on Kunlun."""
+
+    if out_raw_indices is not None:
+        _dsv4_topk_torch_fallback(
+            scores,
+            seq_lens,
+            page_tables,
+            out_page_indices,
+            page_size,
+            out_raw_indices,
+        )
+        if _DEBUG:
+            debug_kernels.capture("topk.raw", locals())
+        return
+    _dsv4_topk_transform_graph_safe(
+        scores, seq_lens, page_tables, out_page_indices, page_size
+    )
+    _canonicalize_dsv4_page_indices_(out_page_indices)
+    if _DEBUG:
+        debug_kernels.capture("topk.graph_safe", locals())
+
+
+@register_jit_op("sglang.jit_kernel.dsv4.topk", "topk_transform_512_v2")
+def dsv4_topk_transform_512_v2_kunlun(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    metadata: torch.Tensor,
+) -> None:
+    """Run the Kunlun top-k transform while retaining the v2 API contract."""
+
+    del metadata
+    dsv4_topk_transform_512_kunlun(
+        scores, seq_lens, page_tables, out_page_indices, page_size
+    )
+
+
+@register_jit_op("sglang.srt.layers.attention.dsv4.indexer", "fused_scale")
+def dsv4_fused_scale_kunlun(
+    weight: torch.Tensor, out_scale: float, q_scale: torch.Tensor
+) -> torch.Tensor:
+    """Fuse DSV4 indexer weight and query scales on Kunlun."""
+
+    weight_2d = weight.squeeze(-1) if weight.ndim > 2 else weight
+    q_scale_2d = q_scale.squeeze(-1) if q_scale.ndim > 2 else q_scale
+    out = torch.ops.xspeedgate_ops.fused_scale(
+        weight=weight_2d, out_scale=out_scale, q_scale=q_scale_2d
+    )
+    return out.unsqueeze(-1) if out.ndim == 2 else out
+
+
+@register_jit_op(
+    "sglang.srt.layers.attention.dsv4.metadata_kernel", "init_compression_metadata"
+)
+def dsv4_init_compression_metadata_kunlun(
+    seq_lens: torch.Tensor,
+    positions: torch.Tensor,
+    raw_out_loc: torch.Tensor,
+    page_table: Optional[torch.Tensor] = None,
+    page_size: int = 0,
+    compute_page_indices: bool = True,
+):
+    """Build compressed-attention metadata with the Kunlun fused operator."""
+
+    values = torch.ops.xspeedgate_ops.init_compressed_attn_metadata(
+        seq_lens,
+        positions,
+        raw_out_loc,
+        page_table,
+        page_size,
+        compute_page_indices,
+    )
+    values = tuple(values)
+    # The 0.5.8 operator predates c128_seq_lens_raw in the public contract.
+    if len(values) == 8:
+        values = values[:6] + (
+            torch.div(seq_lens.to(torch.int32), 128, rounding_mode="floor"),
+        ) + values[6:]
+    if len(values) != 9:
+        raise RuntimeError(
+            f"init_compressed_attn_metadata returned {len(values)} values, expected 8 or 9"
+        )
+    return tuple(values)
+
+
+@register_jit_op(
+    "sglang.srt.layers.attention.dsv4.quant_k_cache",
+    "quant_to_nope_fp8_rope_bf16_pack_triton",
+)
+def dsv4_quant_k_cache_kunlun(k_bf16: torch.Tensor):
+    """Wrap a BF16 DSV4 key for the Kunlun fused cache-store operator."""
+
+    from types import SimpleNamespace
+
+    assert k_bf16.shape[-1] == 512
+    if _DEBUG:
+        debug_kernels.capture("quant_k_cache.callstack", locals())
+    # Kunlun performs the cache conversion while storing. The upstream pack
+    # validates the CUDA FP8 representation in __post_init__, so use the same
+    # attribute contract without constructing that CUDA-only representation.
+    return SimpleNamespace(
+        # Match the patched 0.5.8 compressor contract: its FP32 compressor
+        # output is rounded to BF16 before conversion to the FP16 cache dtype.
+        k_nope_fp8=k_bf16.to(torch.bfloat16).to(torch.float16).contiguous(),
+        k_rope_bf16=None,
+        scale_k_nope_ue8m0=None,
+    )
+
+
+@register_triton_op(
+    "sglang.srt.layers.attention.dsv4.index_buf_accessor",
+    "_set_k_and_s_triton",
+    metadata={"call_style": "direct"},
+)
+def dsv4_set_k_and_s_kunlun(
+    buf: torch.Tensor,
+    loc: torch.Tensor,
+    nope_fp8_rope_bf16_pack,
+    page_size: int,
+):
+    """Store an unquantized DSV4 key through the Kunlun cache wrapper."""
+
+    max_valid_loc = buf.shape[0] * page_size - 1
+    loc_safe = loc.clamp(min=0, max=max_valid_loc) if loc.numel() else loc
+    if _DEBUG:
+        debug_kernels.capture("set_k_and_s.callstack", locals())
+    torch.ops.xspeedgate_ops.set_k_and_s_v4(
+        buf, loc_safe, nope_fp8_rope_bf16_pack.k_nope_fp8, page_size
+    )
+
+
+def dsv4_set_k_and_s_with_mapping_kunlun(
+    buf: torch.Tensor,
+    raw_loc: torch.Tensor,
+    full_to_swa_index_mapping: torch.Tensor,
+    nope_fp8_rope_bf16_pack,
+    page_size: int,
+) -> None:
+    """Match the 0.5.8 raw-location DSV4 cache writer contract.
+
+    The XSpeedGate mapping variant owns full-to-SWA translation. Keeping the
+    raw location and mapping as separate inputs is important for multi-step
+    MTP, where the allocator's full-pool location is the source of truth.
+    """
+    # Golden 0.5.8 passes allocator locations as contiguous int32. Keep the
+    # scheduler's int64 buffer untouched and normalize only the operator input.
+    raw_loc = raw_loc.to(dtype=torch.int32).contiguous()
+    if full_to_swa_index_mapping.device != raw_loc.device:
+        full_to_swa_index_mapping = full_to_swa_index_mapping.to(raw_loc.device)
+    torch.ops.xspeedgate_ops.set_k_and_s_v4_with_mapping(
+        buf,
+        raw_loc,
+        full_to_swa_index_mapping,
+        nope_fp8_rope_bf16_pack.k_nope_fp8,
+        page_size,
+    )
 
 
 @register_triton_op("sglang.srt.mem_cache.common", "write_req_to_token_pool_triton")
@@ -177,6 +555,8 @@ def write_req_to_token_pool_triton(
 ) -> None:
     """Write request token mappings into the request-to-token pool."""
 
+    if _DEBUG:
+        debug_kernels.capture("write_req_to_token.input", locals())
     torch.ops.xspeedgate_ops.write_req_to_token_pool(
         req_to_token_ptr,
         req_pool_indices.to(torch.int32),
@@ -186,6 +566,8 @@ def write_req_to_token_pool_triton(
         extend_lens,
         out_cache_loc.to(torch.int64),
     )
+    if _DEBUG:
+        debug_kernels.capture("write_req_to_token.output", locals())
 
 
 @register_triton_op("sglang.srt.mem_cache.common", "get_last_loc_kernel")
@@ -318,12 +700,21 @@ def clamp_position(seq_lens: torch.Tensor) -> torch.Tensor:
 
 
 @register_jit_op("sglang.jit_kernel.hadamard", "hadamard_transform")
-def hadamard_transform(x: torch.Tensor, scale: float = None) -> torch.Tensor:
-    """Apply Kunlun Hadamard transform replacement."""
+def hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    """Apply the 0.5.8 Kunlun Hadamard matmul contract without dtype changes."""
 
-    if scale is None:
-        return torch.ops.xspeedgate_ops.hadamard_transform(x)
-    return torch.ops.xspeedgate_ops.hadamard_transform(x, scale)
+    import kunlun_ops
+
+    hidden_size = x.shape[-1]
+    matrix = torch.empty(
+        (hidden_size, hidden_size), dtype=x.dtype, device=x.device
+    )
+    kunlun_ops.gen_hadamard_matrix(matrix, scale)
+    original_shape = x.shape
+    x_2d = x.view(-1, hidden_size) if x.ndim > 2 else x
+    out = torch.empty_like(x_2d)
+    kunlun_ops.matmul(x_2d, matrix, out, False, True, 1.0, 0.0)
+    return out.view(original_shape) if x.ndim > 2 else out
 
 
 @register_jit_op("sglang.jit_kernel.activation", "silu_and_mul")
@@ -358,6 +749,57 @@ def silu_and_mul(
     return out
 
 
+@register_jit_op("sglang.jit_kernel.dsv4.moe", "hash_topk")
+def dsv4_hash_topk_kunlun(
+    router_logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    tid2eid: torch.Tensor,
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: float = 1.0,
+    scoring_func: str = "sqrtsoftplus",
+):
+    """Route DSV4 hash top-k through the working 0.5.8 Kunlun operator."""
+
+    if scoring_func != "sqrtsoftplus":
+        raise ValueError(f"unsupported DSV4 hash top-k scoring: {scoring_func}")
+    topk_ids, topk_weights = torch.ops.xspeedgate_ops.moe_hash_topk_fused(
+        router_logits,
+        input_ids.to(torch.int64),
+        tid2eid,
+        num_fused_shared_experts,
+        routed_scaling_factor,
+    )
+    return topk_weights, topk_ids
+
+
+@register_jit_op("sglang.jit_kernel.dsv4.gemm", "linear_bf16_fp32")
+def dsv4_linear_bf16_fp32_kunlun(
+    x: torch.Tensor,
+    y: torch.Tensor,
+) -> torch.Tensor:
+    """Match the 0.5.8 ``torch`` GEMM configuration on Kunlun."""
+
+    return torch.nn.functional.linear(x.float(), y.float())
+
+
+@register_jit_op("sglang.jit_kernel.dsv4.moe", "silu_and_mul_clamp")
+def dsv4_silu_and_mul_clamp_kunlun(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    swiglu_limit: float,
+) -> None:
+    """Match the 0.5.8 clamp-then-Kunlun-SwiGLU contract."""
+
+    import kunlun_ops
+
+    gate, up = input.chunk(2, dim=-1)
+    limit = float(swiglu_limit)
+    clamped = torch.cat(
+        [gate.clamp(max=limit), up.clamp(min=-limit, max=limit)], dim=-1
+    )
+    kunlun_ops.swiglu(x=clamped, y=output)
+
+
 @register_jit_op("sglang.srt.utils.common", "fast_topk")
 def fast_topk(values: torch.Tensor, topk: int, dim: int):
     """Patch speculative fast_topk aliases onto a torch implementation on Kunlun."""
@@ -373,6 +815,42 @@ def mask_topk_ids(topk_ids: torch.Tensor, num_token_non_padded: torch.Tensor) ->
 
     indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
     topk_ids[indices >= num_token_non_padded, :] = -1
+
+
+@register_jit_op("sglang.jit_kernel.moe_fused_gate", "moe_fused_gate")
+def moe_fused_gate_dsv4_kunlun(
+    input: torch.Tensor,
+    bias: torch.Tensor,
+    topk: int,
+    scoring_func: str = "sigmoid",
+    num_fused_shared_experts: int = 0,
+    renormalize: bool = True,
+    routed_scaling_factor: float = 1.0,
+    apply_routed_scaling_factor_on_output: bool = False,
+):
+    """Match the monkey-patched 0.5.8 DeepSeek-V4 fused MoE gate."""
+    import kunlun_ops
+
+    num_rows = input.shape[0]
+    topk_weights = torch.empty(
+        num_rows, topk, dtype=torch.float32, device=input.device
+    )
+    topk_indices = torch.empty(
+        num_rows, topk, dtype=torch.int32, device=input.device
+    )
+    kunlun_ops.moe_fused_gate_dsv4(
+        input.to(torch.float32),
+        bias,
+        topk_weights,
+        topk_indices,
+        topk,
+        scoring_func,
+        num_fused_shared_experts,
+        renormalize,
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output,
+    )
+    return topk_weights, topk_indices
 
 
 @register_jit_op("sglang.jit_kernel.grouped_topk", "grouped_topk")
@@ -397,7 +875,9 @@ def grouped_topk(
     import kunlun_ops
 
     m_, n_ = scores.shape
-    block_statistic = torch.empty(12, n_, dtype=torch.int32, device=scores.device)
+    block_statistic = torch.empty(
+        12, n_ + 1, dtype=torch.int32, device=scores.device
+    )
     topk_values = torch.empty(m_, topk, dtype=torch.float32, device=scores.device)
     topk_indices = torch.empty(m_, topk, dtype=torch.int32, device=scores.device)
     if m_ == 0:
@@ -470,6 +950,8 @@ def alloc_extend_kernel(
 ) -> None:
     """Allocate KV cache pages for extend batches."""
 
+    if _DEBUG:
+        debug_kernels.capture("alloc_extend.input", locals())
     if prefix_lens.dtype != torch.int64:
         prefix_lens = prefix_lens.to(torch.int64)
     if seq_lens.dtype != torch.int64:
@@ -514,6 +996,8 @@ def alloc_extend_kernel(
         out_indices,
         ret_value,
     )
+    if _DEBUG:
+        debug_kernels.capture("alloc_extend.output", locals())
 
 
 @register_triton_op("sglang.srt.mem_cache.triton_ops.allocator", "alloc_decode_kernel")
@@ -529,7 +1013,7 @@ def alloc_decode_kernel(
 
     torch.ops.xspeedgate_ops.alloc_decode_kernel(
         seq_lens,
-        last_loc,
+        last_loc.to(torch.int32).contiguous(),
         free_pages,
         out_indices,
         bs_upper,
@@ -836,7 +1320,7 @@ def assign_hidden_states_pool_triton(
 
     pool_capacity = req_to_hidden_states_pool.shape[0]
     active_req_pool_indices = req_pool_indices[:num_seqs].to(torch.int64)
-    write_req_pool_indices = active_req_pool_indices + 1
+    write_req_pool_indices = active_req_pool_indices
     valid_mask = (write_req_pool_indices >= 0) & (write_req_pool_indices < pool_capacity)
     if not bool(valid_mask.all().item()):
         valid_req_indices = torch.nonzero(valid_mask, as_tuple=False).flatten()
@@ -984,7 +1468,10 @@ def assign_new_state_kernel(
     new_cache[:, 0] = torch.where(valid, first_locs, new_cache[:, 0])
 
     new_hidden[:, 1:, :].copy_(old_hidden)
-    new_hidden[:, 0, :].copy_(req_to_hidden_states_pool[req_indices + 1, -(step + 1)])
+    # Upstream's flattened pointer expression uses ``req_idx + 1`` only to
+    # address a negative step within row ``req_idx``. Tensor indexing must use
+    # the raw request row directly.
+    new_hidden[:, 0, :].copy_(req_to_hidden_states_pool[req_indices, -(step + 1)])
 
 
 @register_triton_op(
@@ -1072,15 +1559,17 @@ def assign_draft_cache_locs_page_size_1(
     ``topk * speculative_num_steps`` slots per request via xspeedgate_ops.
     """
 
+    out_cache_loc_i32 = torch.empty_like(out_cache_loc, dtype=torch.int32)
     torch.ops.xspeedgate_ops.assign_draft_cache_locs_page_size_1(
         req_pool_indices,
         req_to_token,
         seq_lens,
-        out_cache_loc.to(torch.int32),
+        out_cache_loc_i32,
         pool_len,
         topk,
         speculative_num_steps,
     )
+    out_cache_loc.copy_(out_cache_loc_i32)
 
 
 # [Dropped for 0.5.14] ``fill_new_verified_id`` no longer exists upstream; the
@@ -1387,6 +1876,233 @@ def compute_position_kernel(
     )
     positions.copy_(out_positions.to(positions.dtype))
     extend_start_loc.copy_(out_start_loc.to(extend_start_loc.dtype))
+
+
+_DSV4_FREQS_REAL_CACHE: dict[tuple[object, ...], torch.Tensor] = {}
+_DSV4_IDENTITY_MAPPING_CACHE: dict[tuple[object, ...], torch.Tensor] = {}
+
+
+def _dsv4_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
+    """Return the pointer-stable GPT-J cache expected by the Kunlun RoPE op."""
+
+    key = (
+        freqs_cis.data_ptr(),
+        tuple(freqs_cis.shape),
+        freqs_cis.dtype,
+        freqs_cis.device,
+    )
+    cached = _DSV4_FREQS_REAL_CACHE.get(key)
+    if cached is None:
+        cached = torch.cat(
+            (torch.real(freqs_cis), torch.imag(freqs_cis)), dim=-1
+        ).contiguous()
+        _DSV4_FREQS_REAL_CACHE[key] = cached
+    return cached
+
+
+def _dsv4_rotate_gptj_tail(
+    value: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    freqs_real = _dsv4_cos_sin_cache(freqs_cis)
+    rope_dim = freqs_real.shape[-1]
+    rope_tail = value[..., -rope_dim:].contiguous()
+    rope_shape = rope_tail.shape
+    rope_tail_3d = rope_tail.reshape(rope_shape[0], -1, rope_dim)
+    rotated, _ = torch.ops.xspeedgate_ops.flashinfer_rotary_embedding(
+        positions=positions.flatten(),
+        rotary_dim=rope_dim,
+        head_size=rope_dim,
+        cos_sin_cache=freqs_real,
+        is_neox_style=False,
+        query=rope_tail_3d,
+        key=None,
+        offsets=None,
+        inverse=False,
+    )
+    result = value.clone()
+    result[..., -rope_dim:].copy_(rotated.reshape(rope_shape))
+    return result
+
+
+@register_jit_op("sglang.jit_kernel.dsv4.elementwise", "fused_rope_inplace")
+def dsv4_fused_rope_inplace_kunlun(
+    q: torch.Tensor,
+    k: Optional[torch.Tensor],
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    inverse: bool = False,
+) -> None:
+    """Apply the 0.5.8 Kunlun GPT-J RoPE path with 0.5.14 semantics."""
+
+    if q.shape[0] == 0:
+        return
+
+    freqs_real = _dsv4_cos_sin_cache(freqs_cis)
+    rotary_dim = q.shape[-1]
+    q_shape = q.shape
+    q_input = q.contiguous().reshape(q_shape[0], -1, rotary_dim)
+
+    k_shape = k.shape if k is not None else None
+    k_input = (
+        k.contiguous().reshape(k_shape[0], -1, rotary_dim)
+        if k is not None
+        else None
+    )
+    q_rotated, k_rotated = torch.ops.xspeedgate_ops.flashinfer_rotary_embedding(
+        positions=positions.flatten(),
+        rotary_dim=rotary_dim,
+        head_size=rotary_dim,
+        cos_sin_cache=freqs_real,
+        is_neox_style=False,
+        query=q_input,
+        key=k_input,
+        offsets=None,
+        inverse=inverse,
+    )
+    q.copy_(q_rotated.reshape(q_shape))
+    if k is not None:
+        k.copy_(k_rotated.reshape(k_shape))
+
+
+@register_jit_op(
+    "sglang.jit_kernel.dsv4.elementwise",
+    "fused_q_indexer_rope_hadamard_quant",
+)
+def dsv4_fused_q_indexer_rope_hadamard_quant_kunlun(
+    q_input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+):
+    """Compose the exact 0.5.8 RoPE, Hadamard, INT8 and scale path."""
+
+    import kunlun_ops
+
+    q_wq_b = q_input
+    q_rope = _dsv4_rotate_gptj_tail(q_wq_b, freqs_cis, positions)
+    hidden_size = q_rope.shape[-1]
+    hadamard_matrix = torch.empty(
+        (hidden_size, hidden_size), dtype=q_rope.dtype, device=q_rope.device
+    )
+    kunlun_ops.gen_hadamard_matrix(hadamard_matrix, hidden_size ** -0.5)
+    q_hadamard = torch.empty_like(q_rope)
+    q_rope_2d = q_rope.view(-1, hidden_size) if q_rope.ndim > 2 else q_rope
+    q_hadamard_2d = q_hadamard.view(-1, hidden_size) if q_hadamard.ndim > 2 else q_hadamard
+    kunlun_ops.matmul(q_rope_2d, hadamard_matrix, q_hadamard_2d, False, True, 1.0, 0.0)
+    if _DEBUG:
+        debug_kernels.capture("q_fused.hadamard", locals())
+    q = q_hadamard
+    q_shape = q.shape
+    q_2d = q.contiguous().view(-1, q_shape[-1])
+    q_int8 = torch.empty_like(q_2d, dtype=torch.int8)
+    q_scale = torch.empty(
+        (q_2d.shape[0], 1), dtype=torch.float32, device=q.device
+    )
+    kunlun_ops.quant2d(q_2d, q_int8, q_scale, force_sdnn=True)
+    q_int8 = q_int8.view(q_shape)
+    q_scale = q_scale.view(q_shape[0], -1)
+    weights = dsv4_fused_scale_kunlun(weight, weight_scale, q_scale)
+    if _DEBUG:
+        debug_kernels.capture("q_fused.quant", locals())
+    return q_int8, weights
+
+
+@register_jit_op("sglang.jit_kernel.dsv4.elementwise", "fused_q_norm_rope")
+def dsv4_fused_q_norm_rope_kunlun(
+    q_input: torch.Tensor,
+    q_output: torch.Tensor,
+    eps: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> None:
+    """Match the 0.5.14 fused full-head RMSNorm plus GPT-J RoPE contract."""
+
+    if q_input.shape[0] == 0:
+        return
+
+    import kunlun_ops
+
+    normalized = torch.empty_like(q_input)
+    kunlun_ops.rmsnorm(
+        q_input,
+        None,
+        normalized,
+        eps,
+        False,
+        True,
+        None,
+        None,
+        None,
+    )
+    if _DEBUG:
+        debug_kernels.capture("q_norm_rope.rmsnorm", locals())
+
+    q_output.copy_(normalized)
+    rope = q_output[..., -64:]
+    rope_input = rope.contiguous()
+    rotated, _ = torch.ops.xspeedgate_ops.flashinfer_rotary_embedding(
+        positions=positions,
+        rotary_dim=rope.shape[-1],
+        head_size=rope.shape[-1],
+        cos_sin_cache=_dsv4_cos_sin_cache(freqs_cis),
+        is_neox_style=False,
+        query=rope_input,
+        key=None,
+        offsets=None,
+        inverse=False,
+    )
+    rope.copy_(rotated)
+    if _DEBUG:
+        debug_kernels.capture("q_norm_rope.rope", locals())
+
+
+@register_jit_op("sglang.jit_kernel.dsv4.elementwise", "fused_k_norm_rope_flashmla")
+def dsv4_fused_k_norm_rope_flashmla_kunlun(
+    kv: torch.Tensor,
+    kv_weight: torch.Tensor,
+    eps: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    out_loc: torch.Tensor,
+    kvcache: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Use the 0.5.8 normalize/rotate/store sequence for the 0.5.14 K path."""
+
+    if kv.shape[0] == 0:
+        return
+
+    import kunlun_ops
+
+    normalized = torch.empty_like(kv)
+    kunlun_ops.rmsnorm(
+        kv.reshape(-1, kv.shape[-1]),
+        kv_weight,
+        normalized.reshape(-1, normalized.shape[-1]),
+        eps,
+    )
+    rotated = _dsv4_rotate_gptj_tail(normalized, freqs_cis, positions)
+    max_valid_loc = kvcache.shape[0] * page_size - 1
+    loc = out_loc.contiguous().clamp(min=0, max=max_valid_loc)
+    identity_key = (kvcache.device, max_valid_loc + 1)
+    identity_mapping = _DSV4_IDENTITY_MAPPING_CACHE.get(identity_key)
+    if identity_mapping is None:
+        identity_mapping = torch.arange(
+            max_valid_loc + 1, dtype=loc.dtype, device=loc.device
+        )
+        _DSV4_IDENTITY_MAPPING_CACHE[identity_key] = identity_mapping
+    torch.ops.xspeedgate_ops.set_k_and_s_v4_with_mapping(
+        kvcache,
+        loc,
+        identity_mapping,
+        rotated.reshape(rotated.shape[0], -1).contiguous(),
+        page_size,
+    )
+    if _DEBUG:
+        debug_kernels.capture("k_norm_rope.layer0", locals())
 
 
 @register_jit_op("sglang.jit_kernel.rope", "apply_rope_with_cos_sin_cache_inplace")

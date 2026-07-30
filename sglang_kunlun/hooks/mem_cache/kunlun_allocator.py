@@ -7,12 +7,12 @@ customization can be expressed as a subclass instead of REPLACE hooks.
 
 from __future__ import annotations
 
-import os
-
 import torch
 
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
-from sglang.srt.utils import get_num_new_pages, next_power_of_2
+from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
+from sglang_kunlun.debug_bridge import DEBUG_ENABLED as _DEBUG
+from sglang_kunlun.debug_bridge import allocator as debug_allocator
 
 
 def _alloc_extend_kunlun_xdnn(
@@ -78,7 +78,7 @@ def _alloc_extend_kunlun_kernel(
 
 
 def _select_alloc_extend_func():
-    if os.environ.get("USE_FAST_ALLOC_EXTEND_KUNLUN", "1") != "0":
+    if get_bool_env_var("USE_FAST_ALLOC_EXTEND_KUNLUN", "true"):
         return _alloc_extend_kunlun_xdnn
     return _alloc_extend_kunlun_kernel
 
@@ -111,6 +111,8 @@ class KunlunPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             self.merge_and_sort_free()
 
         alloc_fn = _select_alloc_extend_func()
+        if _DEBUG:
+            debug_allocator.capture("alloc_extend.begin", locals())
         out_indices, origin_num_new_pages = alloc_fn(
             self.page_size,
             self.free_pages,
@@ -125,6 +127,8 @@ class KunlunPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
         merged_value = origin_num_new_pages.item()
         num_new_pages = merged_value >> 32
+        if _DEBUG:
+            debug_allocator.capture("alloc_extend.end", locals())
         if num_new_pages > len(self.free_pages):
             return None
 
