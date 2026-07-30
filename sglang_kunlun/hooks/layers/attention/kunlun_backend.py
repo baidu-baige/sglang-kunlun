@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
-import os
+import logging
 import numpy as np
 import torch
 import triton
@@ -19,6 +19,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_compiler_backend
+from sglang_kunlun.debug_bridge import DEBUG_ENABLED as _DEBUG
+from sglang_kunlun.debug_bridge import attention as debug_attention
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -39,6 +41,11 @@ from sglang.jit_kernel.flash_attention_v4 import (
 )
 
 import kunlun_ops
+
+logger = logging.getLogger(__name__)
+if _DEBUG:
+    debug_attention.capture("backend.import", locals())
+
 
 @dataclass
 class KunlunAttentionMetadata:
@@ -898,6 +905,9 @@ class KunlunAttentionBackend(AttentionBackend):
                     page_size=self.page_size,
                 )
                 self.forward_metadata_spec_decode_expand.page_table = expand_page_table
+
+        if _DEBUG:
+            debug_attention.capture("kunlun_backend.metadata", locals())
 
         self.forward_metadata = metadata
 

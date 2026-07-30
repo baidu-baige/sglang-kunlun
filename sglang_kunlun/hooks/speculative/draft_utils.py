@@ -47,6 +47,20 @@ def _create_backend_kunlun(original_fn, self, backend_name, backend_map, error_t
     if backend_type is None:
         backend_type = self.server_args.attention_backend
 
+    if backend_type == "kunlun_compressed":
+        from sglang_kunlun.hooks.layers.attention.kunlun_deepseek_v4_backend import (
+            KunlunDeepseekV4AttnBackend,
+            KunlunDeepseekV4MultiStepBackend,
+        )
+
+        if backend_name == "decode_attention_backend":
+            return KunlunDeepseekV4MultiStepBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            )
+        return KunlunDeepseekV4AttnBackend(
+            self.draft_model_runner, skip_prefill=False
+        )
+
     if backend_type != "kunlun":
         return original_fn(self, backend_name, backend_map, error_template)
 
