@@ -36,6 +36,30 @@ SGLANG_DECODE_GRAPH_RUNNER = (
 MOE_DIR = ROOT / "sglang_kunlun" / "hooks" / "layers" / "moe"
 
 
+class _InertProbes:
+    """Stand-in for the ``sglang_kunlun.debug_bridge`` namespaces.
+
+    The tests execute production functions in an isolated namespace, so the
+    debug bridge has to be supplied explicitly; an inert stub also asserts that
+    the probes never influence the production result.
+    """
+
+    def __getattr__(self, name):
+        return lambda *args, **kwargs: None
+
+
+DEBUG_STUBS = {
+    # Probe sites are compiled into the production functions as
+    # ``if _DEBUG: debug_*.capture(...)``; keep them disabled here so the tests
+    # observe pure production behaviour.
+    "_DEBUG": False,
+    "debug_attention": _InertProbes(),
+    "debug_kernels": _InertProbes(),
+    "debug_allocator": _InertProbes(),
+    "debug_mem_cache": _InertProbes(),
+}
+
+
 class _ForwardMode:
     def __init__(self, *, decode=False, target_verify=False, draft_extend=False):
         self.decode = decode
@@ -151,6 +175,7 @@ class KunlunDSV4BackendContractTest(unittest.TestCase):
             if isinstance(node, ast.FunctionDef) and node.name == "build_replay_fb_view"
         )
         namespace = {
+            **DEBUG_STUBS,
             "DecodeInputBuffers": object,
             "ForwardBatch": object,
             "ForwardMode": object,
@@ -220,6 +245,7 @@ class KunlunDSV4BackendContractTest(unittest.TestCase):
             return os.getenv(name, default).lower() in ("true", "1")
 
         namespace = {
+            **DEBUG_STUBS,
             "get_bool_env_var": get_bool_env_var,
             "_alloc_extend_kunlun_xdnn": fast_allocator,
             "_alloc_extend_kunlun_kernel": kernel_allocator,
@@ -365,7 +391,8 @@ class KunlunDSV4BackendContractTest(unittest.TestCase):
             SGLANG_TOPK_TRANSFORM_512_TORCH=flag,
             SGLANG_OPT_USE_TOPK_V2=flag,
         )
-        namespace = {"torch": torch, "envs": envs}
+        namespace = {
+            **DEBUG_STUBS,"torch": torch, "envs": envs}
         exec(
             compile(
                 ast.Module(body=[forward], type_ignores=[]),
@@ -472,7 +499,8 @@ class KunlunDSV4BackendContractTest(unittest.TestCase):
             if isinstance(node, ast.FunctionDef)
             and node.name == "_clamp_c128_prefill_topk"
         )
-        namespace = {"List": List, "Optional": Optional, "torch": torch}
+        namespace = {
+            **DEBUG_STUBS,"List": List, "Optional": Optional, "torch": torch}
         exec(
             compile(
                 ast.Module(body=[helper], type_ignores=[]),
@@ -513,7 +541,8 @@ class KunlunDSV4BackendContractTest(unittest.TestCase):
         attention_cache = {}
         graph_extend_cache = {}
         c4_cache = {}
-        namespace = {"torch": torch}
+        namespace = {
+            **DEBUG_STUBS,"torch": torch}
         exec(compile(helpers, str(path), "exec"), namespace)
 
         attention_lens_cpu = torch.ones(2, dtype=torch.int32)
@@ -578,7 +607,8 @@ class KunlunDSV4BackendContractTest(unittest.TestCase):
         attention_cache = {}
         graph_extend_cache = {}
         c4_cache = {}
-        namespace = {"torch": torch}
+        namespace = {
+            **DEBUG_STUBS,"torch": torch}
         exec(compile(helpers, str(path), "exec"), namespace)
 
         for forward_mode in (
@@ -746,7 +776,8 @@ class KunlunDSV4BackendContractTest(unittest.TestCase):
             ],
             type_ignores=[],
         )
-        namespace = {"torch": torch}
+        namespace = {
+            **DEBUG_STUBS,"torch": torch}
         exec(compile(helper, str(path), "exec"), namespace)
 
         q = torch.arange(8 * 6, dtype=torch.int8).reshape(8, 1, 2, 3)
@@ -788,7 +819,8 @@ class KunlunDSV4BackendContractTest(unittest.TestCase):
             ],
             type_ignores=[],
         )
-        namespace = {"torch": torch}
+        namespace = {
+            **DEBUG_STUBS,"torch": torch}
         exec(compile(helpers, str(path), "exec"), namespace)
         forward_batch = types.SimpleNamespace(
             extend_seq_lens_cpu=[3, 2], extend_prefix_lens_cpu=[0, 3]
@@ -819,7 +851,8 @@ class KunlunDSV4BackendContractTest(unittest.TestCase):
             ],
             type_ignores=[],
         )
-        namespace = {"torch": torch}
+        namespace = {
+            **DEBUG_STUBS,"torch": torch}
         exec(compile(helpers, str(path), "exec"), namespace)
         raw = torch.zeros((3, 64 * 132), dtype=torch.uint8)
         raw[0, : 64 * 128] = 1
@@ -885,7 +918,8 @@ class KunlunDSV4BackendContractTest(unittest.TestCase):
             ],
             type_ignores=[],
         )
-        namespace = {"torch": torch, "os": os}
+        namespace = {
+            **DEBUG_STUBS,"torch": torch, "os": os}
         exec(compile(helpers, str(path), "exec"), namespace)
 
         calls = []
