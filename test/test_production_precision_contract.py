@@ -528,7 +528,9 @@ class ProductionPrecisionContractTest(unittest.TestCase):
                 )
             )
             stack.enter_context(
-                mock.patch.object(hooks_package, "layers", layers_package, create=True)
+                mock.patch.object(
+                    hooks_package, "layers", layers_package, create=True
+                )
             )
             mtp.capture_cuda_graphs_kunlun(owner)
 
