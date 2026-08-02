@@ -1055,6 +1055,74 @@ def _handle_multistep_replay_metadata(backend, scope):
 
 
 # ---------------------------------------------------------------------------
+# Paged allocator probes
+# ---------------------------------------------------------------------------
+
+_ALLOC_EXTEND_PROBE_CALL = 0
+
+
+def capture_alloc_extend_inputs(allocator, scope):
+    """Snapshot the alloc_extend arguments before the Kunlun kernel runs."""
+    probe_dir = os.environ.get("DSV4_ALLOC_EXTEND_PROBE_DIR")
+    if (
+        probe_dir is None
+        or not torch.distributed.is_initialized()
+        or torch.distributed.get_rank() != 0
+    ):
+        allocator._dsv4_alloc_extend_probe = None
+        return
+
+    prefix_lens = scope["prefix_lens"]
+    seq_lens = scope["seq_lens"]
+    last_loc = scope["last_loc"]
+    allocator._dsv4_alloc_extend_probe = {
+        "version": "0514",
+        "allocator_id": id(allocator),
+        "alloc_fn": scope["alloc_fn"].__name__,
+        "page_size": allocator.page_size,
+        "extend_num_tokens": scope["extend_num_tokens"],
+        "prefix_lens": prefix_lens.detach().cpu(),
+        "prefix_lens_cpu": scope["prefix_lens_cpu"].detach().cpu(),
+        "prefix_lens_dtype": str(prefix_lens.dtype),
+        "prefix_lens_stride": tuple(prefix_lens.stride()),
+        "seq_lens": seq_lens.detach().cpu(),
+        "seq_lens_cpu": scope["seq_lens_cpu"].detach().cpu(),
+        "seq_lens_dtype": str(seq_lens.dtype),
+        "seq_lens_stride": tuple(seq_lens.stride()),
+        "last_loc": last_loc.detach().cpu(),
+        "last_loc_dtype": str(last_loc.dtype),
+        "last_loc_shape": tuple(last_loc.shape),
+        "last_loc_stride": tuple(last_loc.stride()),
+        "last_loc_is_contiguous": last_loc.is_contiguous(),
+        "free_pages_before": allocator.free_pages[:256].detach().cpu(),
+    }
+
+
+def dump_alloc_extend_outputs(allocator, scope):
+    from pathlib import Path
+
+    global _ALLOC_EXTEND_PROBE_CALL
+
+    probe = getattr(allocator, "_dsv4_alloc_extend_probe", None)
+    if not probe:
+        return
+    allocator._dsv4_alloc_extend_probe = None
+    probe_dir = os.environ.get("DSV4_ALLOC_EXTEND_PROBE_DIR")
+    probe.update(
+        {
+            "out_indices": scope["out_indices"].detach().cpu(),
+            "merged_value": scope["merged_value"],
+            "num_new_pages": scope["num_new_pages"],
+        }
+    )
+    torch.save(
+        probe,
+        Path(probe_dir) / f"0514-call{_ALLOC_EXTEND_PROBE_CALL:04d}.pt",
+    )
+    _ALLOC_EXTEND_PROBE_CALL += 1
+
+
+# ---------------------------------------------------------------------------
 # Single-line probe dispatcher
 # ---------------------------------------------------------------------------
 #
@@ -1348,6 +1416,8 @@ _SITE_HANDLERS = {
     "indexer.c4_logits": lambda backend, scope: dump_c4_logits(scope),
     "indexer.operator_outputs": capture_indexer_operator_probes,
     "multistep.replay_metadata": _handle_multistep_replay_metadata,
+    "allocator.alloc_extend_inputs": capture_alloc_extend_inputs,
+    "allocator.alloc_extend_outputs": dump_alloc_extend_outputs,
 }
 
 
