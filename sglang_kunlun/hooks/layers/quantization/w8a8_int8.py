@@ -82,7 +82,6 @@ def linear_apply_kunlun(
         _record_dsv4_decode_static(
             dsv4_layer_id, "wo_b_weight_scale", layer.weight_scale.data
         )
-    # logger.info(f"x type: {type(x)}")
     if isinstance(x, tuple):
         x_q, x_scale = x
         out = torch.empty(

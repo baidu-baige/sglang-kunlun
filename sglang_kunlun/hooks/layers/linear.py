@@ -13,8 +13,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
-import logging
-logger = logging.getLogger(__name__)
+
 
 @plugin_hook(
     "sglang.srt.layers.linear.ColumnParallelLinear.__init__",
@@ -29,10 +28,9 @@ def column_parallel_linear_init_around(original_fn, self, *args, **kwargs):
     # Inline import to avoid circular import at hook-registration time.
     from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8LinearMethod
     from sglang.srt.utils import set_weight_attrs
-    
+
     if not isinstance(getattr(self, "quant_method", None), W8A8Int8LinearMethod):
         return
-    logger.info(f"-----> column_parallel_linear_init_around: wuwuwuwuwuuwuwuwuwuwuwu")
     self.bias = Parameter(
         torch.empty(self.output_size_per_partition, dtype=torch.float32)
     )
