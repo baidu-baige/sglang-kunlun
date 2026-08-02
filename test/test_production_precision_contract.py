@@ -698,6 +698,84 @@ class ProductionPrecisionContractTest(unittest.TestCase):
         self.assertEqual(observed[0].tolist(), [8])
         self.assertEqual(batch.positions.tolist(), [8])
 
+    def test_backend_monkey_patches_are_exact_plugin_hooks(self):
+        source = BACKEND_HOOKS.read_text()
+        tree = ast.parse(source, filename=str(BACKEND_HOOKS))
+        functions = {
+            node.name: node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        expected = {
+            "_create_paged_compressor_data_kunlun": (
+                "sglang.srt.layers.attention.deepseek_v4_backend."
+                "create_paged_compressor_data",
+                "AROUND",
+            ),
+            "_generate_compressor_prefill_plan_kunlun": (
+                "sglang.jit_kernel.dsv4.compress_old."
+                "CompressorPrefillPlan.generate",
+                "REPLACE",
+            ),
+            "_compressor_forward_cuda_kunlun": (
+                "sglang.srt.layers.attention.dsv4.compressor."
+                "Compressor.forward_cuda",
+                "REPLACE",
+            ),
+        }
+        for name, (target, hook_type) in expected.items():
+            function = functions[name]
+            decorators = [
+                decorator
+                for decorator in function.decorator_list
+                if isinstance(decorator, ast.Call)
+                and isinstance(decorator.func, ast.Name)
+                and decorator.func.id == "plugin_hook"
+            ]
+            self.assertEqual(len(decorators), 1)
+            decorator = decorators[0]
+            self.assertEqual(ast.literal_eval(decorator.args[0]), target)
+            type_arg = next(
+                keyword.value
+                for keyword in decorator.keywords
+                if keyword.arg == "type"
+            )
+            self.assertEqual(ast.unparse(type_arg), f"HookType.{hook_type}")
+
+        forbidden_assignments = {
+            "upstream.create_paged_compressor_data",
+            "CompressorPrefillPlan.generate",
+            "Compressor.forward_cuda",
+        }
+        assigned = {
+            ast.unparse(target)
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+        }
+        self.assertTrue(forbidden_assignments.isdisjoint(assigned))
+
+        adapter_node = functions["_create_paged_compressor_data_kunlun"]
+        adapter_node.decorator_list = []
+        namespace = {}
+        exec(
+            compile(
+                ast.Module(body=[adapter_node], type_ignores=[]),
+                str(BACKEND_HOOKS),
+                "exec",
+            ),
+            namespace,
+        )
+        original = mock.Mock(return_value="paged-data")
+        result = namespace["_create_paged_compressor_data_kunlun"](
+            original,
+            "payload",
+            online_state_slot_offset=7,
+            keep=True,
+        )
+        self.assertEqual(result, "paged-data")
+        original.assert_called_once_with("payload", keep=True)
+
     def test_preserved_runtime_contracts_and_no_hot_global_rebinding(self):
         model_source = MODEL_HOOKS.read_text()
         mtp_source = MTP_HOOKS.read_text()

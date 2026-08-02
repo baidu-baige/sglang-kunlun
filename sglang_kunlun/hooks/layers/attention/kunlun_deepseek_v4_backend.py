@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4MultiStepBackend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 from sglang_kunlun.kernels.kernel_ops import (
     dsv4_quant_k_cache_kunlun,
     dsv4_set_k_and_s_with_mapping_kunlun,
@@ -43,18 +44,20 @@ def _clamp_c128_prefill_topk(
     return min(compressed_topk, max(chunk_start_pos // compress_ratio, 1))
 
 
-_upstream_create_paged_compressor_data = upstream.create_paged_compressor_data
-
-
-def _create_paged_compressor_data_kunlun(*args, **kwargs):
+@plugin_hook(
+    "sglang.srt.layers.attention.deepseek_v4_backend.create_paged_compressor_data",
+    type=HookType.AROUND,
+)
+def _create_paged_compressor_data_kunlun(original_fn, *args, **kwargs):
     """Adapt the 0.5.14 call site to the active compressor-v1 signature."""
     kwargs.pop("online_state_slot_offset", None)
-    return _upstream_create_paged_compressor_data(*args, **kwargs)
+    return original_fn(*args, **kwargs)
 
 
-upstream.create_paged_compressor_data = _create_paged_compressor_data_kunlun
-
-
+@plugin_hook(
+    "sglang.jit_kernel.dsv4.compress_old.CompressorPrefillPlan.generate",
+    type=HookType.REPLACE,
+)
 def _generate_compressor_prefill_plan_kunlun(
     compress_ratio,
     num_q_tokens,
@@ -91,12 +94,6 @@ def _generate_compressor_prefill_plan_kunlun(
         plan_device[0, : int(plan_lens[0])],
         plan_device[1, : int(plan_lens[1])],
     )
-
-
-from sglang.jit_kernel.dsv4.compress_old import CompressorPrefillPlan
-
-
-CompressorPrefillPlan.generate = staticmethod(_generate_compressor_prefill_plan_kunlun)
 
 
 class KunlunDSV4AttnMetadata(DSV4AttnMetadata):
@@ -830,18 +827,14 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         return out.to(original_dtype) if out.dtype != original_dtype else out
 
 
+@plugin_hook(
+    "sglang.srt.layers.attention.dsv4.compressor.Compressor.forward_cuda",
+    type=HookType.REPLACE,
+)
 def _compressor_forward_cuda_kunlun(self, x, forward_batch, attn_backend=None):
     """Restore the 0.5.8 Compressor.forward path for Kunlun's CUDA dispatch key."""
 
     return self.forward_native(x, forward_batch, attn_backend=attn_backend)
-
-
-# Compressor inherits MultiPlatformOp but 0.5.14 does not define forward_cuda.
-# Kunlun advertises the CUDA dispatch key, so bind the working native control
-# flow explicitly before any model instance resolves its forward method.
-from sglang.srt.layers.attention.dsv4.compressor import Compressor
-
-Compressor.forward_cuda = _compressor_forward_cuda_kunlun
 
 
 def _build_c4_prefill_contract(forward_batch, c4_seq_lens, page_table, device):
