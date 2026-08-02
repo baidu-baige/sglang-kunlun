@@ -234,9 +234,6 @@ def mqa_forward_global_head_layout_kunlun(
     attn_k = kv if kv is not None else q
     if is_unified_kv_triton():
         attn_q = q_out if q_out is not None else q
-        self._dsv4_dump_probe("attention_backend.q", attn_q)
-        self._dsv4_dump_probe("attention_backend.k", attn_k)
-        self._dsv4_dump_probe("attention_backend.v", attn_k)
         o = attn_backend.forward(
             q=attn_q,
             k=attn_k,
@@ -249,9 +246,6 @@ def mqa_forward_global_head_layout_kunlun(
         )
     else:
         attn_q = q_global if q_global is not None else q
-        self._dsv4_dump_probe("attention_backend.q", attn_q)
-        self._dsv4_dump_probe("attention_backend.k", attn_k)
-        self._dsv4_dump_probe("attention_backend.v", attn_k)
         save_kv_cache = False
         if (
             forward_batch.forward_mode.is_extend()
