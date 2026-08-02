@@ -31,7 +31,15 @@ def load_with_fake_registry(relative_path, module_name):
 
         return decorate
 
+    class HookRegistry:
+        """Records conditional registrations the same way plugin_hook does."""
+
+        @staticmethod
+        def register(target, fn, type=None):
+            registered[target] = (type, fn)
+
     registry.HookType = HookType
+    registry.HookRegistry = HookRegistry
     registry.plugin_hook = plugin_hook
     path = ROOT / relative_path
     spec = importlib.util.spec_from_file_location(module_name, path)
@@ -737,10 +745,16 @@ class DSV4MHCSpeculativeContractTest(unittest.TestCase):
             self.assertIn(f"{wo_b_prefix}.{suffix}", dumper.tensors)
 
     def test_decode_layer_alias_uses_fixed_graph_buffer(self):
-        module, registered = load_with_fake_registry(
-            "debug/tensor_dump_hooks.py",
-            "contract_debug_tensor_dump_decode_buffer",
-        )
+        # The decode-alias hooks are only registered when the dump is enabled,
+        # so that no wrapper frame sits on DeepseekV4DecoderLayer.forward in a
+        # normal serving run.
+        with mock.patch.dict(
+            os.environ, {"DSV4_DECODE_LAYER_ALIAS_DUMP": "1"}, clear=False
+        ):
+            module, registered = load_with_fake_registry(
+                "debug/tensor_dump_hooks.py",
+                "contract_debug_tensor_dump_decode_buffer",
+            )
         prepare_target = (
             "sglang.srt.model_executor.runner.decode_cuda_graph_runner."
             "DecodeCudaGraphRunner.capture_prepare"
