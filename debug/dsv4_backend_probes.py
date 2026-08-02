@@ -359,16 +359,29 @@ BACKEND_FILE = (
 )
 
 
-def _alias_selected(scope):
-    aliases = scope.get("attention_aliases")
-    return aliases is not None and scope["layer"].layer_id == scope["alias_layer"]
+def _decode_attention_aliases(scope):
+    """Resolve the decode-alias dict and target layer without production help.
+
+    The alias dict is planted on the forward batch by the tensor dump hooks, and
+    the target layer comes from the environment, so nothing about this has to be
+    computed in the backend.
+    """
+    aliases = getattr(
+        scope["forward_batch"], "_dsv4_decode_attention_aliases", None
+    )
+    if aliases is None:
+        return None
+    alias_layer = int(os.environ.get("DSV4_DECODE_ATTENTION_ALIAS_LAYER", "2"))
+    if scope["layer"].layer_id != alias_layer:
+        return None
+    return aliases
 
 
 def capture_attention_aliases_inputs(backend, scope):
     """Publish the operator inputs into the decode-alias comparison dict."""
-    if not _alias_selected(scope):
+    aliases = _decode_attention_aliases(scope)
+    if aliases is None:
         return
-    aliases = scope["attention_aliases"]
     operator_only_alias = (
         os.environ.get("DSV4_DECODE_ATTENTION_ALIAS_OPERATOR_ONLY") == "1"
     )
@@ -442,13 +455,14 @@ def capture_attention_aliases_inputs(backend, scope):
 
 
 def capture_attention_aliases_outputs(backend, scope):
-    if not _alias_selected(scope):
+    aliases = _decode_attention_aliases(scope)
+    if aliases is None:
         return
     operator_only_alias = getattr(backend, "_dsv4_alias_operator_only", False)
     out_op = scope["out_op"]
     max_logits_op = scope["max_logits_op"]
     lse_op = scope["lse_op"]
-    scope["attention_aliases"].update(
+    aliases.update(
         {
             "attention_output": (
                 out_op.clone() if operator_only_alias else out_op
@@ -965,6 +979,81 @@ def capture_indexer_operator_probes(backend, scope):
     backend._mtp_tensor_probe_contracts = contracts
 
 
+def log_multistep_replay_metadata(backend, forward_batch, in_capture: bool) -> None:
+    """Log the per-step replayed metadata for the MTP graph investigation."""
+    if (
+        in_capture
+        or os.environ.get("DSV4_MTP_PROBE") != "1"
+        or os.environ.get("RANK", "0") != "0"
+        or forward_batch.seq_lens_cpu is None
+        or int(forward_batch.seq_lens_cpu[: forward_batch.batch_size].max()) <= 10000
+        or getattr(backend, "_mtp_probe_replay_calls", 0) >= 3
+    ):
+        return
+
+    backend._mtp_probe_replay_calls = (
+        getattr(backend, "_mtp_probe_replay_calls", 0) + 1
+    )
+
+    def _values(tensor, limit=8):
+        if tensor is None:
+            return None
+        return tensor.detach().reshape(-1)[:limit].cpu().tolist()
+
+    def _ptr(tensor):
+        return tensor.data_ptr() if tensor is not None else None
+
+    for step, step_backend in enumerate(
+        backend.attn_backends[: backend.speculative_num_steps - 1]
+    ):
+        metadata = step_backend.forward_metadata
+        core = getattr(metadata, "core_attn_metadata", None)
+        if core is None:
+            logger.warning(
+                "[DSV4_MTP_PROBE] dsv4_metadata replay=%d step=%d metadata=%s",
+                backend._mtp_probe_replay_calls,
+                step,
+                type(metadata).__name__,
+            )
+            continue
+        logger.warning(
+            "[DSV4_MTP_PROBE] dsv4_metadata replay=%d step=%d backend_step=%d "
+            "seq_lens=%s seq_lens_cpu=%s positions=%s req_pool_indices=%s "
+            "raw_out_loc=%s seq_lens_casual=%s positions_casual=%s "
+            "page_table=%s swa_page_indices=%s swa_topk_lengths=%s "
+            "c4_out_loc=%s c4_topk_raw=%s c4_topk_clamp1=%s "
+            "ptrs=(raw:%s,page:%s,swa:%s,c4loc:%s)",
+            backend._mtp_probe_replay_calls,
+            step,
+            step_backend.speculative_step_id,
+            _values(forward_batch.seq_lens),
+            _values(forward_batch.seq_lens_cpu),
+            _values(getattr(forward_batch, "positions", None)),
+            _values(forward_batch.req_pool_indices),
+            _values(getattr(core, "raw_out_loc", None), 12),
+            _values(getattr(core, "seq_lens_casual", None)),
+            _values(getattr(core, "positions_casual", None)),
+            _values(getattr(core, "page_table", None), 4),
+            _values(getattr(core, "swa_page_indices", None), 8),
+            _values(getattr(core, "swa_topk_lengths", None)),
+            _values(getattr(core, "c4_out_loc", None), 12),
+            _values(getattr(core, "c4_topk_lengths_raw", None)),
+            _values(getattr(core, "c4_topk_lengths_clamp1", None)),
+            _ptr(getattr(core, "raw_out_loc", None)),
+            _ptr(getattr(core, "page_table", None)),
+            _ptr(getattr(core, "swa_page_indices", None)),
+            _ptr(getattr(core, "c4_out_loc", None)),
+        )
+
+
+def _handle_multistep_replay_metadata(backend, scope):
+    forward_batch = scope["forward_batch"]
+    dump_previous_mtp_tensor_probe(backend, forward_batch)
+    log_multistep_replay_metadata(
+        backend, forward_batch, in_capture=scope.get("in_capture", False)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Single-line probe dispatcher
 # ---------------------------------------------------------------------------
@@ -1049,8 +1138,6 @@ REQUIRED_SCOPE: dict[str, tuple[str, ...]] = {
         "attn_sink_op",
         "effective_ratio",
         "compressed_topk",
-        "attention_aliases",
-        "alias_layer",
     ),
     "forward.operator_outputs": (
         "layer",
@@ -1073,8 +1160,6 @@ REQUIRED_SCOPE: dict[str, tuple[str, ...]] = {
         "attn_sink_op",
         "effective_ratio",
         "compressed_topk",
-        "attention_aliases",
-        "alias_layer",
     ),
 }
 
@@ -1262,11 +1347,7 @@ _SITE_HANDLERS = {
     "forward.operator_outputs": _handle_forward_operator_outputs,
     "indexer.c4_logits": lambda backend, scope: dump_c4_logits(scope),
     "indexer.operator_outputs": capture_indexer_operator_probes,
-    "multistep.replay_metadata": (
-        lambda backend, scope: dump_previous_mtp_tensor_probe(
-            backend, scope["forward_batch"]
-        )
-    ),
+    "multistep.replay_metadata": _handle_multistep_replay_metadata,
 }
 
 

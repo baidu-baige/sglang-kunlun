@@ -801,10 +801,6 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         kv_lens_cpu_op = kv_lens_cpu.contiguous()
         kv_lens_op = kv_lens.contiguous()
         attn_sink_op = attn_sink.contiguous() if attn_sink is not None else None
-        attention_aliases = getattr(
-            forward_batch, "_dsv4_decode_attention_aliases", None
-        )
-        alias_layer = int(os.environ.get("DSV4_DECODE_ATTENTION_ALIAS_LAYER", "2"))
         dsv4_probe(self, "forward.operator_inputs", locals())
         torch.ops.xspeedgate_ops.compressed_attention(
             q_op,
@@ -1190,65 +1186,6 @@ class KunlunDeepseekV4MultiStepBackend(DeepseekV4MultiStepBackend):
             from debug.dsv4_backend_probes import dsv4_probe
 
             dsv4_probe(self, "multistep.replay_metadata", locals())
-        if (
-            in_capture
-            or os.environ.get("DSV4_MTP_PROBE") != "1"
-            or os.environ.get("RANK", "0") != "0"
-            or forward_batch.seq_lens_cpu is None
-            or int(forward_batch.seq_lens_cpu[: forward_batch.batch_size].max()) <= 10000
-            or self._mtp_probe_replay_calls >= 3
-        ):
-            return
-
-        self._mtp_probe_replay_calls += 1
-
-        def _values(tensor, limit=8):
-            if tensor is None:
-                return None
-            return tensor.detach().reshape(-1)[:limit].cpu().tolist()
-
-        def _ptr(tensor):
-            return tensor.data_ptr() if tensor is not None else None
-
-        for step, backend in enumerate(self.attn_backends[: self.speculative_num_steps - 1]):
-            metadata = backend.forward_metadata
-            core = getattr(metadata, "core_attn_metadata", None)
-            if core is None:
-                logger.warning(
-                    "[DSV4_MTP_PROBE] dsv4_metadata replay=%d step=%d metadata=%s",
-                    self._mtp_probe_replay_calls,
-                    step,
-                    type(metadata).__name__,
-                )
-                continue
-            logger.warning(
-                "[DSV4_MTP_PROBE] dsv4_metadata replay=%d step=%d backend_step=%d "
-                "seq_lens=%s seq_lens_cpu=%s positions=%s req_pool_indices=%s "
-                "raw_out_loc=%s seq_lens_casual=%s positions_casual=%s "
-                "page_table=%s swa_page_indices=%s swa_topk_lengths=%s "
-                "c4_out_loc=%s c4_topk_raw=%s c4_topk_clamp1=%s "
-                "ptrs=(raw:%s,page:%s,swa:%s,c4loc:%s)",
-                self._mtp_probe_replay_calls,
-                step,
-                backend.speculative_step_id,
-                _values(forward_batch.seq_lens),
-                _values(forward_batch.seq_lens_cpu),
-                _values(getattr(forward_batch, "positions", None)),
-                _values(forward_batch.req_pool_indices),
-                _values(getattr(core, "raw_out_loc", None), 12),
-                _values(getattr(core, "seq_lens_casual", None)),
-                _values(getattr(core, "positions_casual", None)),
-                _values(getattr(core, "page_table", None), 4),
-                _values(getattr(core, "swa_page_indices", None), 8),
-                _values(getattr(core, "swa_topk_lengths", None)),
-                _values(getattr(core, "c4_out_loc", None), 12),
-                _values(getattr(core, "c4_topk_lengths_raw", None)),
-                _values(getattr(core, "c4_topk_lengths_clamp1", None)),
-                _ptr(getattr(core, "raw_out_loc", None)),
-                _ptr(getattr(core, "page_table", None)),
-                _ptr(getattr(core, "swa_page_indices", None)),
-                _ptr(getattr(core, "c4_out_loc", None)),
-            )
 
 
 # MTP / NextN boundary probes live in debug/dsv4_mtp_nextn_probes.py and are
