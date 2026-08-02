@@ -1671,6 +1671,28 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             and prefill_backend_probe_prefix_len
             in (forward_batch.extend_prefix_lens_cpu or [])
         )
+        from debug.dsv4_probe_bridge import (
+            dump_compressed_attention_inputs,
+            dump_compressed_attention_outputs,
+        )
+
+        dump_compressed_attention_inputs(
+            self,
+            q_op=q_op,
+            win_cache_op=win_cache_op,
+            win_indices_op=win_indices_op,
+            extra_cache_op=extra_cache_op,
+            extra_indices_op=extra_indices_op,
+            q_lod_cpu_op=q_lod_cpu_op,
+            q_lod_op=q_lod_op,
+            kv_lens_cpu_op=kv_lens_cpu_op,
+            kv_lens_op=kv_lens_op,
+            attn_sink_op=attn_sink_op,
+            softmax_scale=self.softmax_scale,
+            causal=True,
+            effective_ratio=effective_ratio,
+            compressed_topk=compressed_topk,
+        )
         torch.ops.xspeedgate_ops.compressed_attention(
             q_op,
             win_cache_op,
@@ -1693,6 +1715,12 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             # Keep the C4 producer on the caller stream so PyTorch owns the
             # lifetime of the contiguous temporary inputs.
             side_stream=torch.cuda.current_stream().cuda_stream,
+        )
+        dump_compressed_attention_outputs(
+            self,
+            out_op=out_op,
+            max_logits_op=max_logits_op,
+            lse_op=lse_op,
         )
         if attention_aliases is not None and layer.layer_id == alias_layer:
             attention_aliases.update(

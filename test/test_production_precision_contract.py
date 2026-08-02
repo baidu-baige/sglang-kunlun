@@ -1,4 +1,5 @@
 import ast
+import importlib.util
 import inspect
 from pathlib import Path
 import sys
@@ -12,11 +13,17 @@ from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 from sglang_kunlun.hooks import mtp_production as mtp
 from sglang_kunlun.hooks import production_precision as runtime
 from sglang_kunlun.hooks import ragged_draft_extend as ragged
-from sglang_kunlun.models import deepseek_v4_precision as model_precision
 
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_HOOKS = ROOT / "sglang_kunlun" / "models" / "deepseek_v4_precision.py"
+MODEL_PRECISION_SPEC = importlib.util.spec_from_file_location(
+    "contract_production_deepseek_v4_precision", MODEL_HOOKS
+)
+assert MODEL_PRECISION_SPEC is not None and MODEL_PRECISION_SPEC.loader is not None
+model_precision = importlib.util.module_from_spec(MODEL_PRECISION_SPEC)
+sys.modules[MODEL_PRECISION_SPEC.name] = model_precision
+MODEL_PRECISION_SPEC.loader.exec_module(model_precision)
 RUNTIME_HOOKS = ROOT / "sglang_kunlun" / "hooks" / "production_precision.py"
 MTP_HOOKS = ROOT / "sglang_kunlun" / "hooks" / "mtp_production.py"
 BACKEND_HOOKS = (
@@ -43,6 +50,36 @@ class ProductionPrecisionContractTest(unittest.TestCase):
 
     def test_actual_plugin_registrations_and_signatures(self):
         targets = (
+            (
+                "sglang.srt.layers.attention.dsv4.indexer.C4Indexer.__init__",
+                HookType.AFTER,
+                model_precision.initialize_c4_indexer_parameter_dtype_kunlun,
+                ("result", "self", "args", "kwargs"),
+            ),
+            (
+                "sglang.srt.layers.attention.dsv4.compressor.Compressor.__init__",
+                HookType.AFTER,
+                model_precision.initialize_compressor_parameter_dtype_kunlun,
+                ("result", "self", "args", "kwargs"),
+            ),
+            (
+                "sglang.srt.models.deepseek_v2.MoEGate.forward",
+                HookType.AROUND,
+                model_precision.moe_gate_forward_half_precision_kunlun,
+                (
+                    "original_fn",
+                    "self",
+                    "hidden_states",
+                    "gemm_output_zero_allocator",
+                    "forward_batch",
+                ),
+            ),
+            (
+                "sglang.srt.models.deepseek_v4.MQALayer.__init__",
+                HookType.AFTER,
+                model_precision.initialize_mqa_rope_policy_kunlun,
+                ("result", "self", "config", "args", "kwargs"),
+            ),
             (
                 "sglang.srt.models.deepseek_v4.MQALayer.forward",
                 HookType.REPLACE,
@@ -84,6 +121,96 @@ class ProductionPrecisionContractTest(unittest.TestCase):
             self.assertEqual(
                 tuple(inspect.signature(function).parameters), expected_parameters
             )
+
+    def test_moe_gate_forward_matches_058_half_contract_and_preserves_fallback(self):
+        for dtype in (torch.bfloat16, torch.float16):
+            with self.subTest(dtype=dtype):
+                hidden_states = torch.tensor(
+                    [[1.0, 2.0], [3.0, 4.0]], dtype=dtype
+                )
+                owner = types.SimpleNamespace(
+                    is_deepseek_v4=True,
+                    weight=torch.tensor(
+                        [[2.0, -1.0], [0.5, 3.0]], dtype=dtype
+                    ),
+                )
+                original_fn = mock.Mock(
+                    side_effect=AssertionError("DSV4 half path must bypass upstream")
+                )
+
+                actual = model_precision.moe_gate_forward_half_precision_kunlun(
+                    original_fn, owner, hidden_states
+                )
+
+                self.assertEqual(actual.dtype, dtype)
+                torch.testing.assert_close(
+                    actual, hidden_states @ owner.weight.T, rtol=0, atol=0
+                )
+                original_fn.assert_not_called()
+
+        fallback = object()
+        owner = types.SimpleNamespace(
+            is_deepseek_v4=False,
+            weight=torch.ones((2, 2), dtype=torch.float16),
+        )
+        hidden_states = torch.ones((1, 2), dtype=torch.float16)
+        allocator = object()
+        forward_batch = object()
+        original_fn = mock.Mock(return_value=fallback)
+
+        actual = model_precision.moe_gate_forward_half_precision_kunlun(
+            original_fn,
+            owner,
+            hidden_states,
+            allocator,
+            forward_batch,
+        )
+
+        self.assertIs(actual, fallback)
+        original_fn.assert_called_once_with(
+            owner,
+            hidden_states,
+            allocator,
+            forward_batch,
+        )
+
+    def test_mqa_init_matches_requested_wo_a_parameter_dtype(self):
+        config = types.SimpleNamespace(rope_scaling=None)
+
+        for requested_dtype, expected_dtype in (
+            ("float16", torch.float16),
+            ("bfloat16", torch.bfloat16),
+        ):
+            with self.subTest(requested_dtype=requested_dtype):
+                weight = torch.nn.Parameter(
+                    torch.ones((1, 2, 4), dtype=torch.bfloat16),
+                    requires_grad=False,
+                )
+                from sglang.srt.layers.quantization.unquant import (
+                    UnquantizedLinearMethod,
+                )
+
+                owner = types.SimpleNamespace(
+                    compress_ratio=0,
+                    wo_a=types.SimpleNamespace(
+                        weight=weight,
+                        quant_method=UnquantizedLinearMethod(),
+                        params_dtype=torch.bfloat16,
+                    ),
+                )
+                server_args = types.SimpleNamespace(dtype=requested_dtype)
+                with mock.patch(
+                    "sglang.srt.server_args.get_global_server_args",
+                    return_value=server_args,
+                ):
+                    result = model_precision.initialize_mqa_rope_policy_kunlun(
+                        None, owner, config
+                    )
+
+                self.assertIsNone(result)
+                self.assertIs(owner.wo_a.weight, weight)
+                self.assertEqual(owner.wo_a.params_dtype, expected_dtype)
+                self.assertEqual(owner.wo_a.weight.dtype, expected_dtype)
 
     def test_mqa_forward_uses_deterministic_global_slots_and_local_output(self):
         upstream = types.ModuleType("sglang.srt.models.deepseek_v4")

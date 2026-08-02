@@ -25,8 +25,12 @@ HOOK_MODULES = (
     "sglang_kunlun.hooks.production_precision",
     "sglang_kunlun.hooks.mtp_production",
     "sglang_kunlun.hooks.ragged_draft_extend",
-
 )
+
+# Diagnostics live outside ``sglang_kunlun``. They register last so that no
+# production hook can resolve against a probe-wrapped function, and they are
+# optional: a deployment without the ``debug`` package simply skips them.
+DEBUG_HOOK_MODULES = ("debug.tensor_dump_hooks",)
 
 
 def register_all() -> None:
@@ -41,9 +45,19 @@ def register_all() -> None:
     kernel_ops.install()
     for module_name in HOOK_MODULES:
         importlib.import_module(module_name)
+    debug_modules = 0
+    for module_name in DEBUG_HOOK_MODULES:
+        try:
+            importlib.import_module(module_name)
+        except ImportError:
+            logger.debug("sglang-kunlun: debug hooks unavailable: %s", module_name)
+        else:
+            debug_modules += 1
     logger.info(
-        "sglang-kunlun: %d hook modules registered, %d triton ops and %d jit ops installed",
+        "sglang-kunlun: %d hook modules registered, %d debug hook modules "
+        "registered, %d triton ops and %d jit ops installed",
         len(HOOK_MODULES),
+        debug_modules,
         len(kernel_ops.registered_triton_ops()),
         len(kernel_ops.registered_jit_ops()),
     )

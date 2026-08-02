@@ -300,8 +300,11 @@ class KernelOpsTest(unittest.TestCase):
         pack = kernel_ops.dsv4_quant_k_cache_kunlun(values)
         expected = values.to(torch.bfloat16).to(torch.float16)
 
+        self.assertEqual(pack.k_nope_fp8.shape[-1], 448 + 64)
         self.assertEqual(pack.k_nope_fp8.dtype, torch.float16)
         self.assertTrue(pack.k_nope_fp8.is_contiguous())
+        self.assertIsNone(pack.k_rope_bf16)
+        self.assertIsNone(pack.scale_k_nope_ue8m0)
         self.assertTrue(torch.equal(pack.k_nope_fp8, expected))
         self.assertFalse(torch.equal(pack.k_nope_fp8, values.to(torch.float16)))
 
@@ -853,18 +856,23 @@ class KernelOpsTest(unittest.TestCase):
             atol=0,
         )
 
-    def test_dsv4_linear_bf16_fp32_matches_058_torch_contract(self):
+    def test_dsv4_linear_bf16_fp32_preserves_shared_fp32_contract(self):
         from sglang_kunlun.kernels import kernel_ops
 
-        x = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16)
-        y = torch.tensor([[2.0, -1.0], [0.5, 3.0]], dtype=torch.bfloat16)
+        for dtype in (torch.bfloat16, torch.float16):
+            with self.subTest(dtype=dtype):
+                x = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=dtype)
+                y = torch.tensor([[2.0, -1.0], [0.5, 3.0]], dtype=dtype)
 
-        with mock.patch.object(torch, "mm") as mm:
-            actual = kernel_ops.dsv4_linear_bf16_fp32_kunlun(x, y)
+                actual = kernel_ops.dsv4_linear_bf16_fp32_kunlun(x, y)
 
-        mm.assert_not_called()
-        self.assertEqual(actual.dtype, torch.float32)
-        torch.testing.assert_close(actual, x.float() @ y.float().t())
+                self.assertEqual(actual.dtype, torch.float32)
+                torch.testing.assert_close(
+                    actual,
+                    torch.nn.functional.linear(x.float(), y.float()),
+                    rtol=0,
+                    atol=0,
+                )
 
     def test_dsv4_silu_and_mul_clamp_matches_058_contract(self):
         from sglang_kunlun.kernels import kernel_ops

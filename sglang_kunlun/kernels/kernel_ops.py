@@ -874,7 +874,7 @@ def dsv4_linear_bf16_fp32_kunlun(
     x: torch.Tensor,
     y: torch.Tensor,
 ) -> torch.Tensor:
-    """Match the 0.5.8 ``torch`` GEMM configuration on Kunlun."""
+    """Preserve the shared DSV4 FP32-output GEMM contract."""
 
     return torch.nn.functional.linear(x.float(), y.float())
 
