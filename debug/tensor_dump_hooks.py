@@ -546,6 +546,19 @@ def _register_dsv4_layer0_block_chain(tensor_dumper, model):
                 add_tensor(f"{name}.input.{key}", item)
             value = output[0] if isinstance(output, (tuple, list)) else output
             add_tensor(f"{name}.output", value)
+            if name == "self_attn.wqkv_a" and isinstance(value, torch.Tensor):
+                add_tensor(
+                    "self_attn.stage.wqkv_a.weight",
+                    getattr(_module, "weight", None),
+                )
+                add_tensor(
+                    "self_attn.stage.wqkv_a.q_lora",
+                    value[..., : self_attn.q_lora_rank],
+                )
+                add_tensor(
+                    "self_attn.stage.wqkv_a.kv_split",
+                    value[..., self_attn.q_lora_rank :],
+                )
             if (
                 capture_parameters
                 and name == "mlp.shared_experts.gate_up_proj"
@@ -581,10 +594,6 @@ def _register_dsv4_layer0_block_chain(tensor_dumper, model):
         )
     self_attn = layer.self_attn
 
-    def capture_attention_stage(name, value):
-        add_tensor(f"self_attn.stage.{name}", value)
-
-    self_attn._dsv4_tensor_dump_stage_callback = capture_attention_stage
     for name, attribute in (
         ("self_attn.wqkv_a", "wqkv_a"),
         ("self_attn.wq_a", "wq_a"),
@@ -600,6 +609,28 @@ def _register_dsv4_layer0_block_chain(tensor_dumper, model):
             module.register_forward_hook(
                 capture_module_io(name), with_kwargs=True
             )
+
+    indexer = getattr(self_attn, "indexer", None)
+    if indexer is not None:
+
+        def capture_indexer_inputs(_module, inputs, kwargs):
+            x = kwargs.get("x", inputs[0] if inputs else None)
+            q_lora = kwargs.get("q_lora", inputs[1] if len(inputs) > 1 else None)
+            add_tensor("self_attn.stage.pre_indexer.x", x)
+            add_tensor("self_attn.stage.pre_indexer.q_lora", q_lora)
+
+        indexer.register_forward_pre_hook(capture_indexer_inputs, with_kwargs=True)
+
+    compressor = getattr(self_attn, "compressor", None)
+    if compressor is not None:
+
+        def capture_compressor_input(_module, inputs, kwargs):
+            x = kwargs.get("x", inputs[0] if inputs else None)
+            add_tensor("self_attn.stage.pre_compressor.x", x)
+
+        compressor.register_forward_pre_hook(
+            capture_compressor_input, with_kwargs=True
+        )
 
     w8a8_module_name = os.getenv("TENSOR_DUMP_DSV4_BLOCK_CHAIN_W8A8_MODULE")
     if w8a8_module_name is not None:
@@ -746,14 +777,22 @@ def _register_dsv4_layer0_block_chain(tensor_dumper, model):
             def backend_forward_with_dump(*backend_args, **backend_kwargs):
                 for index, name in enumerate(("q", "k", "v")):
                     if index < len(backend_args):
+                        value = backend_args[index]
+                        add_tensor(f"self_attn.backend.input.{name}", value)
                         add_tensor(
-                            f"self_attn.backend.input.{name}",
-                            backend_args[index],
+                            f"self_attn.stage.pre_attention.{name}", value
+                        )
+                        add_tensor(
+                            f"self_attn.stage.attention_backend.{name}", value
                         )
                     elif name in backend_kwargs:
+                        value = backend_kwargs[name]
+                        add_tensor(f"self_attn.backend.input.{name}", value)
                         add_tensor(
-                            f"self_attn.backend.input.{name}",
-                            backend_kwargs[name],
+                            f"self_attn.stage.pre_attention.{name}", value
+                        )
+                        add_tensor(
+                            f"self_attn.stage.attention_backend.{name}", value
                         )
                 result = original_backend_forward(
                     *backend_args, **backend_kwargs
@@ -1048,6 +1087,51 @@ def register_layer_boundary_tensor_dump_kunlun(
     )
     _wrap_root_forward(tensor_dumper, model, reset_dsv4_probes)
     return tensor_dumper
+
+
+def _static_w8a8_module_name_enabled() -> bool:
+    return bool(
+        os.getenv("DSV4_STATIC_W8A8_DUMP_PATH")
+        and os.getenv("DSV4_STATIC_W8A8_DUMP_MODULE")
+    )
+
+
+def tag_mqa_wqkv_a_for_static_dump(
+    result,
+    self,
+    config,
+    layer_id,
+    quant_config=None,
+    prefix="",
+    *args,
+    **kwargs,
+):
+    del config, layer_id, quant_config, args, kwargs
+    if getattr(self, "fuse_wqa_wkv", False):
+        from sglang.srt.utils import add_prefix
+
+        self.wqkv_a._dsv4_module_name = add_prefix("wqkv_a", prefix)
+    return result
+
+
+def install_static_w8a8_module_name_hook() -> int:
+    if not _static_w8a8_module_name_enabled():
+        return 0
+    from sglang.srt.plugins.hook_registry import HookRegistry
+
+    HookRegistry.register(
+        "sglang.srt.models.deepseek_v4.MQALayer.__init__",
+        tag_mqa_wqkv_a_for_static_dump,
+        HookType.AFTER,
+    )
+    logger.warning(
+        "DSV4 static W8A8 module-name hook installed because both dump path "
+        "and module are configured"
+    )
+    return 1
+
+
+install_static_w8a8_module_name_hook()
 
 
 def _decode_layer_alias_enabled():

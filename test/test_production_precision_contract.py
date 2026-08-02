@@ -35,6 +35,9 @@ BACKEND_HOOKS = (
     / "kunlun_deepseek_v4_backend.py"
 )
 LEGACY_MODEL_HOOKS = ROOT / "sglang_kunlun" / "models" / "deepseek_v4.py"
+UPSTREAM_DSV4_MODEL = (
+    ROOT.parent / "sglang" / "python" / "sglang" / "srt" / "models" / "deepseek_v4.py"
+)
 
 
 class ProductionPrecisionContractTest(unittest.TestCase):
@@ -781,8 +784,14 @@ class ProductionPrecisionContractTest(unittest.TestCase):
         mtp_source = MTP_HOOKS.read_text()
         runtime_source = RUNTIME_HOOKS.read_text()
         legacy_model_source = LEGACY_MODEL_HOOKS.read_text()
+        upstream_model_source = UPSTREAM_DSV4_MODEL.read_text()
         backend_source = BACKEND_HOOKS.read_text()
 
+        self.assertNotIn("_dsv4_dump_probe", upstream_model_source)
+        self.assertNotIn("_dsv4_module_name", upstream_model_source)
+        self.assertNotIn("dsv4_probe_bridge", upstream_model_source)
+        self.assertNotIn("_dsv4_dump_probe", model_source)
+        self.assertNotIn("_dsv4_dump_probe", legacy_model_source)
         self.assertIn("original_seq_len=0", model_source)
         self.assertIn("local_q_out = torch.empty_like(q)", model_source)
         self.assertIn("kv = self.kv_norm(kv)", model_source)

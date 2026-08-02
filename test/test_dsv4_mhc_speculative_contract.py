@@ -744,6 +744,44 @@ class DSV4MHCSpeculativeContractTest(unittest.TestCase):
         ):
             self.assertIn(f"{wo_b_prefix}.{suffix}", dumper.tensors)
 
+    def test_static_w8a8_module_name_hook_is_environment_gated(self):
+        target = "sglang.srt.models.deepseek_v4.MQALayer.__init__"
+        with mock.patch.dict(os.environ, {}, clear=True):
+            _module, registered = load_with_fake_registry(
+                "debug/tensor_dump_hooks.py",
+                "contract_debug_tensor_dump_static_w8a8_disabled",
+            )
+        self.assertNotIn(target, registered)
+
+        env = {
+            "DSV4_STATIC_W8A8_DUMP_PATH": "/tmp/w8a8.pt",
+            "DSV4_STATIC_W8A8_DUMP_MODULE": "model.layers.3.self_attn.wqkv_a",
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            module, registered = load_with_fake_registry(
+                "debug/tensor_dump_hooks.py",
+                "contract_debug_tensor_dump_static_w8a8_enabled",
+            )
+        self.assertEqual(registered[target][0], "after")
+
+        result = object()
+        owner = types.SimpleNamespace(
+            fuse_wqa_wkv=True,
+            wqkv_a=types.SimpleNamespace(),
+        )
+        returned = module.tag_mqa_wqkv_a_for_static_dump(
+            result,
+            owner,
+            object(),
+            3,
+            prefix="model.layers.3.self_attn",
+        )
+        self.assertIs(returned, result)
+        self.assertEqual(
+            owner.wqkv_a._dsv4_module_name,
+            "model.layers.3.self_attn.wqkv_a",
+        )
+
     def test_decode_layer_alias_uses_fixed_graph_buffer(self):
         # The decode-alias hooks are only registered when the dump is enabled,
         # so that no wrapper frame sits on DeepseekV4DecoderLayer.forward in a

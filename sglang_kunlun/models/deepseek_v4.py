@@ -107,12 +107,9 @@ def mqa_forward_prepare_kunlun(
 
     x_linear = x_quant if x_quant is not None else x
     if self.fuse_wqa_wkv:
-        self._dsv4_dump_probe("wqkv_a.weight", self.wqkv_a.weight)
         qkv_a, _ = self.wqkv_a(x_linear)
         q_lora = qkv_a[..., : self.q_lora_rank]
         kv = qkv_a[..., self.q_lora_rank :]
-        self._dsv4_dump_probe("wqkv_a.q_lora", q_lora)
-        self._dsv4_dump_probe("wqkv_a.kv_split", kv)
     else:
         q_lora, _ = self.wq_a(x_linear)
         kv, _ = self.wkv(x_linear)
@@ -145,11 +142,6 @@ def mqa_forward_prepare_kunlun(
     )
     _store_kv_to_swa_cache_direct(self, kv, forward_batch, attn_backend)
 
-    self._dsv4_dump_probe("pre_indexer.x", x)
-    self._dsv4_dump_probe("pre_indexer.q_lora", q_lora)
-    self._dsv4_dump_probe("pre_attention.q", q)
-    self._dsv4_dump_probe("pre_attention.k", kv)
-    self._dsv4_dump_probe("pre_attention.v", kv)
     if self.indexer is not None:
         self.indexer(
             x=x,
@@ -158,7 +150,6 @@ def mqa_forward_prepare_kunlun(
             attn_backend=attn_backend,
         )
     if self.compressor is not None:
-        self._dsv4_dump_probe("pre_compressor.x", x)
         attn_backend.forward_core_compressor(
             x,
             forward_batch,
