@@ -29,7 +29,7 @@ import os
 
 import torch
 
-from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+from sglang.srt.plugins.hook_registry import HookType
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +115,11 @@ def install() -> int:
     """Register the probes only when the dump directory is configured."""
     if not probes_enabled():
         return 0
+    # Imported lazily: the unit tests stub sglang.srt.plugins.hook_registry with
+    # a module that only provides HookType and plugin_hook, so importing
+    # HookRegistry at module scope would break collection.
+    from sglang.srt.plugins.hook_registry import HookRegistry
+
     for target, hook in _PROBE_HOOKS:
         HookRegistry.register(target, hook, HookType.AROUND)
     logger.warning(

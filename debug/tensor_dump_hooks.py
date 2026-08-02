@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from types import MethodType
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+
+logger = logging.getLogger(__name__)
 
 
 def _register_layer_boundary_hooks(
@@ -1051,11 +1054,6 @@ def _decode_layer_alias_enabled():
     return os.getenv("DSV4_DECODE_LAYER_ALIAS_DUMP", "0") == "1"
 
 
-@plugin_hook(
-    "sglang.srt.model_executor.runner.decode_cuda_graph_runner."
-    "DecodeCudaGraphRunner.capture_prepare",
-    type=HookType.AFTER,
-)
 def prepare_decode_layer_aliases_kunlun(result, self, size, stream_idx=None):
     if not _decode_layer_alias_enabled():
         return result
@@ -1111,10 +1109,6 @@ def prepare_decode_layer_aliases_kunlun(result, self, size, stream_idx=None):
     return result
 
 
-@plugin_hook(
-    "sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayer.forward",
-    type=HookType.AFTER,
-)
 def capture_decode_layer_alias_kunlun(
     result,
     self,
@@ -1146,11 +1140,6 @@ def capture_decode_layer_alias_kunlun(
     return result
 
 
-@plugin_hook(
-    "sglang.srt.model_executor.runner.decode_cuda_graph_runner."
-    "DecodeCudaGraphRunner.capture_one_shape",
-    type=HookType.AFTER,
-)
 def retain_decode_layer_aliases_kunlun(
     result,
     self,
@@ -1175,11 +1164,6 @@ def retain_decode_layer_aliases_kunlun(
     return result
 
 
-@plugin_hook(
-    "sglang.srt.model_executor.runner.decode_cuda_graph_runner."
-    "DecodeCudaGraphRunner.execute",
-    type=HookType.AFTER,
-)
 def dump_decode_layer_aliases_kunlun(
     result, self, forward_batch, pp_proxy_tensors=None
 ):
@@ -1233,3 +1217,58 @@ def dump_decode_layer_aliases_kunlun(
     )
     self._dsv4_decode_layer_alias_dumped = True
     return result
+
+
+# The four decode-alias hooks are registered only when
+# DSV4_DECODE_LAYER_ALIAS_DUMP=1. capture_decode_layer_alias_kunlun is an AFTER
+# hook on DeepseekV4DecoderLayer.forward, so registering it unconditionally
+# would put a wrapper frame on every layer of every decode step just to reach a
+# disabled body.
+#
+# register_layer_boundary_tensor_dump_kunlun above keeps its decorator: it wraps
+# a setup function that only runs when --debug-tensor-dump-output-folder is
+# given, its enable condition is a server argument that is not known at
+# registration time, and it is not on any per-token path.
+_DECODE_ALIAS_HOOKS = (
+    (
+        "sglang.srt.model_executor.runner.decode_cuda_graph_runner."
+        "DecodeCudaGraphRunner.capture_prepare",
+        prepare_decode_layer_aliases_kunlun,
+    ),
+    (
+        "sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayer.forward",
+        capture_decode_layer_alias_kunlun,
+    ),
+    (
+        "sglang.srt.model_executor.runner.decode_cuda_graph_runner."
+        "DecodeCudaGraphRunner.capture_one_shape",
+        retain_decode_layer_aliases_kunlun,
+    ),
+    (
+        "sglang.srt.model_executor.runner.decode_cuda_graph_runner."
+        "DecodeCudaGraphRunner.execute",
+        dump_decode_layer_aliases_kunlun,
+    ),
+)
+
+
+def install_decode_layer_alias_hooks() -> int:
+    if not _decode_layer_alias_enabled():
+        return 0
+    # Imported lazily: the unit tests stub sglang.srt.plugins.hook_registry with
+    # a module that only provides HookType and plugin_hook, so importing
+    # HookRegistry at module scope would break collection.
+    from sglang.srt.plugins.hook_registry import HookRegistry
+
+    for target, hook in _DECODE_ALIAS_HOOKS:
+        HookRegistry.register(target, hook, HookType.AFTER)
+    logger.warning(
+        "DSV4 decode-alias hooks installed on %d targets because "
+        "DSV4_DECODE_LAYER_ALIAS_DUMP=1; this adds a wrapper frame to every "
+        "decoder forward",
+        len(_DECODE_ALIAS_HOOKS),
+    )
+    return len(_DECODE_ALIAS_HOOKS)
+
+
+install_decode_layer_alias_hooks()
