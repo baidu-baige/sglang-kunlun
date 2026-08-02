@@ -66,7 +66,7 @@ def compute_kv_to_cache_kunlun(
     "sglang.srt.models.deepseek_v4.MQALayer._forward_prepare",
     type=HookType.AROUND,
 )
-def mqa_forward_prepare_058_kunlun(
+def mqa_forward_prepare_kunlun(
     original_fn,
     self,
     x: torch.Tensor,
