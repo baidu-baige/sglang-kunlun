@@ -30,7 +30,10 @@ HOOK_MODULES = (
 # Diagnostics live outside ``sglang_kunlun``. They register last so that no
 # production hook can resolve against a probe-wrapped function, and they are
 # optional: a deployment without the ``debug`` package simply skips them.
-DEBUG_HOOK_MODULES = ("debug.tensor_dump_hooks",)
+DEBUG_HOOK_MODULES = (
+    "debug.tensor_dump_hooks",
+    "debug.dsv4_mtp_nextn_probes",
+)
 
 
 def register_all() -> None:
