@@ -80,7 +80,7 @@ def write_cache_indices_kunlun(
         )
         req_to_token_pool.write(
             (req_idx, slice(prefix_len, seq_len)),
-            out_cache_loc[offset:offset + extend_len],
+            out_cache_loc[offset : offset + extend_len],
         )
         offset += extend_len
 
