@@ -646,13 +646,40 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         q_lod_cpu = torch.zeros(batch_size + 1, dtype=torch.int32)
         if batch_size:
             torch.cumsum(torch.tensor(lengths, dtype=torch.int32), 0, out=q_lod_cpu[1:])
-        q_lod = q_lod_cpu.to(device, non_blocking=False)
+
+        actual_queries = int(q_lod_cpu[-1].item())
+        pad_tokens = num_queries - actual_queries
+        if pad_tokens < 0:
+            raise ValueError(
+                "Kunlun DSV4 extend lengths exceed the query rows: "
+                f"lengths={actual_queries}, queries={num_queries}"
+            )
+        if pad_tokens:
+            q_lod_cpu = torch.cat(
+                [
+                    q_lod_cpu,
+                    q_lod_cpu[-1]
+                    + torch.arange(1, pad_tokens + 1, dtype=torch.int32),
+                ]
+            )
+
         kv_lens = forward_batch.seq_lens[:batch_size].to(torch.int32)
         kv_lens_cpu = (
             forward_batch.seq_lens_cpu[:batch_size].to(torch.int32)
             if forward_batch.seq_lens_cpu is not None
             else kv_lens.to("cpu", non_blocking=False)
         )
+        if pad_tokens:
+            kv_lens = torch.cat(
+                [
+                    kv_lens,
+                    torch.ones(pad_tokens, dtype=torch.int32, device=device),
+                ]
+            )
+            kv_lens_cpu = torch.cat(
+                [kv_lens_cpu, torch.ones(pad_tokens, dtype=torch.int32)]
+            )
+        q_lod = q_lod_cpu.to(device, non_blocking=False)
         return q_lod_cpu, q_lod, kv_lens_cpu, kv_lens
 
     def store_cache(
@@ -837,21 +864,53 @@ def _compressor_forward_cuda_kunlun(self, x, forward_batch, attn_backend=None):
     return self.forward_native(x, forward_batch, attn_backend=attn_backend)
 
 
-def _build_c4_prefill_contract(forward_batch, c4_seq_lens, page_table, device):
+def _build_c4_prefill_contract(
+    forward_batch, c4_seq_lens, page_table, device, num_queries
+):
     """Build the request-level LoD contract used by the 0.5.8 extend path."""
     extend_lens = [int(value) for value in forward_batch.extend_seq_lens_cpu]
     qlod_cpu = torch.zeros(len(extend_lens) + 1, dtype=torch.int32)
     if extend_lens:
         qlod_cpu[1:] = torch.cumsum(torch.tensor(extend_lens, dtype=torch.int32), 0)
+
+    actual_queries = int(qlod_cpu[-1].item())
+    pad_tokens = num_queries - actual_queries
+    if pad_tokens < 0:
+        raise ValueError(
+            "Kunlun C4 extend lengths exceed the query rows: "
+            f"lengths={actual_queries}, queries={num_queries}"
+        )
+    if pad_tokens:
+        qlod_cpu = torch.cat(
+            [
+                qlod_cpu,
+                qlod_cpu[-1]
+                + torch.arange(1, pad_tokens + 1, dtype=torch.int32),
+            ]
+        )
+
     last_rows = (qlod_cpu[1:] - 1).clamp(min=0, max=page_table.shape[0] - 1)
     c4_flat = c4_seq_lens.reshape(-1).to("cpu", dtype=torch.int32)
-    per_req_k_lens = c4_flat.index_select(
-        0, last_rows.clamp(max=c4_flat.numel() - 1).long()
-    )
-    klod_cpu = torch.zeros(len(extend_lens) + 1, dtype=torch.int32)
-    if extend_lens:
+    seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+    if seq_lens_cpu is not None and len(seq_lens_cpu) >= len(extend_lens):
+        # CP prefix-cache metadata must use the complete request context, not
+        # the c4 length at the last local round-robin token.
+        per_req_k_lens = (seq_lens_cpu[: len(extend_lens)] // 4).to(torch.int32)
+        per_req_k_lens = torch.clamp(per_req_k_lens, min=1)
+    else:
+        per_req_k_lens = c4_flat.index_select(
+            0, last_rows[: len(extend_lens)].clamp(max=c4_flat.numel() - 1).long()
+        )
+        per_req_k_lens = torch.clamp(per_req_k_lens, min=1)
+    if pad_tokens:
+        per_req_k_lens = torch.cat(
+            [per_req_k_lens, torch.ones(pad_tokens, dtype=torch.int32)]
+        )
+
+    klod_cpu = torch.zeros(len(per_req_k_lens) + 1, dtype=torch.int32)
+    if per_req_k_lens.numel():
         klod_cpu[1:] = torch.cumsum(per_req_k_lens * 4, 0)
-    com_k_start_cpu = torch.zeros(len(extend_lens), dtype=torch.int32)
+    com_k_start_cpu = torch.zeros(len(per_req_k_lens), dtype=torch.int32)
     prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
     return {
         "qlod_cpu": qlod_cpu,
@@ -970,7 +1029,7 @@ def _compute_c4_logits_kunlun(
             q = q.view(torch.int8)
         weights = weight.float().contiguous()
         contract = _build_c4_prefill_contract(
-            forward_batch, seq_lens, page_table, q.device
+            forward_batch, seq_lens, page_table, q.device, q.shape[0]
         )
         k, k_scale = _gather_c4_prefill_kv(
             kvcache_fp8, page_table, contract, q.device
