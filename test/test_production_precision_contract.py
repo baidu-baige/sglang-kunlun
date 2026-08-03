@@ -13,6 +13,7 @@ from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 from sglang_kunlun.hooks import mtp_production as mtp
 from sglang_kunlun.hooks import production_precision as runtime
 from sglang_kunlun.hooks import ragged_draft_extend as ragged
+from sglang_kunlun.hooks.mem_cache import common as mem_cache_common
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +36,15 @@ BACKEND_HOOKS = (
     / "kunlun_deepseek_v4_backend.py"
 )
 LEGACY_MODEL_HOOKS = ROOT / "sglang_kunlun" / "models" / "deepseek_v4.py"
+DEEPEP_HOOKS = (
+    ROOT
+    / "sglang_kunlun"
+    / "hooks"
+    / "layers"
+    / "moe"
+    / "token_dispatcher"
+    / "deepep.py"
+)
 UPSTREAM_DSV4_MODEL = (
     ROOT.parent / "sglang" / "python" / "sglang" / "srt" / "models" / "deepseek_v4.py"
 )
@@ -118,12 +128,33 @@ class ProductionPrecisionContractTest(unittest.TestCase):
                 ragged.make_ragged_draft_extend_lod_kunlun,
                 ("original_fn", "self", "forward_batch", "num_queries", "device"),
             ),
+            (
+                "sglang.srt.mem_cache.deepseek_v4_memory_pool."
+                "DeepSeekV4IndexerPool._create_buffer",
+                HookType.AROUND,
+                mem_cache_common.dsv4_indexer_pool_create_buffer_kunlun,
+                ("original_fn", "self"),
+            ),
         )
         for target, hook_type, function, expected_parameters in targets:
             self.assert_registered(target, hook_type, function)
             self.assertEqual(
                 tuple(inspect.signature(function).parameters), expected_parameters
             )
+
+    def test_deepep_auto_declares_two_mode_buffers(self):
+        tree = ast.parse(DEEPEP_HOOKS.read_text(), filename=str(DEEPEP_HOOKS))
+        buffer_class = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "DeepEPBuffer"
+        )
+        source = ast.unparse(buffer_class)
+        self.assertIn("_normal_buffer = None", source)
+        self.assertIn("_low_latency_buffer = None", source)
+        self.assertIn("'_normal_buffer'", source)
+        self.assertIn("'_low_latency_buffer'", source)
+        self.assertIn("setattr(cls, buffer_attr, buffer)", source)
 
     def test_moe_gate_forward_matches_058_half_contract_and_preserves_fallback(self):
         for dtype in (torch.bfloat16, torch.float16):
