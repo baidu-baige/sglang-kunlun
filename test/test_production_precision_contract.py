@@ -1,6 +1,5 @@
 import ast
 import importlib.util
-import contextlib
 import inspect
 from pathlib import Path
 import sys
@@ -343,28 +342,21 @@ class ProductionPrecisionContractTest(unittest.TestCase):
             env_gate.__name__: env_gate,
         }
         srt_module = sys.modules["sglang.srt"]
-        with contextlib.ExitStack() as stack:
-            stack.enter_context(mock.patch.dict(sys.modules, modules))
-            stack.enter_context(
-                mock.patch.object(srt_module, "models", models_package, create=True)
-            )
-            stack.enter_context(
-                mock.patch.object(
-                    srt_module, "model_executor", model_executor_package, create=True
-                )
-            )
-            stack.enter_context(
-                mock.patch.object(srt_module, "layers", layers_package, create=True)
-            )
-            stack.enter_context(
-                mock.patch.object(
-                    model_precision,
-                    "dsv4_mqa_wo_a_einsum_kunlun",
-                    side_effect=lambda value, weight: torch.einsum(
-                        "tgd,grd->tgr", value, weight
-                    ),
-                )
-            )
+        with (
+            mock.patch.dict(sys.modules, modules),
+            mock.patch.object(srt_module, "models", models_package, create=True),
+            mock.patch.object(
+                srt_module, "model_executor", model_executor_package, create=True
+            ),
+            mock.patch.object(srt_module, "layers", layers_package, create=True),
+            mock.patch.object(
+                model_precision,
+                "dsv4_mqa_wo_a_einsum_kunlun",
+                side_effect=lambda value, weight: torch.einsum(
+                    "tgd,grd->tgr", value, weight
+                ),
+            ),
+        ):
             output = model_precision.mqa_forward_global_head_layout_kunlun(
                 owner,
                 torch.ones((1, 2)),
@@ -475,13 +467,10 @@ class ProductionPrecisionContractTest(unittest.TestCase):
                 mark_forward_metadata_ready=mock.Mock(),
             )
 
-        with contextlib.ExitStack() as stack:
-            stack.enter_context(
-                mock.patch.object(ForwardBatch, "init_new", side_effect=init_new)
-            )
-            stack.enter_context(
-                mock.patch.object(async_probe, "maybe_detect_oob", return_value=None)
-            )
+        with (
+            mock.patch.object(ForwardBatch, "init_new", side_effect=init_new),
+            mock.patch.object(async_probe, "maybe_detect_oob", return_value=None),
+        ):
             forward_batch = mtp.prepare_for_draft_extend_kunlun(
                 None,
                 draft_extend_input,
@@ -519,13 +508,10 @@ class ProductionPrecisionContractTest(unittest.TestCase):
         draft_extend_input.num_accept_tokens = graph_accept_lens
         draft_extend_input.extend_seq_lens_cpu = None
         draft_extend_input.extend_seq_lens_tensor = None
-        with contextlib.ExitStack() as stack:
-            stack.enter_context(
-                mock.patch.object(ForwardBatch, "init_new", side_effect=init_new)
-            )
-            stack.enter_context(
-                mock.patch.object(async_probe, "maybe_detect_oob", return_value=None)
-            )
+        with (
+            mock.patch.object(ForwardBatch, "init_new", side_effect=init_new),
+            mock.patch.object(async_probe, "maybe_detect_oob", return_value=None),
+        ):
             graph_batch = mtp.prepare_for_draft_extend_kunlun(
                 None,
                 draft_extend_input,
@@ -670,29 +656,22 @@ class ProductionPrecisionContractTest(unittest.TestCase):
         layers_package.attention = attention_package
         srt_module = sys.modules["sglang.srt"]
         hooks_package = sys.modules["sglang_kunlun.hooks"]
-        with contextlib.ExitStack() as stack:
-            stack.enter_context(
-                mock.patch.dict(
-                    sys.modules,
-                    {
-                        upstream.__name__: upstream,
-                        speculative_package.__name__: speculative_package,
-                        layers_package.__name__: layers_package,
-                        attention_package.__name__: attention_package,
-                        backend_module.__name__: backend_module,
-                    },
-                )
-            )
-            stack.enter_context(
-                mock.patch.object(
-                    srt_module, "speculative", speculative_package, create=True
-                )
-            )
-            stack.enter_context(
-                mock.patch.object(
-                    hooks_package, "layers", layers_package, create=True
-                )
-            )
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {
+                    upstream.__name__: upstream,
+                    speculative_package.__name__: speculative_package,
+                    layers_package.__name__: layers_package,
+                    attention_package.__name__: attention_package,
+                    backend_module.__name__: backend_module,
+                },
+            ),
+            mock.patch.object(
+                srt_module, "speculative", speculative_package, create=True
+            ),
+            mock.patch.object(hooks_package, "layers", layers_package, create=True),
+        ):
             mtp.capture_cuda_graphs_kunlun(owner)
 
         self.assertEqual(
