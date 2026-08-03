@@ -31,7 +31,6 @@ def column_parallel_linear_init_around(original_fn, self, *args, **kwargs):
 
     if not isinstance(getattr(self, "quant_method", None), W8A8Int8LinearMethod):
         return
-
     self.bias = Parameter(
         torch.empty(self.output_size_per_partition, dtype=torch.float32)
     )
