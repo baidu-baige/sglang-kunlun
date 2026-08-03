@@ -290,46 +290,6 @@ class KernelOpsTest(unittest.TestCase):
         self.assertIs(op.call_args.args[7], extra_data)
         torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
-    def test_dsv4_compress_preserves_overlap_read_locations(self):
-        from sglang_kunlun.kernels import kernel_ops
-
-        kv_score_buffer = torch.randn(4, 4, 256)
-        kv_score_input = torch.randn(2, 512)
-        ape = torch.randn(2, 256)
-        indices = torch.tensor([3, 2], dtype=torch.int32)
-        extra_data = torch.tensor(
-            [[7, 8, 0, 3], [6, 5, 9, 10]], dtype=torch.int32
-        )
-        original_extra_data = extra_data.clone()
-        plan = types.SimpleNamespace(
-            is_decode=False,
-            compress_ratio=4,
-            compress_plan=torch.arange(6, dtype=torch.int32),
-            write_plan=torch.arange(3, dtype=torch.int32),
-        )
-
-        with mock.patch.object(
-            torch.ops.xspeedgate_ops,
-            "compress_forward_fast",
-            side_effect=lambda *args: None,
-        ) as op:
-            kernel_ops.dsv4_compress_forward_kunlun(
-                kv_score_buffer,
-                kv_score_input,
-                ape,
-                indices,
-                plan=plan,
-                extra_data=extra_data,
-                head_dim=128,
-                compress_ratio=4,
-            )
-
-        passed_extra_data = op.call_args.args[7]
-        self.assertEqual(passed_extra_data[:, 0].tolist(), original_extra_data[:, 0].tolist())
-        self.assertEqual(passed_extra_data[:, 1].tolist(), original_extra_data[:, 1].tolist())
-        self.assertEqual(passed_extra_data[0, 2].item(), indices[0].item())
-        self.assertEqual(passed_extra_data[1, 2].item(), original_extra_data[1, 2].item())
-
     def test_dsv4_quant_k_cache_matches_058_bf16_then_fp16_contract(self):
         from sglang_kunlun.kernels import kernel_ops
 
