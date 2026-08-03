@@ -1179,7 +1179,3 @@ class KunlunDeepseekV4MultiStepBackend(DeepseekV4MultiStepBackend):
             from debug.dsv4_backend_probes import dsv4_probe
 
             dsv4_probe(self, "multistep.replay_metadata", locals())
-
-
-# MTP / NextN boundary probes live in debug/dsv4_mtp_nextn_probes.py and are
-# registered through plugin_hook, so this module installs no diagnostics.

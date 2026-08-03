@@ -1,0 +1,5 @@
+Host icode.baidu.com
+User fangzhou07
+HostkeyAlgorithms +ssh-rsa
+PubkeyAcceptedKeyTypes +ssh-rsa
+IdentityFile ~/.ssh/id_rsa
