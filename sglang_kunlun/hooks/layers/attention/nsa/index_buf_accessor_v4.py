@@ -35,6 +35,7 @@ class NopeFp8RopeBf16Pack:
             assert self.scale_k_nope_ue8m0.shape[-1] == 7
 
     def slice_pack(self, _slice: Any) -> "NopeFp8RopeBf16Pack":
+        """Return the selected rows while preserving the cache representation."""
         is_half_cache = self.kv_cache_dtype in (torch.bfloat16, torch.float16)
         return NopeFp8RopeBf16Pack(
             k_nope_fp8=self.k_nope_fp8[_slice],
