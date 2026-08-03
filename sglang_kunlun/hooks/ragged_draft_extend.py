@@ -17,12 +17,13 @@ def _ragged_extend_lengths(forward_batch, num_queries: int):
         return None
 
     lengths = [int(length) for length in lengths]
-    if sum(lengths) != num_queries:
+    total = sum(lengths)
+    if total > num_queries:
         raise ValueError(
             "Kunlun ragged Draft Extend query count mismatch: "
             f"lengths={lengths}, num_queries={num_queries}"
         )
-    if num_queries % batch_size == 0:
+    if total == num_queries and num_queries % batch_size == 0:
         uniform_length = num_queries // batch_size
         if all(length == uniform_length for length in lengths):
             return None
@@ -50,11 +51,30 @@ def make_ragged_draft_extend_lod_kunlun(
             dim=0,
             out=q_lod_cpu[1:],
         )
-    q_lod = q_lod_cpu.to(device, non_blocking=False)
     kv_lens = forward_batch.seq_lens[:batch_size].to(torch.int32)
     kv_lens_cpu = (
         forward_batch.seq_lens_cpu[:batch_size].to(torch.int32)
         if forward_batch.seq_lens_cpu is not None
         else kv_lens.to("cpu", non_blocking=False)
     )
+    # CP alignment pads the token dimension past the accepted draft tokens; give
+    # every padding row its own item with a dummy KV length.
+    pad_rows = num_queries - int(q_lod_cpu[-1].item())
+    if pad_rows:
+        q_lod_cpu = torch.cat(
+            [
+                q_lod_cpu,
+                q_lod_cpu[-1] + torch.arange(1, pad_rows + 1, dtype=torch.int32),
+            ]
+        )
+        kv_lens_cpu = torch.cat(
+            [kv_lens_cpu, torch.ones(pad_rows, dtype=torch.int32)]
+        )
+        kv_lens = torch.cat(
+            [
+                kv_lens,
+                torch.ones(pad_rows, dtype=torch.int32, device=kv_lens.device),
+            ]
+        )
+    q_lod = q_lod_cpu.to(device, non_blocking=False)
     return q_lod_cpu, q_lod, kv_lens_cpu, kv_lens

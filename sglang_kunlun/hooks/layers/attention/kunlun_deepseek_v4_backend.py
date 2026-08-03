@@ -177,6 +177,83 @@ def _seq_lens_cpu_i32(forward_batch) -> torch.Tensor:
     return seq_lens_cpu[: forward_batch.batch_size].to(torch.int32)
 
 
+def _dsa_prefill_cp_enabled() -> bool:
+    """True only when DSA prefill context parallel is switched on.
+
+    Every CP-specific adjustment below is gated on this so that a CP-off server
+    keeps the exact pre-CP contract.
+    """
+    from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+
+    return is_dsa_enable_prefill_cp()
+
+
+def _dsa_cp_prefill_ranks(forward_batch) -> Optional[tuple]:
+    """Return ``(cp_rank, cp_size)`` when DSA prefill CP round-robin is active.
+
+    Upstream ``DeepseekV4ForCausalLM.forward`` calls ``apply_cp_reindex()`` before
+    the layers run, so every per-token metadata field the Kunlun boundary consumes
+    is already CP-local while ``forward_batch.extend_seq_lens_cpu`` stays global.
+    """
+    from sglang.srt.layers.attention.dsa.utils import (
+        can_dsa_prefill_cp_round_robin_split,
+    )
+
+    if not can_dsa_prefill_cp_round_robin_split(forward_batch):
+        return None
+
+    from sglang.srt.runtime_context import get_parallel
+
+    parallel = get_parallel()
+    return parallel.attn_cp_rank, parallel.attn_cp_size
+
+
+def _dsa_cp_local_extend_lens(extend_seq_lens_cpu, cp_rank: int, cp_size: int):
+    """Round-robin split the global extend lengths onto this CP rank.
+
+    Token ``i`` of the flattened batch belongs to rank ``i % cp_size``, so the
+    remainder of one request carries over into the next request's window.
+    """
+    local_lens = []
+    carry = 0
+    for length in extend_seq_lens_cpu:
+        total = int(length) + carry
+        local = total // cp_size + int(total % cp_size > cp_rank)
+        local_lens.append(local)
+        carry = total - local * cp_size
+    return local_lens
+
+
+def _make_cp_prefill_lod(core_metadata, num_queries: int, device: torch.device):
+    """CP round-robin contract: every local Q token is its own batch item.
+
+    ``seq_lens_casual`` is per-token and already CP-reindexed, so it is the exact
+    KV context length for each local query row.
+    """
+    kv_lens_cpu = core_metadata.seq_lens_casual.to(
+        "cpu", non_blocking=False
+    ).to(torch.int32)
+    if kv_lens_cpu.shape[0] > num_queries:
+        kv_lens_cpu = kv_lens_cpu[:num_queries]
+    elif kv_lens_cpu.shape[0] < num_queries:
+        kv_lens_cpu = torch.cat(
+            [
+                kv_lens_cpu,
+                torch.ones(
+                    num_queries - kv_lens_cpu.shape[0], dtype=torch.int32
+                ),
+            ]
+        )
+    kv_lens_cpu = torch.clamp(kv_lens_cpu, min=1).contiguous()
+    q_lod_cpu = torch.arange(num_queries + 1, dtype=torch.int32)
+    return (
+        q_lod_cpu,
+        q_lod_cpu.to(device, non_blocking=False),
+        kv_lens_cpu,
+        kv_lens_cpu.to(device, non_blocking=False),
+    )
+
+
 def _refresh_graph_host_lengths(
     forward_batch, attention_decode_aux, c4_decode_aux, graph_extend_aux
 ) -> None:
@@ -636,6 +713,11 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             torch.maximum(kv_lens, query_lens, out=kv_lens)
             return q_lod_cpu, q_lod, kv_lens_cpu, kv_lens
 
+        if _dsa_cp_prefill_ranks(forward_batch) is not None:
+            return _make_cp_prefill_lod(
+                self.forward_metadata.core_attn_metadata, num_queries, device
+            )
+
         lengths = forward_batch.extend_seq_lens_cpu
         if lengths is None:
             batch_size = forward_batch.seq_lens.shape[0]
@@ -646,13 +728,43 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         q_lod_cpu = torch.zeros(batch_size + 1, dtype=torch.int32)
         if batch_size:
             torch.cumsum(torch.tensor(lengths, dtype=torch.int32), 0, out=q_lod_cpu[1:])
-        q_lod = q_lod_cpu.to(device, non_blocking=False)
         kv_lens = forward_batch.seq_lens[:batch_size].to(torch.int32)
         kv_lens_cpu = (
             forward_batch.seq_lens_cpu[:batch_size].to(torch.int32)
             if forward_batch.seq_lens_cpu is not None
             else kv_lens.to("cpu", non_blocking=False)
         )
+        # CP alignment pads the token dimension past the scheduler's extend
+        # lengths. Give every padding row its own batch item with a dummy KV
+        # length so the operator contract qlod[-1] == q rows still holds.
+        pad_rows = (
+            num_queries - int(q_lod_cpu[-1].item())
+            if _dsa_prefill_cp_enabled()
+            else 0
+        )
+        if pad_rows < 0:
+            raise ValueError(
+                "Kunlun DSV4 extend lengths exceed the query rows: "
+                f"lengths={int(q_lod_cpu[-1].item())}, queries={num_queries}"
+            )
+        if pad_rows:
+            q_lod_cpu = torch.cat(
+                [
+                    q_lod_cpu,
+                    q_lod_cpu[-1]
+                    + torch.arange(1, pad_rows + 1, dtype=torch.int32),
+                ]
+            )
+            kv_lens_cpu = torch.cat(
+                [kv_lens_cpu, torch.ones(pad_rows, dtype=torch.int32)]
+            )
+            kv_lens = torch.cat(
+                [
+                    kv_lens,
+                    torch.ones(pad_rows, dtype=torch.int32, device=kv_lens.device),
+                ]
+            )
+        q_lod = q_lod_cpu.to(device, non_blocking=False)
         return q_lod_cpu, q_lod, kv_lens_cpu, kv_lens
 
     def store_cache(
@@ -734,6 +846,18 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         q_lod_cpu, q_lod, kv_lens_cpu, kv_lens = self._make_lod(
             forward_batch, q_3d.shape[0], q_3d.device
         )
+        cp_prefill = _dsa_cp_prefill_ranks(forward_batch) is not None
+        if int(q_lod_cpu[-1].item()) != q_3d.shape[0]:
+            raise ValueError(
+                "Kunlun DSV4 attention LoD does not cover the query rows: "
+                f"qlod_last={int(q_lod_cpu[-1].item())}, q_rows={q_3d.shape[0]}, "
+                f"cp_prefill={cp_prefill}, "
+                f"casual_rows={core.seq_lens_casual.shape[0]}, "
+                f"page_table_rows={core.page_table.shape[0]}, "
+                f"extend_lens={forward_batch.extend_seq_lens_cpu}, "
+                f"batch_size={forward_batch.batch_size}, "
+                f"mode={forward_batch.forward_mode}"
+            )
         dsv4_probe(self, "forward.attention_consume", locals())
         dsv4_probe(self, "forward.c4_metadata", locals())
         if extra_cache is None:
@@ -764,6 +888,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                     compress_ratio == 128
                     and forward_batch.forward_mode.is_extend()
                     and not _is_graph_extend_mode(forward_batch.forward_mode)
+                    and not cp_prefill
                 ):
                     compressed_topk = _clamp_c128_prefill_topk(
                         compressed_topk,
@@ -813,7 +938,10 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             kv_lens_cpu_op,
             kv_lens_op,
             self.softmax_scale,
-            True,
+            # CP round-robin batches one local token per item; the per-token KV
+            # lengths already encode the causal prefix, so kernel-side causal
+            # masking would truncate valid context.
+            not cp_prefill,
             win_indices_op.shape[1],
             effective_ratio,
             compressed_topk,
@@ -837,22 +965,87 @@ def _compressor_forward_cuda_kunlun(self, x, forward_batch, attn_backend=None):
     return self.forward_native(x, forward_batch, attn_backend=attn_backend)
 
 
-def _build_c4_prefill_contract(forward_batch, c4_seq_lens, page_table, device):
+def _build_c4_prefill_contract(
+    forward_batch, c4_seq_lens, page_table, device, num_queries
+):
     """Build the request-level LoD contract used by the 0.5.8 extend path."""
-    extend_lens = [int(value) for value in forward_batch.extend_seq_lens_cpu]
-    qlod_cpu = torch.zeros(len(extend_lens) + 1, dtype=torch.int32)
-    if extend_lens:
-        qlod_cpu[1:] = torch.cumsum(torch.tensor(extend_lens, dtype=torch.int32), 0)
-    last_rows = (qlod_cpu[1:] - 1).clamp(min=0, max=page_table.shape[0] - 1)
+    global_extend_lens = [int(value) for value in forward_batch.extend_seq_lens_cpu]
+    cp_ranks = _dsa_cp_prefill_ranks(forward_batch)
     c4_flat = c4_seq_lens.reshape(-1).to("cpu", dtype=torch.int32)
-    per_req_k_lens = c4_flat.index_select(
-        0, last_rows.clamp(max=c4_flat.numel() - 1).long()
-    )
+
+    if cp_ranks is None:
+        extend_lens = global_extend_lens
+        qlod_cpu = torch.zeros(len(extend_lens) + 1, dtype=torch.int32)
+        if extend_lens:
+            qlod_cpu[1:] = torch.cumsum(
+                torch.tensor(extend_lens, dtype=torch.int32), 0
+            )
+        last_rows = (qlod_cpu[1:] - 1).clamp(min=0, max=page_table.shape[0] - 1)
+        per_req_k_lens = c4_flat.index_select(
+            0, last_rows.clamp(max=c4_flat.numel() - 1).long()
+        )
+        prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+        use_causal = prefix_lens is not None and all(
+            int(value) < 3 for value in prefix_lens
+        )
+    else:
+        # CP round-robin: c4_seq_lens/page_table are per local token while
+        # extend_seq_lens_cpu stays global, so rebuild the per-request query
+        # windows from this rank's round-robin share.
+        cp_rank, cp_size = cp_ranks
+        extend_lens = _dsa_cp_local_extend_lens(
+            global_extend_lens, cp_rank, cp_size
+        )
+        extend_lens_tensor = torch.tensor(extend_lens, dtype=torch.int32)
+        qlod_cpu = torch.zeros(len(extend_lens) + 1, dtype=torch.int32)
+        if extend_lens:
+            qlod_cpu[1:] = torch.cumsum(extend_lens_tensor, 0)
+        last_rows = (qlod_cpu[1:].long() - 1).clamp(min=0)
+        # Ranks with no local token for a request must still address a valid
+        # page_table row.
+        last_rows[extend_lens_tensor <= 0] = 0
+        last_rows = last_rows.clamp(max=max(page_table.shape[0] - 1, 0)).to(
+            torch.int32
+        )
+        # The last LOCAL token is not the last GLOBAL token of the request, so
+        # the compressed KV length must come from the full request context.
+        per_req_k_lens = (
+            _seq_lens_cpu_i32(forward_batch)[: len(extend_lens)] // 4
+        ).to(torch.int32)
+        per_req_k_lens = torch.clamp(per_req_k_lens, min=1)
+        use_causal = False
+
     klod_cpu = torch.zeros(len(extend_lens) + 1, dtype=torch.int32)
     if extend_lens:
         klod_cpu[1:] = torch.cumsum(per_req_k_lens * 4, 0)
     com_k_start_cpu = torch.zeros(len(extend_lens), dtype=torch.int32)
-    prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+
+    # CP alignment pads the token dimension past the scheduler's extend lengths;
+    # each padding row becomes its own item with a single dummy compressed entry.
+    pad_rows = num_queries - int(qlod_cpu[-1].item())
+    if pad_rows < 0:
+        raise ValueError(
+            "Kunlun C4 extend lengths exceed the query rows: "
+            f"lengths={int(qlod_cpu[-1].item())}, queries={num_queries}"
+        )
+    if pad_rows:
+        pad_offsets = torch.arange(1, pad_rows + 1, dtype=torch.int32)
+        pad_last_rows = int(qlod_cpu[-1].item()) - 1 + pad_offsets
+        qlod_cpu = torch.cat([qlod_cpu, qlod_cpu[-1] + pad_offsets])
+        last_rows = torch.cat(
+            [
+                last_rows.to(torch.int32),
+                pad_last_rows.clamp(min=0, max=max(page_table.shape[0] - 1, 0)),
+            ]
+        )
+        per_req_k_lens = torch.cat(
+            [per_req_k_lens, torch.ones(pad_rows, dtype=torch.int32)]
+        )
+        klod_cpu = torch.cat([klod_cpu, klod_cpu[-1] + pad_offsets * 4])
+        com_k_start_cpu = torch.cat(
+            [com_k_start_cpu, torch.zeros(pad_rows, dtype=torch.int32)]
+        )
+
     return {
         "qlod_cpu": qlod_cpu,
         "qlod_xpu": qlod_cpu.to(device),
@@ -862,9 +1055,10 @@ def _build_c4_prefill_contract(forward_batch, c4_seq_lens, page_table, device):
         "com_k_start_xpu": com_k_start_cpu.to(device),
         "per_req_k_lens": per_req_k_lens,
         "last_rows": last_rows,
+        "max_seq_q": max(extend_lens) if extend_lens else 0,
         "max_seq_k": int(per_req_k_lens.max().item()) * 4 if per_req_k_lens.numel() else 0,
         "max_seq_k_compressed": int(per_req_k_lens.max().item()) if per_req_k_lens.numel() else 0,
-        "use_causal": prefix_lens is not None and all(int(value) < 3 for value in prefix_lens),
+        "use_causal": use_causal,
     }
 
 
@@ -970,7 +1164,7 @@ def _compute_c4_logits_kunlun(
             q = q.view(torch.int8)
         weights = weight.float().contiguous()
         contract = _build_c4_prefill_contract(
-            forward_batch, seq_lens, page_table, q.device
+            forward_batch, seq_lens, page_table, q.device, q.shape[0]
         )
         k, k_scale = _gather_c4_prefill_kv(
             kvcache_fp8, page_table, contract, q.device
@@ -987,7 +1181,7 @@ def _compute_c4_logits_kunlun(
                 k=k,
                 k_scale=k_scale,
                 logits=logits,
-                max_seq_q=max(int(value) for value in forward_batch.extend_seq_lens_cpu),
+                max_seq_q=contract["max_seq_q"],
                 max_seq_k=contract["max_seq_k"],
                 qlod_cpu=contract["qlod_cpu"],
                 qlod_xpu=contract["qlod_xpu"],

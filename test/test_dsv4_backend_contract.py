@@ -776,28 +776,41 @@ class KunlunDSV4BackendContractTest(unittest.TestCase):
         self.assertEqual(selected_lens.data_ptr(), request_lens.data_ptr())
         self.assertIs(selected_pages, request_pages)
 
-    def test_contiguous_prefill_matches_058_lod_contract(self):
+    @staticmethod
+    def _load_c4_prefill_contract(cp_ranks=None):
         path = ATTENTION_DIR / "kunlun_deepseek_v4_backend.py"
         tree = ast.parse(path.read_text(), filename=str(path))
+        wanted = {
+            "_build_c4_prefill_contract",
+            "_dsa_cp_local_extend_lens",
+            "_seq_lens_cpu_i32",
+        }
         helpers = ast.Module(
             body=[
                 node
                 for node in tree.body
-                if isinstance(node, ast.FunctionDef)
-                and node.name == "_build_c4_prefill_contract"
+                if isinstance(node, ast.FunctionDef) and node.name in wanted
             ],
             type_ignores=[],
         )
-        namespace = {"torch": torch}
+        namespace = {
+            "torch": torch,
+            "_dsa_cp_prefill_ranks": lambda _forward_batch: cp_ranks,
+        }
         exec(compile(helpers, str(path), "exec"), namespace)
+        return namespace["_build_c4_prefill_contract"]
+
+    def test_contiguous_prefill_matches_058_lod_contract(self):
+        build_contract = self._load_c4_prefill_contract()
         forward_batch = types.SimpleNamespace(
             extend_seq_lens_cpu=[3, 2], extend_prefix_lens_cpu=[0, 3]
         )
-        contract = namespace["_build_c4_prefill_contract"](
+        contract = build_contract(
             forward_batch,
             torch.tensor([[1], [2], [3], [4], [5]], dtype=torch.int32),
             torch.zeros((5, 2), dtype=torch.int32),
             torch.device("cpu"),
+            5,
         )
         self.assertEqual(contract["qlod_cpu"].tolist(), [0, 3, 5])
         self.assertEqual(contract["last_rows"].tolist(), [2, 4])
@@ -805,7 +818,99 @@ class KunlunDSV4BackendContractTest(unittest.TestCase):
         self.assertEqual(contract["klod_cpu"].tolist(), [0, 12, 32])
         self.assertEqual(contract["com_k_start_cpu"].tolist(), [0, 0])
         self.assertEqual(contract["max_seq_k"], 20)
+        self.assertEqual(contract["max_seq_q"], 3)
         self.assertFalse(contract["use_causal"])
+
+    def test_cp_aligned_padding_rows_extend_the_c4_contract(self):
+        build_contract = self._load_c4_prefill_contract()
+        forward_batch = types.SimpleNamespace(
+            extend_seq_lens_cpu=[6], extend_prefix_lens_cpu=[0]
+        )
+        contract = build_contract(
+            forward_batch,
+            torch.tensor([[1], [2], [3], [4], [5], [7], [0], [0]], dtype=torch.int32),
+            torch.zeros((8, 2), dtype=torch.int32),
+            torch.device("cpu"),
+            8,
+        )
+        self.assertEqual(int(contract["qlod_cpu"][-1].item()), 8)
+        self.assertEqual(contract["qlod_cpu"].tolist(), [0, 6, 7, 8])
+        self.assertEqual(contract["last_rows"].tolist(), [5, 6, 7])
+        self.assertEqual(contract["per_req_k_lens"].tolist(), [7, 1, 1])
+        self.assertEqual(contract["klod_cpu"].tolist(), [0, 28, 32, 36])
+        self.assertEqual(contract["com_k_start_cpu"].tolist(), [0, 0, 0])
+
+    def test_cp_round_robin_prefill_uses_local_windows_and_full_context(self):
+        build_contract = self._load_c4_prefill_contract(cp_ranks=(1, 4))
+        forward_batch = types.SimpleNamespace(
+            extend_seq_lens_cpu=[9, 3],
+            extend_prefix_lens_cpu=[0, 0],
+            seq_lens_cpu=torch.tensor([40, 24], dtype=torch.int32),
+            batch_size=2,
+        )
+        contract = build_contract(
+            forward_batch,
+            torch.ones((3, 1), dtype=torch.int32),
+            torch.zeros((3, 2), dtype=torch.int32),
+            torch.device("cpu"),
+            3,
+        )
+        # cp_rank=1, cp_size=4: request 0 keeps ceil-ish share 2, the spill of
+        # one token carries into request 1 which then keeps 1 token.
+        self.assertEqual(contract["qlod_cpu"].tolist(), [0, 2, 3])
+        self.assertEqual(contract["max_seq_q"], 2)
+        self.assertEqual(contract["last_rows"].tolist(), [1, 2])
+        # Full request context, not the c4 length at the last local token.
+        self.assertEqual(contract["per_req_k_lens"].tolist(), [10, 6])
+        self.assertEqual(contract["klod_cpu"].tolist(), [0, 40, 64])
+        self.assertFalse(contract["use_causal"])
+
+    def test_cp_round_robin_prefill_builds_per_token_attention_lod(self):
+        path = ATTENTION_DIR / "kunlun_deepseek_v4_backend.py"
+        tree = ast.parse(path.read_text(), filename=str(path))
+        helpers = ast.Module(
+            body=[
+                node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "_make_cp_prefill_lod"
+            ],
+            type_ignores=[],
+        )
+        namespace = {"torch": torch}
+        exec(compile(helpers, str(path), "exec"), namespace)
+        core_metadata = types.SimpleNamespace(
+            seq_lens_casual=torch.tensor([17, 21, 25], dtype=torch.int32)
+        )
+        q_lod_cpu, q_lod, kv_lens_cpu, kv_lens = namespace["_make_cp_prefill_lod"](
+            core_metadata, 4, torch.device("cpu")
+        )
+        self.assertEqual(q_lod_cpu.tolist(), [0, 1, 2, 3, 4])
+        self.assertEqual(q_lod.tolist(), q_lod_cpu.tolist())
+        self.assertEqual(int(q_lod_cpu[-1].item()), 4)
+        self.assertEqual(kv_lens_cpu.tolist(), [17, 21, 25, 1])
+        self.assertEqual(kv_lens.tolist(), kv_lens_cpu.tolist())
+
+    def test_cp_local_extend_lens_cover_every_global_token(self):
+        path = ATTENTION_DIR / "kunlun_deepseek_v4_backend.py"
+        tree = ast.parse(path.read_text(), filename=str(path))
+        helpers = ast.Module(
+            body=[
+                node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "_dsa_cp_local_extend_lens"
+            ],
+            type_ignores=[],
+        )
+        namespace = {"torch": torch}
+        exec(compile(helpers, str(path), "exec"), namespace)
+        split = namespace["_dsa_cp_local_extend_lens"]
+        global_lens = [9, 3, 7]
+        cp_size = 4
+        totals = [sum(split(global_lens, rank, cp_size)) for rank in range(cp_size)]
+        self.assertEqual(sum(totals), sum(global_lens))
+        self.assertEqual(split(global_lens, 0, 1), global_lens)
 
     def test_contiguous_prefill_gathers_058_segmented_cache_layout(self):
         path = ATTENTION_DIR / "kunlun_deepseek_v4_backend.py"
