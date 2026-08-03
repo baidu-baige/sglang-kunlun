@@ -1,4 +1,5 @@
 import ast
+import importlib.util
 import contextlib
 import inspect
 from pathlib import Path
@@ -13,11 +14,18 @@ from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 from sglang_kunlun.hooks import mtp_production as mtp
 from sglang_kunlun.hooks import production_precision as runtime
 from sglang_kunlun.hooks import ragged_draft_extend as ragged
-from sglang_kunlun.models import deepseek_v4_precision as model_precision
+from sglang_kunlun.hooks.mem_cache import common as mem_cache_common
 
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_HOOKS = ROOT / "sglang_kunlun" / "models" / "deepseek_v4_precision.py"
+MODEL_PRECISION_SPEC = importlib.util.spec_from_file_location(
+    "contract_production_deepseek_v4_precision", MODEL_HOOKS
+)
+assert MODEL_PRECISION_SPEC is not None and MODEL_PRECISION_SPEC.loader is not None
+model_precision = importlib.util.module_from_spec(MODEL_PRECISION_SPEC)
+sys.modules[MODEL_PRECISION_SPEC.name] = model_precision
+MODEL_PRECISION_SPEC.loader.exec_module(model_precision)
 RUNTIME_HOOKS = ROOT / "sglang_kunlun" / "hooks" / "production_precision.py"
 MTP_HOOKS = ROOT / "sglang_kunlun" / "hooks" / "mtp_production.py"
 BACKEND_HOOKS = (
@@ -29,6 +37,18 @@ BACKEND_HOOKS = (
     / "kunlun_deepseek_v4_backend.py"
 )
 LEGACY_MODEL_HOOKS = ROOT / "sglang_kunlun" / "models" / "deepseek_v4.py"
+DEEPEP_HOOKS = (
+    ROOT
+    / "sglang_kunlun"
+    / "hooks"
+    / "layers"
+    / "moe"
+    / "token_dispatcher"
+    / "deepep.py"
+)
+UPSTREAM_DSV4_MODEL = (
+    ROOT.parent / "sglang" / "python" / "sglang" / "srt" / "models" / "deepseek_v4.py"
+)
 
 
 class ProductionPrecisionContractTest(unittest.TestCase):
@@ -44,6 +64,36 @@ class ProductionPrecisionContractTest(unittest.TestCase):
 
     def test_actual_plugin_registrations_and_signatures(self):
         targets = (
+            (
+                "sglang.srt.layers.attention.dsv4.indexer.C4Indexer.__init__",
+                HookType.AFTER,
+                model_precision.initialize_c4_indexer_parameter_dtype_kunlun,
+                ("result", "self", "args", "kwargs"),
+            ),
+            (
+                "sglang.srt.layers.attention.dsv4.compressor.Compressor.__init__",
+                HookType.AFTER,
+                model_precision.initialize_compressor_parameter_dtype_kunlun,
+                ("result", "self", "args", "kwargs"),
+            ),
+            (
+                "sglang.srt.models.deepseek_v2.MoEGate.forward",
+                HookType.AROUND,
+                model_precision.moe_gate_forward_half_precision_kunlun,
+                (
+                    "original_fn",
+                    "self",
+                    "hidden_states",
+                    "gemm_output_zero_allocator",
+                    "forward_batch",
+                ),
+            ),
+            (
+                "sglang.srt.models.deepseek_v4.MQALayer.__init__",
+                HookType.AFTER,
+                model_precision.initialize_mqa_rope_policy_kunlun,
+                ("result", "self", "config", "args", "kwargs"),
+            ),
             (
                 "sglang.srt.models.deepseek_v4.MQALayer.forward",
                 HookType.REPLACE,
@@ -79,12 +129,123 @@ class ProductionPrecisionContractTest(unittest.TestCase):
                 ragged.make_ragged_draft_extend_lod_kunlun,
                 ("original_fn", "self", "forward_batch", "num_queries", "device"),
             ),
+            (
+                "sglang.srt.mem_cache.deepseek_v4_memory_pool."
+                "DeepSeekV4IndexerPool._create_buffer",
+                HookType.AROUND,
+                mem_cache_common.dsv4_indexer_pool_create_buffer_kunlun,
+                ("original_fn", "self"),
+            ),
         )
         for target, hook_type, function, expected_parameters in targets:
             self.assert_registered(target, hook_type, function)
             self.assertEqual(
                 tuple(inspect.signature(function).parameters), expected_parameters
             )
+
+    def test_deepep_auto_declares_two_mode_buffers(self):
+        tree = ast.parse(DEEPEP_HOOKS.read_text(), filename=str(DEEPEP_HOOKS))
+        buffer_class = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "DeepEPBuffer"
+        )
+        source = ast.unparse(buffer_class)
+        self.assertIn("_normal_buffer = None", source)
+        self.assertIn("_low_latency_buffer = None", source)
+        self.assertIn("'_normal_buffer'", source)
+        self.assertIn("'_low_latency_buffer'", source)
+        self.assertIn("setattr(cls, buffer_attr, buffer)", source)
+
+    def test_moe_gate_forward_matches_058_half_contract_and_preserves_fallback(self):
+        for dtype in (torch.bfloat16, torch.float16):
+            with self.subTest(dtype=dtype):
+                hidden_states = torch.tensor(
+                    [[1.0, 2.0], [3.0, 4.0]], dtype=dtype
+                )
+                owner = types.SimpleNamespace(
+                    is_deepseek_v4=True,
+                    weight=torch.tensor(
+                        [[2.0, -1.0], [0.5, 3.0]], dtype=dtype
+                    ),
+                )
+                original_fn = mock.Mock(
+                    side_effect=AssertionError("DSV4 half path must bypass upstream")
+                )
+
+                actual = model_precision.moe_gate_forward_half_precision_kunlun(
+                    original_fn, owner, hidden_states
+                )
+
+                self.assertEqual(actual.dtype, dtype)
+                torch.testing.assert_close(
+                    actual, hidden_states @ owner.weight.T, rtol=0, atol=0
+                )
+                original_fn.assert_not_called()
+
+        fallback = object()
+        owner = types.SimpleNamespace(
+            is_deepseek_v4=False,
+            weight=torch.ones((2, 2), dtype=torch.float16),
+        )
+        hidden_states = torch.ones((1, 2), dtype=torch.float16)
+        allocator = object()
+        forward_batch = object()
+        original_fn = mock.Mock(return_value=fallback)
+
+        actual = model_precision.moe_gate_forward_half_precision_kunlun(
+            original_fn,
+            owner,
+            hidden_states,
+            allocator,
+            forward_batch,
+        )
+
+        self.assertIs(actual, fallback)
+        original_fn.assert_called_once_with(
+            owner,
+            hidden_states,
+            allocator,
+            forward_batch,
+        )
+
+    def test_mqa_init_matches_requested_wo_a_parameter_dtype(self):
+        config = types.SimpleNamespace(rope_scaling=None)
+
+        for requested_dtype, expected_dtype in (
+            ("float16", torch.float16),
+            ("bfloat16", torch.bfloat16),
+        ):
+            with self.subTest(requested_dtype=requested_dtype):
+                weight = torch.nn.Parameter(
+                    torch.ones((1, 2, 4), dtype=torch.bfloat16),
+                    requires_grad=False,
+                )
+                from sglang.srt.layers.quantization.unquant import (
+                    UnquantizedLinearMethod,
+                )
+
+                owner = types.SimpleNamespace(
+                    compress_ratio=0,
+                    wo_a=types.SimpleNamespace(
+                        weight=weight,
+                        quant_method=UnquantizedLinearMethod(),
+                        params_dtype=torch.bfloat16,
+                    ),
+                )
+                server_args = types.SimpleNamespace(dtype=requested_dtype)
+                with mock.patch(
+                    "sglang.srt.server_args.get_global_server_args",
+                    return_value=server_args,
+                ):
+                    result = model_precision.initialize_mqa_rope_policy_kunlun(
+                        None, owner, config
+                    )
+
+                self.assertIsNone(result)
+                self.assertIs(owner.wo_a.weight, weight)
+                self.assertEqual(owner.wo_a.params_dtype, expected_dtype)
+                self.assertEqual(owner.wo_a.weight.dtype, expected_dtype)
 
     def test_mqa_forward_uses_deterministic_global_slots_and_local_output(self):
         upstream = types.ModuleType("sglang.srt.models.deepseek_v4")
@@ -592,13 +753,97 @@ class ProductionPrecisionContractTest(unittest.TestCase):
         self.assertEqual(observed[0].tolist(), [8])
         self.assertEqual(batch.positions.tolist(), [8])
 
+    def test_backend_monkey_patches_are_exact_plugin_hooks(self):
+        source = BACKEND_HOOKS.read_text()
+        tree = ast.parse(source, filename=str(BACKEND_HOOKS))
+        functions = {
+            node.name: node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        expected = {
+            "_create_paged_compressor_data_kunlun": (
+                "sglang.srt.layers.attention.deepseek_v4_backend."
+                "create_paged_compressor_data",
+                "AROUND",
+            ),
+            "_generate_compressor_prefill_plan_kunlun": (
+                "sglang.jit_kernel.dsv4.compress_old."
+                "CompressorPrefillPlan.generate",
+                "REPLACE",
+            ),
+            "_compressor_forward_cuda_kunlun": (
+                "sglang.srt.layers.attention.dsv4.compressor."
+                "Compressor.forward_cuda",
+                "REPLACE",
+            ),
+        }
+        for name, (target, hook_type) in expected.items():
+            function = functions[name]
+            decorators = [
+                decorator
+                for decorator in function.decorator_list
+                if isinstance(decorator, ast.Call)
+                and isinstance(decorator.func, ast.Name)
+                and decorator.func.id == "plugin_hook"
+            ]
+            self.assertEqual(len(decorators), 1)
+            decorator = decorators[0]
+            self.assertEqual(ast.literal_eval(decorator.args[0]), target)
+            type_arg = next(
+                keyword.value
+                for keyword in decorator.keywords
+                if keyword.arg == "type"
+            )
+            self.assertEqual(ast.unparse(type_arg), f"HookType.{hook_type}")
+
+        forbidden_assignments = {
+            "upstream.create_paged_compressor_data",
+            "CompressorPrefillPlan.generate",
+            "Compressor.forward_cuda",
+        }
+        assigned = {
+            ast.unparse(target)
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+        }
+        self.assertTrue(forbidden_assignments.isdisjoint(assigned))
+
+        adapter_node = functions["_create_paged_compressor_data_kunlun"]
+        adapter_node.decorator_list = []
+        namespace = {}
+        exec(
+            compile(
+                ast.Module(body=[adapter_node], type_ignores=[]),
+                str(BACKEND_HOOKS),
+                "exec",
+            ),
+            namespace,
+        )
+        original = mock.Mock(return_value="paged-data")
+        result = namespace["_create_paged_compressor_data_kunlun"](
+            original,
+            "payload",
+            online_state_slot_offset=7,
+            keep=True,
+        )
+        self.assertEqual(result, "paged-data")
+        original.assert_called_once_with("payload", keep=True)
+
     def test_preserved_runtime_contracts_and_no_hot_global_rebinding(self):
         model_source = MODEL_HOOKS.read_text()
         mtp_source = MTP_HOOKS.read_text()
         runtime_source = RUNTIME_HOOKS.read_text()
         legacy_model_source = LEGACY_MODEL_HOOKS.read_text()
+        upstream_model_source = UPSTREAM_DSV4_MODEL.read_text()
         backend_source = BACKEND_HOOKS.read_text()
 
+        self.assertNotIn("_dsv4_dump_probe", upstream_model_source)
+        self.assertNotIn("_dsv4_module_name", upstream_model_source)
+        self.assertNotIn("dsv4_probe_bridge", upstream_model_source)
+        self.assertNotIn("_dsv4_dump_probe", model_source)
+        self.assertNotIn("_dsv4_dump_probe", legacy_model_source)
         self.assertIn("original_seq_len=0", model_source)
         self.assertIn("local_q_out = torch.empty_like(q)", model_source)
         self.assertIn("kv = self.kv_norm(kv)", model_source)

@@ -40,7 +40,7 @@ def moe_fused_gate(
 
     num_tokens, num_experts = input_tensor.shape
     block_statistic = torch.empty(
-        12, num_experts, dtype=torch.int32, device=input_tensor.device
+        12, num_experts + 1, dtype=torch.int32, device=input_tensor.device
     )
     topk_weights = torch.empty(
         num_tokens, topk, dtype=torch.float32, device=input_tensor.device
@@ -52,7 +52,7 @@ def moe_fused_gate(
         x=input_tensor,
         topk_index=topk_ids,
         norm_score=topk_weights,
-        block_static=block_statistic,
+        block_statistic=block_statistic,
         bias=bias.float(),
         scale=(routed_scaling_factor if apply_routed_scaling_factor_on_output else 1.0),
         n_group=num_expert_group,

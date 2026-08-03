@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import nullcontext
 
 import torch
 
@@ -59,6 +60,54 @@ def dsv4_create_buffer_kunlun(original_fn, self, *, num_pages: int):
         dtype=self.store_dtype,
         device=self.device,
     )
+
+
+_ALIGNMENT_2M = 2 * 1024 * 1024
+
+
+def _alloc_2m_aligned(total_bytes: int, dtype: torch.dtype, device: str):
+    element_size = torch.tensor([], dtype=dtype).element_size()
+    assert total_bytes % element_size == 0
+    aligned_bytes = (total_bytes + _ALIGNMENT_2M - 1) // _ALIGNMENT_2M * _ALIGNMENT_2M
+    flat = torch.zeros(
+        aligned_bytes + _ALIGNMENT_2M,
+        dtype=torch.uint8,
+        device=device,
+    )
+    offset = (_ALIGNMENT_2M - flat.data_ptr() % _ALIGNMENT_2M) % _ALIGNMENT_2M
+    return flat[offset : offset + total_bytes].view(dtype)
+
+
+@plugin_hook(
+    "sglang.srt.mem_cache.deepseek_v4_memory_pool.DeepSeekV4IndexerPool._create_buffer",
+    type=HookType.AROUND,
+)
+def dsv4_indexer_pool_create_buffer_kunlun(original_fn, self):
+    """Allocate the Kunlun indexer pool with RDMA-safe 2MB backing pages."""
+    from sglang_kunlun.hooks.utils.common import _is_kunlun
+
+    if not _is_kunlun():
+        return original_fn(self)
+
+    from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+
+    page_bytes = self.page_size * self.get_bytes_per_token()
+    num_pages = (self.size + self.page_size + 1) // self.page_size
+    dtype = self.index_k_with_scale_buffer_dtype
+    total_bytes = num_pages * page_bytes * torch.tensor([], dtype=dtype).element_size()
+    with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+        with (
+            torch.cuda.use_mem_pool(self.custom_mem_pool)
+            if self.custom_mem_pool
+            else nullcontext()
+        ):
+            self.index_k_with_scale_buffer = [
+                _alloc_2m_aligned(total_bytes, dtype, self.device).reshape(
+                    num_pages, page_bytes
+                )
+                for _ in range(self.layer_num)
+            ]
+
 
 # from __future__ import annotations
 

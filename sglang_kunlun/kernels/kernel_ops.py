@@ -262,6 +262,28 @@ def dsv4_compress_forward_kunlun(
         )
     assert head_dim % 128 == 0
     assert plan.compress_ratio == compress_ratio
+
+    buffer_size = kv_score_buffer.shape[0]
+    if indices is not None and indices.numel() > 0:
+        invalid_indices = (indices < 0) | (indices >= buffer_size)
+        if invalid_indices.any():
+            indices = indices.clamp(min=0, max=buffer_size - 1)
+    if extra_data is not None and extra_data.numel() > 0:
+        if indices is not None and indices.numel() > 0:
+            if extra_data.dim() == 2 and extra_data.shape[1] == 4:
+                # Preserve overlap READ sources in columns 0/1. Only redirect the
+                # invalid prefill WRITE destination away from shared state slot 0.
+                mask = extra_data[:, 2] == 0
+                if mask.any():
+                    extra_data = extra_data.clone()
+                    extra_data[:, 2] = torch.where(mask, indices, extra_data[:, 2])
+            elif extra_data.dim() == 2 and extra_data.shape[1] == 1:
+                # Decode has a single overlap write destination per request.
+                mask = extra_data[:, 0] == 0
+                if mask.any():
+                    extra_data = extra_data.clone()
+                    extra_data[:, 0] = torch.where(mask, indices, extra_data[:, 0])
+
     if out is None:
         out = kv_score_input.new_empty((kv_score_input.shape[0], head_dim))
     payload, write_plan, _ = _dsv4_plan_payload(plan)
@@ -875,7 +897,7 @@ def dsv4_linear_bf16_fp32_kunlun(
     x: torch.Tensor,
     y: torch.Tensor,
 ) -> torch.Tensor:
-    """Match the 0.5.8 ``torch`` GEMM configuration on Kunlun."""
+    """Preserve the shared DSV4 FP32-output GEMM contract."""
 
     return torch.nn.functional.linear(x.float(), y.float())
 
