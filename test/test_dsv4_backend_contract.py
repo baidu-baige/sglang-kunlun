@@ -776,6 +776,31 @@ class KunlunDSV4BackendContractTest(unittest.TestCase):
         self.assertEqual(selected_lens.data_ptr(), request_lens.data_ptr())
         self.assertIs(selected_pages, request_pages)
 
+    def test_indexer_pool_backing_is_2m_aligned(self):
+        path = ROOT / "sglang_kunlun" / "hooks" / "mem_cache" / "common.py"
+        tree = ast.parse(path.read_text(), filename=str(path))
+        nodes = [
+            node
+            for node in tree.body
+            if (
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name) and target.id == "_ALIGNMENT_2M"
+                    for target in node.targets
+                )
+            )
+            or (
+                isinstance(node, ast.FunctionDef)
+                and node.name == "_alloc_2m_aligned"
+            )
+        ]
+        namespace = {"torch": torch}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
+        tensor = namespace["_alloc_2m_aligned"](4096, torch.uint8, "cpu")
+        self.assertEqual(tensor.data_ptr() % (2 * 1024 * 1024), 0)
+        self.assertEqual(tensor.numel(), 4096)
+        self.assertTrue(torch.equal(tensor, torch.zeros_like(tensor)))
+
     def test_contiguous_prefill_matches_058_lod_contract(self):
         path = ATTENTION_DIR / "kunlun_deepseek_v4_backend.py"
         tree = ast.parse(path.read_text(), filename=str(path))
@@ -798,6 +823,7 @@ class KunlunDSV4BackendContractTest(unittest.TestCase):
             torch.tensor([[1], [2], [3], [4], [5]], dtype=torch.int32),
             torch.zeros((5, 2), dtype=torch.int32),
             torch.device("cpu"),
+            5,
         )
         self.assertEqual(contract["qlod_cpu"].tolist(), [0, 3, 5])
         self.assertEqual(contract["last_rows"].tolist(), [2, 4])
@@ -806,6 +832,34 @@ class KunlunDSV4BackendContractTest(unittest.TestCase):
         self.assertEqual(contract["com_k_start_cpu"].tolist(), [0, 0])
         self.assertEqual(contract["max_seq_k"], 20)
         self.assertFalse(contract["use_causal"])
+
+    def test_cp_prefix_lens_and_padding_extend_lod_contract(self):
+        path = ATTENTION_DIR / "kunlun_deepseek_v4_backend.py"
+        tree = ast.parse(path.read_text(), filename=str(path))
+        helper = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_build_c4_prefill_contract"
+        )
+        namespace = {"torch": torch}
+        exec(compile(ast.Module(body=[helper], type_ignores=[]), str(path), "exec"), namespace)
+        forward_batch = types.SimpleNamespace(
+            extend_seq_lens_cpu=[3, 2],
+            seq_lens_cpu=torch.tensor([20, 12], dtype=torch.int32),
+            extend_prefix_lens_cpu=[16, 8],
+        )
+        contract = namespace["_build_c4_prefill_contract"](
+            forward_batch,
+            torch.ones((6, 1), dtype=torch.int32),
+            torch.zeros((6, 2), dtype=torch.int32),
+            torch.device("cpu"),
+            6,
+        )
+        self.assertEqual(contract["qlod_cpu"].tolist(), [0, 3, 5, 6])
+        self.assertEqual(contract["last_rows"].tolist(), [2, 4, 5])
+        self.assertEqual(contract["per_req_k_lens"].tolist(), [5, 3, 1])
+        self.assertEqual(contract["klod_cpu"].tolist(), [0, 20, 32, 36])
 
     def test_contiguous_prefill_gathers_058_segmented_cache_layout(self):
         path = ATTENTION_DIR / "kunlun_deepseek_v4_backend.py"

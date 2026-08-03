@@ -28,4 +28,4 @@ sglang-kunlun-launch = "sglang_kunlun.launch:main"
 py-modules = ["sitecustomize"]
 
 [tool.setuptools.packages.find]
-include = ["sglang_kunlun*"]
+include = ["sglang_kunlun*", "debug*"]

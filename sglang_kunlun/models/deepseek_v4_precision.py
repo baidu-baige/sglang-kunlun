@@ -8,12 +8,81 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 from sglang_kunlun.kernels.kernel_ops import dsv4_mqa_wo_a_einsum_kunlun
 
 
+_FP16_DTYPE_NAMES = frozenset(("fp16", "float16", "half"))
+
+
+@plugin_hook(
+    "sglang.srt.models.deepseek_v2.MoEGate.forward",
+    type=HookType.AROUND,
+)
+def moe_gate_forward_half_precision_kunlun(
+    original_fn,
+    self,
+    hidden_states,
+    gemm_output_zero_allocator=None,
+    forward_batch=None,
+):
+    """Match the 0.5.8 direct half-precision DSV4 router GEMM contract."""
+    if (
+        self.is_deepseek_v4
+        and hidden_states.dtype == self.weight.dtype
+        and hidden_states.dtype in (torch.bfloat16, torch.float16)
+    ):
+        return hidden_states @ self.weight.T
+    return original_fn(
+        self,
+        hidden_states,
+        gemm_output_zero_allocator,
+        forward_batch,
+    )
+
+
+def _restore_requested_fp16_parameter_dtype(*linears):
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+    from sglang.srt.server_args import get_global_server_args
+
+    if get_global_server_args().dtype not in _FP16_DTYPE_NAMES:
+        return
+
+    for linear in linears:
+        if not isinstance(
+            getattr(linear, "quant_method", None), UnquantizedLinearMethod
+        ):
+            continue
+        linear.params_dtype = torch.float16
+        weight = getattr(linear, "weight", None)
+        if weight is not None and weight.dtype != torch.float16:
+            weight.data = weight.data.to(dtype=torch.float16)
+
+
+@plugin_hook(
+    "sglang.srt.layers.attention.dsv4.indexer.C4Indexer.__init__",
+    type=HookType.AFTER,
+)
+def initialize_c4_indexer_parameter_dtype_kunlun(result, self, *args, **kwargs):
+    """Restore the 0.5.8 requested dtype for C4 indexer projections."""
+    _restore_requested_fp16_parameter_dtype(self.wq_b, self.weights_proj)
+    return result
+
+
+@plugin_hook(
+    "sglang.srt.layers.attention.dsv4.compressor.Compressor.__init__",
+    type=HookType.AFTER,
+)
+def initialize_compressor_parameter_dtype_kunlun(result, self, *args, **kwargs):
+    """Restore the 0.5.8 requested dtype for the compressor gate projection."""
+    _restore_requested_fp16_parameter_dtype(self.wkv_gate)
+    return result
+
+
 @plugin_hook(
     "sglang.srt.models.deepseek_v4.MQALayer.__init__",
     type=HookType.AFTER,
 )
 def initialize_mqa_rope_policy_kunlun(result, self, config, *args, **kwargs):
-    """Use plain RoPE for dense layers and retain YaRN for compressed layers."""
+    """Restore the 0.5.8 FP16 wo_a and dense-layer RoPE contracts."""
+    _restore_requested_fp16_parameter_dtype(self.wo_a)
+
     if self.compress_ratio:
         return result
 
@@ -164,8 +233,9 @@ def mqa_forward_global_head_layout_kunlun(
 
     attn_k = kv if kv is not None else q
     if is_unified_kv_triton():
+        attn_q = q_out if q_out is not None else q
         o = attn_backend.forward(
-            q=q_out if q_out is not None else q,
+            q=attn_q,
             k=attn_k,
             v=attn_k,
             layer=self.attn_mqa,
