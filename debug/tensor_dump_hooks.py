@@ -1106,6 +1106,7 @@ def tag_mqa_wqkv_a_for_static_dump(
     *args,
     **kwargs,
 ):
+    """Tag the fused W8A8 projection with its fully qualified module name."""
     del config, layer_id, quant_config, args, kwargs
     if getattr(self, "fuse_wqa_wkv", False):
         from sglang.srt.utils import add_prefix
@@ -1115,6 +1116,7 @@ def tag_mqa_wqkv_a_for_static_dump(
 
 
 def install_static_w8a8_module_name_hook() -> int:
+    """Install the optional static W8A8 module-name hook."""
     if not _static_w8a8_module_name_enabled():
         return 0
     from sglang.srt.plugins.hook_registry import HookRegistry
@@ -1139,6 +1141,7 @@ def _decode_layer_alias_enabled():
 
 
 def prepare_decode_layer_aliases_kunlun(result, self, size, stream_idx=None):
+    """Prepare a reusable buffer for decode-layer alias capture."""
     if not _decode_layer_alias_enabled():
         return result
     batch_size = int(os.getenv("DSV4_DECODE_LAYER_ALIAS_BATCH_SIZE", "1"))
@@ -1204,6 +1207,7 @@ def capture_decode_layer_alias_kunlun(
     *args,
     **kwargs,
 ):
+    """Capture decoder-layer hidden states into the reusable alias buffer."""
     if not hasattr(forward_batch, "_dsv4_decode_layer_buffer"):
         return result
     if getattr(self, "use_fused_mhc_post_pre", False):
@@ -1232,6 +1236,7 @@ def retain_decode_layer_aliases_kunlun(
     stream_idx=None,
     variant_label=None,
 ):
+    """Retain the captured decode-layer buffer for the active CUDA graph."""
     batch_size = int(os.getenv("DSV4_DECODE_LAYER_ALIAS_BATCH_SIZE", "1"))
     capture_batch = getattr(self, "_dsv4_decode_layer_capture_batch", None)
     if size != batch_size or capture_batch is None or not hasattr(
@@ -1251,6 +1256,7 @@ def retain_decode_layer_aliases_kunlun(
 def dump_decode_layer_aliases_kunlun(
     result, self, forward_batch, pp_proxy_tensors=None
 ):
+    """Persist the captured decode-layer aliases for the selected sequence."""
     if not _decode_layer_alias_enabled() or not forward_batch.forward_mode.is_decode():
         return result
     dump_dir = os.getenv("DSV4_DECODE_LAYER_ALIAS_DUMP_DIR")
@@ -1337,6 +1343,7 @@ _DECODE_ALIAS_HOOKS = (
 
 
 def install_decode_layer_alias_hooks() -> int:
+    """Install the optional decode-layer alias hooks."""
     if not _decode_layer_alias_enabled():
         return 0
     # Imported lazily: the unit tests stub sglang.srt.plugins.hook_registry with

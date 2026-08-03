@@ -38,6 +38,7 @@ def dump_linear_stage(layer, name: str, value) -> None:
 
 
 def dump_selected_linear_parameters(layer: torch.nn.Module) -> None:
+    """Dump parameters for the configured static W8A8 module and rank."""
     output_path = os.getenv("DSV4_STATIC_W8A8_DUMP_PATH")
     selected_module = os.getenv("DSV4_STATIC_W8A8_DUMP_MODULE")
     module_name = getattr(layer, "_dsv4_module_name", None)
@@ -73,6 +74,7 @@ def dump_selected_moe_rows(
     num_tokens: int,
     top_k: int,
 ) -> None:
+    """Dump configured token rows from a MoE tensor callback."""
     callback = getattr(layer, "_dsv4_moe_tensor_dump_callback", None)
     rows_text = os.getenv("DSV4_W8A8_MOE_DUMP_ROWS")
     stages_text = os.getenv("DSV4_W8A8_MOE_DUMP_STAGES")
@@ -107,6 +109,7 @@ def dump_selected_moe_tensor(
     name: str,
     value: torch.Tensor,
 ) -> None:
+    """Dump a selected MoE tensor when its stage is enabled."""
     callback = getattr(layer, "_dsv4_moe_tensor_dump_callback", None)
     stages_text = os.getenv("DSV4_W8A8_MOE_DUMP_STAGES")
     if callback is None or not isinstance(value, torch.Tensor):
@@ -197,6 +200,7 @@ def dump_compressed_attention_outputs(
     max_logits_op,
     lse_op,
 ) -> None:
+    """Capture outputs returned by the compressed-attention operator."""
     operator_probe = getattr(
         backend, "_dsv4_tensor_dump_compressed_attention_callback", None
     )

@@ -45,6 +45,7 @@ ACCURACY_DUMP_DIR = os.environ.get("DSV4_ACCURACY_DUMP_ROOT", "/home/zx/debug_du
 
 
 def accuracy_dumps_enabled() -> bool:
+    """Return whether one-off accuracy tensor dumps are enabled."""
     return os.environ.get(ACCURACY_DUMP_ENV_VAR) == "1"
 
 
@@ -213,6 +214,7 @@ def _mtp_probe_layout(tensor: torch.Tensor) -> dict:
 
 
 def dump_previous_mtp_tensor_probe(multistep_backend, forward_batch) -> None:
+    """Dump the previous multistep backend tensor probe when selected."""
     dump_dir = os.environ.get("DSV4_MTP_TENSOR_DUMP_DIR")
     rank = (
         torch.distributed.get_rank()
@@ -455,6 +457,7 @@ def capture_attention_aliases_inputs(backend, scope):
 
 
 def capture_attention_aliases_outputs(backend, scope):
+    """Capture compressed-attention outputs in the active alias payload."""
     aliases = _decode_attention_aliases(scope)
     if aliases is None:
         return
@@ -583,6 +586,7 @@ def capture_mtp_attention_inputs(backend, scope):
 
 
 def capture_mtp_attention_outputs(backend, scope):
+    """Capture compressed-attention outputs for the active MTP probe."""
     prefix = getattr(backend, "_dsv4_mtp_attention_prefix", None)
     if not prefix:
         return
@@ -688,6 +692,7 @@ def capture_prefill_backend_inputs(backend, scope):
 
 
 def dump_prefill_backend_probe(backend, scope):
+    """Persist the selected prefill backend probe and clear its state."""
     probe = getattr(backend, "_dsv4_prefill_backend_probe", None)
     if not probe:
         return
@@ -1099,6 +1104,7 @@ def capture_alloc_extend_inputs(allocator, scope):
 
 
 def dump_alloc_extend_outputs(allocator, scope):
+    """Persist allocator outputs for the active extend probe."""
     from pathlib import Path
 
     global _ALLOC_EXTEND_PROBE_CALL
@@ -1758,6 +1764,7 @@ def capture_layer42_summary(
 
 
 def dump_layer42_summary(backend, *, out):
+    """Persist the layer-42 NaN and index summary."""
     summary = getattr(backend, "_dsv4_layer42_summary", None)
     if not summary:
         return
@@ -1770,6 +1777,7 @@ def dump_layer42_summary(backend, *, out):
 
 
 def dump_matched_attention_output(*, layer, forward_batch, q_3d, out):
+    """Persist attention output for the selected matched prefill chunk."""
     if not _matched_prefill_snapshot_selected(
         layer, forward_batch, q_3d, 0, 8192
     ):
@@ -1782,6 +1790,7 @@ def dump_matched_attention_output(*, layer, forward_batch, q_3d, out):
 
 
 def dump_decode_layer_attention_output(backend, *, out):
+    """Store decode attention output in the selected layer probe payload."""
     probe_prefix = getattr(backend, "_dsv4_decode_probe_prefix", None)
     if not probe_prefix:
         return
@@ -1794,6 +1803,7 @@ def dump_decode_layer_cache_rows(
     backend, *, forward_batch, win_cache_op, win_indices_op, extra_cache_op,
     extra_indices_op,
 ):
+    """Store cache rows consumed by the selected decode layer probe."""
     probe_prefix = getattr(backend, "_dsv4_decode_probe_prefix", None)
     if not probe_prefix:
         return
