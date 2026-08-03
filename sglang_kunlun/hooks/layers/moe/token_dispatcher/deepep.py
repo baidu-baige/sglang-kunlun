@@ -139,6 +139,8 @@ class DeepEPDispatchMode(IntEnum):
 class DeepEPBuffer:
     """DeepEPBuffer"""
     _buffer = None
+    _normal_buffer = None
+    _low_latency_buffer = None
     _dispatch_mode: Optional[DeepEPDispatchMode] = None
     _hidden_size: Optional[int] = None
     _num_max_dispatch_tokens_per_rank: Optional[int] = None
@@ -155,15 +157,29 @@ class DeepEPBuffer:
         num_experts: int = -1,
     ):
         """get_deepep_buffer"""
-        if cls._buffer is not None:
-            return cls._buffer
+        if deepep_mode == DeepEPMode.AUTO:
+            buffer_attr = (
+                "_low_latency_buffer"
+                if cls._dispatch_mode == DeepEPDispatchMode.LOW_LATENCY
+                else "_normal_buffer"
+            )
+            enable_normal = cls._dispatch_mode == DeepEPDispatchMode.NORMAL
+            enable_low_latency = cls._dispatch_mode == DeepEPDispatchMode.LOW_LATENCY
+        else:
+            buffer_attr = "_buffer"
+            enable_normal = deepep_mode.enable_normal()
+            enable_low_latency = deepep_mode.enable_low_latency()
+
+        buffer = getattr(cls, buffer_attr)
+        if buffer is not None:
+            return buffer
 
         cls._hidden_size = hidden_size
         cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         cls._num_experts = num_experts
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
-        if deepep_mode.enable_normal():
+        if enable_normal:
             hidden_bytes = hidden_size * param_bytes
             for config in (
                 DeepEPConfig.get_instance().normal_dispatch_config
@@ -179,7 +195,7 @@ class DeepEPBuffer:
                     config.get_rdma_buffer_size_hint(hidden_bytes, group.size()),
                     num_rdma_bytes,
                 )
-        if deepep_mode.enable_low_latency():
+        if enable_low_latency:
             assert num_max_dispatch_tokens_per_rank != -1
             assert num_experts != -1 and num_experts % group.size() == 0
             num_rdma_bytes = max(
@@ -223,25 +239,27 @@ class DeepEPBuffer:
                 f"Consider using --deepep-config to change the behavior."
             )
         
-        cls._buffer = Buffer(
+        buffer = Buffer(
             group,
             num_nvl_bytes,
             num_rdma_bytes,
-            low_latency_mode=deepep_mode.enable_low_latency(),
+            low_latency_mode=enable_low_latency,
             num_qps_per_rank=num_qps_per_rank,
             # TODO can be false when unneeded
             allow_mnnvl=True,
             num_experts=num_experts,
         )
-        
-        return cls._buffer
+        setattr(cls, buffer_attr, buffer)
+
+        return buffer
 
     @classmethod
     def clean_buffer(cls):
         """clean_buffer"""
-        if not cls._buffer.low_latency_mode:
+        buffer = cls._low_latency_buffer or cls._buffer
+        if buffer is None or not buffer.low_latency_mode:
             return
-        cls._buffer.clean_low_latency_buffer(
+        buffer.clean_low_latency_buffer(
             cls._num_max_dispatch_tokens_per_rank,
             cls._hidden_size,
             cls._num_experts,
