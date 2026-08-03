@@ -54,7 +54,6 @@ def _dsv4_probe(group: str, tensors: Mapping[str, object], **meta) -> None:
     os.makedirs(output_dir, exist_ok=True)
     torch.save(payload, os.path.join(output_dir, f"rank{rank}_{group}_{index:04d}.pt"))
 
-
 def _debug_tensor_meta(name: str, value: object) -> str:
     if isinstance(value, torch.Tensor):
         return f"{name}: shape={tuple(value.shape)}, dtype={value.dtype}, device={value.device}"
