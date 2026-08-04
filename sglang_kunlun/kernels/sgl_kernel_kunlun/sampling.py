@@ -89,7 +89,7 @@ def tree_speculative_sampling_target_only(
 
     # NOTE: In the mimo reference (speculative_klx.py), predicts has shape
     # [bs * num_draft_tokens + 1] so [:-1] removes the bonus-token slot.
-    # In aiak_sglang 0.5.8, predict is allocated as [bs * num_draft_tokens]
+    # In aiak_sglang , predict is allocated as [bs * num_draft_tokens]
     # (no extra slot), so we view directly without slicing.
     kunlun_ops.tree_speculative_sampling_target_only(
         candidates.to(torch.int32),

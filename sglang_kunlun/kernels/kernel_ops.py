@@ -192,13 +192,13 @@ def _patch_symbol(spec: KernelSpec, replacement: object) -> None:
 def dsv4_mqa_wo_a_einsum_kunlun(
     o: torch.Tensor, weight: torch.Tensor
 ) -> torch.Tensor:
-    """Run the 0.5.8 Kunlun wo_a reduction contract."""
+    """Run the Kunlun wo_a reduction contract."""
 
     return torch.ops.xspeedgate_ops.einsum_tgd_grd_tgr(o.contiguous(), weight)
 
 
 def dsv4_mqa_forward_with_full_sink_kunlun(original_fn, self, *args, **kwargs):
-    """Expose the full 0.5.8 attention sink while MQALayer.forward runs."""
+    """Expose the full attention sink while MQALayer.forward runs."""
 
     original_local_sink = self._attn_sink_local
     if self.tp_size > 1:
@@ -502,7 +502,7 @@ def dsv4_init_compression_metadata_kunlun(
         compute_page_indices,
     )
     values = tuple(values)
-    # The 0.5.8 operator predates c128_seq_lens_raw in the public contract.
+    # The operator predates c128_seq_lens_raw in the public contract.
     if len(values) == 8:
         values = values[:6] + (
             torch.div(seq_lens.to(torch.int32), 128, rounding_mode="floor"),
@@ -539,7 +539,7 @@ def dsv4_quant_k_cache_kunlun(k_bf16: torch.Tensor):
     # validates the CUDA FP8 representation in __post_init__, so use the same
     # attribute contract without constructing that CUDA-only representation.
     return SimpleNamespace(
-        # Match the patched 0.5.8 compressor contract: its FP32 compressor
+        # Match the patched compressor contract: its FP32 compressor
         # output is rounded to BF16 before conversion to the FP16 cache dtype.
         k_nope_fp8=k_bf16.to(torch.bfloat16).to(torch.float16).contiguous(),
         k_rope_bf16=None,
@@ -590,13 +590,13 @@ def dsv4_set_k_and_s_with_mapping_kunlun(
     nope_fp8_rope_bf16_pack,
     page_size: int,
 ) -> None:
-    """Match the 0.5.8 raw-location DSV4 cache writer contract.
+    """Match the raw-location DSV4 cache writer contract.
 
     The XSpeedGate mapping variant owns full-to-SWA translation. Keeping the
     raw location and mapping as separate inputs is important for multi-step
     MTP, where the allocator's full-pool location is the source of truth.
     """
-    # Golden 0.5.8 passes allocator locations as contiguous int32. Keep the
+    # Golden passes allocator locations as contiguous int32. Keep the
     # scheduler's int64 buffer untouched and normalize only the operator input.
     raw_loc = raw_loc.to(dtype=torch.int32).contiguous()
     if full_to_swa_index_mapping.device != raw_loc.device:
@@ -798,7 +798,7 @@ def clamp_position(seq_lens: torch.Tensor) -> torch.Tensor:
 
 @register_jit_op("sglang.jit_kernel.hadamard", "hadamard_transform")
 def hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-    """Apply the 0.5.8 Kunlun Hadamard matmul contract without dtype changes."""
+    """Apply the Kunlun Hadamard matmul contract without dtype changes."""
 
     import kunlun_ops
 
@@ -855,7 +855,7 @@ def dsv4_hash_topk_kunlun(
     routed_scaling_factor: float = 1.0,
     scoring_func: str = "sqrtsoftplus",
 ):
-    """Route DSV4 hash top-k through the working 0.5.8 Kunlun operator."""
+    """Route DSV4 hash top-k through the working Kunlun operator."""
 
     if scoring_func != "sqrtsoftplus":
         raise ValueError(f"unsupported DSV4 hash top-k scoring: {scoring_func}")
@@ -885,7 +885,7 @@ def dsv4_silu_and_mul_clamp_kunlun(
     output: torch.Tensor,
     swiglu_limit: float,
 ) -> None:
-    """Match the 0.5.8 clamp-then-Kunlun-SwiGLU contract."""
+    """Match the clamp-then-Kunlun-SwiGLU contract."""
 
     import kunlun_ops
 
@@ -925,7 +925,7 @@ def moe_fused_gate_dsv4_kunlun(
     routed_scaling_factor: float = 1.0,
     apply_routed_scaling_factor_on_output: bool = False,
 ):
-    """Match the monkey-patched 0.5.8 DeepSeek-V4 fused MoE gate."""
+    """Match the monkey-patched DeepSeek-V4 fused MoE gate."""
     import kunlun_ops
 
     num_rows = input.shape[0]
@@ -2054,7 +2054,7 @@ def dsv4_fused_rope_inplace_kunlun(
     positions: torch.Tensor,
     inverse: bool = False,
 ) -> None:
-    """Apply the 0.5.8 Kunlun GPT-J RoPE path with 0.5.14 semantics."""
+    """Apply the Kunlun GPT-J RoPE path with 0.5.14 semantics."""
 
     if q.shape[0] == 0:
         return
@@ -2097,7 +2097,7 @@ def dsv4_fused_q_indexer_rope_hadamard_quant_kunlun(
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
 ):
-    """Compose the exact 0.5.8 RoPE, Hadamard, INT8 and scale path."""
+    """Compose the exact RoPE, Hadamard, INT8 and scale path."""
 
     import kunlun_ops
 
@@ -2226,7 +2226,7 @@ def dsv4_fused_k_norm_rope_flashmla_kunlun(
     kvcache: torch.Tensor,
     page_size: int,
 ) -> None:
-    """Use the 0.5.8 normalize/rotate/store sequence for the 0.5.14 K path."""
+    """Use the normalize/rotate/store sequence for the 0.5.14 K path."""
 
     if kv.shape[0] == 0:
         return
