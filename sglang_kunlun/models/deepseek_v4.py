@@ -76,7 +76,7 @@ def mqa_forward_prepare_kunlun(
     q_out: Optional[torch.Tensor] = None,
     x_quant=None,
 ):
-    """Use the 0.5.8 single-call Q/KV RoPE order for prefill and decode."""
+    """Use the single-call Q/KV RoPE order for prefill and decode."""
     from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
         is_unified_kv_triton,
     )
@@ -173,7 +173,7 @@ def moe_gate_forward_kunlun(
     gemm_output_zero_allocator=None,
     forward_batch=None,
 ):
-    """Match the 0.5.8 Kunlun DSV4 router GEMM contract."""
+    """Match the Kunlun DSV4 router GEMM contract."""
 
     del gemm_output_zero_allocator, forward_batch
     if hidden_states.dtype not in (torch.bfloat16, torch.float16):
@@ -196,7 +196,7 @@ def hc_head_kunlun(
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
 ):
-    """Match the graph-captured 0.5.8 base-model MHC head exactly."""
+    """Match the graph-captured base-model MHC head exactly."""
     shape, dtype = x.size(), x.dtype
     x = x.flatten(1).float()
     rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)

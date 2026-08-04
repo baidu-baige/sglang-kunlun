@@ -180,7 +180,7 @@ def moe_apply_kunlun(
     dump_selected_moe_rows(
         layer, "input.topk_weights", topk_weights, num_tokens, top_k
     )
-    # Keep the exact 0.5.8 preprocessing contract: expand token rows first,
+    # Keep the exact preprocessing contract: expand token rows first,
     # then quantize the M * top_k matrix consumed by both grouped GEMMs.
     block_statistic = torch.zeros(
         12, num_experts, dtype=torch.int32, device=device

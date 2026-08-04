@@ -66,7 +66,7 @@ def _generate_compressor_prefill_plan_kunlun(
     device,
     use_cuda_graph=False,
 ):
-    """Build compressor-v1 plans with the 0.5.8 XSpeedGate planner."""
+    """Build compressor-v1 plans with the XSpeedGate planner."""
     from sglang.jit_kernel.dsv4.compress_old import CompressorPrefillPlan
 
     if seq_lens.dtype != torch.int64:
@@ -116,7 +116,7 @@ class KunlunDSV4AttnMetadata(DSV4AttnMetadata):
             self.c4_sparse_page_indices
         )
         # Kunlun's custom prefill attention consumes physical page indices only.
-        # Keep this unset to match the patched 0.5.8 xspeedgate top-k path; a raw
+        # Keep this unset to match the patched xspeedgate top-k path; a raw
         # buffer would force the 0.5.14 JIT wrapper into its PyTorch fallback.
         self.c4_sparse_raw_indices = None
         self.c1_flashmla_metadata = None
@@ -298,7 +298,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
 
     def get_swa_page_indices(self, seq_lens_casual, req_pool_indices_repeated):
         """Translate request token offsets into Kunlun SWA page indices."""
-        # Match the 0.5.8 contract: invalid history offsets are clamped to the
+        # Match the contract: invalid history offsets are clamped to the
         # first physical row and remain valid indices; the length tensor masks
         # those rows. Upstream 0.5.14 writes -1 here, which changes graph replay
         # inputs and is not accepted by the Kunlun compressed-attention path.
@@ -584,7 +584,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         )
 
     def on_after_cuda_graph_warmup(self):
-        """Skip FlashMLA metadata refresh, matching the 0.5.8 Kunlun backend."""
+        """Skip FlashMLA metadata refresh, matching the Kunlun backend."""
         metadata = self.forward_metadata
         if isinstance(metadata, upstream.DSV4Metadata) and isinstance(
             metadata.core_attn_metadata, upstream.DSV4AttnMetadata
@@ -615,7 +615,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             seq_lens_casual=seq_lens_casual,
             req_pool_indices_repeated=req_pool_indices_repeated,
         )
-        # Match the 0.5.8 PyTorch metadata contract: mapping==0 denotes an
+        # Match the PyTorch metadata contract: mapping==0 denotes an
         # invalid/tombstoned SWA slot, and valid entries must be a leading
         # prefix. Preserve -1 sentinels for the Kunlun attention operator.
         effective_swa_len = (
@@ -646,7 +646,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             swa_topk_lengths=torch.clamp(seq_lens_casual, max=upstream.SWA_WINDOW),
             c4_sparse_topk=self.c4_topk,
         )
-        # Apply the 0.5.8 effective-length contract after construction as well;
+        # Apply the effective-length contract after construction as well;
         # this keeps the value correct if upstream metadata initialization resets it.
         metadata.swa_topk_lengths = swa_topk_lengths
         if need_compress:
@@ -770,7 +770,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
     def store_cache(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch
     ) -> None:
-        """Use the 0.5.8 half-cache writer for the non-fused DSV4 path."""
+        """Use the half-cache writer for the non-fused DSV4 path."""
         pool = self.token_to_kv_pool
         if (
             envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get()
@@ -877,7 +877,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 # During graph capture (decode, TARGET_VERIFY, DRAFT_EXTEND_V2),
                 # kv_lens_cpu holds dummy placeholder values. Use the full static
                 # stride so replay can consume the actual indices produced in-graph,
-                # matching the 0.5.8 MAX_SEQ_LEN_FOR_CAPTURE behaviour.
+                # matching the MAX_SEQ_LEN_FOR_CAPTURE behaviour.
                 compressed_topk = extra_indices.shape[1]
             else:
                 max_seq_len = int(kv_lens_cpu.max().item()) if kv_lens_cpu.numel() else 0
@@ -960,7 +960,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
     type=HookType.REPLACE,
 )
 def _compressor_forward_cuda_kunlun(self, x, forward_batch, attn_backend=None):
-    """Restore the 0.5.8 Compressor.forward path for Kunlun's CUDA dispatch key."""
+    """Restore the Compressor.forward path for Kunlun's CUDA dispatch key."""
 
     return self.forward_native(x, forward_batch, attn_backend=attn_backend)
 
@@ -968,7 +968,7 @@ def _compressor_forward_cuda_kunlun(self, x, forward_batch, attn_backend=None):
 def _build_c4_prefill_contract(
     forward_batch, c4_seq_lens, page_table, device, num_queries
 ):
-    """Build the request-level LoD contract used by the 0.5.8 extend path."""
+    """Build the request-level LoD contract used by the extend path."""
     global_extend_lens = [int(value) for value in forward_batch.extend_seq_lens_cpu]
     cp_ranks = _dsa_cp_prefill_ranks(forward_batch)
     c4_flat = c4_seq_lens.reshape(-1).to("cpu", dtype=torch.int32)
@@ -1063,7 +1063,7 @@ def _build_c4_prefill_contract(
 
 
 def _gather_c4_prefill_kv(cache, page_table, contract, device):
-    """Gather packed C4 pages exactly as the 0.5.8 extend path."""
+    """Gather packed C4 pages exactly as the extend path."""
     block_size = cache.shape[1]
     head_dim = cache.shape[-1] - 4
     cache_u8 = cache.contiguous().view(torch.uint8).reshape(
@@ -1100,7 +1100,7 @@ def _gather_c4_prefill_kv(cache, page_table, contract, device):
 def _select_c4_target_verify_rows(
     q_fp8, weight, seq_lens, page_table, num_requests
 ):
-    """Match the 0.5.8 C4 TARGET_VERIFY representative-row contract."""
+    """Match the C4 TARGET_VERIFY representative-row contract."""
     num_queries = q_fp8.shape[0]
     if num_requests <= 0 or num_queries % num_requests:
         raise ValueError(
@@ -1144,7 +1144,7 @@ def _compute_c4_logits_kunlun(
     forward_batch,
     c4_indexer,
 ):
-    """Use the 0.5.8 Kunlun C4 operator with explicit batch ownership."""
+    """Use the Kunlun C4 operator with explicit batch ownership."""
 
     import kunlun_ops
 

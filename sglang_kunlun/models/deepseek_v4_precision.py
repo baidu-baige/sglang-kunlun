@@ -22,7 +22,7 @@ def moe_gate_forward_half_precision_kunlun(
     gemm_output_zero_allocator=None,
     forward_batch=None,
 ):
-    """Match the 0.5.8 direct half-precision DSV4 router GEMM contract."""
+    """Match the direct half-precision DSV4 router GEMM contract."""
     if (
         self.is_deepseek_v4
         and hidden_states.dtype == self.weight.dtype
@@ -60,7 +60,7 @@ def _restore_requested_fp16_parameter_dtype(*linears):
     type=HookType.AFTER,
 )
 def initialize_c4_indexer_parameter_dtype_kunlun(result, self, *args, **kwargs):
-    """Restore the 0.5.8 requested dtype for C4 indexer projections."""
+    """Restore the requested dtype for C4 indexer projections."""
     _restore_requested_fp16_parameter_dtype(self.wq_b, self.weights_proj)
     return result
 
@@ -70,7 +70,7 @@ def initialize_c4_indexer_parameter_dtype_kunlun(result, self, *args, **kwargs):
     type=HookType.AFTER,
 )
 def initialize_compressor_parameter_dtype_kunlun(result, self, *args, **kwargs):
-    """Restore the 0.5.8 requested dtype for the compressor gate projection."""
+    """Restore the requested dtype for the compressor gate projection."""
     _restore_requested_fp16_parameter_dtype(self.wkv_gate)
     return result
 
@@ -80,7 +80,7 @@ def initialize_compressor_parameter_dtype_kunlun(result, self, *args, **kwargs):
     type=HookType.AFTER,
 )
 def initialize_mqa_rope_policy_kunlun(result, self, config, *args, **kwargs):
-    """Restore the 0.5.8 FP16 wo_a and dense-layer RoPE contracts."""
+    """Restore the FP16 wo_a and dense-layer RoPE contracts."""
     _restore_requested_fp16_parameter_dtype(self.wo_a)
 
     if self.compress_ratio:
