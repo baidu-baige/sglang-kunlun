@@ -18,7 +18,7 @@ def hc_head_kunlun(
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
 ):
-    """Match the Golden 0.5.8 explicit FP32 MHC-head sequence."""
+    """Match the Golden explicit FP32 MHC-head sequence."""
     if x.numel() == 0:
         return x.new_empty((0, x.shape[-1]))
     shape, dtype = x.size(), x.dtype
