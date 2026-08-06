@@ -344,15 +344,6 @@ def _dsv4_topk_torch_fallback(*args, **kwargs) -> None:
     topk_transform_512_pytorch_vectorized(*args, **kwargs)
 
 
-def _canonicalize_dsv4_page_indices_(page_indices: torch.Tensor) -> None:
-    """Use a deterministic physical-page order while keeping sentinels last."""
-    sentinel = torch.iinfo(page_indices.dtype).max
-    sortable = torch.where(page_indices < 0, sentinel, page_indices)
-    ordered = torch.sort(sortable, dim=-1).values
-    ordered.masked_fill_(ordered == sentinel, -1)
-    page_indices.copy_(ordered)
-
-
 def _dsv4_topk_transform_graph_safe(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -421,7 +412,14 @@ def dsv4_topk_transform_512_kunlun(
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
-    """Transform DSV4 top-k indices to paged locations on Kunlun."""
+    """Transform DSV4 top-k indices to paged locations on Kunlun (XPU fused).
+
+    Uses ``xspeedgate_ops::topk_transform`` — the same fused kernel wired in
+    the legacy 0.5.8 patch — so the top-K search, length masking and
+    page-table transform run as one XPU op with no multi-GiB torch
+    intermediates.  Falls back to the pure-torch path only when the caller
+    requests ``out_raw_indices`` (the XPU kernel does not emit raw indices).
+    """
 
     if out_raw_indices is not None:
         _dsv4_topk_torch_fallback(
@@ -438,10 +436,27 @@ def dsv4_topk_transform_512_kunlun(
             page_size=page_size,
         )
         return
-    _dsv4_topk_transform_graph_safe(
-        scores, seq_lens, page_tables, out_page_indices, page_size
+
+    topk = out_page_indices.shape[1]
+    # Pre-fill -1: XPU kernel skips writes for seq_len=0 rows, so the sentinel
+    # guards those slots and matches the contract downstream expects.
+    dst_page_table = scores.new_full(
+        (scores.size(0), topk), -1, dtype=torch.int32,
     )
-    _canonicalize_dsv4_page_indices_(out_page_indices)
+    # xspeedgate_ops::topk_transform(score, lengths, src_page_table,
+    #     dst_page_table, topk, cu_seqlens_q=None, block_size=page_size,
+    #     fast_path=True)
+    torch.ops.xspeedgate_ops.topk_transform(
+        scores,
+        seq_lens,
+        page_tables,
+        dst_page_table,
+        topk,
+        None,
+        page_size,
+        True,
+    )
+    out_page_indices.copy_(dst_page_table)
     _dsv4_probe(
         "topk",
         {"scores": scores, "page_indices": out_page_indices},

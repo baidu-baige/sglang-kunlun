@@ -55,6 +55,21 @@ def _create_paged_compressor_data_kunlun(original_fn, *args, **kwargs):
 
 
 @plugin_hook(
+    "sglang.jit_kernel.dsv4.attn.get_paged_mqa_logits_metadata",
+    type=HookType.REPLACE,
+)
+def _get_paged_mqa_logits_metadata_kunlun(seq_lens, page_size, num_sm):
+    """Kunlun: bypass sglang JIT compile of paged_mqa_metadata.cuh.
+
+    The upstream JIT kernel requires C++20 ``std::bit_cast`` (needs gcc-11+
+    libstdc++), which the current build env (gcc-10) cannot provide. The
+    downstream Kunlun path (``_compute_c4_logits_kunlun`` via XSpeedGate ops)
+    does not consume ``deep_gemm_metadata``, so an empty placeholder is safe.
+    """
+    return torch.empty(0, dtype=torch.int32, device=seq_lens.device)
+
+
+@plugin_hook(
     "sglang.jit_kernel.dsv4.compress_old.CompressorPrefillPlan.generate",
     type=HookType.REPLACE,
 )
@@ -418,22 +433,11 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         weights = weights.squeeze(2)
         if use_fp4_indexer:
             weights = weights.float()
-            if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
-                raise RuntimeError("DeepSeek V4 FP4 indexer requires DeepGEMM indexer.")
-            from deep_gemm import fp8_fp4_paged_mqa_logits as fn
-        elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
-            from sglang.srt.layers.attention.dsa.tilelang_kernel import (
-                tilelang_fp8_paged_mqa_logits as fn,
-            )
-        elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
-            fn = upstream_indexer._aiter_fp8_paged_mqa_logits
-        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
-            if upstream_indexer.is_sm120_supported():
-                fn = upstream_indexer.fp8_paged_mqa_logits_torch_sm120
-            else:
-                fn = upstream_indexer.fp8_paged_mqa_logits_torch
-        else:
-            from deep_gemm import fp8_paged_mqa_logits as fn
+        # Kunlun always dispatches to `_compute_c4_logits_kunlun` (XPU op),
+        # which ignores `fn`. Skip the upstream `fn` selection to avoid
+        # importing `deep_gemm.fp8_paged_mqa_logits` (does not exist on Kunlun)
+        # or other GPU/backends' fallbacks.
+        fn = None
 
         query_rows = (
             q_indexer[0].shape[0] if use_fp4_indexer else q_indexer.shape[0]
