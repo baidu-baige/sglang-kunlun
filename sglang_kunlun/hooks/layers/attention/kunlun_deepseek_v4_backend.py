@@ -30,6 +30,75 @@ from sglang_kunlun.kernels.kernel_ops import (
 
 
 logger = logging.getLogger(__name__)
+
+
+@plugin_hook(
+    "sglang.srt.layers.attention.dsv4.compressor."
+    "CompressorBackendMixin.forward_compress",
+    type=HookType.REPLACE,
+)
+def _forward_compress_zeroed_kunlun(
+    self,
+    *,
+    kv_score_buffer,
+    kv_score_input,
+    ape,
+    head_dim,
+    norm,
+    freqs_cis_cache,
+    rotate,
+    forward_batch,
+    compress_ratio,
+    is_paged=False,
+):
+    """Zero sparse-plan rows that the kernel leaves untouched before cache store."""
+    from sglang.jit_kernel.dsv4.compress_old import (
+        compress_forward,
+        compress_fused_norm_rope_inplace,
+    )
+    from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
+    from sglang.srt.layers.attention.dsv4.compressor import (
+        is_overlap_compress,
+        make_compressor_plan,
+    )
+
+    assert compress_ratio in (4, 128)
+    if is_paged:
+        metadata = self.get_paged_compress_metadata(compress_ratio)
+        coff = 2 if is_overlap_compress(compress_ratio) else 1
+        if compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+            kv_score_buffer = kv_score_buffer.view(-1, 1, head_dim * 3)
+        else:
+            last_dim = 2 * head_dim * coff
+            assert kv_score_buffer.shape[-1] == last_dim
+            kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
+    else:
+        plan = make_compressor_plan(compress_ratio, forward_batch)
+        metadata = (forward_batch.req_pool_indices.to(torch.int32), None, plan)
+    indices, extra_data, plan = metadata
+
+    out = kv_score_input.new_zeros((kv_score_input.shape[0], head_dim))
+    kv_compressed = compress_forward(
+        kv_score_buffer=kv_score_buffer,
+        kv_score_input=kv_score_input,
+        ape=ape,
+        indices=indices,
+        plan=plan,
+        compress_ratio=compress_ratio,
+        head_dim=head_dim,
+        extra_data=extra_data,
+        out=out,
+    )
+    compress_fused_norm_rope_inplace(
+        kv_compressed,
+        norm.weight,
+        norm.variance_epsilon,
+        freqs_cis_cache,
+        plan,
+    )
+    return rotate_activation(kv_compressed) if rotate else kv_compressed
+
+
 def _clamp_c128_prefill_topk(
     compressed_topk: int,
     kv_lens_cpu: Optional[torch.Tensor],
@@ -1368,10 +1437,17 @@ class KunlunDeepseekV4MultiStepBackend(DeepseekV4MultiStepBackend):
             self.attn_backends[0].init_forward_metadata_out_graph(inner_fb)
             temp_metadata = self.attn_backends[0].forward_metadata
             for i in range(1, self.speculative_num_steps - 1):
-                self.attn_backends[i].replay_cuda_graph_metadata_from(
+                backend = self.attn_backends[i]
+                backend.replay_cuda_graph_metadata_from(
                     bs=forward_batch.batch_size,
                     temp_metadata=temp_metadata,
                     bucket=upstream._GraphBucket.DECODE_OR_IDLE,
+                )
+                _refresh_graph_host_lengths(
+                    inner_fb,
+                    backend._attention_decode_aux,
+                    backend._c4_decode_aux,
+                    backend._attention_graph_extend_aux,
                 )
         if not in_capture:
             from debug.dsv4_backend_probes import dsv4_probe

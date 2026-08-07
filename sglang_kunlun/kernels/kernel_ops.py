@@ -508,6 +508,15 @@ def dsv4_init_compression_metadata_kunlun(
 ):
     """Build compressed-attention metadata with the Kunlun fused operator."""
 
+    # xspeedgate reads these tensors as dense arrays. Decode and speculative
+    # paths may pass strided slices (for example, graph buffers sliced to the
+    # runtime batch size), so normalize the layout at the vendor-op boundary.
+    seq_lens = seq_lens.contiguous()
+    positions = positions.contiguous()
+    raw_out_loc = raw_out_loc.contiguous()
+    if page_table is not None:
+        page_table = page_table.contiguous()
+
     values = torch.ops.xspeedgate_ops.init_compressed_attn_metadata(
         seq_lens,
         positions,
