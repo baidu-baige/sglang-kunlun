@@ -937,6 +937,41 @@ class KernelOpsTest(unittest.TestCase):
             values[6], torch.tensor([0, 0, 1, 2], dtype=torch.int32)
         )
 
+    def test_dsv4_metadata_normalizes_vendor_inputs_to_contiguous(self):
+        from sglang_kunlun.kernels import kernel_ops
+
+        seq_lens = torch.arange(8, dtype=torch.int64)[::2]
+        positions = torch.arange(8, dtype=torch.int32)[::2]
+        raw_out_loc = torch.arange(8, dtype=torch.int64)[::2]
+        page_table = torch.arange(32, dtype=torch.int32).view(4, 8)[:, ::2]
+        self.assertFalse(seq_lens.is_contiguous())
+        self.assertFalse(positions.is_contiguous())
+        self.assertFalse(raw_out_loc.is_contiguous())
+        self.assertFalse(page_table.is_contiguous())
+
+        def op(seq, pos, raw, pages, _page_size, _compute_page_indices):
+            self.assertTrue(seq.is_contiguous())
+            self.assertTrue(pos.is_contiguous())
+            self.assertTrue(raw.is_contiguous())
+            self.assertTrue(pages.is_contiguous())
+            zeros = torch.zeros(4, dtype=torch.int32)
+            return (zeros, zeros, zeros, zeros, zeros, zeros, zeros, None)
+
+        with mock.patch.object(
+            torch.ops.xspeedgate_ops,
+            "init_compressed_attn_metadata",
+            side_effect=op,
+        ):
+            values = kernel_ops.dsv4_init_compression_metadata_kunlun(
+                seq_lens,
+                positions,
+                raw_out_loc,
+                page_table,
+                page_size=256,
+            )
+
+        self.assertEqual(len(values), 9)
+
     def test_grouped_topk_preserves_058_statistic_padding(self):
         from sglang_kunlun.kernels import kernel_ops
 

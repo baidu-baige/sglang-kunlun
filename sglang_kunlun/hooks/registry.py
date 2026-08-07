@@ -33,6 +33,7 @@ HOOK_MODULES = (
 DEBUG_HOOK_MODULES = (
     "debug.tensor_dump_hooks",
     "debug.dsv4_mtp_nextn_probes",
+    "debug.mtp_alignment_plugin",
 )
 
 
