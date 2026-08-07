@@ -206,10 +206,10 @@ def hc_head_kunlun(
     return y.to(dtype)
 
 
-# @plugin_hook(
-#     "sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayer.hc_pre",
-#     type=HookType.REPLACE,
-# )
+@plugin_hook(
+    "sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayer.hc_pre",
+    type=HookType.REPLACE,
+)
 def hc_pre_kunlun(
     self,
     x: torch.Tensor,
