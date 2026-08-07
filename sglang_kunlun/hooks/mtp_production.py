@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import inspect
 
 import torch
 
@@ -25,8 +24,8 @@ def accepted_prefix_indices(accept_lens, tokens_per_request):
 
 
 def packed_rows_fit_fixed_width(accepted_lengths, width: int) -> bool:
-    """Return whether a linear packed copy preserves fixed-width request slots."""
-    return all(length == width for length in accepted_lengths[:-1])
+    """Return whether packed rows exactly match fixed-width graph request slots."""
+    return all(length == width for length in accepted_lengths)
 
 
 def can_run_draft_extend_graph(cuda_graph_runner, forward_batch) -> bool:
@@ -121,8 +120,8 @@ def prepare_for_draft_extend_kunlun(
         else num_draft_tokens
     )
     forward_batch.seq_lens = forward_batch.seq_lens + increment
-    # Linear graph-buffer copies preserve request slots only while every
-    # non-final packed request remains full-width.
+    # The captured graph and DSV4 LoD use exactly num_draft_tokens queries per
+    # request, so any shortened accepted-only row must use ragged eager metadata.
     packed_layout_safe = not accepted_only or packed_rows_fit_fixed_width(
         accepted_lengths_cpu, num_draft_tokens
     )
@@ -311,34 +310,6 @@ def capture_cuda_graphs_kunlun(self):
 
 
 @plugin_hook(
-    "sglang.srt.speculative.eagle_worker_v2.EagleDraftWorker.draft_forward",
-    type=HookType.AROUND,
-)
-def draft_forward_position_kunlun(original_fn, self, forward_batch):
-    """Advance draft positions before model forward while preserving final state."""
-    source = inspect.getsource(original_fn)
-    position_update = source.find("forward_batch.positions.add_(1)")
-    model_forward = source.find("self.draft_runner.forward(forward_batch)")
-    if 0 <= position_update < model_forward:
-        return original_fn(self, forward_batch)
-
-    original_forward = self.draft_runner.forward
-
-    def next_position_forward(inner_batch, *args, **kwargs):
-        inner_batch.positions.add_(1)
-        try:
-            return original_forward(inner_batch, *args, **kwargs)
-        finally:
-            inner_batch.positions.sub_(1)
-
-    self.draft_runner.forward = next_position_forward
-    try:
-        return original_fn(self, forward_batch)
-    finally:
-        self.draft_runner.forward = original_forward
-
-
-@plugin_hook(
     "sglang.srt.speculative.eagle_worker_v2.EAGLEWorkerV2.verify",
     type=HookType.AFTER,
 )
@@ -409,7 +380,7 @@ def resolve_spec_v2_tokens_kunlun(self, result, batch):
     type=HookType.REPLACE,
 )
 def draft_extend_for_decode_kunlun(self, batch, batch_result):
-    """Compact accepted prefixes and run ragged inputs only through eager."""
+    """Compact accepted request prefixes for synchronous DSV4 draft extend."""
     import sglang.srt.speculative.eagle_worker_v2 as upstream
 
     if self.server_args.disable_overlap_schedule:
@@ -424,9 +395,9 @@ def draft_extend_for_decode_kunlun(self, batch, batch_result):
         )
         out_cache_loc = batch.out_cache_loc.index_select(0, accepted)
         select_index = torch.cumsum(batch_result.accept_lens, dim=0) - 1
-        next_token_ids = batch_result.next_token_ids.index_select(
-            0, accepted
-        ).to(torch.int64)
+        next_token_ids = batch_result.next_token_ids.index_select(0, accepted).to(
+            torch.int64
+        )
     else:
         hidden_states = batch_result.logits_output.hidden_states
         out_cache_loc = batch.out_cache_loc
