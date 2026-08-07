@@ -366,6 +366,8 @@ class ProductionPrecisionContractTest(unittest.TestCase):
         namespace = {
             "torch": torch,
             "_is_graph_extend_mode": lambda _mode: True,
+            "_dsa_cp_prefill_ranks": lambda _forward_batch: None,
+            "_dsa_prefill_cp_enabled": lambda: False,
         }
         exec(
             compile(
@@ -505,10 +507,15 @@ class ProductionPrecisionContractTest(unittest.TestCase):
                 graph_runner,
             )
 
-        self.assertFalse(graph_batch._kunlun_ragged_draft_extend)
-        self.assertTrue(graph_batch._kunlun_can_run_draft_extend_graph)
-        graph_runner.can_run_graph.assert_called_once_with(graph_batch)
-        self.assertEqual(metadata, {})
+        self.assertTrue(graph_batch._kunlun_ragged_draft_extend)
+        self.assertFalse(graph_batch._kunlun_can_run_draft_extend_graph)
+        graph_runner.can_run_graph.assert_not_called()
+        q_lod_cpu, q_lod, kv_lens_cpu, kv_lens = metadata["lod"]
+        self.assertEqual(q_lod_cpu.tolist(), [0, 4, 7])
+        self.assertEqual(q_lod.tolist(), [0, 4, 7])
+        self.assertEqual(kv_lens_cpu.tolist(), [14, 23])
+        self.assertEqual(kv_lens.tolist(), [14, 23])
+        self.assertEqual(metadata["cache_rows"].tolist(), full_cache_rows[:7].tolist())
         self.assertEqual(graph_batch.extend_seq_lens_cpu, [4, 3])
         self.assertEqual(graph_batch.seq_lens.tolist(), [14, 23])
 
@@ -530,9 +537,10 @@ class ProductionPrecisionContractTest(unittest.TestCase):
         forward_batch.extend_seq_lens_cpu = [2, 2, 2]
         self.assertIsNone(ragged._ragged_extend_lengths(forward_batch, 6))
 
-    def test_packed_rows_only_admit_fixed_width_safe_layouts(self):
-        self.assertTrue(mtp.packed_rows_fit_fixed_width([1], 4))
-        self.assertTrue(mtp.packed_rows_fit_fixed_width([4, 4, 2], 4))
+    def test_packed_rows_only_admit_exact_fixed_width_layouts(self):
+        self.assertTrue(mtp.packed_rows_fit_fixed_width([4], 4))
+        self.assertTrue(mtp.packed_rows_fit_fixed_width([4, 4, 4], 4))
+        self.assertFalse(mtp.packed_rows_fit_fixed_width([4, 4, 2], 4))
         self.assertFalse(mtp.packed_rows_fit_fixed_width([4, 2, 4], 4))
         self.assertFalse(mtp.packed_rows_fit_fixed_width([1, 2, 1, 2], 4))
 
@@ -701,26 +709,19 @@ class ProductionPrecisionContractTest(unittest.TestCase):
         )
         self.assertEqual(dirty.kv_score_buffer.calls, 1)
 
-    def test_draft_position_is_advanced_before_forward(self):
-        observed = []
+    def test_draft_position_hook_is_not_registered(self):
+        source = MTP_HOOKS.read_text()
+        self.assertNotIn("draft_forward_position_kunlun", source)
+        self.assertNotIn("EagleDraftWorker.draft_forward", source)
 
-        class Runner:
-            def forward(self, batch):
-                observed.append(batch.positions.clone())
-                return "ok"
-
-        owner = types.SimpleNamespace(draft_runner=Runner())
-        batch = types.SimpleNamespace(positions=torch.tensor([7], dtype=torch.int32))
-
-        def original(worker, forward_batch):
-            result = worker.draft_runner.forward(forward_batch)
-            forward_batch.positions.add_(1)
-            return result
-
-        result = mtp.draft_forward_position_kunlun(original, owner, batch)
-        self.assertEqual(result, "ok")
-        self.assertEqual(observed[0].tolist(), [8])
-        self.assertEqual(batch.positions.tolist(), [8])
+    def test_decode_draft_extend_compacts_synchronous_accepted_rows(self):
+        source = inspect.getsource(mtp.draft_extend_for_decode_kunlun)
+        self.assertIn("if self.server_args.disable_overlap_schedule", source)
+        self.assertIn("accepted_prefix_indices", source)
+        self.assertIn("hidden_states.index_select(0, accepted)", source)
+        self.assertIn("batch.out_cache_loc.index_select(0, accepted)", source)
+        self.assertIn("torch.cumsum(batch_result.accept_lens", source)
+        self.assertIn("batch_result.next_token_ids.index_select(0, accepted)", source)
 
     def test_backend_monkey_patches_are_exact_plugin_hooks(self):
         source = BACKEND_HOOKS.read_text()

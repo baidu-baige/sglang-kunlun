@@ -23,6 +23,17 @@ SGLANG_MEM_CACHE_COMMON = (
     / "mem_cache"
     / "common.py"
 )
+SGLANG_DSV4_COMPRESSOR = (
+    ROOT.parent
+    / "sglang"
+    / "python"
+    / "sglang"
+    / "srt"
+    / "layers"
+    / "attention"
+    / "dsv4"
+    / "compressor.py"
+)
 SGLANG_DECODE_GRAPH_RUNNER = (
     ROOT.parent
     / "sglang"
@@ -648,8 +659,13 @@ class KunlunDSV4BackendContractTest(unittest.TestCase):
             replay_source,
         )
         self.assertIn("range(1, self.speculative_num_steps - 1)", replay_source)
-        self.assertIn("replay_cuda_graph_metadata_from", replay_source)
+        self.assertIn("backend = self.attn_backends[i]", replay_source)
+        self.assertIn("backend.replay_cuda_graph_metadata_from", replay_source)
         self.assertIn("temp_metadata=temp_metadata", replay_source)
+        self.assertIn("_refresh_graph_host_lengths", replay_source)
+        self.assertIn("backend._attention_decode_aux", replay_source)
+        self.assertIn("backend._c4_decode_aux", replay_source)
+        self.assertIn("backend._attention_graph_extend_aux", replay_source)
 
     def test_moe_sqrtsoftplus_calls_058_fused_gate_symbol(self):
         source = (MOE_DIR / "topk.py").read_text()
@@ -709,6 +725,42 @@ class KunlunDSV4BackendContractTest(unittest.TestCase):
         self.assertEqual(len(assignments), 1)
         self.assertIsInstance(assignments[0].value, ast.Constant)
         self.assertIsNone(assignments[0].value.value)
+
+    def test_sparse_compressor_zeroes_untouched_output_rows(self):
+        path = ATTENTION_DIR / "kunlun_deepseek_v4_backend.py"
+        source = path.read_text()
+        tree = ast.parse(source, filename=str(path))
+        hook = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_forward_compress_zeroed_kunlun"
+        )
+        hook_source = ast.get_source_segment(source, hook)
+        self.assertIn("kv_score_input.new_zeros", hook_source)
+        self.assertIn("out=out", hook_source)
+        self.assertEqual(len(hook.decorator_list), 1)
+        decorator = hook.decorator_list[0]
+        self.assertIsInstance(decorator, ast.Call)
+        target = decorator.args[0].value
+        self.assertEqual(
+            target,
+            "sglang.srt.layers.attention.dsv4.compressor."
+            "CompressorBackendMixin.forward_compress",
+        )
+        upstream_tree = ast.parse(
+            SGLANG_DSV4_COMPRESSOR.read_text(), filename=str(SGLANG_DSV4_COMPRESSOR)
+        )
+        owner = next(
+            node
+            for node in upstream_tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "CompressorBackendMixin"
+        )
+        self.assertIn(
+            "forward_compress",
+            {node.name for node in owner.body if isinstance(node, ast.FunctionDef)},
+        )
 
     def test_compressed_attention_matches_058_argument_contract(self):
         path = ATTENTION_DIR / "kunlun_deepseek_v4_backend.py"

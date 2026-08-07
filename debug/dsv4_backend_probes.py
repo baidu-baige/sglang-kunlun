@@ -117,6 +117,55 @@ def _append_dsv4_ifeval_backend_event(owner, event: dict) -> None:
     owner._dsv4_ifeval_diag_event_count = event_count + 1
 
 
+def dump_mtp_verify_accept(
+    *,
+    verify_input,
+    predict,
+    accept_lens,
+    accept_index,
+    forward_batch_output,
+):
+    """Persist the verify acceptance contract for a selected diagnostic run."""
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_is_capture_mode,
+    )
+
+    if get_is_capture_mode():
+        return
+    dump_dir = os.environ.get("DSV4_IFEVAL_MTP_DIAG_DIR") or os.environ.get(
+        "DSV4_MTP_TENSOR_DUMP_DIR"
+    )
+    if not dump_dir or _dsv4_ifeval_diag_rank() != 0:
+        return
+    cycle = int(os.environ.get("DSV4_MTP_VERIFY_DUMP_CYCLE", "0"))
+    max_cycles = int(os.environ.get("DSV4_MTP_TENSOR_DUMP_CYCLES", "3"))
+    if cycle >= max_cycles:
+        return
+
+    def clone_cpu(value):
+        return value.detach().cpu() if isinstance(value, torch.Tensor) else value
+
+    logits_output = getattr(forward_batch_output, "logits_output", None)
+    next_token_logits = getattr(logits_output, "next_token_logits", None)
+    payload = {
+        "cycle": cycle,
+        "speculative_num_steps": int(verify_input.num_tokens_per_req - 1),
+        "draft_token": clone_cpu(verify_input.draft_token),
+        "retrieve_index": clone_cpu(verify_input.retrieve_index),
+        "predict": clone_cpu(predict),
+        "accept_lens": clone_cpu(accept_lens),
+        "accept_index": clone_cpu(accept_index),
+        "target_argmax": clone_cpu(
+            torch.argmax(next_token_logits, dim=-1)
+            if isinstance(next_token_logits, torch.Tensor)
+            else None
+        ),
+    }
+    os.makedirs(dump_dir, exist_ok=True)
+    torch.save(payload, os.path.join(dump_dir, f"verify_accept_cycle{cycle}.pt"))
+    os.environ["DSV4_MTP_VERIFY_DUMP_CYCLE"] = str(cycle + 1)
+
+
 def _summarize_c4_metadata_tensor(value):
     if value is None:
         return None
