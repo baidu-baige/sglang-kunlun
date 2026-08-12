@@ -34,6 +34,7 @@ DEBUG_HOOK_MODULES = (
     "debug.tensor_dump_hooks",
     "debug.dsv4_mtp_nextn_probes",
     "debug.mtp_alignment_plugin",
+    "debug.ragged_draft_attention_probe",
 )
 
 
@@ -46,6 +47,18 @@ def register_all() -> None:
     from sglang_kunlun.kernels import flashinfer_hook as _flashinfer_hook  # noqa: F401
     from sglang_kunlun.kernels import kernel_ops
 
+    legacy_jit_specs = [
+        key
+        for key, spec in kernel_ops._JIT_OPS.items()
+        if spec.module_path.startswith("sglang.jit_kernel.")
+    ]
+    for key in legacy_jit_specs:
+        kernel_ops._JIT_OPS.pop(key)
+    if legacy_jit_specs:
+        logger.info(
+            "sglang-kunlun: ignored %d removed sglang.jit_kernel registrations",
+            len(legacy_jit_specs),
+        )
     kernel_ops.install()
     for module_name in HOOK_MODULES:
         importlib.import_module(module_name)

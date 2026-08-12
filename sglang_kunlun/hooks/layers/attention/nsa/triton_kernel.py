@@ -11,7 +11,7 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 
 @plugin_hook(
-    target="sglang.srt.layers.attention.dsa.triton_kernel.act_quant",
+    target="sglang.kernels.ops.attention.dsa.triton_kernel.act_quant",
     type=HookType.REPLACE,
 )
 def act_quant_kunlun(

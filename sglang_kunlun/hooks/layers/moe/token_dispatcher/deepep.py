@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 try:
     from deep_ep import Config
     from deep_ep.buffer_v2 import BufferV2 as Buffer
-    from sglang.srt.layers.quantization.fp8_kernel import (
+    from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
 

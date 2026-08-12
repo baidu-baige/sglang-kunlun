@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
-
 import torch
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
@@ -25,12 +23,12 @@ def evict_swa_with_page_margin_kunlun(self, req, pre_len):
         page_size=self.tree_cache.page_size,
         req_to_token_pool=self.req_to_token_pool,
         token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-        drop_page_margin=False,
+        is_chunk_cache=False,
     )
 
 
 @plugin_hook(
-    "sglang.srt.mem_cache.common.write_cache_indices",
+    "sglang.srt.mem_cache.allocation.write_cache_indices",
     type=HookType.REPLACE,
 )
 def write_cache_indices_kunlun(
@@ -47,42 +45,24 @@ def write_cache_indices_kunlun(
     req_to_token_pool,
 ):
     """Build prefix pointer tables directly on the consuming device."""
-    import sglang.srt.mem_cache.common as upstream
+    from sglang_kunlun.kernels.kernel_ops import write_req_to_token_pool_triton
 
-    if upstream.support_triton(upstream.get_global_server_args().attention_backend):
-        prefix_pointers = torch.tensor(
-            [tensor.data_ptr() for tensor in prefix_tensors],
-            dtype=torch.uint64,
-            device=req_to_token_pool.device,
-        )
-        upstream.write_req_to_token_pool_triton[
-            (req_pool_indices_tensor.shape[0],)
-        ](
-            req_to_token_pool.req_to_token,
-            req_pool_indices_tensor,
-            prefix_pointers,
-            prefix_lens_tensor,
-            seq_lens_tensor,
-            extend_lens_tensor,
-            out_cache_loc,
-            req_to_token_pool.req_to_token.shape[1],
-        )
-        return
-
-    offset = 0
-    for index in range(req_pool_indices_cpu.shape[0]):
-        req_idx = req_pool_indices_cpu[index].item()
-        prefix_len = prefix_lens_cpu[index].item()
-        seq_len = seq_lens_cpu[index].item()
-        extend_len = extend_lens_cpu[index].item()
-        req_to_token_pool.write(
-            (req_idx, slice(0, prefix_len)), prefix_tensors[index]
-        )
-        req_to_token_pool.write(
-            (req_idx, slice(prefix_len, seq_len)),
-            out_cache_loc[offset : offset + extend_len],
-        )
-        offset += extend_len
+    prefix_pointers = torch.tensor(
+        [tensor.data_ptr() for tensor in prefix_tensors],
+        dtype=torch.uint64,
+        device=req_to_token_pool.device,
+    )
+    write_req_to_token_pool_triton(
+        req_to_token_pool.req_to_token,
+        req_pool_indices_tensor,
+        prefix_pointers,
+        prefix_lens_tensor,
+        seq_lens_tensor,
+        extend_lens_tensor,
+        out_cache_loc,
+        req_to_token_pool.req_to_token.shape[1],
+    )
+    return
 
 
 @plugin_hook(
@@ -106,13 +86,5 @@ def initialize_non_online_compress_state_kunlun(
 ):
     """Initialize every non-online KV row and score sentinel, not only the last."""
     if not online:
-        wrapped_init = inspect.unwrap(type(self).__init__)
-        try:
-            upstream_has_full_clear = (
-                "self.kv_score_buffer.clear()" in inspect.getsource(wrapped_init)
-            )
-        except (OSError, TypeError):
-            upstream_has_full_clear = False
-        if not upstream_has_full_clear:
-            self.kv_score_buffer.clear()
+        self.kv_score_buffer.clear()
     return result

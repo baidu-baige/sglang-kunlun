@@ -32,6 +32,83 @@ def _ragged_extend_lengths(forward_batch, num_queries: int):
 
 @plugin_hook(
     "sglang_kunlun.hooks.layers.attention.kunlun_deepseek_v4_backend."
+    "KunlunDeepseekV4AttnBackend._build_forward_metadata",
+    type=HookType.AROUND,
+)
+def build_ragged_draft_extend_metadata_kunlun(
+    original_fn,
+    self,
+    forward_batch,
+    *,
+    max_seq_len_override=None,
+    use_prefill_cuda_graph: bool = False,
+):
+    """Build compact per-token metadata for eager ragged Draft Extend."""
+    if not getattr(forward_batch, "_kunlun_ragged_draft_extend", False):
+        return original_fn(
+            self,
+            forward_batch,
+            max_seq_len_override=max_seq_len_override,
+            use_prefill_cuda_graph=use_prefill_cuda_graph,
+        )
+
+    from sglang.srt.layers.attention import deepseek_v4_backend as upstream
+
+    logical_forward_mode = upstream._get_logical_forward_mode(forward_batch)
+    if not logical_forward_mode.is_draft_extend_v2():
+        return original_fn(
+            self,
+            forward_batch,
+            max_seq_len_override=max_seq_len_override,
+            use_prefill_cuda_graph=use_prefill_cuda_graph,
+        )
+    if use_prefill_cuda_graph:
+        raise ValueError("ragged Draft Extend metadata cannot use a fixed-width graph")
+
+    req_pool_indices = forward_batch.req_pool_indices
+    seq_lens = forward_batch.seq_lens.to(torch.int32)
+    seq_lens_cpu = forward_batch.seq_lens_cpu
+    extend_seq_lens = forward_batch.extend_seq_lens
+    extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+    assert (
+        seq_lens_cpu is not None
+        and extend_seq_lens is not None
+        and extend_seq_lens_cpu is not None
+    )
+    assert self.req_to_token_pool.req_to_token is self.req_to_token
+    assert self.swa_page_size % upstream.SWA_WINDOW == 0 and self.page_size % 128 == 0
+
+    if max_seq_len_override is None:
+        max_seq_len_override = getattr(forward_batch, "max_seq_len_override", None)
+    max_seq_len = (
+        max_seq_len_override
+        if max_seq_len_override is not None
+        else int(seq_lens_cpu.max().item())
+    )
+    verify_bs = upstream._get_target_verify_bs(forward_batch)
+    self.online_c128_mtp.prepare_forward(
+        logical_forward_mode,
+        req_pool_indices,
+        seq_lens,
+        verify_bs=verify_bs,
+    )
+    return self.init_forward_metadata_prefill(
+        max_seq_len=max_seq_len,
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens_cpu.tolist(),
+        out_cache_loc=forward_batch.out_cache_loc,
+        num_tokens=sum(extend_seq_lens_cpu),
+        extend_seq_lens=extend_seq_lens,
+        extend_seq_lens_cpu=extend_seq_lens_cpu,
+        extend_start_loc=forward_batch.extend_start_loc,
+        need_compress=False,
+        use_prefill_cuda_graph=False,
+    )
+
+
+@plugin_hook(
+    "sglang_kunlun.hooks.layers.attention.kunlun_deepseek_v4_backend."
     "KunlunDeepseekV4AttnBackend._make_lod",
     type=HookType.AROUND,
 )

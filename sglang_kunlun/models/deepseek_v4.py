@@ -6,8 +6,6 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
-import kunlun_ops
-from kunlun_ops import hc_post_kunlun_impl
 from torch import nn
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -16,20 +14,12 @@ from sglang_kunlun.kernels.kernel_ops import dsv4_mqa_wo_a_einsum_kunlun
 
 
 def _store_kv_to_swa_cache_direct(self, kv, forward_batch, attn_backend) -> None:
-    """Match the dirty 0.5.14 SWA cache writer exactly."""
-    from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
-
-    token_to_kv_pool = get_token_to_kv_pool()
-    swa_loc = attn_backend.get_swa_out_cache_loc(forward_batch)
-    cache = token_to_kv_pool.swa_kv_pool.kv_buffer[
-        token_to_kv_pool._swa_local_layer_id(self.layer_id)
-    ]
-    cache_tokens = cache.view(-1, kv.shape[-1])
-    loc = swa_loc.contiguous().clamp(
-        min=0, max=cache_tokens.shape[0] - 1
-    ).long()
-    cache_value = kv.reshape(kv.shape[0], -1).to(cache.dtype)
-    cache_tokens.index_copy_(0, loc, cache_value)
+    """Store normalized KV through the active DSV4 cache-pack contract."""
+    attn_backend.store_cache(
+        layer_id=self.layer_id,
+        swa_k=kv,
+        forward_batch=forward_batch,
+    )
 
 
 @plugin_hook(
@@ -77,7 +67,7 @@ def mqa_forward_prepare_kunlun(
     x_quant=None,
 ):
     """Use the single-call Q/KV RoPE order for prefill and decode."""
-    from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
         is_unified_kv_triton,
     )
 
@@ -117,19 +107,9 @@ def mqa_forward_prepare_kunlun(
     q_lora = self.q_norm(q_lora)
     q, _ = self.wq_b(q_lora)
     q = q.view(-1, self.n_local_heads, self.head_dim)
-    q_normalized = torch.empty_like(q)
-    kunlun_ops.rmsnorm(
-        q,
-        None,
-        q_normalized,
-        self.eps,
-        False,
-        True,
-        None,
-        None,
-        None,
-    )
-    q = q_normalized
+    q = q * torch.rsqrt(
+        q.float().square().mean(dim=-1, keepdim=True) + self.eps
+    ).to(q.dtype)
     kv = self.kv_norm(kv)
 
     from sglang.srt.models.deepseek_v4 import fused_rope_inplace
@@ -232,17 +212,32 @@ def hc_pre_kunlun(
 
     if self.hc_mult != 4:
         raise ValueError("Kunlun hc_pre supports hc_mult=4 only")
-    y, post, comb = torch.ops.xspeedgate_ops.hc_pre(
-        x.contiguous(),
-        hc_fn.contiguous(),
-        hc_scale.contiguous(),
-        hc_base.contiguous(),
-        rms_eps=self.rms_norm_eps,
-        hc_pre_eps=self.hc_eps,
-        hc_sinkhorn_eps=self.hc_eps,
-        mhc_post_mult_value=2.0,
-        sinkhorn_iters=self.hc_sinkhorn_iters,
+    x_flat = x.reshape(x.shape[0], -1).float()
+    x_view = x_flat.view(x.shape[0], self.hc_mult, -1)
+    rms = torch.rsqrt(
+        x_flat.square().mean(dim=-1, keepdim=True) + self.rms_norm_eps
     )
+    mixes = F.linear(x_flat, hc_fn.float()) * rms
+    pre = torch.sigmoid(mixes[:, : self.hc_mult] * hc_scale[:1] + hc_base[: self.hc_mult])
+    pre = pre + self.hc_eps
+    post = 2.0 * torch.sigmoid(
+        mixes[:, self.hc_mult : 2 * self.hc_mult] * hc_scale[1:2]
+        + hc_base[self.hc_mult : 2 * self.hc_mult]
+    )
+    comb = (
+        mixes[:, 2 * self.hc_mult :] * hc_scale[2]
+        + hc_base[2 * self.hc_mult :]
+    ).view(x.shape[0], self.hc_mult, self.hc_mult)
+
+    # Sinkhorn normalization matches the reference's stabilized row/column order.
+    comb = comb - comb.amax(dim=-1, keepdim=True)
+    comb = torch.exp(comb)
+    comb = comb / comb.sum(dim=-1, keepdim=True) + self.hc_eps
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
+    for _ in range(max(self.hc_sinkhorn_iters - 1, 0)):
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
+    y = (pre.unsqueeze(-1) * x_view).sum(dim=1).to(dtype)
     return y, post, comb, False
 
 
@@ -266,19 +261,8 @@ def hc_post_kunlun(
     assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
     assert post.shape == (x.shape[0], self.hc_mult)
     assert comb.shape == (x.shape[0], self.hc_mult, self.hc_mult)
-    batch, hidden_size = x.shape[0], x.shape[-1]
-    out = torch.empty(
-        (batch, self.hc_mult, hidden_size), dtype=x.dtype, device=x.device
-    )
-    hc_post_kunlun_impl(
-        post.contiguous(),
-        x.contiguous(),
-        comb.contiguous(),
-        residual.contiguous(),
-        out,
-        batch,
-        self.hc_mult,
-        hidden_size,
-    )
-    return out
+    return (
+        post.unsqueeze(-1) * x.unsqueeze(1)
+        + (comb.unsqueeze(-1) * residual.unsqueeze(2)).sum(dim=1)
+    ).type_as(x)
 

@@ -107,7 +107,9 @@ if (
     try:
         _enable_transformers_compatibility()
         os.environ.setdefault("SGLANG_OPT_USE_TOPK_V2", "0")
-        os.environ.setdefault("SGLANG_OPT_USE_COMPRESSOR_V2", "0")
+        # SGLang 0.5.17 DeepSeek-V4 uses compressor_v2 as the public contract.
+        # Keep an explicit user override, but never silently downgrade to v1.
+        os.environ.setdefault("SGLANG_OPT_USE_COMPRESSOR_V2", "1")
 
         from sglang_kunlun import _kunlun_pre_shim
 

@@ -24,79 +24,14 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 from sglang_kunlun.kernels.kernel_ops import (
+    dsv4_c4_paged_mqa_logits_torch,
+    dsv4_compressed_attention_torch,
     dsv4_quant_k_cache_kunlun,
     dsv4_set_k_and_s_with_mapping_kunlun,
 )
 
 
 logger = logging.getLogger(__name__)
-
-
-@plugin_hook(
-    "sglang.srt.layers.attention.dsv4.compressor."
-    "CompressorBackendMixin.forward_compress",
-    type=HookType.REPLACE,
-)
-def _forward_compress_zeroed_kunlun(
-    self,
-    *,
-    kv_score_buffer,
-    kv_score_input,
-    ape,
-    head_dim,
-    norm,
-    freqs_cis_cache,
-    rotate,
-    forward_batch,
-    compress_ratio,
-    is_paged=False,
-):
-    """Zero sparse-plan rows that the kernel leaves untouched before cache store."""
-    from sglang.jit_kernel.dsv4.compress_old import (
-        compress_forward,
-        compress_fused_norm_rope_inplace,
-    )
-    from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
-    from sglang.srt.layers.attention.dsv4.compressor import (
-        is_overlap_compress,
-        make_compressor_plan,
-    )
-
-    assert compress_ratio in (4, 128)
-    if is_paged:
-        metadata = self.get_paged_compress_metadata(compress_ratio)
-        coff = 2 if is_overlap_compress(compress_ratio) else 1
-        if compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
-            kv_score_buffer = kv_score_buffer.view(-1, 1, head_dim * 3)
-        else:
-            last_dim = 2 * head_dim * coff
-            assert kv_score_buffer.shape[-1] == last_dim
-            kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
-    else:
-        plan = make_compressor_plan(compress_ratio, forward_batch)
-        metadata = (forward_batch.req_pool_indices.to(torch.int32), None, plan)
-    indices, extra_data, plan = metadata
-
-    out = kv_score_input.new_zeros((kv_score_input.shape[0], head_dim))
-    kv_compressed = compress_forward(
-        kv_score_buffer=kv_score_buffer,
-        kv_score_input=kv_score_input,
-        ape=ape,
-        indices=indices,
-        plan=plan,
-        compress_ratio=compress_ratio,
-        head_dim=head_dim,
-        extra_data=extra_data,
-        out=out,
-    )
-    compress_fused_norm_rope_inplace(
-        kv_compressed,
-        norm.weight,
-        norm.variance_epsilon,
-        freqs_cis_cache,
-        plan,
-    )
-    return rotate_activation(kv_compressed) if rotate else kv_compressed
 
 
 def _clamp_c128_prefill_topk(
@@ -114,17 +49,7 @@ def _clamp_c128_prefill_topk(
 
 
 @plugin_hook(
-    "sglang.srt.layers.attention.deepseek_v4_backend.create_paged_compressor_data",
-    type=HookType.AROUND,
-)
-def _create_paged_compressor_data_kunlun(original_fn, *args, **kwargs):
-    """Adapt the 0.5.14 call site to the active compressor-v1 signature."""
-    kwargs.pop("online_state_slot_offset", None)
-    return original_fn(*args, **kwargs)
-
-
-@plugin_hook(
-    "sglang.jit_kernel.dsv4.attn.get_paged_mqa_logits_metadata",
+    "sglang.kernels.ops.attention.dsv4.attn.get_paged_mqa_logits_metadata",
     type=HookType.REPLACE,
 )
 def _get_paged_mqa_logits_metadata_kunlun(seq_lens, page_size, num_sm):
@@ -136,48 +61,6 @@ def _get_paged_mqa_logits_metadata_kunlun(seq_lens, page_size, num_sm):
     does not consume ``deep_gemm_metadata``, so an empty placeholder is safe.
     """
     return torch.empty(0, dtype=torch.int32, device=seq_lens.device)
-
-
-@plugin_hook(
-    "sglang.jit_kernel.dsv4.compress_old.CompressorPrefillPlan.generate",
-    type=HookType.REPLACE,
-)
-def _generate_compressor_prefill_plan_kunlun(
-    compress_ratio,
-    num_q_tokens,
-    seq_lens,
-    extend_lens,
-    device,
-    use_cuda_graph=False,
-):
-    """Build compressor-v1 plans with the XSpeedGate planner."""
-    from sglang.jit_kernel.dsv4.compress_old import CompressorPrefillPlan
-
-    if seq_lens.dtype != torch.int64:
-        seq_lens = seq_lens.to(torch.int64)
-    if extend_lens.dtype != torch.int64:
-        extend_lens = extend_lens.to(torch.int64)
-    plan_tensor = torch.empty(
-        (2, num_q_tokens, 16),
-        dtype=torch.uint8,
-        device=seq_lens.device,
-        pin_memory=seq_lens.is_cpu,
-    )
-    plan_lens = torch.ops.xspeedgate_ops.plan_compress_prefill(
-        extend_lens,
-        seq_lens,
-        plan_tensor[0],
-        plan_tensor[1],
-        compress_ratio,
-        compress_ratio == 4,
-        use_cuda_graph,
-    )
-    plan_device = plan_tensor.to(device, non_blocking=True)
-    return CompressorPrefillPlan(
-        compress_ratio,
-        plan_device[0, : int(plan_lens[0])],
-        plan_device[1, : int(plan_lens[1])],
-    )
 
 
 class KunlunDSV4AttnMetadata(DSV4AttnMetadata):
@@ -341,7 +224,7 @@ def _make_cp_prefill_lod(core_metadata, num_queries: int, device: torch.device):
 def _refresh_graph_host_lengths(
     forward_batch, attention_decode_aux, c4_decode_aux, graph_extend_aux
 ) -> None:
-    """Refresh this backend's pointer-stable lengths before graph replay."""
+    """Refresh pointer-stable backend lengths before graph replay."""
     seq_lens = _seq_lens_cpu_i32(forward_batch)
     batch_size = forward_batch.batch_size
 
@@ -453,30 +336,29 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             positions = positions[:num_queries]
 
         if enable_multi_stream:
-            q_indexer, weights, c4_indexer_kv_cache = (
-                self._forward_prepare_multi_stream(
-                    x=x,
-                    q_lora=q_lora,
-                    c4_indexer=c4_indexer,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    token_to_kv_pool=token_to_kv_pool,
-                    alt_streams=alt_streams,
-                    q_lora_ready=q_lora_ready,
-                )
-            )
-        else:
-            assert q_lora_ready is None
-            q_indexer, weights, c4_indexer_kv_cache = self._forward_prepare_normal(
+            q_indexer, weights = self._forward_prepare_multi_stream(
                 x=x,
                 q_lora=q_lora,
                 c4_indexer=c4_indexer,
                 positions=positions,
                 forward_batch=forward_batch,
-                token_to_kv_pool=token_to_kv_pool,
+                alt_streams=alt_streams,
+                q_lora_ready=q_lora_ready,
+            )
+        else:
+            assert q_lora_ready is None
+            q_indexer, weights = self._forward_prepare_normal(
+                x=x,
+                q_lora=q_lora,
+                c4_indexer=c4_indexer,
+                positions=positions,
+                forward_batch=forward_batch,
                 skip_compressor=skip_compressor,
             )
 
+        c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
+            layer_id=c4_indexer.layer_id,
+        )
         assert len(c4_indexer_kv_cache.shape) == 2
         block_kv = 64
         num_heads_kv = 1
@@ -680,8 +562,11 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         out_loc: torch.Tensor,
         need_compress: bool = True,
         is_prefill: bool = False,
+        dspark_block_size: Optional[int] = None,
     ) -> KunlunDSV4AttnMetadata:
         """Build Kunlun core attention metadata for the current request."""
+        if dspark_block_size is not None:
+            raise NotImplementedError("Kunlun DSV4 does not support DSpark draft metadata")
         assert self.swa_page_size == upstream.SWA_WINDOW
         seq_lens_casual = seq_lens_casual.to(torch.int32)
         swa_page_indices = self.get_swa_page_indices(
@@ -735,7 +620,10 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         # Golden Prefill keeps -1 as the invalid-tail sentinel. Decode and
         # speculative verify/draft modes use the existing Kunlun page-0
         # normalization contract.
-        if not is_prefill:
+        if (
+            not is_prefill
+            and os.environ.get("DSV4_KUNLUN_REFERENCE_ONLY") != "1"
+        ):
             for field_name in (
                 "swa_page_indices",
                 "c4_sparse_page_indices",
@@ -859,9 +747,6 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         swa_pool = pool.swa_kv_pool
         local_layer_id = pool._swa_local_layer_id(layer_id)
         pack = dsv4_quant_k_cache_kunlun(swa_k)
-        from debug.dsv4_backend_probes import dsv4_probe
-
-        dsv4_probe(self, "store_cache.pre_store", locals())
         dsv4_set_k_and_s_with_mapping_kunlun(
             swa_pool.kv_buffer[local_layer_id],
             raw_loc,
@@ -869,7 +754,6 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             pack,
             swa_pool.page_size,
         )
-        dsv4_probe(self, "store_cache.post_store", locals())
 
     def forward(
         self,
@@ -898,22 +782,43 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         win_cache = win_cache.reshape(-1, cache_dim)
 
         win_indices = self._match_queries(core.swa_page_indices, q.shape[0], 0)
-        win_indices = win_indices[:, :swa_size]
-        from debug.dsv4_backend_probes import dsv4_probe
-
-        dsv4_probe(self, "forward.pre_normalization", locals())
-        win_indices = win_indices.contiguous()
+        win_indices = win_indices[:, :swa_size].contiguous()
+        win_lengths = self._match_queries(core.swa_topk_lengths, q.shape[0], 0)
         extra_cache = None
         extra_indices = None
+        extra_lengths = None
         if compress_ratio == 4:
             extra_cache = pool.get_extra_key_buffer(layer.layer_id)
             extra_indices = core.c4_sparse_page_indices
+            extra_lengths = core.c4_sparse_topk_lengths
         elif compress_ratio == 128:
             extra_cache = pool.get_extra_key_buffer(layer.layer_id)
             extra_indices = core.c128_page_indices
+            extra_lengths = core.c128_topk_lengths_clamp1
         extra_indices = self._match_queries(extra_indices, q.shape[0], -1)
+        extra_lengths = self._match_queries(extra_lengths, q.shape[0], 0)
         q_3d = q.squeeze(1) if q.ndim == 4 else q
         original_dtype = q_3d.dtype
+
+        if os.environ.get("DSV4_KUNLUN_REFERENCE_ONLY") == "1":
+
+            if extra_cache is not None:
+                page_width = pool.page_size // compress_ratio
+                extra_cache = extra_cache[:, : page_width * cache_dim].reshape(
+                    -1, cache_dim
+                )
+            return dsv4_compressed_attention_torch(
+                q=q_3d,
+                win_cache=win_cache,
+                win_indices=win_indices,
+                win_lengths=win_lengths,
+                softmax_scale=self.softmax_scale,
+                attn_sink=attn_sink,
+                extra_cache=extra_cache,
+                extra_indices=extra_indices,
+                extra_lengths=extra_lengths,
+            )
+
         if q_3d.dtype != win_cache.dtype:
             q_3d = q_3d.to(win_cache.dtype)
         q_lod_cpu, q_lod, kv_lens_cpu, kv_lens = self._make_lod(
@@ -931,8 +836,6 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 f"batch_size={forward_batch.batch_size}, "
                 f"mode={forward_batch.forward_mode}"
             )
-        dsv4_probe(self, "forward.attention_consume", locals())
-        dsv4_probe(self, "forward.c4_metadata", locals())
         if extra_cache is None:
             extra_cache = win_cache.new_empty((0, cache_dim))
             extra_indices = torch.empty(
@@ -981,8 +884,6 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             device=q_3d.device,
         )
         lse = torch.zeros_like(max_logits)
-        dsv4_probe(self, "forward.pre_operator", locals())
-
         q_op = q_3d.contiguous()
         win_cache_op = win_cache.contiguous()
         win_indices_op = win_indices.contiguous()
@@ -996,7 +897,6 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         kv_lens_cpu_op = kv_lens_cpu.contiguous()
         kv_lens_op = kv_lens.contiguous()
         attn_sink_op = attn_sink.contiguous() if attn_sink is not None else None
-        dsv4_probe(self, "forward.operator_inputs", locals())
         torch.ops.xspeedgate_ops.compressed_attention(
             q_op,
             win_cache_op,
@@ -1023,8 +923,6 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             # lifetime of the contiguous temporary inputs.
             side_stream=torch.cuda.current_stream().cuda_stream,
         )
-        dsv4_probe(self, "forward.operator_outputs", locals())
-
         return out.to(original_dtype) if out.dtype != original_dtype else out
 
 
@@ -1217,11 +1115,42 @@ def _compute_c4_logits_kunlun(
     forward_batch,
     c4_indexer,
 ):
-    """Use the Kunlun C4 operator with explicit batch ownership."""
+    """Compute C4 logits with explicit Kunlun request ownership."""
+
+    is_target_verify = (
+        forward_batch is not None
+        and forward_batch.forward_mode.is_target_verify()
+    )
+    if os.environ.get("DSV4_KUNLUN_REFERENCE_ONLY") == "1":
+        num_queries_per_request = 1
+        if is_target_verify:
+            q_fp8, weight, seq_lens, page_table, num_queries_per_request = (
+                _select_c4_target_verify_rows(
+                    q_fp8,
+                    weight,
+                    seq_lens,
+                    page_table,
+                    forward_batch.batch_size,
+                )
+            )
+        logits = dsv4_c4_paged_mqa_logits_torch(
+            q_int8=q_fp8,
+            kvcache_int8=kvcache_fp8,
+            weight=weight,
+            seq_lens=seq_lens,
+            page_table=page_table,
+            max_seq_len=max_seq_len,
+        )
+        if is_target_verify:
+            logits = (
+                logits.unsqueeze(1)
+                .expand(-1, num_queries_per_request, -1)
+                .reshape(-1, max_seq_len)
+                .contiguous()
+            )
+        return logits
 
     import kunlun_ops
-
-    from debug.dsv4_backend_probes import dsv4_probe
 
     layer_id = c4_indexer.layer_id
 
@@ -1277,7 +1206,6 @@ def _compute_c4_logits_kunlun(
             )
             padded[:, : logits.shape[1]] = logits
             logits = padded
-        dsv4_probe(backend, "indexer.c4_logits", locals())
         return logits
 
     num_queries_per_request = 1
@@ -1372,7 +1300,6 @@ def _compute_c4_logits_kunlun(
         clean_logits=True,
         use_xfa_boost=False,
     )
-    dsv4_probe(backend, "indexer.operator_outputs", locals())
     logits = logits.squeeze(1)
     if is_target_verify:
         logits = (
@@ -1449,7 +1376,3 @@ class KunlunDeepseekV4MultiStepBackend(DeepseekV4MultiStepBackend):
                     backend._c4_decode_aux,
                     backend._attention_graph_extend_aux,
                 )
-        if not in_capture:
-            from debug.dsv4_backend_probes import dsv4_probe
-
-            dsv4_probe(self, "multistep.replay_metadata", locals())

@@ -7,7 +7,12 @@ from __future__ import annotations
 
 import logging
 
+import torch
+
+from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+
 logger = logging.getLogger(__name__)
+
 
 try:
     from sglang.srt.layers.attention.attention_registry import register_attention_backend
@@ -31,4 +36,18 @@ if register_attention_backend is not None:
 
         return KunlunDeepseekV4AttnBackend(runner)
 
-    logger.info("Registered 'kunlun' and 'kunlun_compressed' attention backends")
+    @register_attention_backend("kunlun_nsa")
+    def create_kunlun_nsa_attention_backend(runner):
+        """Lazy-construct the Kunlun DeepSeek sparse attention (DSA/NSA) backend."""
+        from .kunlun_nsa_backend import KunlunDSAAttnBackend
+
+        return KunlunDSAAttnBackend(runner)
+
+    # Upstream keys a lot of DSA-specific plumbing on the *name* "dsa"/"nsa"
+    register_attention_backend("dsa")(create_kunlun_nsa_attention_backend)
+    register_attention_backend("nsa")(create_kunlun_nsa_attention_backend)
+
+    logger.info(
+        "Registered 'kunlun', 'kunlun_compressed' and 'kunlun_nsa' attention "
+        "backends; 'dsa'/'nsa' now resolve to KunlunDSAAttnBackend"
+    )

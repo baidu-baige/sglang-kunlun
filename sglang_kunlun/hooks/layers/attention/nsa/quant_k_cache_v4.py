@@ -25,7 +25,7 @@ def _resolve_kv_cache_dtype(kv_cache_dtype: torch.dtype | None) -> torch.dtype:
 
 @plugin_hook(
     target=(
-        "sglang.srt.layers.attention.dsv4.quant_k_cache."
+        "sglang.kernels.ops.attention.dsv4.quant_k_cache."
         "quant_to_nope_fp8_rope_bf16_pack_triton"
     ),
     type=HookType.REPLACE,
