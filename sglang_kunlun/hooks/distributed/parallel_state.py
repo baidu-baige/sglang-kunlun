@@ -59,6 +59,8 @@ def kunlun_init_model_parallel_group(
     use_mscclpp_allreduce: Optional[bool] = None,
     use_torch_symm_mem_allreduce: Optional[bool] = None,
     recovered_rank: bool = False,
+    rank_offset: int = 0,
+    max_world_size: Optional[int] = None,
 ):
     """Kunlun: init GroupCoordinator with XPU/NPU/HPU communicators."""
     from sglang.srt.distributed.parallel_state import (
@@ -89,4 +91,6 @@ def kunlun_init_model_parallel_group(
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
         recovered_rank=recovered_rank,
+        rank_offset=rank_offset,
+        max_world_size=max_world_size,
     )

@@ -12,6 +12,8 @@ from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 import torch
 
+from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+
 logger = logging.getLogger(__name__)
 _ENABLE_DSV4_ACCURACY_DUMPS = False
 _DSV4_PROBE_COUNTERS: Dict[str, int] = {}
@@ -55,7 +57,6 @@ def _dsv4_probe(group: str, tensors: Mapping[str, object], **meta) -> None:
     torch.save(payload, os.path.join(output_dir, f"rank{rank}_{group}_{index:04d}.pt"))
 
 def _debug_tensor_meta(name: str, value: object) -> str:
-    """Format tensor metadata or a generic value for debug logging."""
     if isinstance(value, torch.Tensor):
         return f"{name}: shape={tuple(value.shape)}, dtype={value.dtype}, device={value.device}"
     return f"{name}: value={value!r}, type={type(value).__name__}"
@@ -193,16 +194,16 @@ def _patch_symbol(spec: KernelSpec, replacement: object) -> None:
 def dsv4_mqa_wo_a_einsum_kunlun(
     o: torch.Tensor, weight: torch.Tensor
 ) -> torch.Tensor:
-    """Run the Kunlun wo_a reduction contract."""
+    """Run the DSV4 wo_a reduction with the Torch reference contraction."""
 
-    return torch.ops.xspeedgate_ops.einsum_tgd_grd_tgr(o.contiguous(), weight)
+    return torch.einsum("tgd,grd->tgr", o, weight)
 
 
 def dsv4_mqa_forward_with_full_sink_kunlun(original_fn, self, *args, **kwargs):
     """Expose the full attention sink while MQALayer.forward runs."""
 
     original_local_sink = self._attn_sink_local
-    if self.tp_size > 1:
+    if self.attn_tp_size > 1:
         self._attn_sink_local = self.attn_sink
     try:
         return original_fn(self, *args, **kwargs)
@@ -345,6 +346,152 @@ def _dsv4_topk_torch_fallback(*args, **kwargs) -> None:
     topk_transform_512_pytorch_vectorized(*args, **kwargs)
 
 
+def dsv4_c4_paged_mqa_logits_torch(
+    q_int8: torch.Tensor,
+    kvcache_int8: torch.Tensor,
+    weight: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    max_seq_len: int,
+) -> torch.Tensor:
+    """Compute C4 indexer logits from Kunlun's INT8 plus FP32-scale cache."""
+
+    batch_size, _, num_heads, head_dim = q_int8.shape
+    block_size = kvcache_int8.shape[1]
+    if head_dim != 128 or block_size != 64:
+        raise ValueError(
+            f"unsupported C4 layout: head_dim={head_dim}, block_size={block_size}"
+        )
+    if kvcache_int8.shape[2:] != (1, head_dim + 4):
+        raise ValueError(f"invalid C4 cache shape: {tuple(kvcache_int8.shape)}")
+
+    seq_lens = seq_lens.reshape(-1)[:batch_size]
+    page_table = page_table[:batch_size]
+    if weight.shape != (batch_size, num_heads):
+        raise ValueError(
+            f"invalid C4 weight shape: expected {(batch_size, num_heads)}, "
+            f"got {tuple(weight.shape)}"
+        )
+
+    page_count = kvcache_int8.shape[0]
+    page_bytes = block_size * (head_dim + 4)
+    scale_offset = block_size * head_dim
+    cache_flat = kvcache_int8.reshape(page_count, page_bytes).view(torch.int8)
+    safe_pages = page_table.to(torch.int64).clamp(min=0, max=max(page_count - 1, 0))
+    gathered = cache_flat.index_select(0, safe_pages.reshape(-1)).reshape(
+        batch_size, page_table.shape[1], page_bytes
+    )
+
+    keys = gathered[..., :scale_offset].contiguous().float()
+    keys = keys.reshape(batch_size, -1, head_dim)
+    scales = gathered[..., scale_offset:].contiguous().view(torch.float32)
+    scales = scales.reshape(batch_size, -1)
+    queries = q_int8[:, 0].view(torch.int8).float()
+
+    scores = torch.bmm(keys, queries.transpose(1, 2))
+    scores = torch.relu(scores) * weight.float().unsqueeze(1)
+    scores = scores.sum(dim=2) * scales
+
+    padded_seq_len = scores.shape[1]
+    positions = torch.arange(padded_seq_len, device=scores.device).unsqueeze(0)
+    scores = scores.masked_fill(positions >= seq_lens.unsqueeze(1), 0.0)
+    if padded_seq_len < max_seq_len:
+        scores = torch.nn.functional.pad(
+            scores, (0, max_seq_len - padded_seq_len), value=0.0
+        )
+    return scores[:, :max_seq_len]
+
+
+def dsv4_compressed_attention_torch(
+    q: torch.Tensor,
+    win_cache: torch.Tensor,
+    win_indices: torch.Tensor,
+    win_lengths: torch.Tensor,
+    softmax_scale: float,
+    attn_sink: Optional[torch.Tensor] = None,
+    extra_cache: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    extra_lengths: Optional[torch.Tensor] = None,
+    query_block_size: int = 256,
+) -> torch.Tensor:
+    """Reference DSV4 SWA plus compressed-K attention over half-precision caches."""
+
+    if q.ndim != 3:
+        raise ValueError(f"expected q to be rank 3, got shape {tuple(q.shape)}")
+    num_queries, num_heads, head_dim = q.shape
+    if win_cache.ndim != 2 or win_cache.shape[1] != head_dim:
+        raise ValueError(f"invalid SWA cache shape: {tuple(win_cache.shape)}")
+    if win_indices.shape[0] != num_queries or win_lengths.shape[0] != num_queries:
+        raise ValueError("SWA metadata does not match the query count")
+    has_extra = extra_cache is not None
+    if has_extra != (extra_indices is not None and extra_lengths is not None):
+        raise ValueError("extra cache, indices, and lengths must be provided together")
+    if has_extra and (
+        extra_cache.ndim != 2
+        or extra_cache.shape[1] != head_dim
+        or extra_indices.shape[0] != num_queries
+        or extra_lengths.shape[0] != num_queries
+    ):
+        raise ValueError("compressed-K metadata does not match the query layout")
+    if attn_sink is not None and attn_sink.numel() != num_heads:
+        raise ValueError(
+            f"attention sink has {attn_sink.numel()} heads, expected {num_heads}"
+        )
+
+    def gather_rows(cache: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        safe = indices.to(torch.int64).clamp(min=0, max=cache.shape[0] - 1)
+        return cache.index_select(0, safe.reshape(-1)).reshape(
+            indices.shape[0], indices.shape[1], head_dim
+        )
+
+    output = torch.empty_like(q)
+    for query_start in range(0, num_queries, query_block_size):
+        query_end = min(query_start + query_block_size, num_queries)
+        query = q[query_start:query_end].float()
+
+        block_win_indices = win_indices[query_start:query_end]
+        block_win_lengths = win_lengths[query_start:query_end].to(torch.int64)
+        win_slots = torch.arange(
+            block_win_indices.shape[1], device=q.device, dtype=torch.int64
+        ).unsqueeze(0)
+        win_valid = (
+            (win_slots < block_win_lengths.unsqueeze(1))
+            & (block_win_indices >= 0)
+            & (block_win_indices < win_cache.shape[0])
+        )
+        keys = gather_rows(win_cache, block_win_indices).float()
+        valid = win_valid
+
+        if has_extra:
+            block_extra_indices = extra_indices[query_start:query_end]
+            block_extra_lengths = extra_lengths[query_start:query_end].to(torch.int64)
+            extra_slots = torch.arange(
+                block_extra_indices.shape[1], device=q.device, dtype=torch.int64
+            ).unsqueeze(0)
+            extra_valid = (
+                (extra_slots < block_extra_lengths.unsqueeze(1))
+                & (block_extra_indices >= 0)
+                & (block_extra_indices < extra_cache.shape[0])
+            )
+            extra_keys = gather_rows(extra_cache, block_extra_indices).float()
+            keys = torch.cat((keys, extra_keys), dim=1)
+            valid = torch.cat((valid, extra_valid), dim=1)
+
+        scores = torch.einsum("qhd,qkd->qhk", query, keys) * softmax_scale
+        scores = scores.masked_fill(~valid.unsqueeze(1), float("-inf"))
+        if attn_sink is not None:
+            sink_scores = attn_sink.float().reshape(1, num_heads, 1)
+            sink_scores = sink_scores.expand(query_end - query_start, -1, -1)
+            probabilities = torch.softmax(
+                torch.cat((scores, sink_scores), dim=-1), dim=-1
+            )[..., :-1]
+        else:
+            probabilities = torch.softmax(scores, dim=-1)
+        block_output = torch.einsum("qhk,qkd->qhd", probabilities, keys)
+        output[query_start:query_end].copy_(block_output.to(q.dtype))
+    return output
+
+
 def _dsv4_topk_transform_graph_safe(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -371,6 +518,7 @@ def _dsv4_topk_transform_graph_safe(
     raw_indices = torch.topk(
         masked_scores, k=actual_k, dim=1, largest=True, sorted=False
     ).indices
+    raw_indices = torch.sort(raw_indices, dim=1).values
     if actual_k < topk:
         raw_indices = torch.nn.functional.pad(
             raw_indices, (0, topk - actual_k), value=0
@@ -404,6 +552,7 @@ def _dsv4_topk_transform_graph_safe(
     out_page_indices.copy_(page_indices.to(torch.int32))
 
 
+@register_jit_op("sglang.kernels.ops.attention.dsv4.topk", "topk_transform_512")
 @register_jit_op("sglang.jit_kernel.dsv4.topk", "topk_transform_512")
 def dsv4_topk_transform_512_kunlun(
     scores: torch.Tensor,
@@ -437,6 +586,20 @@ def dsv4_topk_transform_512_kunlun(
             page_size=page_size,
         )
         return
+    if os.environ.get("DSV4_KUNLUN_REFERENCE_ONLY") == "1":
+        _dsv4_topk_transform_graph_safe(
+            scores,
+            seq_lens,
+            page_tables,
+            out_page_indices,
+            page_size,
+        )
+        _dsv4_probe(
+            "topk",
+            {"scores": scores, "page_indices": out_page_indices},
+            page_size=page_size,
+        )
+        return
 
     topk = out_page_indices.shape[1]
     # Pre-fill -1: XPU kernel skips writes for seq_len=0 rows, so the sentinel
@@ -465,6 +628,7 @@ def dsv4_topk_transform_512_kunlun(
     )
 
 
+@register_jit_op("sglang.kernels.ops.attention.dsv4.topk", "topk_transform_512_v2")
 @register_jit_op("sglang.jit_kernel.dsv4.topk", "topk_transform_512_v2")
 def dsv4_topk_transform_512_v2_kunlun(
     scores: torch.Tensor,
@@ -482,7 +646,6 @@ def dsv4_topk_transform_512_v2_kunlun(
     )
 
 
-@register_jit_op("sglang.srt.layers.attention.dsv4.indexer", "fused_scale")
 def dsv4_fused_scale_kunlun(
     weight: torch.Tensor, out_scale: float, q_scale: torch.Tensor
 ) -> torch.Tensor:
@@ -497,7 +660,8 @@ def dsv4_fused_scale_kunlun(
 
 
 @register_jit_op(
-    "sglang.srt.layers.attention.dsv4.metadata_kernel", "init_compression_metadata"
+    "sglang.kernels.ops.attention.dsv4.metadata_kernel",
+    "init_compression_metadata",
 )
 def dsv4_init_compression_metadata_kunlun(
     seq_lens: torch.Tensor,
@@ -507,40 +671,708 @@ def dsv4_init_compression_metadata_kunlun(
     page_size: int = 0,
     compute_page_indices: bool = True,
 ):
-    """Build compressed-attention metadata with the Kunlun fused operator."""
+    """Build the upstream DSV4 metadata contract with device Torch ops."""
 
-    # xspeedgate reads these tensors as dense arrays. Decode and speculative
-    # paths may pass strided slices (for example, graph buffers sliced to the
-    # runtime batch size), so normalize the layout at the vendor-op boundary.
-    seq_lens = seq_lens.contiguous()
-    positions = positions.contiguous()
-    raw_out_loc = raw_out_loc.contiguous()
-    if page_table is not None:
-        page_table = page_table.contiguous()
+    if seq_lens.ndim != 1 or positions.shape != seq_lens.shape:
+        raise ValueError("seq_lens and positions must be one-dimensional and aligned")
+    if raw_out_loc.shape != seq_lens.shape:
+        raise ValueError("raw_out_loc must have the same shape as seq_lens")
 
-    values = torch.ops.xspeedgate_ops.init_compressed_attn_metadata(
-        seq_lens,
-        positions,
-        raw_out_loc,
-        page_table,
-        page_size,
-        compute_page_indices,
+    seq_lens_i32 = seq_lens.to(torch.int32)
+    positions_i32 = positions.to(torch.int32)
+    raw_out_loc_i64 = raw_out_loc.to(torch.int64)
+
+    c4_seq_lens_raw = torch.div(seq_lens_i32, 4, rounding_mode="floor")
+    c4_out_loc = torch.where(
+        seq_lens_i32.remainder(4) == 0,
+        torch.div(raw_out_loc_i64, 4, rounding_mode="floor"),
+        torch.zeros_like(raw_out_loc_i64),
     )
-    values = tuple(values)
-    # The operator predates c128_seq_lens_raw in the public contract.
-    if len(values) == 8:
-        values = values[:6] + (
-            torch.div(seq_lens.to(torch.int32), 128, rounding_mode="floor"),
-        ) + values[6:]
-    if len(values) != 9:
-        raise RuntimeError(
-            f"init_compressed_attn_metadata returned {len(values)} values, expected 8 or 9"
+    c4_positions = torch.bitwise_and(positions_i32, -4)
+    c4_seq_lens_clamp1 = c4_seq_lens_raw.clamp_min(1)
+
+    c128_seq_lens_raw = torch.div(seq_lens_i32, 128, rounding_mode="floor")
+    c128_out_loc = torch.where(
+        seq_lens_i32.remainder(128) == 0,
+        torch.div(raw_out_loc_i64, 128, rounding_mode="floor"),
+        torch.zeros_like(raw_out_loc_i64),
+    )
+    c128_positions = torch.bitwise_and(positions_i32, -128)
+    c128_seq_lens_clamp1 = c128_seq_lens_raw.clamp_min(1)
+
+    c128_page_indices = None
+    if compute_page_indices:
+        if page_table is None:
+            raise ValueError("page_table required when compute_page_indices=True")
+        if page_table.ndim != 2 or page_table.shape[0] < seq_lens.shape[0]:
+            raise ValueError("page_table must be [batch, max_pages]")
+        if page_size < 128 or page_size % 128:
+            raise ValueError(
+                "page_size must be a multiple of 128 when compute_page_indices=True"
+            )
+
+        c128_page_size = page_size // 128
+        max_pages = page_table.shape[1]
+        offsets = torch.arange(
+            max_pages * c128_page_size,
+            dtype=torch.int64,
+            device=seq_lens.device,
         )
-    return tuple(values)
+        page_ids = torch.div(offsets, c128_page_size, rounding_mode="floor")
+        offsets_in_page = offsets.remainder(c128_page_size)
+        physical_pages = page_table[: seq_lens.shape[0]].to(torch.int64)
+        c128_page_indices_i64 = (
+            physical_pages.index_select(1, page_ids)
+            * c128_page_size
+            + offsets_in_page.unsqueeze(0)
+        )
+        valid = offsets.unsqueeze(0) < c128_seq_lens_raw.to(torch.int64).unsqueeze(1)
+        c128_page_indices = torch.where(
+            valid,
+            c128_page_indices_i64,
+            torch.full_like(c128_page_indices_i64, -1),
+        ).to(torch.int32)
+
+    return (
+        c4_out_loc,
+        c4_positions,
+        c4_seq_lens_raw,
+        c4_seq_lens_clamp1,
+        c128_out_loc,
+        c128_positions,
+        c128_seq_lens_raw,
+        c128_seq_lens_clamp1,
+        c128_page_indices,
+    )
+
+
+@plugin_hook(
+    "sglang.kernels.ops.attention.dsv4_attn_metadata_kernels."
+    "ExpandPrefillCausally.execute",
+    type=HookType.REPLACE,
+)
+def dsv4_expand_prefill_causally_torch(
+    cls,
+    *,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    extend_start_loc: Optional[torch.Tensor],
+    seq_lens_cpu: Optional[List[int]],
+    extend_seq_lens_cpu: Optional[List[int]],
+    num_tokens: int,
+    padded_num_tokens: Optional[int],
+):
+    """Expand target-verify metadata with graph-safe Torch tensor operations."""
+
+    del extend_start_loc, seq_lens_cpu, extend_seq_lens_cpu
+    total_tokens = max(num_tokens, padded_num_tokens or num_tokens)
+    device = req_pool_indices.device
+    from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
+        ExpandPrefillCausallyResult,
+    )
+
+    if req_pool_indices.shape[0] == 0:
+        return ExpandPrefillCausallyResult(
+            seq_lens_casual=torch.ones(
+                total_tokens, dtype=torch.int32, device=device
+            ),
+            req_pool_indices_repeated=torch.zeros(
+                total_tokens, dtype=req_pool_indices.dtype, device=device
+            ),
+        )
+
+    token_ids = torch.arange(total_tokens, dtype=torch.int64, device=device)
+    real_tokens = token_ids < num_tokens
+    safe_token_ids = torch.where(real_tokens, token_ids, torch.zeros_like(token_ids))
+    extend_i64 = extend_seq_lens.to(torch.int64)
+    cumulative = torch.cumsum(extend_i64, dim=0)
+    batch_ids = torch.searchsorted(cumulative, safe_token_ids, right=True).clamp(
+        max=req_pool_indices.shape[0] - 1
+    )
+    batch_ids = torch.where(
+        real_tokens,
+        batch_ids,
+        torch.full_like(batch_ids, req_pool_indices.shape[0] - 1),
+    )
+    start_locs = torch.cat([cumulative.new_zeros(1), cumulative[:-1]])
+    starts = start_locs.index_select(0, batch_ids)
+    seq = seq_lens.to(torch.int64).index_select(0, batch_ids)
+    extend = extend_i64.index_select(0, batch_ids)
+    causal = seq - extend + 1 + safe_token_ids - starts
+    causal = torch.where(real_tokens, causal, torch.ones_like(causal)).to(torch.int32)
+    repeated = req_pool_indices.index_select(0, batch_ids)
+
+    return ExpandPrefillCausallyResult(
+        seq_lens_casual=causal,
+        req_pool_indices_repeated=repeated,
+    )
+
+
+def _dsv4_state_loc_torch(
+    compress_ratio: int,
+    req_pool_indices: torch.Tensor,
+    positions: torch.Tensor,
+    req_to_token: torch.Tensor,
+    full_to_state: torch.Tensor,
+    swa_page_size: int,
+    ring_size: int,
+) -> torch.Tensor:
+    """Translate request positions to the v2 compressor state-slot address."""
+
+    rid = req_pool_indices.to(torch.int64)
+    pos = positions.to(torch.int64)
+    if compress_ratio == 128:
+        return rid * ring_size + pos.remainder(ring_size)
+    if compress_ratio != 4:
+        raise ValueError(f"unsupported compression ratio: {compress_ratio}")
+    safe_pos = pos.clamp(min=0, max=req_to_token.shape[1] - 1)
+    raw_loc = req_to_token[rid, safe_pos].to(torch.int64)
+    swa_loc = full_to_state[raw_loc].to(torch.int64)
+    return (
+        torch.div(swa_loc, swa_page_size, rounding_mode="floor") * ring_size
+        + swa_loc.remainder(ring_size)
+    )
+
+
+def _dsv4_pack_plan_i32(columns: List[torch.Tensor], width: int) -> torch.Tensor:
+    """Pack int32 plan fields into the byte ABI consumed by compressor v2."""
+
+    if not columns:
+        raise ValueError("at least one plan column is required")
+    return torch.stack([column.to(torch.int32) for column in columns], dim=1).contiguous().view(
+        torch.uint8
+    ).reshape(columns[0].shape[0], width)
+
+
+@plugin_hook(
+    "sglang.kernels.ops.attention.dsv4.compress.CompressorDecodePlan.generate",
+    type=HookType.REPLACE,
+)
+def dsv4_compressor_decode_plan_torch(
+    compress_ratio: int,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    full_to_state: torch.Tensor,
+    seq_lens: torch.Tensor,
+    swa_page_size: int,
+    ring_size: int,
+):
+    """Build a graph-safe v2 decode plan using device Torch operations."""
+
+    from sglang.kernels.ops.attention.dsv4.compress import CompressorDecodePlan
+
+    if compress_ratio not in (4, 128):
+        raise ValueError(f"unsupported compression ratio: {compress_ratio}")
+    seq_lens_i32 = seq_lens.to(torch.int32)
+    position_1 = seq_lens_i32.to(torch.int64) - 1
+    position_0 = (position_1 - compress_ratio).clamp_min(0)
+    write_loc = _dsv4_state_loc_torch(
+        compress_ratio,
+        req_pool_indices,
+        position_1,
+        req_to_token,
+        full_to_state,
+        swa_page_size,
+        ring_size,
+    )
+    read_page_0 = torch.div(
+        _dsv4_state_loc_torch(
+            compress_ratio,
+            req_pool_indices,
+            position_0,
+            req_to_token,
+            full_to_state,
+            swa_page_size,
+            ring_size,
+        ),
+        compress_ratio,
+        rounding_mode="floor",
+    )
+    read_page_1 = torch.div(write_loc, compress_ratio, rounding_mode="floor")
+    plan_d = _dsv4_pack_plan_i32(
+        [seq_lens_i32, write_loc, read_page_0, read_page_1], 16
+    )
+    return CompressorDecodePlan(compress_ratio, plan_d)
+
+
+@plugin_hook(
+    "sglang.kernels.ops.attention.dsv4.compress.CompressorPrefillPlan.generate",
+    type=HookType.REPLACE,
+)
+def dsv4_compressor_prefill_plan_torch(
+    compress_ratio: int,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    extend_lens: torch.Tensor,
+    req_to_token: torch.Tensor,
+    full_to_state: torch.Tensor,
+    swa_page_size: int,
+    ring_size: int,
+    num_q_tokens: int,
+    use_cuda_graph: bool = False,
+):
+    """Build the v2 prefill plan ABI without a JIT or vendor planner."""
+
+    from sglang.kernels.ops.attention.dsv4.compress import CompressorPrefillPlan
+
+    if compress_ratio not in (4, 128):
+        raise ValueError(f"unsupported compression ratio: {compress_ratio}")
+    if num_q_tokens < req_pool_indices.shape[0]:
+        raise ValueError("num_q_tokens must be at least the batch size")
+    device = req_pool_indices.device
+    seq_lens_i64 = seq_lens.to(device=device, dtype=torch.int64)
+    extend_lens_i64 = extend_lens.to(device=device, dtype=torch.int64)
+    if seq_lens_i64.shape != extend_lens_i64.shape:
+        raise ValueError("seq_lens and extend_lens must have the same shape")
+    if num_q_tokens == 0:
+        return CompressorPrefillPlan(
+            compress_ratio,
+            torch.empty((0, 16), dtype=torch.uint8, device=device),
+            torch.empty((0, 8), dtype=torch.uint8, device=device),
+            None,
+        )
+
+    token_ids = torch.arange(num_q_tokens, dtype=torch.int64, device=device)
+    cumulative = torch.cumsum(extend_lens_i64, dim=0)
+    batch_ids = torch.searchsorted(cumulative, token_ids, right=True)
+    safe_batch_ids = batch_ids.clamp(max=max(req_pool_indices.shape[0] - 1, 0))
+    starts = torch.cat([cumulative.new_zeros(1), cumulative[:-1]])
+    token_in_request = token_ids - starts.index_select(0, safe_batch_ids)
+    prefix_lens = seq_lens_i64 - extend_lens_i64
+    positions = prefix_lens.index_select(0, safe_batch_ids) + token_in_request
+    real_token_mask = token_ids < cumulative[-1]
+
+    should_compress = real_token_mask & ((positions + 1).remainder(compress_ratio) == 0)
+    is_overlap = compress_ratio == 4
+    window_size = compress_ratio * (2 if is_overlap else 1)
+    last_compress_position = torch.div(
+        seq_lens_i64, compress_ratio, rounding_mode="floor"
+    ) * compress_ratio
+    first_write_position = last_compress_position - (compress_ratio if is_overlap else 0)
+    if seq_lens.device.type != "cpu":
+        mtp_pad = min(ring_size - compress_ratio, 4)
+        first_write_position = torch.minimum(
+            first_write_position, seq_lens_i64 - mtp_pad
+        )
+    should_write = real_token_mask & (
+        positions >= first_write_position.index_select(0, safe_batch_ids)
+    )
+    if is_overlap:
+        should_write |= real_token_mask & (
+            positions.remainder(swa_page_size) >= swa_page_size - compress_ratio
+        )
+
+    compress_order = torch.argsort(
+        torch.where(should_compress, token_ids, token_ids + num_q_tokens)
+    )
+    write_order = torch.argsort(torch.where(should_write, token_ids, token_ids + num_q_tokens))
+    compress_valid = should_compress.index_select(0, compress_order)
+    write_valid = should_write.index_select(0, write_order)
+    if not use_cuda_graph:
+        compress_order = compress_order[compress_valid]
+        write_order = write_order[write_valid]
+        compress_valid = compress_valid[compress_valid]
+        write_valid = write_valid[write_valid]
+
+    c_batch = safe_batch_ids.index_select(0, compress_order)
+    c_position = positions.index_select(0, compress_order)
+    c_ragged_id = token_ids.index_select(0, compress_order)
+    c_seq_len = c_position + 1
+    c_buffer_len = window_size - torch.minimum(
+        token_in_request.index_select(0, compress_order) + 1,
+        torch.full_like(c_seq_len, window_size),
+    )
+    position_0_unclamped = c_position - compress_ratio
+    position_0 = (
+        position_0_unclamped
+        if position_0_unclamped.numel() == 0
+        else torch.where(
+            position_0_unclamped >= 0,
+            position_0_unclamped,
+            torch.zeros_like(position_0_unclamped),
+        )
+    )
+    c_rid = req_pool_indices.to(torch.int64).index_select(0, c_batch)
+    c_page_0 = torch.div(
+        _dsv4_state_loc_torch(
+            compress_ratio,
+            c_rid,
+            position_0,
+            req_to_token,
+            full_to_state,
+            swa_page_size,
+            ring_size,
+        ),
+        compress_ratio,
+        rounding_mode="floor",
+    )
+    c_page_1 = torch.div(
+        _dsv4_state_loc_torch(
+            compress_ratio,
+            c_rid,
+            c_position,
+            req_to_token,
+            full_to_state,
+            swa_page_size,
+            ring_size,
+        ),
+        compress_ratio,
+        rounding_mode="floor",
+    )
+    c_page_0 = torch.where(c_buffer_len > 0, c_page_0, torch.full_like(c_page_0, -1))
+    c_page_1 = torch.where(c_buffer_len > 0, c_page_1, c_batch)
+    c_seq_len = torch.where(compress_valid, c_seq_len, torch.full_like(c_seq_len, -1))
+    c_ragged_buffer = (
+        c_ragged_id.to(torch.int32).bitwise_and(0xFFFF)
+        | c_buffer_len.to(torch.int32).bitwise_left_shift(16)
+    )
+    c_ragged_buffer = torch.where(
+        compress_valid, c_ragged_buffer, torch.zeros_like(c_ragged_buffer)
+    )
+    c_page_0 = torch.where(compress_valid, c_page_0, torch.full_like(c_page_0, -1))
+    c_page_1 = torch.where(compress_valid, c_page_1, torch.full_like(c_page_1, -1))
+    plan_c = _dsv4_pack_plan_i32(
+        [c_seq_len, c_ragged_buffer, c_page_0, c_page_1], 16
+    )
+
+    w_batch = safe_batch_ids.index_select(0, write_order)
+    w_position = positions.index_select(0, write_order)
+    w_rid = req_pool_indices.to(torch.int64).index_select(0, w_batch)
+    w_ragged_id = token_ids.index_select(0, write_order)
+    w_write_loc = _dsv4_state_loc_torch(
+        compress_ratio,
+        w_rid,
+        w_position,
+        req_to_token,
+        full_to_state,
+        swa_page_size,
+        ring_size,
+    )
+    w_ragged_id = torch.where(write_valid, w_ragged_id, torch.full_like(w_ragged_id, -1))
+    w_write_loc = torch.where(write_valid, w_write_loc, torch.full_like(w_write_loc, -1))
+    plan_w = _dsv4_pack_plan_i32([w_ragged_id, w_write_loc], 8)
+    return CompressorPrefillPlan(compress_ratio, plan_c, plan_w, None)
+
+
+def _dsv4_compress_rows_torch(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    ape: torch.Tensor,
+    plan,
+    head_dim: int,
+    compress_ratio: int,
+) -> torch.Tensor:
+    """Execute the v2 C4/C128 weighted-pooling contract with Torch ops."""
+
+    plan_c = plan[1].contiguous().view(torch.int32)
+    num_rows = plan_c.shape[0]
+    if num_rows == 0:
+        return kv_score_input.new_empty((0, head_dim))
+    is_decode = plan.is_decode
+    valid = (
+        plan_c[:, 0].remainder(compress_ratio) == 0
+        if is_decode
+        else plan_c[:, 0] != -1
+    )
+    ragged_ids = (
+        torch.arange(num_rows, device=plan_c.device, dtype=torch.int64)
+        if is_decode
+        else plan_c[:, 1].bitwise_and(0xFFFF).to(torch.int64)
+    )
+    ragged_ids_safe = ragged_ids.clamp(min=0, max=max(kv_score_input.shape[0] - 1, 0))
+    buffer_len = (
+        torch.full((num_rows,), compress_ratio * (2 if compress_ratio == 4 else 1),
+                device=plan_c.device, dtype=torch.int64)
+        if is_decode
+        else plan_c[:, 1].bitwise_right_shift(16).bitwise_and(0xFFFF).to(torch.int64)
+    )
+
+    width = 8 if compress_ratio == 4 else 128
+    offsets = torch.arange(width, device=plan_c.device, dtype=torch.int64)
+    input_rows = ragged_ids_safe.unsqueeze(1) - (width - 1 - offsets).unsqueeze(0)
+    input_rows_safe = input_rows.clamp(min=0, max=max(kv_score_input.shape[0] - 1, 0))
+    input_values = kv_score_input.index_select(0, input_rows_safe.reshape(-1)).reshape(
+        num_rows, width, -1
+    )
+
+    max_page = max(kv_score_buffer.shape[0] - 1, 0)
+    if compress_ratio == 128:
+        page_1 = plan_c[:, 3].to(torch.int64).clamp(min=0, max=max_page)
+        buffer_values = kv_score_buffer.index_select(0, page_1)
+        buffer_kv = buffer_values[:, :, :head_dim]
+        buffer_score = buffer_values[:, :, head_dim : 2 * head_dim]
+        input_kv = input_values[:, :, :head_dim]
+        input_score = input_values[:, :, head_dim : 2 * head_dim]
+    else:
+        page_0 = plan_c[:, 2].to(torch.int64).clamp(min=0, max=max_page)
+        page_1 = plan_c[:, 3].to(torch.int64).clamp(min=0, max=max_page)
+        buffer_0 = kv_score_buffer.index_select(0, page_0)
+        buffer_1 = kv_score_buffer.index_select(0, page_1)
+        buffer_kv = torch.cat(
+            [buffer_0[:, :, :head_dim], buffer_1[:, :, head_dim : 2 * head_dim]],
+            dim=1,
+        )
+        buffer_score = torch.cat(
+            [
+                buffer_0[:, :, 2 * head_dim : 3 * head_dim],
+                buffer_1[:, :, 3 * head_dim : 4 * head_dim],
+            ],
+            dim=1,
+        )
+        input_kv = torch.cat(
+            [input_values[:, :4, :head_dim], input_values[:, 4:, head_dim : 2 * head_dim]],
+            dim=1,
+        )
+        input_score = torch.cat(
+            [
+                input_values[:, :4, 2 * head_dim : 3 * head_dim],
+                input_values[:, 4:, 3 * head_dim : 4 * head_dim],
+            ],
+            dim=1,
+        )
+        need_overlap = plan_c[:, 0].to(torch.int64) > compress_ratio
+        overlap_rows = offsets.unsqueeze(0) < compress_ratio
+        input_kv = torch.where(
+            overlap_rows.unsqueeze(-1) & ~need_overlap[:, None, None],
+            torch.zeros_like(input_kv),
+            input_kv,
+        )
+        input_score = torch.where(
+            overlap_rows.unsqueeze(-1) & ~need_overlap[:, None, None],
+            torch.full_like(input_score, -torch.inf),
+            input_score,
+        )
+        buffer_kv = torch.where(
+            overlap_rows.unsqueeze(-1) & ~need_overlap[:, None, None],
+            torch.zeros_like(buffer_kv),
+            buffer_kv,
+        )
+        buffer_score = torch.where(
+            overlap_rows.unsqueeze(-1) & ~need_overlap[:, None, None],
+            torch.full_like(buffer_score, -torch.inf),
+            buffer_score,
+        )
+
+    from_buffer = offsets.unsqueeze(0) < buffer_len.unsqueeze(1)
+    values = torch.where(from_buffer.unsqueeze(-1), buffer_kv, input_kv).float()
+    scores = torch.where(from_buffer.unsqueeze(-1), buffer_score, input_score).float()
+    weights = torch.softmax(scores + ape[:width].float().unsqueeze(0), dim=1)
+    output = (weights * values).sum(dim=1).to(kv_score_input.dtype)
+    return torch.where(valid.unsqueeze(1), output, torch.zeros_like(output))
 
 
 @register_jit_op(
-    "sglang.srt.layers.attention.dsv4.quant_k_cache",
+    "sglang.kernels.ops.attention.dsv4.compress", "compress_forward"
+)
+def dsv4_compress_forward_v2_torch(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    ape: torch.Tensor,
+    plan,
+    *,
+    head_dim: int,
+    compress_ratio: int,
+    out: Optional[torch.Tensor] = None,
+    is_online: bool = False,
+) -> torch.Tensor:
+    """Run compressor v2 with a device Torch reference implementation."""
+
+    if is_online:
+        raise NotImplementedError("online C128 is not enabled for the Torch reference")
+    if compress_ratio not in (4, 128):
+        raise ValueError(f"unsupported compression ratio: {compress_ratio}")
+    flat_buffer = kv_score_buffer.view(-1, kv_score_buffer.shape[-1])
+    if plan.is_decode:
+        plan_raw = plan[1].contiguous().view(torch.int32)
+        write_locs = plan_raw[:, 1].to(torch.int64)
+        source_rows = torch.arange(
+            write_locs.shape[0], device=write_locs.device, dtype=torch.int64
+        )
+    else:
+        plan_w = plan[2].contiguous().view(torch.int32)
+        write_locs = plan_w[:, 1].to(torch.int64)
+        source_rows = plan_w[:, 0].to(torch.int64)
+    valid_write = (
+        (write_locs >= 0)
+        & (write_locs < flat_buffer.shape[0] - 1)
+        & (source_rows >= 0)
+        & (source_rows < kv_score_input.shape[0])
+    )
+    sentinel = flat_buffer.shape[0] - 1
+    safe_write_locs = torch.where(
+        valid_write, write_locs, torch.full_like(write_locs, sentinel)
+    )
+    safe_source_rows = source_rows.clamp(
+        min=0, max=max(kv_score_input.shape[0] - 1, 0)
+    )
+    write_values = kv_score_input.index_select(0, safe_source_rows).to(flat_buffer.dtype)
+    write_values = torch.where(
+        valid_write.unsqueeze(1), write_values, torch.zeros_like(write_values)
+    )
+    if plan.is_decode:
+        flat_buffer.index_copy_(0, safe_write_locs, write_values)
+
+    result = _dsv4_compress_rows_torch(
+        kv_score_buffer,
+        kv_score_input,
+        ape,
+        plan,
+        head_dim,
+        compress_ratio,
+    )
+    if not plan.is_decode:
+        flat_buffer.index_copy_(0, safe_write_locs, write_values)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
+def _dsv4_hadamard_torch(value: torch.Tensor) -> torch.Tensor:
+    """Apply the normalized Walsh-Hadamard transform along the last axis."""
+
+    width = value.shape[-1]
+    if width <= 0 or width & (width - 1):
+        raise ValueError("Hadamard width must be a positive power of two")
+    output = value.float()
+    block = 1
+    while block < width:
+        pairs = output.reshape(*output.shape[:-1], -1, 2, block)
+        low, high = pairs.unbind(dim=-2)
+        output = torch.cat((low + high, low - high), dim=-1).reshape_as(output)
+        block *= 2
+    return output * (width ** -0.5)
+
+
+def _dsv4_norm_rope_torch(
+    kv: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    freq_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the fused RMSNorm and complex RoPE math in Torch."""
+
+    value = kv.float()
+    value = value * torch.rsqrt(value.square().mean(dim=-1, keepdim=True) + norm_eps)
+    value = value * norm_weight.float()
+    freq_real = (
+        torch.view_as_real(freq_cis).flatten(-2)
+        if freq_cis.is_complex()
+        else freq_cis
+    ).float()
+    rope_dim = freq_real.shape[-1]
+    if rope_dim:
+        positions_safe = positions.to(torch.int64).clamp(
+            min=0, max=max(freq_real.shape[0] - 1, 0)
+        )
+        freq = freq_real.index_select(0, positions_safe).reshape(value.shape[0], -1, 2)
+        rope = value[:, -rope_dim:].reshape(value.shape[0], -1, 2)
+        real = rope[..., 0] * freq[..., 0] - rope[..., 1] * freq[..., 1]
+        imag = rope[..., 0] * freq[..., 1] + rope[..., 1] * freq[..., 0]
+        value = torch.cat(
+            [value[:, :-rope_dim], torch.stack((real, imag), dim=-1).flatten(-2)],
+            dim=-1,
+        )
+    return value
+
+
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.compress", "compress_norm_rope_store"
+)
+def dsv4_compress_norm_rope_store_v2_torch(
+    kv: torch.Tensor,
+    plan,
+    *,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    freq_cis: torch.Tensor,
+    out_loc: torch.Tensor,
+    kvcache: torch.Tensor,
+    page_size: int,
+    use_fp4: bool = False,
+    bf16_store: bool = False,
+) -> None:
+    """Apply v2 post-compression transforms and store into Kunlun cache pages."""
+
+    if use_fp4:
+        raise NotImplementedError("FP4 indexer is not enabled for the Torch reference")
+    plan_raw = plan[1].contiguous().view(torch.int32)
+    if plan_raw.shape[0] == 0:
+        return
+    if plan.is_decode:
+        valid = plan_raw[:, 0].remainder(plan.compress_ratio) == 0
+        ragged_ids = torch.arange(
+            plan_raw.shape[0], device=plan_raw.device, dtype=torch.int64
+        )
+    else:
+        valid = plan_raw[:, 0] != -1
+        ragged_ids = plan_raw[:, 1].bitwise_and(0xFFFF).to(torch.int64)
+    ragged_ids_safe = ragged_ids.clamp(min=0, max=max(out_loc.shape[0] - 1, 0))
+    positions = plan_raw[:, 0].to(torch.int64) - plan.compress_ratio
+    transformed = _dsv4_norm_rope_torch(
+        kv,
+        norm_weight,
+        norm_eps,
+        freq_cis,
+        positions.clamp_min(0),
+    )
+    locations = out_loc.index_select(0, ragged_ids_safe).to(torch.int64)
+
+    if kv.shape[-1] == 512:
+        store_dtype = torch.bfloat16 if bf16_store else torch.float16
+        cache = kvcache.view(store_dtype).reshape(kvcache.shape[0], page_size, 512)
+        flat_cache = cache.reshape(-1, 512)
+        sentinel = flat_cache.shape[0] - 1
+        safe_locations = torch.where(
+            valid & (locations >= 0) & (locations < sentinel),
+            locations,
+            torch.full_like(locations, sentinel),
+        )
+        values = torch.where(
+            valid.unsqueeze(1),
+            transformed.to(store_dtype),
+            torch.zeros_like(transformed, dtype=store_dtype),
+        )
+        flat_cache[safe_locations] = values
+        return
+
+    if kv.shape[-1] != 128:
+        raise ValueError(f"unsupported compressed head dimension: {kv.shape[-1]}")
+    transformed = _dsv4_hadamard_torch(transformed)
+    scale = transformed.abs().amax(dim=-1).clamp_min(1e-10)
+    quant_divisor = scale / 127.0
+    quantized = (
+        torch.round(transformed / quant_divisor.unsqueeze(1))
+        .clamp(-127, 127)
+        .to(torch.int8)
+    )
+    page_bytes = page_size * (128 + 4)
+    if kvcache.shape[1] < page_bytes:
+        raise ValueError("indexer cache page is smaller than the INT8+FP32 layout")
+    value_pages = kvcache[:, : page_size * 128].reshape(
+        kvcache.shape[0], page_size, 128
+    )
+    scale_pages = kvcache[:, page_size * 128 : page_bytes].view(torch.float32)
+    sentinel = kvcache.shape[0] * page_size - 1
+    safe_locations = torch.where(
+        valid & (locations >= 0) & (locations < sentinel),
+        locations,
+        torch.full_like(locations, sentinel),
+    )
+    quantized = torch.where(
+        valid.unsqueeze(1), quantized, torch.zeros_like(quantized)
+    )
+    scale = torch.where(valid, scale, torch.zeros_like(scale))
+    page_ids = torch.div(safe_locations, page_size, rounding_mode="floor")
+    offsets = safe_locations.remainder(page_size)
+    value_pages.view(torch.int8)[page_ids, offsets] = quantized
+    scale_pages[page_ids, offsets] = scale.to(torch.float32)
+
+
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.quant_k_cache",
     "quant_to_nope_fp8_rope_bf16_pack_triton",
 )
 def dsv4_quant_k_cache_kunlun(k_bf16: torch.Tensor):
@@ -573,7 +1405,7 @@ def dsv4_quant_k_cache_kunlun(k_bf16: torch.Tensor):
 
 
 @register_triton_op(
-    "sglang.srt.layers.attention.dsv4.index_buf_accessor",
+    "sglang.kernels.ops.attention.dsv4.index_buf_accessor",
     "_set_k_and_s_triton",
     metadata={"call_style": "direct"},
 )
@@ -603,9 +1435,14 @@ def dsv4_set_k_and_s_kunlun(
             page_size,
         )
         dsv4_set_k_and_s_kunlun._probe_logged = True
-    torch.ops.xspeedgate_ops.set_k_and_s_v4(
-        buf, loc_safe, nope_fp8_rope_bf16_pack.k_nope_fp8, page_size
-    )
+    k_value = nope_fp8_rope_bf16_pack.k_nope_fp8
+    if k_value.ndim != 2:
+        raise ValueError(f"invalid DSV4 packed key shape: {tuple(k_value.shape)}")
+    packed_width = k_value.shape[-1]
+    cache_rows = buf.reshape(-1, packed_width)
+    slot = (loc_safe.to(torch.int64) // page_size) * page_size + (loc_safe.to(torch.int64) % page_size)
+    slot = slot.clamp(min=0, max=cache_rows.shape[0] - 1)
+    cache_rows[slot] = k_value.to(dtype=buf.dtype)
 
 
 def dsv4_set_k_and_s_with_mapping_kunlun(
@@ -621,21 +1458,23 @@ def dsv4_set_k_and_s_with_mapping_kunlun(
     raw location and mapping as separate inputs is important for multi-step
     MTP, where the allocator's full-pool location is the source of truth.
     """
-    # Golden passes allocator locations as contiguous int32. Keep the
-    # scheduler's int64 buffer untouched and normalize only the operator input.
-    raw_loc = raw_loc.to(dtype=torch.int32).contiguous()
-    if full_to_swa_index_mapping.device != raw_loc.device:
-        full_to_swa_index_mapping = full_to_swa_index_mapping.to(raw_loc.device)
-    torch.ops.xspeedgate_ops.set_k_and_s_v4_with_mapping(
-        buf,
-        raw_loc,
-        full_to_swa_index_mapping,
-        nope_fp8_rope_bf16_pack.k_nope_fp8,
-        page_size,
-    )
+    raw_loc = raw_loc.to(dtype=torch.int64).contiguous()
+    mapping = full_to_swa_index_mapping.to(raw_loc.device).reshape(-1)
+    k_value = nope_fp8_rope_bf16_pack.k_nope_fp8
+    if k_value.ndim != 2:
+        raise ValueError(f"invalid DSV4 packed key shape: {tuple(k_value.shape)}")
+    packed_width = k_value.shape[-1]
+    cache_rows = buf.reshape(-1, packed_width)
+    valid_raw = (raw_loc >= 0) & (raw_loc < mapping.numel())
+    raw_safe = raw_loc.clamp(min=0, max=max(mapping.numel() - 1, 0))
+    mapped_loc = mapping.index_select(0, raw_safe.reshape(-1)).view_as(raw_safe)
+    mapped_loc = torch.where(valid_raw, mapped_loc, torch.zeros_like(mapped_loc))
+    max_slot = cache_rows.shape[0] - 1
+    mapped_loc = mapped_loc.clamp(min=0, max=max_slot)
+    cache_rows[mapped_loc] = k_value.to(dtype=buf.dtype)
 
 
-@register_triton_op("sglang.srt.mem_cache.common", "write_req_to_token_pool_triton")
+@register_triton_op("sglang.kernels.ops.memory.common", "write_req_to_token_pool_triton")
 def write_req_to_token_pool_triton(
     req_to_token_ptr: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -692,7 +1531,7 @@ def write_req_to_token_pool_triton(
         )
 
 
-@register_triton_op("sglang.srt.mem_cache.common", "get_last_loc_kernel")
+@register_triton_op("sglang.kernels.ops.memory.common", "get_last_loc_kernel")
 def get_last_loc_kernel(
     req_to_token: torch.Tensor,
     req_pool_indices_tensor: torch.Tensor,
@@ -713,7 +1552,7 @@ def get_last_loc_kernel(
 
 
 @register_triton_op(
-    "sglang.srt.layers.attention.utils",
+    "sglang.kernels.ops.kvcache.cache_ops",
     "concat_and_cast_mha_k_kernel",
 )
 def concat_and_cast_mha_k_kernel(
@@ -735,7 +1574,7 @@ def concat_and_cast_mha_k_kernel(
 
 
 @register_triton_op(
-    "sglang.srt.layers.attention.utils",
+    "sglang.kernels.ops.attention.pad",
     "seqlens_expand_kernel",
 )
 def seqlens_expand_kernel(
@@ -791,7 +1630,7 @@ def create_chunked_prefix_cache_kv_indices(
 
 
 @register_triton_op(
-    "sglang.srt.layers.dp_attention",
+    "sglang.kernels.ops.memory.memcpy_triton",
     "memcpy_triton_kernel",
 )
 def memcpy_triton_kernel(
@@ -871,7 +1710,70 @@ def silu_and_mul(
     return out
 
 
-@register_jit_op("sglang.jit_kernel.dsv4.moe", "hash_topk")
+@register_jit_op("sglang.kernels.ops.moe.moe_fused_gate", "moe_fused_gate")
+def dsv4_moe_fused_gate_kunlun(
+    scores: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    topk: int,
+    scoring_func: str = "sqrtsoftplus",
+    num_fused_shared_experts: int = 0,
+    renormalize: bool = True,
+    routed_scaling_factor: float = 1.0,
+    apply_routed_scaling_factor_on_output: bool = False,
+    moe_softcapping: float = 0.0,
+    num_expert_group: int = 1,
+    topk_group: int = 1,
+):
+    """Compute the DSV4 fused-gate routing contract with Torch operators."""
+
+    if scoring_func != "sqrtsoftplus":
+        raise ValueError(f"unsupported DSV4 fused-gate scoring: {scoring_func}")
+    if num_expert_group != 1 or topk_group != 1:
+        raise ValueError("grouped routing is not supported by the DSV4 reference gate")
+    if moe_softcapping != 0.0:
+        raise ValueError("MoE softcapping is not supported by the DSV4 reference gate")
+    if topk <= num_fused_shared_experts:
+        raise ValueError("topk must exceed the number of fused shared experts")
+
+    scores_fp32 = torch.nn.functional.softplus(scores.float()).sqrt()
+    ranking_scores = scores_fp32
+    if bias is not None:
+        ranking_scores = ranking_scores + bias.float().unsqueeze(0)
+    ranking_scores = torch.nan_to_num(ranking_scores, nan=-1e30)
+
+    routed_topk = topk - num_fused_shared_experts
+    _, topk_ids = torch.topk(
+        ranking_scores,
+        k=routed_topk,
+        dim=-1,
+        sorted=True,
+    )
+    topk_weights = torch.gather(scores_fp32, 1, topk_ids)
+    routed_sum = topk_weights.sum(dim=-1, keepdim=True)
+    scale = 1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+
+    if num_fused_shared_experts:
+        num_tokens, num_experts = scores.shape
+        shared_ids = torch.arange(
+            num_experts,
+            num_experts + num_fused_shared_experts,
+            device=scores.device,
+            dtype=topk_ids.dtype,
+        ).reshape(1, -1).expand(num_tokens, -1)
+        shared_weights = (routed_sum / scale).expand(-1, num_fused_shared_experts)
+        topk_ids = torch.cat((topk_ids, shared_ids), dim=-1)
+        topk_weights = torch.cat((topk_weights, shared_weights), dim=-1)
+
+    if renormalize:
+        normalizer = torch.where(routed_sum > 0.0, routed_sum, 1.0)
+        topk_weights = topk_weights / normalizer
+    if apply_routed_scaling_factor_on_output:
+        topk_weights = topk_weights * scale
+
+    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+
+@register_jit_op("sglang.kernels.ops.attention.dsv4.moe", "hash_topk")
 def dsv4_hash_topk_kunlun(
     router_logits: torch.Tensor,
     input_ids: torch.Tensor,
@@ -880,18 +1782,35 @@ def dsv4_hash_topk_kunlun(
     routed_scaling_factor: float = 1.0,
     scoring_func: str = "sqrtsoftplus",
 ):
-    """Route DSV4 hash top-k through the working Kunlun operator."""
+    """Compute the DSV4 hash top-k contract with graph-safe Torch operators."""
 
     if scoring_func != "sqrtsoftplus":
         raise ValueError(f"unsupported DSV4 hash top-k scoring: {scoring_func}")
-    topk_ids, topk_weights = torch.ops.xspeedgate_ops.moe_hash_topk_fused(
-        router_logits,
-        input_ids.to(torch.int64),
-        tid2eid,
-        num_fused_shared_experts,
-        routed_scaling_factor,
-    )
-    return topk_weights, topk_ids
+
+    num_tokens, num_experts = router_logits.shape
+    topk_routed = tid2eid.shape[1]
+    token_rows = input_ids.reshape(-1, 1).long().expand(-1, topk_routed)
+    topk_ids = torch.gather(tid2eid, 0, token_rows).long()
+    selected_logits = torch.gather(router_logits.float(), 1, topk_ids)
+    topk_weights = torch.nn.functional.softplus(selected_logits).sqrt()
+    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+    if num_fused_shared_experts:
+        shared_ids = torch.arange(
+            num_experts,
+            num_experts + num_fused_shared_experts,
+            device=router_logits.device,
+            dtype=torch.int64,
+        ).reshape(1, -1).expand(num_tokens, -1)
+        shared_weights = router_logits.new_full(
+            (num_tokens, num_fused_shared_experts),
+            1.0 / float(routed_scaling_factor),
+            dtype=torch.float32,
+        )
+        topk_ids = torch.cat((topk_ids, shared_ids), dim=-1)
+        topk_weights = torch.cat((topk_weights, shared_weights), dim=-1)
+
+    return topk_weights, topk_ids.to(torch.int32)
 
 
 @register_jit_op("sglang.jit_kernel.dsv4.gemm", "linear_bf16_fp32")
@@ -904,22 +1823,19 @@ def dsv4_linear_bf16_fp32_kunlun(
     return torch.nn.functional.linear(x.float(), y.float())
 
 
-@register_jit_op("sglang.jit_kernel.dsv4.moe", "silu_and_mul_clamp")
+@register_jit_op("sglang.kernels.ops.attention.dsv4.moe", "silu_and_mul_clamp")
 def dsv4_silu_and_mul_clamp_kunlun(
     input: torch.Tensor,
     output: torch.Tensor,
     swiglu_limit: float,
 ) -> None:
-    """Match the clamp-then-Kunlun-SwiGLU contract."""
-
-    import kunlun_ops
+    """Compute the clamped DSV4 SwiGLU contract with Torch operators."""
 
     gate, up = input.chunk(2, dim=-1)
     limit = float(swiglu_limit)
-    clamped = torch.cat(
-        [gate.clamp(max=limit), up.clamp(min=-limit, max=limit)], dim=-1
-    )
-    kunlun_ops.swiglu(x=clamped, y=output)
+    gate = gate.clamp(max=limit)
+    up = up.clamp(min=-limit, max=limit)
+    output.copy_(torch.nn.functional.silu(gate) * up)
 
 
 @register_jit_op("sglang.srt.utils.common", "fast_topk")
@@ -931,7 +1847,7 @@ def fast_topk(values: torch.Tensor, topk: int, dim: int):
     return torch.topk(values, topk, dim=dim)
 
 
-@register_jit_op("sglang.srt.layers.moe.topk", "mask_topk_ids")
+@register_jit_op("sglang.kernels.ops.attention.dsv4.moe", "mask_topk_ids")
 def mask_topk_ids(topk_ids: torch.Tensor, num_token_non_padded: torch.Tensor) -> None:
     """Mask padded token rows in MoE top-k ids on Kunlun."""
 
@@ -1060,7 +1976,7 @@ def get_mla_kv_buffer_kernel(
     torch.ops.xspeedgate_ops.get_mla_kv_buffer(kv_buffer, loc, cache_k_nope, cache_k_rope)
 
 
-@register_triton_op("sglang.srt.mem_cache.triton_ops.allocator", "alloc_extend_kernel")
+@register_triton_op("sglang.kernels.ops.memory.allocator", "alloc_extend_kernel")
 def alloc_extend_kernel(
     prefix_lens: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -1145,7 +2061,7 @@ def alloc_extend_kernel(
     )
 
 
-@register_triton_op("sglang.srt.mem_cache.triton_ops.allocator", "alloc_decode_kernel")
+@register_triton_op("sglang.kernels.ops.memory.allocator", "alloc_decode_kernel")
 def alloc_decode_kernel(
     seq_lens: torch.Tensor,
     last_loc: torch.Tensor,
@@ -1156,22 +2072,11 @@ def alloc_decode_kernel(
 ) -> None:
     """Allocate KV cache pages for decode batches."""
 
-    # The Kunlun kernel indexes free_pages over the whole padded range
-    # [0, bs_upper) without masking, so a shorter tensor is read out of bounds
-    # It only ever consumes the first num_new_pages (<= bs) entries, 
-    # so padding the tail with zeros is safe: those slots are
-    # never written into out_indices. self.free_pages itself is untouched, which
-    # keeps the allocator's page accounting intact.
-    if free_pages.numel() < bs_upper:
-        free_pages = torch.cat(
-            [free_pages, free_pages.new_zeros(bs_upper - free_pages.numel())]
-        )
-
     torch.ops.xspeedgate_ops.alloc_decode_kernel(
         seq_lens,
         last_loc.to(torch.int32).contiguous(),
         free_pages,
-        out_indices.contiguous(),
+        out_indices,
         bs_upper,
         page_size,
         seq_lens.shape[0],
@@ -1442,15 +2347,6 @@ def rotate_input_ids_kernel(
     )
 
 
-@register_triton_op(
-    "sglang.srt.speculative.triton_ops.multi_layer_eagle",
-    "assign_hidden_states_pool_triton",
-    metadata={"call_style": "direct"},
-)
-@register_jit_op(
-    "sglang.srt.speculative.multi_layer_eagle_utils",
-    "assign_hidden_states_pool_triton",
-)
 def assign_hidden_states_pool_triton(
     hidden_states: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -1508,10 +2404,76 @@ def assign_hidden_states_pool_triton(
         )
 
 
-@register_triton_op(
-    "sglang.srt.speculative.triton_ops.multi_layer_eagle",
-    "rotate_input_ids_triton",
-    metadata={"call_style": "direct"},
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.c128_cleanup",
+    "clear_unaccepted_c128_draft_states",
+)
+def clear_unaccepted_c128_draft_states_torch(
+    state: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    accept_lens: torch.Tensor,
+    *,
+    ring_size: int,
+    num_draft_tokens: int,
+) -> None:
+    """Reset rejected offline C128 draft slots without launching Triton."""
+
+    batch_size = req_pool_indices.numel()
+    if batch_size == 0 or num_draft_tokens == 0:
+        return
+
+    draft_offsets = torch.arange(
+        num_draft_tokens,
+        dtype=torch.int64,
+        device=state.device,
+    ).unsqueeze(0)
+    row_indices = (
+        req_pool_indices.to(torch.int64).unsqueeze(1) * ring_size
+        + (seq_lens.to(torch.int64).unsqueeze(1) + draft_offsets).remainder(ring_size)
+    ).reshape(-1)
+    rows = state.index_select(0, row_indices)
+    half = state.shape[-1] // 2
+    reset_rows = torch.cat(
+        (
+            torch.zeros_like(rows[:, :half]),
+            torch.full_like(rows[:, half:], float("-inf")),
+        ),
+        dim=-1,
+    )
+    rejected = draft_offsets >= accept_lens.to(torch.int64).unsqueeze(1)
+    state[row_indices] = torch.where(rejected.reshape(-1, 1), reset_rows, rows)
+
+
+@register_jit_op(
+    "sglang.kernels.ops.speculative.cache_locs",
+    "assign_extend_cache_locs_uniform_func",
+)
+def assign_extend_cache_locs_uniform_torch(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    start_offset: torch.Tensor,
+    batch_size: int,
+    draft_token_num: int,
+    device,
+) -> torch.Tensor:
+    """Gather uniform target-verify cache slots without launching Triton."""
+
+    del device
+    req_indices = req_pool_indices[:batch_size].to(torch.int64)
+    token_rows = req_to_token.index_select(0, req_indices)
+    token_offsets = torch.arange(
+        draft_token_num,
+        dtype=torch.int64,
+        device=req_to_token.device,
+    ).unsqueeze(0)
+    token_offsets = token_offsets + start_offset[:batch_size].to(torch.int64).unsqueeze(1)
+    return torch.gather(token_rows, 1, token_offsets).reshape(-1).to(torch.int64)
+
+
+@register_jit_op(
+    "sglang.kernels.ops.speculative.multi_layer_eagle",
+    "rotate_input_ids",
 )
 def rotate_input_ids_triton(
     input_ids: torch.Tensor,
@@ -1541,10 +2503,6 @@ def rotate_input_ids_triton(
     return input_ids
 
 
-@register_triton_op(
-    "sglang.srt.speculative.multi_layer_eagle_utils",
-    "assign_new_state_kernel",
-)
 def assign_new_state_kernel(
     old_input_ids: torch.Tensor,
     old_positions: torch.Tensor,
@@ -1630,11 +2588,6 @@ def assign_new_state_kernel(
     new_hidden[:, 0, :].copy_(req_to_hidden_states_pool[req_indices, -(step + 1)])
 
 
-@register_triton_op(
-    "sglang.srt.speculative.triton_ops.multi_layer_eagle",
-    "assign_new_state_triton",
-    metadata={"call_style": "direct"},
-)
 def assign_new_state_triton(
     next_token_ids: torch.Tensor,
     old_input_ids: torch.Tensor,
@@ -1694,7 +2647,7 @@ def assign_new_state_triton(
 
 
 @register_triton_op(
-    "sglang.srt.speculative.triton_ops.cache_locs",
+    "sglang.kernels.ops.speculative.cache_locs",
     "assign_draft_cache_locs_contiguous",
 )
 def assign_draft_cache_locs_page_size_1(
@@ -1710,7 +2663,7 @@ def assign_draft_cache_locs_page_size_1(
 
     0.5.14 renamed the upstream Triton kernel to
     ``assign_draft_cache_locs_contiguous`` (in
-    ``sglang.srt.speculative.triton_ops.cache_locs``), called from
+    ``sglang.kernels.ops.speculative.cache_locs``), called from
     ``base_spec_worker.prepare_for_draft``. The Kunlun replacement copies
     ``topk * speculative_num_steps`` slots per request via xspeedgate_ops.
     """
@@ -1734,7 +2687,7 @@ def assign_draft_cache_locs_page_size_1(
 # replacement needed.
 
 
-@register_triton_op("sglang.srt.speculative.triton_ops.eagle", "fill_bonus_tokens")
+@register_triton_op("sglang.kernels.ops.speculative.eagle", "fill_bonus_tokens")
 def fill_bonus_tokens(
     accept_tokens: torch.Tensor,
     accept_lens: torch.Tensor,
@@ -1753,7 +2706,7 @@ def fill_bonus_tokens(
     )
 
 
-@register_triton_op("sglang.srt.speculative.triton_ops.eagle", "fill_accept_out_cache_loc")
+@register_triton_op("sglang.kernels.ops.speculative.eagle", "fill_accept_out_cache_loc")
 def fill_accepted_out_cache_loc(
     accept_index: torch.Tensor,
     out_cache_loc: torch.Tensor,
@@ -1763,7 +2716,7 @@ def fill_accepted_out_cache_loc(
     """Collect accepted output cache locations from draft indices.
 
     0.5.14 renamed the upstream Triton kernel to ``fill_accept_out_cache_loc``
-    (in ``sglang.srt.speculative.triton_ops.eagle``).
+    (in ``sglang.kernels.ops.speculative.eagle``).
     """
 
     valid_indices = accept_index[accept_index != -1]
@@ -1772,7 +2725,7 @@ def fill_accepted_out_cache_loc(
 
 
 @register_triton_op(
-    "sglang.srt.speculative.triton_ops.cache_locs",
+    "sglang.kernels.ops.speculative.cache_locs",
     "generate_draft_decode_kv_indices",
 )
 def generate_draft_decode_kv_indices(
@@ -1842,7 +2795,7 @@ def generate_draft_decode_kv_indices(
             kv_indptr_row[zid] = base + zid * iters
 
 
-@register_triton_op("sglang.srt.speculative.triton_ops.cache_locs", "assign_extend_cache_locs")
+@register_triton_op("sglang.kernels.ops.speculative.cache_locs", "assign_extend_cache_locs")
 def assign_extend_cache_locs(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -1855,7 +2808,7 @@ def assign_extend_cache_locs(
     """Assign cache locations for accepted extended tokens.
 
     0.5.14 moved this Triton kernel to
-    ``sglang.srt.speculative.triton_ops.cache_locs`` (wrapped by
+    ``sglang.kernels.ops.speculative.cache_locs`` (wrapped by
     ``assign_extend_cache_locs_func``).
     """
 
@@ -1877,8 +2830,7 @@ def assign_extend_cache_locs(
 # the modern EAGLE v2 pipeline. No Triton kernel to replace.
 
 
-@register_triton_op("sglang.srt.speculative.triton_ops.cache_locs", "assign_req_to_token_pool")
-@register_triton_op("sglang.srt.speculative.spec_utils", "assign_req_to_token_pool")
+@register_triton_op("sglang.srt.mem_cache.allocation", "assign_req_to_token_pool")
 def assign_req_to_token_pool(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -1904,7 +2856,7 @@ def assign_req_to_token_pool(
     )
 
 
-@register_triton_op("sglang.srt.speculative.spec_utils", "align_evict_mask_to_page_size")
+@register_triton_op("sglang.kernels.ops.speculative.cache_locs", "align_evict_mask_to_page_size")
 def align_evict_mask_to_page_size(
     seq_lens: torch.Tensor,
     evict_mask: torch.Tensor,
@@ -1923,7 +2875,7 @@ def align_evict_mask_to_page_size(
     )
 
 
-@register_jit_op("sglang.srt.speculative.triton_ops.gather_spec_extras", "gather_spec_extras")
+@register_jit_op("sglang.kernels.ops.speculative.gather_spec_extras", "gather_spec_extras")
 def gather_spec_extras(
     indices: torch.Tensor,
     topk_p_buf: torch.Tensor,
@@ -1945,7 +2897,7 @@ def gather_spec_extras(
     return topk_p, topk_index, bonus_tokens, hidden_states
 
 
-@register_jit_op("sglang.srt.speculative.reject_sampling", "chain_speculative_sampling_triton")
+@register_jit_op("sglang.kernels.ops.speculative.reject_sampling", "chain_speculative_sampling_triton")
 def chain_speculative_sampling_triton(
     predicts: torch.Tensor,
     accept_index: torch.Tensor,
@@ -2013,7 +2965,7 @@ def chain_speculative_sampling_triton(
 
 
 @register_triton_op(
-    "sglang.srt.model_executor.triton_ops.position",
+    "sglang.kernels.ops.attention.position",
     "compute_position_kernel",
 )
 def compute_position_kernel(
@@ -2060,29 +3012,33 @@ def _dsv4_rotate_gptj_tail(
     value: torch.Tensor,
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
+    inverse: bool = False,
 ) -> torch.Tensor:
-    freqs_real = _dsv4_cos_sin_cache(freqs_cis)
-    rope_dim = freqs_real.shape[-1]
+    rope_dim = freqs_cis.shape[-1] * 2
     rope_tail = value[..., -rope_dim:].contiguous()
-    rope_shape = rope_tail.shape
-    rope_tail_3d = rope_tail.reshape(rope_shape[0], -1, rope_dim)
-    rotated, _ = torch.ops.xspeedgate_ops.flashinfer_rotary_embedding(
-        positions=positions.flatten(),
-        rotary_dim=rope_dim,
-        head_size=rope_dim,
-        cos_sin_cache=freqs_real,
-        is_neox_style=False,
-        query=rope_tail_3d,
-        key=None,
-        offsets=None,
-        inverse=False,
+    rope_complex = torch.view_as_complex(
+        rope_tail.float().reshape(*rope_tail.shape[:-1], -1, 2)
     )
+    freqs_real = torch.view_as_real(freqs_cis)
+    gather_indices = positions.reshape(-1, 1, 1).long().expand(
+        -1, freqs_real.shape[1], freqs_real.shape[2]
+    )
+    token_freqs = torch.view_as_complex(
+        torch.gather(freqs_real, 0, gather_indices).contiguous()
+    )
+    if inverse:
+        token_freqs = token_freqs.conj()
+    while token_freqs.ndim < rope_complex.ndim:
+        token_freqs = token_freqs.unsqueeze(1)
+    rotated = torch.view_as_real(rope_complex * token_freqs).flatten(-2)
     result = value.clone()
-    result[..., -rope_dim:].copy_(rotated.reshape(rope_shape))
+    result[..., -rope_dim:].copy_(rotated.to(value.dtype))
     return result
 
 
-@register_jit_op("sglang.jit_kernel.dsv4.elementwise", "fused_rope_inplace")
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.elementwise", "fused_rope_inplace"
+)
 def dsv4_fused_rope_inplace_kunlun(
     q: torch.Tensor,
     k: Optional[torch.Tensor],
@@ -2095,35 +3051,13 @@ def dsv4_fused_rope_inplace_kunlun(
     if q.shape[0] == 0:
         return
 
-    freqs_real = _dsv4_cos_sin_cache(freqs_cis)
-    rotary_dim = q.shape[-1]
-    q_shape = q.shape
-    q_input = q.contiguous().reshape(q_shape[0], -1, rotary_dim)
-
-    k_shape = k.shape if k is not None else None
-    k_input = (
-        k.contiguous().reshape(k_shape[0], -1, rotary_dim)
-        if k is not None
-        else None
-    )
-    q_rotated, k_rotated = torch.ops.xspeedgate_ops.flashinfer_rotary_embedding(
-        positions=positions.flatten(),
-        rotary_dim=rotary_dim,
-        head_size=rotary_dim,
-        cos_sin_cache=freqs_real,
-        is_neox_style=False,
-        query=q_input,
-        key=k_input,
-        offsets=None,
-        inverse=inverse,
-    )
-    q.copy_(q_rotated.reshape(q_shape))
+    q.copy_(_dsv4_rotate_gptj_tail(q, freqs_cis, positions, inverse=inverse))
     if k is not None:
-        k.copy_(k_rotated.reshape(k_shape))
+        k.copy_(_dsv4_rotate_gptj_tail(k, freqs_cis, positions, inverse=inverse))
 
 
 @register_jit_op(
-    "sglang.jit_kernel.dsv4.elementwise",
+    "sglang.kernels.ops.attention.dsv4.elementwise",
     "fused_q_indexer_rope_hadamard_quant",
 )
 def dsv4_fused_q_indexer_rope_hadamard_quant_kunlun(
@@ -2133,51 +3067,29 @@ def dsv4_fused_q_indexer_rope_hadamard_quant_kunlun(
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
 ):
-    """Compose the exact RoPE, Hadamard, INT8 and scale path."""
+    """Compose RoPE, Hadamard and row-wise INT8 quantization in Torch."""
 
-    import kunlun_ops
-
-    q_wq_b = q_input
-    q_rope = _dsv4_rotate_gptj_tail(q_wq_b, freqs_cis, positions)
-    hidden_size = q_rope.shape[-1]
-    hadamard_matrix = torch.empty(
-        (hidden_size, hidden_size), dtype=q_rope.dtype, device=q_rope.device
+    q_rope = _dsv4_rotate_gptj_tail(q_input, freqs_cis, positions)
+    q_hadamard = _dsv4_hadamard_torch(q_rope)
+    q_scale = q_hadamard.float().abs().amax(dim=-1, keepdim=True)
+    q_scale = q_scale.clamp_min(torch.finfo(torch.float32).tiny)
+    quant_divisor = q_scale / 127.0
+    q_int8 = (
+        torch.round(q_hadamard.float() / quant_divisor)
+        .clamp(-127, 127)
+        .to(torch.int8)
     )
-    kunlun_ops.gen_hadamard_matrix(hadamard_matrix, hidden_size ** -0.5)
-    q_hadamard = torch.empty_like(q_rope)
-    q_rope_2d = q_rope.view(-1, hidden_size) if q_rope.ndim > 2 else q_rope
-    q_hadamard_2d = q_hadamard.view(-1, hidden_size) if q_hadamard.ndim > 2 else q_hadamard
-    kunlun_ops.matmul(q_rope_2d, hadamard_matrix, q_hadamard_2d, False, True, 1.0, 0.0)
-    _dsv4_probe(
-        "q_fused",
-        {"q_wq_b": q_wq_b, "q_rope": q_rope, "q_hadamard": q_hadamard},
-        positions_shape=tuple(positions.shape),
-    )
-    q = q_hadamard
-    q_shape = q.shape
-    q_2d = q.contiguous().view(-1, q_shape[-1])
-    q_int8 = torch.empty_like(q_2d, dtype=torch.int8)
-    q_scale = torch.empty(
-        (q_2d.shape[0], 1), dtype=torch.float32, device=q.device
-    )
-    kunlun_ops.quant2d(q_2d, q_int8, q_scale, force_sdnn=True)
-    q_int8 = q_int8.view(q_shape)
-    q_scale = q_scale.view(q_shape[0], -1)
-    weights = dsv4_fused_scale_kunlun(weight, weight_scale, q_scale)
-    _dsv4_probe(
-        "q_fused_quant",
-        {
-            "q_int8": q_int8,
-            "q_scale": q_scale,
-            "weights_raw": weight,
-            "weights_scaled": weights,
-        },
-        weight_scale=float(weight_scale),
-    )
+    weights = weight.float()
+    while weights.ndim < q_scale.ndim:
+        weights = weights.unsqueeze(-1)
+    weights = weights * float(weight_scale) * q_scale
     return q_int8, weights
 
 
-@register_jit_op("sglang.jit_kernel.dsv4.elementwise", "fused_q_norm_rope")
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.elementwise", "fused_q_norm_rope"
+)
+
 def dsv4_fused_q_norm_rope_kunlun(
     q_input: torch.Tensor,
     q_output: torch.Tensor,
@@ -2190,20 +3102,10 @@ def dsv4_fused_q_norm_rope_kunlun(
     if q_input.shape[0] == 0:
         return
 
-    import kunlun_ops
-
-    normalized = torch.empty_like(q_input)
-    kunlun_ops.rmsnorm(
-        q_input,
-        None,
-        normalized,
-        eps,
-        False,
-        True,
-        None,
-        None,
-        None,
-    )
+    q_float = q_input.float()
+    normalized = (
+        q_float * torch.rsqrt(q_float.square().mean(dim=-1, keepdim=True) + eps)
+    ).to(q_input.dtype)
     if (
         _ENABLE_DSV4_ACCURACY_DUMPS
         and q_input.shape[0] == 8192
@@ -2218,20 +3120,9 @@ def dsv4_fused_q_norm_rope_kunlun(
         dsv4_fused_q_norm_rope_kunlun._accuracy_dumped = True
 
     q_output.copy_(normalized)
-    rope = q_output[..., -64:]
-    rope_input = rope.contiguous()
-    rotated, _ = torch.ops.xspeedgate_ops.flashinfer_rotary_embedding(
-        positions=positions,
-        rotary_dim=rope.shape[-1],
-        head_size=rope.shape[-1],
-        cos_sin_cache=_dsv4_cos_sin_cache(freqs_cis),
-        is_neox_style=False,
-        query=rope_input,
-        key=None,
-        offsets=None,
-        inverse=False,
-    )
-    rope.copy_(rotated)
+    rope_dim = freqs_cis.shape[-1] * 2
+    rope = q_output[..., -rope_dim:]
+    rope.copy_(_dsv4_rotate_gptj_tail(rope, freqs_cis, positions))
     if (
         _ENABLE_DSV4_ACCURACY_DUMPS
         and q_input.shape[0] == 8192
@@ -2251,7 +3142,9 @@ def dsv4_fused_q_norm_rope_kunlun(
         dsv4_fused_q_norm_rope_kunlun._rope_dumped = True
 
 
-@register_jit_op("sglang.jit_kernel.dsv4.elementwise", "fused_k_norm_rope_flashmla")
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.elementwise", "fused_k_norm_rope_flashmla"
+)
 def dsv4_fused_k_norm_rope_flashmla_kunlun(
     kv: torch.Tensor,
     kv_weight: torch.Tensor,
@@ -2267,15 +3160,11 @@ def dsv4_fused_k_norm_rope_flashmla_kunlun(
     if kv.shape[0] == 0:
         return
 
-    import kunlun_ops
-
-    normalized = torch.empty_like(kv)
-    kunlun_ops.rmsnorm(
-        kv.reshape(-1, kv.shape[-1]),
-        kv_weight,
-        normalized.reshape(-1, normalized.shape[-1]),
-        eps,
+    kv_float = kv.float()
+    normalized = kv_float * torch.rsqrt(
+        kv_float.square().mean(dim=-1, keepdim=True) + eps
     )
+    normalized = (normalized * kv_weight.float()).to(kv.dtype)
     rotated = _dsv4_rotate_gptj_tail(normalized, freqs_cis, positions)
     max_valid_loc = kvcache.shape[0] * page_size - 1
     loc = out_loc.contiguous().clamp(min=0, max=max_valid_loc)
@@ -2288,19 +3177,11 @@ def dsv4_fused_k_norm_rope_flashmla_kunlun(
         and torch.distributed.get_rank() == 0
         and not getattr(dsv4_fused_k_norm_rope_flashmla_kunlun, "_dumped", False)
     )
-    identity_key = (kvcache.device, max_valid_loc + 1)
-    identity_mapping = _DSV4_IDENTITY_MAPPING_CACHE.get(identity_key)
-    if identity_mapping is None:
-        identity_mapping = torch.arange(
-            max_valid_loc + 1, dtype=loc.dtype, device=loc.device
-        )
-        _DSV4_IDENTITY_MAPPING_CACHE[identity_key] = identity_mapping
-    torch.ops.xspeedgate_ops.set_k_and_s_v4_with_mapping(
-        kvcache,
-        loc,
-        identity_mapping,
-        rotated.reshape(rotated.shape[0], -1).contiguous(),
-        page_size,
+    cache_rows = kvcache.view(-1, kvcache.shape[-1])
+    cache_rows.index_copy_(
+        0,
+        loc.long(),
+        rotated.reshape(rotated.shape[0], -1).to(kvcache.dtype),
     )
     if dump_layer0_k:
         cache_rows = kvcache.view(-1, rotated.shape[-1])[loc.long()]
@@ -2354,7 +3235,7 @@ def apply_rope_with_cos_sin_cache_inplace(
 
 
 @register_triton_op(
-    "sglang.srt.layers.attention.dsa.index_buf_accessor",
+    "sglang.kernels.ops.attention.dsa.index_buf_accessor",
     "_get_k_triton_kernel",
 )
 def _get_k_triton_kernel(
@@ -2376,7 +3257,7 @@ def _get_k_triton_kernel(
 
 
 @register_triton_op(
-    "sglang.srt.layers.attention.dsa.index_buf_accessor",
+    "sglang.kernels.ops.attention.dsa.index_buf_accessor",
     "_get_s_triton_kernel",
 )
 def _get_s_triton_kernel(
@@ -2396,7 +3277,7 @@ def _get_s_triton_kernel(
 
 
 @register_triton_op(
-    "sglang.srt.layers.attention.dsa.index_buf_accessor",
+    "sglang.kernels.ops.attention.dsa.index_buf_accessor",
     "_set_k_and_s_triton_kernel",
 )
 def _set_k_and_s_triton_kernel(
@@ -2425,7 +3306,7 @@ def _set_k_and_s_triton_kernel(
 
 
 @register_triton_op(
-    "sglang.srt.layers.attention.dsa.triton_kernel",
+    "sglang.kernels.ops.attention.dsa.triton_kernel",
     "_act_quant_kernel",
 )
 def _act_quant_kernel(
@@ -2450,7 +3331,7 @@ def _act_quant_kernel(
 
 
 @register_triton_op(
-    "sglang.srt.layers.quantization.int8_kernel",
+    "sglang.kernels.ops.quantization.int8_kernel",
     "_per_token_quant_int8",
 )
 def _per_token_quant_int8(
@@ -2479,7 +3360,7 @@ def _per_token_quant_int8(
 
 
 @register_triton_op(
-    "sglang.srt.layers.quantization.int8_kernel",
+    "sglang.kernels.ops.quantization.int8_kernel",
     "_per_token_group_quant_int8",
 )
 def _per_token_group_quant_int8(
@@ -2501,7 +3382,7 @@ def _per_token_group_quant_int8(
 
 
 @register_jit_op(
-    "sglang.srt.layers.quantization.int8_kernel",
+    "sglang.kernels.ops.quantization.int8_kernel",
     "sglang_per_token_group_quant_int8",
 )
 def sglang_per_token_group_quant_int8(
@@ -2516,7 +3397,7 @@ def sglang_per_token_group_quant_int8(
 
 
 @register_triton_op(
-    "sglang.srt.layers.quantization.int8_kernel",
+    "sglang.kernels.ops.quantization.int8_kernel",
     "_w8a8_block_int8_matmul",
 )
 def _w8a8_block_int8_matmul(

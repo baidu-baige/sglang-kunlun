@@ -8,7 +8,7 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 
 @plugin_hook(
-    target="sglang.srt.layers.attention.dsa.index_buf_accessor._get_k_triton",
+    target="sglang.kernels.ops.attention.dsa.index_buf_accessor._get_k_triton",
     type=HookType.REPLACE,
 )
 def _get_k_triton(
@@ -30,7 +30,7 @@ def _get_k_triton(
 
 
 @plugin_hook(
-    target="sglang.srt.layers.attention.dsa.index_buf_accessor._get_s_triton",
+    target="sglang.kernels.ops.attention.dsa.index_buf_accessor._get_s_triton",
     type=HookType.REPLACE,
 )
 def _get_s_triton(
@@ -52,7 +52,7 @@ def _get_s_triton(
 
 
 @plugin_hook(
-    target="sglang.srt.layers.attention.dsa.index_buf_accessor.SetKAndS.triton",
+    target="sglang.kernels.ops.attention.dsa.index_buf_accessor.SetKAndS.triton",
     type=HookType.REPLACE,
 )
 def set_k_and_s_triton(cls, pool, buf, loc, index_k, index_k_scale) -> None:

@@ -42,6 +42,10 @@ def load_with_fake_registry(relative_path, module_name):
     registry.HookRegistry = HookRegistry
     registry.plugin_hook = plugin_hook
     path = ROOT / relative_path
+    if not path.is_file():
+        if relative_path.startswith("debug/"):
+            raise unittest.SkipTest(f"optional debug hook is not installed: {relative_path}")
+        raise FileNotFoundError(path)
     spec = importlib.util.spec_from_file_location(module_name, path)
     module = importlib.util.module_from_spec(spec)
     old = sys.modules.get("sglang.srt.plugins.hook_registry")
@@ -71,6 +75,102 @@ class DSV4MHCSpeculativeContractTest(unittest.TestCase):
 
         bf16_values = values.to(torch.bfloat16)
         self.assertIs(module._clamp_fp16_moe_output(bf16_values), bf16_values)
+
+    def test_w8a8_moe_chunked_routes_match_vectorized_reference(self):
+        module, _registered = load_with_fake_registry(
+            "sglang_kunlun/hooks/layers/quantization/w8a8_int8.py",
+            "contract_w8a8_int8_chunked",
+        )
+
+        class StandardCombineInput:
+            def __init__(self, hidden_states):
+                self.hidden_states = hidden_states
+
+        dispatcher = types.ModuleType("sglang.srt.layers.moe.token_dispatcher")
+        dispatcher.StandardCombineInput = StandardCombineInput
+        config = types.SimpleNamespace(
+            top_k=2,
+            activation="silu",
+            is_gated=True,
+            gemm1_alpha=None,
+            gemm1_clamp_limit=None,
+            apply_router_weight_on_input=False,
+            gate_up_interleaved=True,
+            swiglu_limit=None,
+            routed_scaling_factor=1.0,
+        )
+        owner = types.SimpleNamespace(moe_runner_config=config)
+        layer = types.SimpleNamespace(
+            w13_weight=torch.tensor(
+                [
+                    [
+                        [1.0, 2.0, 3.0],
+                        [0.5, -1.0, 2.0],
+                        [1.0, 0.0, 1.0],
+                        [2.0, 1.0, -1.0],
+                        [0.25, 1.0, 0.5],
+                        [-1.0, 0.5, 1.5],
+                        [0.75, -0.25, 2.0],
+                        [1.5, 1.0, 0.25],
+                    ],
+                    [
+                        [-1.0, 0.5, 2.0],
+                        [2.0, 1.0, 0.0],
+                        [0.5, 1.5, -1.0],
+                        [1.0, -2.0, 0.5],
+                        [1.0, 0.25, -0.5],
+                        [-0.5, 1.0, 1.25],
+                        [0.25, -1.5, 0.75],
+                        [2.0, 0.5, 1.0],
+                    ],
+                ]
+            ),
+            w13_weight_scale=torch.ones((2, 8, 1)) * 127,
+            w2_weight=torch.tensor(
+                [
+                    [[1.0, 0.5, -1.0, 2.0], [0.0, 1.0, 2.0, -0.5]],
+                    [[-1.0, 2.0, 0.5, 1.0], [2.0, -0.5, 1.0, 0.0]],
+                ]
+            ),
+            w2_weight_scale=torch.ones((2, 2, 1)) * 127,
+        )
+        hidden_states = torch.tensor(
+            [[0.25, -0.5, 1.0], [1.5, 0.5, -0.25]], dtype=torch.float16
+        )
+        topk_ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int64)
+        topk_weights = torch.tensor([[0.25, 0.75], [0.6, 0.4]])
+        dispatch = types.SimpleNamespace(
+            hidden_states=hidden_states,
+            topk_output=types.SimpleNamespace(
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+            ),
+        )
+
+        with mock.patch.dict(sys.modules, {dispatcher.__name__: dispatcher}):
+            actual = module.moe_apply_kunlun(owner, layer, dispatch).hidden_states
+
+        w13 = layer.w13_weight.float()
+        w2 = layer.w2_weight.float()
+        route_input = hidden_states.unsqueeze(1)
+        hidden_q, hidden_scale = module._quantize_per_token_int8(route_input)
+        hidden_dequant = hidden_q.float() * hidden_scale / 127.0
+        token_w13 = w13.index_select(0, topk_ids.reshape(-1)).view(2, 2, 8, 3)
+        gate_up = torch.einsum(
+            "mkh,mkdh->mkd", hidden_dequant, token_w13
+        ).to(hidden_states.dtype)
+        gate = gate_up[..., :4]
+        up = gate_up[..., 4:]
+        activated = torch.nn.functional.silu(gate) * up
+        activated_q, activated_scale = module._quantize_per_token_int8(activated)
+        activated_dequant = activated_q.float() * activated_scale / 127.0
+        token_w2 = w2.index_select(0, topk_ids.reshape(-1)).view(2, 2, 2, 4)
+        expected = torch.einsum(
+            "mki,mkhi->mkh", activated_dequant, token_w2
+        ).to(hidden_states.dtype)
+        expected = (expected * topk_weights.unsqueeze(-1)).sum(dim=1)
+        expected = expected.to(hidden_states.dtype)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_base_model_hc_head_matches_058_fp32_sequence(self):
         from sglang_kunlun.models.deepseek_v4 import hc_head_kunlun
@@ -373,7 +473,7 @@ class DSV4MHCSpeculativeContractTest(unittest.TestCase):
             module, registered = load_with_fake_registry(
                 "sglang_kunlun/hooks/layers/mhc.py", "contract_mhc"
             )
-        target = "sglang.srt.layers.mhc.hc_split_sinkhorn"
+        target = "sglang.kernels.ops.layernorm.mhc.hc_split_sinkhorn"
         self.assertIn(target, registered)
         mixes = torch.empty((0, 1, 24), dtype=torch.bfloat16)
         pre, post, comb = module.hc_split_sinkhorn_kunlun(
@@ -1056,9 +1156,9 @@ class DSV4MHCSpeculativeContractTest(unittest.TestCase):
         self.assertEqual(
             targets,
             {
-                "sglang.srt.layers.attention.dsv4.index_buf_accessor.NopeFp8RopeBf16Pack",
-                "sglang.srt.layers.attention.dsv4.index_buf_accessor._set_k_and_s_triton",
-                "sglang.srt.layers.attention.dsv4.quant_k_cache.quant_to_nope_fp8_rope_bf16_pack_triton",
+                "sglang.kernels.ops.attention.dsv4.index_buf_accessor.NopeFp8RopeBf16Pack",
+                "sglang.kernels.ops.attention.dsv4.index_buf_accessor._set_k_and_s_triton",
+                "sglang.kernels.ops.attention.dsv4.quant_k_cache.quant_to_nope_fp8_rope_bf16_pack_triton",
             },
         )
         nsa_init = (
@@ -1118,16 +1218,87 @@ class DSV4MHCSpeculativeContractTest(unittest.TestCase):
         }
         self.assertEqual(hooks, upstream)
 
+    def test_hc_pre_uses_reference_first_row_sinkhorn_normalization(self):
+        source = (ROOT / "sglang_kunlun/models/deepseek_v4.py").read_text()
+        tree = ast.parse(source)
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "hc_pre_kunlun"
+        )
+        function.decorator_list = []
+        namespace = {
+            "torch": torch,
+            "F": torch.nn.functional,
+            "nn": torch.nn,
+            "Optional": __import__("typing").Optional,
+            "ForwardBatch": object,
+        }
+        exec(
+            compile(
+                ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])),
+                "<hc_pre_kunlun>",
+                "exec",
+            ),
+            namespace,
+        )
+
+        layer = types.SimpleNamespace(
+            hc_mult=4,
+            hc_eps=0.05,
+            hc_sinkhorn_iters=3,
+            rms_norm_eps=1e-6,
+        )
+        x = torch.linspace(-1.5, 1.75, 24, dtype=torch.float32).view(2, 4, 3)
+        hc_fn = torch.linspace(-0.4, 0.6, 24 * 12, dtype=torch.float32).view(24, 12)
+        hc_scale = torch.tensor([0.75, 1.25, 0.5], dtype=torch.float32)
+        hc_base = torch.linspace(-0.2, 0.3, 24, dtype=torch.float32)
+
+        y, post, actual, norm_fused = namespace["hc_pre_kunlun"](
+            layer, x, hc_fn, hc_scale, hc_base
+        )
+        self.assertEqual(y.shape, (2, 3))
+        self.assertEqual(post.shape, (2, 4))
+        self.assertEqual(actual.shape, (2, 4, 4))
+        self.assertEqual(actual.dtype, torch.float32)
+        self.assertFalse(norm_fused)
+
+        x_flat = x.reshape(2, -1).float()
+        rms = torch.rsqrt(
+            x_flat.square().mean(dim=-1, keepdim=True) + layer.rms_norm_eps
+        )
+        mixes = torch.nn.functional.linear(x_flat, hc_fn.float()) * rms
+        logits = (
+            mixes[:, 2 * layer.hc_mult :] * hc_scale[2]
+            + hc_base[2 * layer.hc_mult :]
+        ).view(2, layer.hc_mult, layer.hc_mult)
+        expected = torch.exp(logits - logits.amax(dim=-1, keepdim=True))
+        expected = expected / expected.sum(dim=-1, keepdim=True) + layer.hc_eps
+        expected = expected / (
+            expected.sum(dim=-2, keepdim=True) + layer.hc_eps
+        )
+        for _ in range(layer.hc_sinkhorn_iters - 1):
+            expected = expected / (
+                expected.sum(dim=-1, keepdim=True) + layer.hc_eps
+            )
+            expected = expected / (
+                expected.sum(dim=-2, keepdim=True) + layer.hc_eps
+            )
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=1e-6)
+
     def test_speculative_imports_both_worker_hooks_and_upstream_supports_steps1_draft2(self):
         init = (ROOT / "sglang_kunlun/hooks/speculative/__init__.py").read_text()
         self.assertIn("from . import eagle_worker_v2", init)
         self.assertIn("from . import multi_layer_eagle_worker_v2", init)
 
+        base = (UPSTREAM / "speculative/base_spec_worker.py").read_text()
         eagle = (UPSTREAM / "speculative/eagle_worker_v2.py").read_text()
         multi = (UPSTREAM / "speculative/multi_layer_eagle_worker_v2.py").read_text()
         expected = "self.speculative_num_draft_tokens == self.speculative_num_steps + 1"
-        self.assertIn(expected, eagle)
-        self.assertIn(expected, multi)
+        self.assertIn(expected, base)
+        self.assertIn("self._rebuild_topk1_chain_buffers()", eagle)
+        self.assertIn("self._rebuild_topk1_chain_buffers()", multi)
         self.assertIn("if self.speculative_num_steps == 1:", multi)
 
     def test_function_call_and_grammar_are_not_reimplemented(self):

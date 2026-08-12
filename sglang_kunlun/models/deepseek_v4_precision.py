@@ -12,6 +12,55 @@ _FP16_DTYPE_NAMES = frozenset(("fp16", "float16", "half"))
 
 
 @plugin_hook(
+    "sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayer.hc_pre",
+    type=HookType.REPLACE,
+)
+def hc_pre_reference_sinkhorn_kunlun(
+    self,
+    x,
+    hc_fn,
+    hc_scale,
+    hc_base,
+    norm=None,
+    forward_batch=None,
+):
+    """Match the upstream DSV4 MHC normalization contract exactly."""
+    del norm, forward_batch
+    dtype = x.dtype
+    if self.hc_mult != 4:
+        raise ValueError("Kunlun hc_pre supports hc_mult=4 only")
+
+    x_flat = x.reshape(x.shape[0], -1).float()
+    x_view = x_flat.view(x.shape[0], self.hc_mult, -1)
+    rms = torch.rsqrt(
+        x_flat.square().mean(dim=-1, keepdim=True) + self.rms_norm_eps
+    )
+    mixes = torch.nn.functional.linear(x_flat, hc_fn.float()) * rms
+    pre = torch.sigmoid(
+        mixes[:, : self.hc_mult] * hc_scale[:1] + hc_base[: self.hc_mult]
+    )
+    pre = pre + self.hc_eps
+    post = 2.0 * torch.sigmoid(
+        mixes[:, self.hc_mult : 2 * self.hc_mult] * hc_scale[1:2]
+        + hc_base[self.hc_mult : 2 * self.hc_mult]
+    )
+    comb = (
+        mixes[:, 2 * self.hc_mult :] * hc_scale[2]
+        + hc_base[2 * self.hc_mult :]
+    ).view(x.shape[0], self.hc_mult, self.hc_mult)
+
+    comb = torch.exp(comb - comb.amax(dim=-1, keepdim=True))
+    comb = comb / comb.sum(dim=-1, keepdim=True) + self.hc_eps
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
+    for _ in range(max(self.hc_sinkhorn_iters - 1, 0)):
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
+
+    y = (pre.unsqueeze(-1) * x_view).sum(dim=1).to(dtype)
+    return y, post, comb, False
+
+
+@plugin_hook(
     "sglang.srt.models.deepseek_v2.MoEGate.forward",
     type=HookType.AROUND,
 )
@@ -86,7 +135,7 @@ def initialize_mqa_rope_policy_kunlun(result, self, config, *args, **kwargs):
     if self.compress_ratio:
         return result
 
-    from sglang.srt.layers.deepseek_v4_rope import precompute_freqs_cis
+    from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
     from sglang.srt.models.deepseek_v4 import get_rope_config
 
     rope_theta, rope_scaling = get_rope_config(config)
@@ -160,7 +209,7 @@ def mqa_forward_global_head_layout_kunlun(
     and only this rank's local output slice is returned.
     """
     import sglang.srt.models.deepseek_v4 as upstream
-    from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
         is_unified_kv_triton,
     )
     from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -184,22 +233,15 @@ def mqa_forward_global_head_layout_kunlun(
     q_global = None
     q_out = None
     local_sink = self.attn_sink
-    if self.tp_size > 1:
-        start = self.tp_rank * self.n_local_heads
+    if self.attn_tp_size > 1:
+        start = self.attn_tp_rank * self.n_local_heads
         stop = start + self.n_local_heads
         tp_slice = slice(start, stop)
         q_global = x.new_zeros(x.shape[0], self.n_heads, self.head_dim)
         q_out = q_global[:, tp_slice, :]
 
-        local_sink = getattr(self, "_attn_sink_local", None)
-        if (
-            local_sink is None
-            or local_sink.shape[0] != self.n_heads
-            or local_sink.device != self.attn_sink.device
-        ):
-            local_sink = self.attn_sink.new_zeros(self.n_heads)
-            local_sink[tp_slice].copy_(self.attn_sink[tp_slice])
-            self._attn_sink_local = local_sink
+        local_sink = self.attn_sink.new_zeros(self.n_heads)
+        local_sink[tp_slice].copy_(self.attn_sink[tp_slice])
 
     if enable_multi_stream:
         if upstream._is_hip:
@@ -331,9 +373,6 @@ def mqa_forward_global_head_layout_kunlun(
         o = dsv4_mqa_wo_a_einsum_kunlun(o, wo_a)
 
     o, _ = self.wo_b(o.flatten(1))
-    if (
-        self.tp_size > 1
-        and self.tp_size < upstream.get_tensor_model_parallel_world_size()
-    ):
+    if self.attn_tp_size > 1 and self.attn_tp_size < upstream.get_parallel().tp_size:
         o = upstream.attn_tp_all_reduce(o)
     return o

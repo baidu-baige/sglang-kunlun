@@ -11,7 +11,7 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 
 @plugin_hook(
-    target="sglang.srt.layers.attention.dsv4.index_buf_accessor.NopeFp8RopeBf16Pack",
+    target="sglang.kernels.ops.attention.dsv4.index_buf_accessor.NopeFp8RopeBf16Pack",
     type=HookType.REPLACE,
 )
 @dataclass
@@ -48,7 +48,7 @@ class NopeFp8RopeBf16Pack:
 
 
 @plugin_hook(
-    target="sglang.srt.layers.attention.dsv4.index_buf_accessor._set_k_and_s_triton",
+    target="sglang.kernels.ops.attention.dsv4.index_buf_accessor._set_k_and_s_triton",
     type=HookType.REPLACE,
 )
 def _set_k_and_s_triton(
