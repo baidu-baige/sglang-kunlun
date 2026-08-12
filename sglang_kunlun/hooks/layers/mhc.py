@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import torch
-from kunlun_ops import mhc_split_sinkhorn
+import kunlun_ops
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 
 @plugin_hook(
-    "sglang.srt.layers.mhc.hc_split_sinkhorn",
+    "sglang.kernels.ops.layernorm.mhc.hc_split_sinkhorn",
     type=HookType.REPLACE,
 )
 def hc_split_sinkhorn_kunlun(
@@ -31,7 +31,7 @@ def hc_split_sinkhorn_kunlun(
     flat_pre = pre.view(flat_tokens, hc_mult)
     flat_post = post.view(flat_tokens, hc_mult)
     flat_comb = comb.view(flat_tokens, hc_mult * hc_mult)
-    mhc_split_sinkhorn(
+    kunlun_ops.mhc_split_sinkhorn(
         mixes.reshape(flat_tokens, -1),
         hc_scale,
         hc_base,

@@ -33,10 +33,10 @@ from sgl_kernel.flash_attn import flash_attn_with_kvcache as flash_attn_with_kvc
 flash_attn_varlen_func = flash_attn_varlen_func_fa3
 flash_attn_with_kvcache = flash_attn_with_kvcache_fa3
 
-from sglang.jit_kernel.flash_attention_v4 import (
+from sglang.kernels.ops.attention.flash_attention_v4 import (
     flash_attn_varlen_func as flash_attn_varlen_func_fa4,
 )
-from sglang.jit_kernel.flash_attention_v4 import (
+from sglang.kernels.ops.attention.flash_attention_v4 import (
     flash_attn_with_kvcache as flash_attn_with_kvcache_fa4,
 )
 

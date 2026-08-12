@@ -37,10 +37,6 @@ def can_run_draft_extend_graph(cuda_graph_runner, forward_batch) -> bool:
     )
 
 
-@plugin_hook(
-    "sglang.srt.speculative.base_spec_worker.EagleDraftWorkerBase.prepare_for_draft_extend",
-    type=HookType.REPLACE,
-)
 def prepare_for_draft_extend_kunlun(
     self,
     draft_extend_input,
@@ -113,7 +109,12 @@ def prepare_for_draft_extend_kunlun(
         else CaptureHiddenMode.FULL
     )
 
-    forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+    forward_batch = ForwardBatch.init_new(
+        batch,
+        draft_model_runner,
+        capture_hidden_mode=batch.capture_hidden_mode,
+        return_hidden_states_before_norm=False,
+    )
     increment = (
         accept_lens.to(forward_batch.seq_lens.dtype)
         if accepted_only
@@ -175,76 +176,6 @@ def reject_ragged_draft_extend_graph_kunlun(original_fn, self, forward_batch):
     if getattr(forward_batch, "_kunlun_ragged_draft_extend", False):
         return False
     return original_fn(self, forward_batch)
-
-
-@plugin_hook(
-    "sglang.srt.speculative.eagle_info_v2.EagleDraftInputV2Mixin.prepare_for_decode",
-    type=HookType.REPLACE,
-)
-def prepare_for_decode_kunlun(self, batch):
-    """Synchronously publish current/next KV lengths before mapping writes."""
-    import sglang.srt.speculative.eagle_info_v2 as upstream
-    from sglang.srt.server_args import get_global_server_args
-    from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-
-    batch.maybe_evict_swa()
-    batch_size = batch.batch_size()
-    if batch.sampling_info.penalizer_orchestrator.is_required:
-        batch.cumulate_penalty_output_tokens()
-    page_size = batch.token_to_kv_pool_allocator.page_size
-    reserve = upstream.get_alloc_reserve_per_decode()
-    current_lengths = [0] * batch_size
-    next_lengths = [0] * batch_size
-    num_needed_tokens = 0
-    for index, request in enumerate(batch.reqs):
-        current = request.kv_allocated_len
-        next_length = max(current, request.kv_committed_len + reserve)
-        current_lengths[index] = current
-        next_lengths[index] = next_length
-        num_needed_tokens += next_length - current
-        request.kv_allocated_len = next_length
-        request.decode_batch_idx += 1
-        request.kv_committed_len += 1
-
-    current_cpu = torch.tensor(current_lengths, dtype=torch.int32, device="cpu")
-    next_cpu = torch.tensor(next_lengths, dtype=torch.int32, device="cpu")
-    if page_size > 1 and (get_global_server_args().speculative_eagle_topk or 1) > 1:
-        max_alloc_len = int(next_cpu.max())
-        row_width = batch.req_to_token_pool.req_to_token.shape[1]
-        assert max_alloc_len <= row_width, (
-            f"spec v2 allocation {max_alloc_len} exceeds req_to_token width "
-            f"{row_width}; page_size={page_size}"
-        )
-
-    current_device = current_cpu.to(device=batch.device)
-    next_device = next_cpu.to(device=batch.device)
-    if page_size == 1:
-        out_cache_loc = upstream.alloc_token_slots(
-            batch.tree_cache, num_needed_tokens
-        )
-    else:
-        last_loc = upstream.get_last_loc(
-            batch.req_to_token_pool.req_to_token,
-            batch.req_pool_indices,
-            current_device,
-        )
-        out_cache_loc = upstream.alloc_paged_token_slots_extend(
-            batch.tree_cache,
-            current_device,
-            current_cpu,
-            next_device,
-            next_cpu,
-            last_loc,
-            num_needed_tokens,
-        )
-    assign_req_to_token_pool_func(
-        batch.req_pool_indices,
-        batch.req_to_token_pool.req_to_token,
-        current_device,
-        next_device,
-        out_cache_loc,
-        batch_size,
-    )
 
 
 @plugin_hook(
@@ -313,7 +244,7 @@ def capture_cuda_graphs_kunlun(self):
     "sglang.srt.speculative.eagle_worker_v2.EAGLEWorkerV2.verify",
     type=HookType.AFTER,
 )
-def publish_verify_stride_kunlun(result, self, batch):
+def publish_verify_stride_kunlun(result, self, batch, grammar_barrier=None):
     """Carry the verify-time fixed row width to scheduler result processing."""
     result.speculative_num_draft_tokens = self.speculative_num_draft_tokens
     return result
@@ -418,7 +349,8 @@ def draft_extend_for_decode_kunlun(self, batch, batch_result):
     )
     batch.out_cache_loc = out_cache_loc
     with self.plan_stream_ctx:
-        forward_batch = self.prepare_for_draft_extend(
+        forward_batch = prepare_for_draft_extend_kunlun(
+            self,
             draft_extend_input,
             batch,
             next_token_ids,

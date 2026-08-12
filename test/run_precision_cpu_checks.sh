@@ -1,8 +1,11 @@
 #!/bin/bash
 set -euo pipefail
-ROOT=/home/zx/code/open_src/sglang/v0.5.14_precision_migration_20260730/baidu/sglang-kunlun
+ROOT=/home/zx/code/v0.5.17/sglang-kunlun
 export PYTHONPATH="$ROOT:$ROOT/../sglang/python${PYTHONPATH:+:$PYTHONPATH}"
 export SGLANG_PLATFORM=kunlun
+export SGLANG_USE_XPU=1
+export SGLANG_OPT_USE_COMPRESSOR_V2=1
+export DSV4_KUNLUN_REFERENCE_ONLY=1
 UPSTREAM="$ROOT/../sglang"
 python_status="$(git -C "$UPSTREAM" status --porcelain -- python)"
 if [[ -n "$python_status" ]]; then

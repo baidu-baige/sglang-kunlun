@@ -17,6 +17,29 @@ from sglang_kunlun.hooks import ragged_draft_extend as ragged
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_contract_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+eagle_hooks = load_contract_module(
+    "contract_eagle_worker_v2_hooks",
+    ROOT / "sglang_kunlun" / "hooks" / "speculative" / "eagle_worker_v2.py",
+)
+multi_layer_eagle_hooks = load_contract_module(
+    "contract_multi_layer_eagle_worker_v2_hooks",
+    ROOT
+    / "sglang_kunlun"
+    / "hooks"
+    / "speculative"
+    / "multi_layer_eagle_worker_v2.py",
+)
 MODEL_HOOKS = ROOT / "sglang_kunlun" / "models" / "deepseek_v4_precision.py"
 MODEL_PRECISION_SPEC = importlib.util.spec_from_file_location(
     "contract_production_deepseek_v4_precision", MODEL_HOOKS
@@ -55,6 +78,20 @@ class ProductionPrecisionContractTest(unittest.TestCase):
     def test_actual_plugin_registrations_and_signatures(self):
         targets = (
             (
+                "sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayer.hc_pre",
+                HookType.REPLACE,
+                model_precision.hc_pre_reference_sinkhorn_kunlun,
+                (
+                    "self",
+                    "x",
+                    "hc_fn",
+                    "hc_scale",
+                    "hc_base",
+                    "norm",
+                    "forward_batch",
+                ),
+            ),
+            (
                 "sglang.srt.layers.attention.dsv4.indexer.C4Indexer.__init__",
                 HookType.AFTER,
                 model_precision.initialize_c4_indexer_parameter_dtype_kunlun,
@@ -91,21 +128,6 @@ class ProductionPrecisionContractTest(unittest.TestCase):
                 ("self", "x", "positions", "forward_batch", "x_quant"),
             ),
             (
-                "sglang.srt.speculative.base_spec_worker."
-                "EagleDraftWorkerBase.prepare_for_draft_extend",
-                HookType.REPLACE,
-                mtp.prepare_for_draft_extend_kunlun,
-                (
-                    "self",
-                    "draft_extend_input",
-                    "batch",
-                    "predict",
-                    "num_draft_tokens",
-                    "draft_model_runner",
-                    "cuda_graph_runner",
-                ),
-            ),
-            (
                 "sglang.srt.managers.scheduler_components.batch_result_processor."
                 "SchedulerBatchResultProcessor._resolve_spec_v2_tokens",
                 HookType.REPLACE,
@@ -125,6 +147,34 @@ class ProductionPrecisionContractTest(unittest.TestCase):
             self.assertEqual(
                 tuple(inspect.signature(function).parameters), expected_parameters
             )
+
+    def test_swa_eviction_uses_0517_page_margin_contract(self):
+        common = types.ModuleType("sglang.srt.mem_cache.common")
+        common.free_swa_out_of_window_slots = mock.Mock()
+        req_to_token_pool = object()
+        allocator = object()
+        owner = types.SimpleNamespace(
+            tree_cache=types.SimpleNamespace(
+                supports_swa=lambda: True,
+                sliding_window_size=4096,
+                page_size=256,
+            ),
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+        )
+        req = object()
+        with mock.patch.dict(sys.modules, {common.__name__: common}):
+            runtime.evict_swa_with_page_margin_kunlun(owner, req, 8192)
+
+        common.free_swa_out_of_window_slots.assert_called_once_with(
+            req,
+            8192,
+            sliding_window_size=4096,
+            page_size=256,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+            is_chunk_cache=False,
+        )
 
     def test_moe_gate_forward_matches_058_half_contract_and_preserves_fallback(self):
         for dtype in (torch.bfloat16, torch.float16):
@@ -179,42 +229,48 @@ class ProductionPrecisionContractTest(unittest.TestCase):
         )
 
     def test_mqa_init_matches_requested_wo_a_parameter_dtype(self):
-        config = types.SimpleNamespace(rope_scaling=None)
+        class UnquantizedLinearMethod:
+            pass
 
-        for requested_dtype, expected_dtype in (
-            ("float16", torch.float16),
-            ("bfloat16", torch.bfloat16),
-        ):
-            with self.subTest(requested_dtype=requested_dtype):
-                weight = torch.nn.Parameter(
-                    torch.ones((1, 2, 4), dtype=torch.bfloat16),
-                    requires_grad=False,
-                )
-                from sglang.srt.layers.quantization.unquant import (
-                    UnquantizedLinearMethod,
-                )
+        unquant_module = types.ModuleType(
+            "sglang.srt.layers.quantization.unquant"
+        )
+        unquant_module.UnquantizedLinearMethod = UnquantizedLinearMethod
+        server_args_module = types.ModuleType("sglang.srt.server_args")
 
-                owner = types.SimpleNamespace(
-                    compress_ratio=0,
-                    wo_a=types.SimpleNamespace(
-                        weight=weight,
-                        quant_method=UnquantizedLinearMethod(),
-                        params_dtype=torch.bfloat16,
-                    ),
-                )
-                server_args = types.SimpleNamespace(dtype=requested_dtype)
-                with mock.patch(
-                    "sglang.srt.server_args.get_global_server_args",
-                    return_value=server_args,
-                ):
+        modules = {
+            unquant_module.__name__: unquant_module,
+            server_args_module.__name__: server_args_module,
+        }
+        with mock.patch.dict(sys.modules, modules):
+            for requested_dtype, expected_dtype in (
+                ("float16", torch.float16),
+                ("bfloat16", torch.bfloat16),
+            ):
+                with self.subTest(requested_dtype=requested_dtype):
+                    weight = torch.nn.Parameter(
+                        torch.ones((1, 2, 4), dtype=torch.bfloat16),
+                        requires_grad=False,
+                    )
+                    owner = types.SimpleNamespace(
+                        compress_ratio=4,
+                        wo_a=types.SimpleNamespace(
+                            weight=weight,
+                            quant_method=UnquantizedLinearMethod(),
+                            params_dtype=torch.bfloat16,
+                        ),
+                    )
+                    server_args_module.get_global_server_args = (
+                        lambda dtype=requested_dtype: types.SimpleNamespace(dtype=dtype)
+                    )
                     result = model_precision.initialize_mqa_rope_policy_kunlun(
-                        None, owner, config
+                        None, owner, types.SimpleNamespace()
                     )
 
-                self.assertIsNone(result)
-                self.assertIs(owner.wo_a.weight, weight)
-                self.assertEqual(owner.wo_a.params_dtype, expected_dtype)
-                self.assertEqual(owner.wo_a.weight.dtype, expected_dtype)
+                    self.assertIsNone(result)
+                    self.assertIs(owner.wo_a.weight, weight)
+                    self.assertEqual(owner.wo_a.params_dtype, expected_dtype)
+                    self.assertEqual(owner.wo_a.weight.dtype, expected_dtype)
 
     def test_mqa_forward_uses_deterministic_global_slots_and_local_output(self):
         upstream = types.ModuleType("sglang.srt.models.deepseek_v4")
@@ -231,7 +287,7 @@ class ProductionPrecisionContractTest(unittest.TestCase):
         upstream._FP8_WO_A_GEMM = False
         upstream.fused_rope_inplace = mock.Mock()
         upstream.is_in_breakable_cuda_graph = lambda: False
-        upstream.get_tensor_model_parallel_world_size = lambda: 2
+        upstream.get_parallel = lambda: types.SimpleNamespace(tp_size=2)
 
         class Backend:
             def forward(inner_self, *args, **kwargs):
@@ -245,13 +301,13 @@ class ProductionPrecisionContractTest(unittest.TestCase):
         )
         forward_context.get_attn_backend = lambda: backend
         env_gate = types.ModuleType(
-            "sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate"
+            "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate"
         )
         env_gate.is_unified_kv_triton = lambda: False
 
         owner = types.SimpleNamespace(
-            tp_size=2,
-            tp_rank=1,
+            attn_tp_size=2,
+            attn_tp_rank=1,
             n_local_heads=2,
             n_heads=4,
             head_dim=1,
@@ -286,31 +342,36 @@ class ProductionPrecisionContractTest(unittest.TestCase):
         model_executor_package = types.ModuleType("sglang.srt.model_executor")
         model_executor_package.__path__ = []
         model_executor_package.forward_context = forward_context
-        layers_package = types.ModuleType("sglang.srt.layers")
-        layers_package.__path__ = []
-        attention_package = types.ModuleType("sglang.srt.layers.attention")
+        kernels_package = types.ModuleType("sglang.kernels")
+        kernels_package.__path__ = []
+        ops_package = types.ModuleType("sglang.kernels.ops")
+        ops_package.__path__ = []
+        attention_package = types.ModuleType("sglang.kernels.ops.attention")
         attention_package.__path__ = []
-        dsv4_package = types.ModuleType("sglang.srt.layers.attention.dsv4")
+        dsv4_package = types.ModuleType("sglang.kernels.ops.attention.dsv4")
         dsv4_package.__path__ = []
         unified_package = types.ModuleType(
-            "sglang.srt.layers.attention.dsv4.unified_kv_kernels"
+            "sglang.kernels.ops.attention.dsv4.unified_kv_kernels"
         )
         unified_package.__path__ = []
         unified_package.env_gate = env_gate
         dsv4_package.unified_kv_kernels = unified_package
         attention_package.dsv4 = dsv4_package
-        layers_package.attention = attention_package
+        ops_package.attention = attention_package
+        kernels_package.ops = ops_package
         modules = {
             upstream.__name__: upstream,
             models_package.__name__: models_package,
             forward_context.__name__: forward_context,
             model_executor_package.__name__: model_executor_package,
-            layers_package.__name__: layers_package,
+            kernels_package.__name__: kernels_package,
+            ops_package.__name__: ops_package,
             attention_package.__name__: attention_package,
             dsv4_package.__name__: dsv4_package,
             unified_package.__name__: unified_package,
             env_gate.__name__: env_gate,
         }
+        sglang_module = sys.modules["sglang"]
         srt_module = sys.modules["sglang.srt"]
         with ExitStack() as stack:
             stack.enter_context(mock.patch.dict(sys.modules, modules))
@@ -323,7 +384,7 @@ class ProductionPrecisionContractTest(unittest.TestCase):
                 )
             )
             stack.enter_context(
-                mock.patch.object(srt_module, "layers", layers_package, create=True)
+                mock.patch.object(sglang_module, "kernels", kernels_package, create=True)
             )
             stack.enter_context(
                 mock.patch.object(
@@ -430,7 +491,15 @@ class ProductionPrecisionContractTest(unittest.TestCase):
             can_run_graph=mock.Mock(return_value=False)
         )
 
-        def init_new(schedule_batch, _runner):
+        def init_new(
+            schedule_batch,
+            _runner,
+            *,
+            capture_hidden_mode,
+            return_hidden_states_before_norm,
+        ):
+            self.assertIs(capture_hidden_mode, schedule_batch.capture_hidden_mode)
+            self.assertFalse(return_hidden_states_before_norm)
             return types.SimpleNamespace(
                 seq_lens=schedule_batch.seq_lens.clone(),
                 seq_lens_cpu=None,
@@ -536,6 +605,58 @@ class ProductionPrecisionContractTest(unittest.TestCase):
         forward_batch.batch_size = 3
         forward_batch.extend_seq_lens_cpu = [2, 2, 2]
         self.assertIsNone(ragged._ragged_extend_lengths(forward_batch, 6))
+
+    def test_target_verify_graph_lengths_match_golden_contract(self):
+        import ast as _ast
+        import types as _types
+
+        source = BACKEND_HOOKS.read_text()
+        tree = _ast.parse(source, filename=str(BACKEND_HOOKS))
+        helper_names = {
+            "_copy_host_lengths_",
+            "_is_graph_extend_mode",
+            "_alloc_graph_extend_aux",
+            "_get_graph_extend_aux",
+            "_seq_lens_cpu_i32",
+            "_refresh_graph_host_lengths",
+        }
+        helpers = _ast.Module(
+            body=[
+                node
+                for node in tree.body
+                if isinstance(node, _ast.FunctionDef) and node.name in helper_names
+            ],
+            type_ignores=[],
+        )
+        namespace = {"torch": torch}
+        exec(compile(helpers, str(BACKEND_HOOKS), "exec"), namespace)
+
+        forward_mode = _types.SimpleNamespace(
+            is_decode_or_idle=lambda: False,
+            is_target_verify=lambda: True,
+            is_draft_extend_v2=lambda: False,
+        )
+        forward_batch = _types.SimpleNamespace(
+            batch_size=2,
+            forward_mode=forward_mode,
+            seq_lens=torch.tensor([2, 31], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([2, 31], dtype=torch.int64),
+        )
+        graph_extend_cache = {}
+        aux = namespace["_get_graph_extend_aux"](
+            graph_extend_cache, 2, 6, torch.device("cpu")
+        )
+        pointers = [tensor.data_ptr() for tensor in aux]
+
+        namespace["_refresh_graph_host_lengths"](
+            forward_batch, {}, {}, graph_extend_cache
+        )
+
+        _, _, kv_lens_cpu, kv_lens, query_lens = aux
+        self.assertEqual([tensor.data_ptr() for tensor in aux], pointers)
+        self.assertEqual(query_lens.tolist(), [3, 3])
+        self.assertEqual(kv_lens_cpu.tolist(), [2, 31])
+        self.assertEqual(kv_lens.tolist(), [3, 31])
 
     def test_packed_rows_only_admit_exact_fixed_width_layouts(self):
         self.assertTrue(mtp.packed_rows_fit_fixed_width([4], 4))
@@ -678,7 +799,7 @@ class ProductionPrecisionContractTest(unittest.TestCase):
         extend_runner.assert_called_once_with(owner)
         self.assertIs(upstream.FlashInferAttnBackend, original_flashinfer)
 
-    def test_compression_clear_survives_restore_without_double_clear(self):
+    def test_compression_clear_initializes_every_non_online_state(self):
         class Buffer:
             def __init__(self):
                 self.calls = 0
@@ -686,28 +807,32 @@ class ProductionPrecisionContractTest(unittest.TestCase):
             def clear(self):
                 self.calls += 1
 
-        class RestoredOwner:
-            def __init__(self):
+        class Owner:
+            def __init__(self, clear_during_init=False):
                 self.kv_score_buffer = Buffer()
+                if clear_during_init:
+                    self.kv_score_buffer.clear()
 
-        class DirtyOwner:
-            def __init__(self):
-                self.kv_score_buffer = Buffer()
-                self.kv_score_buffer.clear()
-
-        restored = RestoredOwner()
+        uninitialized = Owner()
         runtime.initialize_non_online_compress_state_kunlun(
-            None, restored, 1, 1, False, 4, torch.float32, "cpu", False, 4,
+            None, uninitialized, 1, 1, False, 4, torch.float32, "cpu", False, 4,
             online=False,
         )
-        self.assertEqual(restored.kv_score_buffer.calls, 1)
+        self.assertEqual(uninitialized.kv_score_buffer.calls, 1)
 
-        dirty = DirtyOwner()
+        upstream_cleared = Owner(clear_during_init=True)
         runtime.initialize_non_online_compress_state_kunlun(
-            None, dirty, 1, 1, False, 4, torch.float32, "cpu", False, 4,
+            None, upstream_cleared, 1, 1, False, 4, torch.float32, "cpu", False, 4,
             online=False,
         )
-        self.assertEqual(dirty.kv_score_buffer.calls, 1)
+        self.assertEqual(upstream_cleared.kv_score_buffer.calls, 2)
+
+        online = Owner()
+        runtime.initialize_non_online_compress_state_kunlun(
+            None, online, 1, 1, False, 4, torch.float32, "cpu", False, 4,
+            online=True,
+        )
+        self.assertEqual(online.kv_score_buffer.calls, 0)
 
     def test_draft_position_hook_is_not_registered(self):
         source = MTP_HOOKS.read_text()
@@ -732,16 +857,6 @@ class ProductionPrecisionContractTest(unittest.TestCase):
             if isinstance(node, ast.FunctionDef)
         }
         expected = {
-            "_create_paged_compressor_data_kunlun": (
-                "sglang.srt.layers.attention.deepseek_v4_backend."
-                "create_paged_compressor_data",
-                "AROUND",
-            ),
-            "_generate_compressor_prefill_plan_kunlun": (
-                "sglang.jit_kernel.dsv4.compress_old."
-                "CompressorPrefillPlan.generate",
-                "REPLACE",
-            ),
             "_compressor_forward_cuda_kunlun": (
                 "sglang.srt.layers.attention.dsv4.compressor."
                 "Compressor.forward_cuda",
@@ -779,27 +894,9 @@ class ProductionPrecisionContractTest(unittest.TestCase):
             for target in node.targets
         }
         self.assertTrue(forbidden_assignments.isdisjoint(assigned))
-
-        adapter_node = functions["_create_paged_compressor_data_kunlun"]
-        adapter_node.decorator_list = []
-        namespace = {}
-        exec(
-            compile(
-                ast.Module(body=[adapter_node], type_ignores=[]),
-                str(BACKEND_HOOKS),
-                "exec",
-            ),
-            namespace,
-        )
-        original = mock.Mock(return_value="paged-data")
-        result = namespace["_create_paged_compressor_data_kunlun"](
-            original,
-            "payload",
-            online_state_slot_offset=7,
-            keep=True,
-        )
-        self.assertEqual(result, "paged-data")
-        original.assert_called_once_with("payload", keep=True)
+        self.assertNotIn("_create_paged_compressor_data_kunlun", functions)
+        self.assertNotIn("_generate_compressor_prefill_plan_kunlun", functions)
+        self.assertNotIn('kwargs.pop("online_state_slot_offset", None)', source)
 
     def test_preserved_runtime_contracts_and_no_hot_global_rebinding(self):
         model_source = MODEL_HOOKS.read_text()
@@ -817,10 +914,19 @@ class ProductionPrecisionContractTest(unittest.TestCase):
         self.assertIn("original_seq_len=0", model_source)
         self.assertIn("local_q_out = torch.empty_like(q)", model_source)
         self.assertIn("kv = self.kv_norm(kv)", model_source)
-        self.assertIn("drop_page_margin=False", runtime_source)
+        self.assertIn("is_chunk_cache=False", runtime_source)
+        self.assertNotIn("drop_page_margin=", runtime_source)
         self.assertIn("device=req_to_token_pool.device", runtime_source)
-        self.assertIn("current_cpu.to(device=batch.device)", mtp_source)
-        self.assertIn("next_cpu.to(device=batch.device)", mtp_source)
+        self.assertIn(
+            "batch_result.next_token_ids.index_select(0, accepted).to(", mtp_source
+        )
+        self.assertIn(
+            "next_token_ids = batch_result.next_token_ids.to(torch.int64)", mtp_source
+        )
+        self.assertIn("forward_batch = prepare_for_draft_extend_kunlun(", mtp_source)
+        self.assertIn("capture_hidden_mode=batch.capture_hidden_mode", mtp_source)
+        self.assertIn("return_hidden_states_before_norm=False", mtp_source)
+        self.assertNotIn("self.prepare_for_draft_extend(", mtp_source)
 
         for forbidden in (
             "upstream.get_attn_backend =",

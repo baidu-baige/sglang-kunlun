@@ -1,20 +1,4 @@
 """Hook for ``sglang.srt.speculative.draft_utils.DraftBackendFactory``.
-
-0.5.14's ``DraftBackendFactory._create_backend`` resolves the draft attention
-backend through a fixed ``backend_map`` keyed by backend name (flashinfer /
-triton / fa3 / dsa / ...). It has **no out-of-tree platform branch**, so when
-the active attention backend is ``"kunlun"`` it raises::
-
-    ValueError: EAGLE is not supported in attention backend kunlun
-
-The Kunlun platform already exposes the draft backend classes via
-``KunlunSRTPlatform.get_draft_prefill_attention_backend_cls()`` /
-``get_draft_decode_attention_backend_cls()``. We add an AROUND hook on
-``_create_backend`` that intercepts the ``"kunlun"`` backend type and builds the
-Kunlun draft backend from those platform factory methods, delegating every
-other backend to the original implementation.
-
-Mirrors the defensive registration style of ``attention_registry.py``.
 """
 
 from __future__ import annotations
@@ -60,6 +44,18 @@ def _create_backend_kunlun(original_fn, self, backend_name, backend_map, error_t
         return KunlunDeepseekV4AttnBackend(
             self.draft_model_runner, skip_prefill=False
         )
+
+    if backend_type in ("dsa", "nsa"):
+        from sglang_kunlun.hooks.layers.attention.kunlun_nsa_backend import (
+            KunlunDSAAttnBackend,
+            KunlunDSAMultiStepBackend,
+        )
+
+        if backend_name == "decode_attention_backend":
+            return KunlunDSAMultiStepBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            )
+        return KunlunDSAAttnBackend(self.draft_model_runner, skip_prefill=False)
 
     if backend_type != "kunlun":
         return original_fn(self, backend_name, backend_map, error_template)
