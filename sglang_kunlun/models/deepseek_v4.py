@@ -107,9 +107,21 @@ def mqa_forward_prepare_kunlun(
     q_lora = self.q_norm(q_lora)
     q, _ = self.wq_b(q_lora)
     q = q.view(-1, self.n_local_heads, self.head_dim)
-    q = q * torch.rsqrt(
-        q.float().square().mean(dim=-1, keepdim=True) + self.eps
-    ).to(q.dtype)
+    import kunlun_ops
+
+    q_normalized = torch.empty_like(q)
+    kunlun_ops.rmsnorm(
+        q,
+        None,
+        q_normalized,
+        self.eps,
+        False,
+        True,
+        None,
+        None,
+        None,
+    )
+    q = q_normalized
     kv = self.kv_norm(kv)
 
     from sglang.srt.models.deepseek_v4 import fused_rope_inplace
@@ -186,10 +198,12 @@ def hc_head_kunlun(
     return y.to(dtype)
 
 
-@plugin_hook(
-    "sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayer.hc_pre",
-    type=HookType.REPLACE,
-)
+# Golden keeps this hook disabled so the upstream Torch hc_pre runs and the
+# mHC post/comb stay fp32; the Kunlun fused hc_pre returns fp16.
+# @plugin_hook(
+#     "sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayer.hc_pre",
+#     type=HookType.REPLACE,
+# )
 def hc_pre_kunlun(
     self,
     x: torch.Tensor,
@@ -261,8 +275,21 @@ def hc_post_kunlun(
     assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
     assert post.shape == (x.shape[0], self.hc_mult)
     assert comb.shape == (x.shape[0], self.hc_mult, self.hc_mult)
-    return (
-        post.unsqueeze(-1) * x.unsqueeze(1)
-        + (comb.unsqueeze(-1) * residual.unsqueeze(2)).sum(dim=1)
-    ).type_as(x)
+    from kunlun_ops import hc_post_kunlun_impl
+
+    batch, hidden_size = x.shape[0], x.shape[-1]
+    out = torch.empty(
+        (batch, self.hc_mult, hidden_size), dtype=x.dtype, device=x.device
+    )
+    hc_post_kunlun_impl(
+        post.contiguous(),
+        x.contiguous(),
+        comb.contiguous(),
+        residual.contiguous(),
+        out,
+        batch,
+        self.hc_mult,
+        hidden_size,
+    )
+    return out
 

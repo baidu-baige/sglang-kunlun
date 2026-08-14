@@ -43,3 +43,21 @@ def hc_split_sinkhorn_kunlun(
         eps,
     )
     return pre, post, comb
+
+
+@plugin_hook(
+    "sglang.srt.models.deepseek_v4._get_mhc_ops",
+    type=HookType.REPLACE,
+)
+def _get_mhc_ops_kunlun():
+    """Resolve the MHC ops through the hooked module instead of ``sgl_kernel``.
+
+    Upstream short-circuits to ``sgl_kernel.hc_split_sinkhorn`` on XPU, which
+    returns fp16 ``post``/``comb``. Golden reaches the Kunlun replacement
+    registered on the layernorm module, whose outputs follow the fp32 ``mixes``
+    dtype, so route through that module to keep the mHC boundary aligned.
+    """
+    from sglang.srt.models.deepseek_v4 import MhcOps
+    from sglang.kernels.ops.layernorm import mhc as mhc_module
+
+    return MhcOps(mhc_module.hc_split_sinkhorn, None, None)

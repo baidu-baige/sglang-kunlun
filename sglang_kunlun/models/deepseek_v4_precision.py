@@ -3,18 +3,30 @@
 from __future__ import annotations
 
 import torch
+from kunlun_ops import hc_post_kunlun_impl
+from typing import Optional
+from torch import nn
 
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 from sglang_kunlun.kernels.kernel_ops import dsv4_mqa_wo_a_einsum_kunlun
+
+
+def _dsv4_dump(self, name, value):
+    callback = getattr(self, "_dsv4_tensor_dump_callback", None)
+    if callback is not None and isinstance(value, torch.Tensor):
+        callback(name, value)
 
 
 _FP16_DTYPE_NAMES = frozenset(("fp16", "float16", "half"))
 
 
-@plugin_hook(
-    "sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayer.hc_pre",
-    type=HookType.REPLACE,
-)
+# Golden keeps this hook disabled so the upstream Torch hc_pre runs and the
+# mHC post/comb stay fp32; the Kunlun fused hc_pre returns fp16.
+# @plugin_hook(
+#     "sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayer.hc_pre",
+#     type=HookType.REPLACE,
+# )
 def hc_pre_reference_sinkhorn_kunlun(
     self,
     x,
@@ -24,40 +36,66 @@ def hc_pre_reference_sinkhorn_kunlun(
     norm=None,
     forward_batch=None,
 ):
-    """Match the upstream DSV4 MHC normalization contract exactly."""
+    """Use the Golden Kunlun fused MHC-pre contract."""
     del norm, forward_batch
     dtype = x.dtype
     if self.hc_mult != 4:
         raise ValueError("Kunlun hc_pre supports hc_mult=4 only")
 
-    x_flat = x.reshape(x.shape[0], -1).float()
-    x_view = x_flat.view(x.shape[0], self.hc_mult, -1)
-    rms = torch.rsqrt(
-        x_flat.square().mean(dim=-1, keepdim=True) + self.rms_norm_eps
-    )
-    mixes = torch.nn.functional.linear(x_flat, hc_fn.float()) * rms
-    pre = torch.sigmoid(
-        mixes[:, : self.hc_mult] * hc_scale[:1] + hc_base[: self.hc_mult]
-    )
-    pre = pre + self.hc_eps
-    post = 2.0 * torch.sigmoid(
-        mixes[:, self.hc_mult : 2 * self.hc_mult] * hc_scale[1:2]
-        + hc_base[self.hc_mult : 2 * self.hc_mult]
-    )
-    comb = (
-        mixes[:, 2 * self.hc_mult :] * hc_scale[2]
-        + hc_base[2 * self.hc_mult :]
-    ).view(x.shape[0], self.hc_mult, self.hc_mult)
+    if x.shape[0] == 0:
+        y = torch.empty((0, x.shape[-1]), dtype=dtype, device=x.device)
+        post = torch.empty((0, self.hc_mult), dtype=torch.float32, device=x.device)
+        comb = torch.empty(
+            (0, self.hc_mult, self.hc_mult), dtype=torch.float32, device=x.device
+        )
+        return y, post, comb, False
 
-    comb = torch.exp(comb - comb.amax(dim=-1, keepdim=True))
-    comb = comb / comb.sum(dim=-1, keepdim=True) + self.hc_eps
-    comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
-    for _ in range(max(self.hc_sinkhorn_iters - 1, 0)):
-        comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
-
-    y = (pre.unsqueeze(-1) * x_view).sum(dim=1).to(dtype)
+    y, post, comb = torch.ops.xspeedgate_ops.hc_pre(
+        x.contiguous(),
+        hc_fn.contiguous(),
+        hc_scale.contiguous(),
+        hc_base.contiguous(),
+        rms_eps=self.rms_norm_eps,
+        hc_pre_eps=self.hc_eps,
+        hc_sinkhorn_eps=self.hc_eps,
+        mhc_post_mult_value=2.0,
+        sinkhorn_iters=self.hc_sinkhorn_iters,
+    )
     return y, post, comb, False
+
+
+@plugin_hook(
+    "sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayer.hc_post",
+    type=HookType.REPLACE,
+)
+def hc_post_kunlun(
+    self,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+):
+    """Use the Golden Kunlun fused MHC-post contract."""
+    if x.shape[0] == 0:
+        return torch.empty(
+            (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
+        )
+
+    assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
+    assert post.shape == (x.shape[0], self.hc_mult)
+    assert comb.shape == (x.shape[0], self.hc_mult, self.hc_mult)
+    out = torch.empty_like(residual)
+    hc_post_kunlun_impl(
+        post.contiguous(),
+        x.contiguous(),
+        comb.contiguous(),
+        residual.contiguous(),
+        out,
+        x.shape[0],
+        self.hc_mult,
+        x.shape[-1],
+    )
+    return out
 
 
 @plugin_hook(
@@ -161,10 +199,196 @@ def compute_q_b_kunlun(self, q, positions, q_out=None):
     """Write Q norm/RoPE into contiguous local storage before a TP-slice copy."""
     from sglang.srt.models.deepseek_v4 import fused_q_norm_rope
 
+    if not getattr(torch, "_dsv4_qnorm_resolution_probed", False):
+        import sys as _sys
+
+        torch._dsv4_qnorm_resolution_probed = True
+        print(
+            "DSV4_QNORM_RESOLUTION module=%s qualname=%s file=%s"
+            % (
+                getattr(fused_q_norm_rope, "__module__", "?"),
+                getattr(fused_q_norm_rope, "__qualname__", "?"),
+                getattr(getattr(fused_q_norm_rope, "__code__", None), "co_filename", "?"),
+            ),
+            file=_sys.stderr,
+            flush=True,
+        )
+
+        torch._dsv4_qnorm_resolution_probed = True
+        print(
+            "DSV4_QNORM_RESOLUTION module=%s qualname=%s file=%s"
+            % (
+                getattr(fused_q_norm_rope, "__module__", "?"),
+                getattr(fused_q_norm_rope, "__qualname__", "?"),
+                getattr(getattr(fused_q_norm_rope, "__code__", None), "co_filename", "?"),
+            ),
+            file=_sys.stderr,
+            flush=True,
+        )
+
+        torch._dsv4_qnorm_resolution_probed = True
+        print(
+            "DSV4_QNORM_RESOLUTION module=%s qualname=%s file=%s"
+            % (
+                getattr(fused_q_norm_rope, "__module__", "?"),
+                getattr(fused_q_norm_rope, "__qualname__", "?"),
+                getattr(getattr(fused_q_norm_rope, "__code__", None), "co_filename", "?"),
+            ),
+            file=_sys.stderr,
+            flush=True,
+        )
+
+        torch._dsv4_qnorm_resolution_probed = True
+        print(
+            "DSV4_QNORM_RESOLUTION module=%s qualname=%s file=%s"
+            % (
+                getattr(fused_q_norm_rope, "__module__", "?"),
+                getattr(fused_q_norm_rope, "__qualname__", "?"),
+                getattr(getattr(fused_q_norm_rope, "__code__", None), "co_filename", "?"),
+            ),
+            file=_sys.stderr,
+            flush=True,
+        )
+
+        torch._dsv4_qnorm_resolution_probed = True
+        print(
+            "DSV4_QNORM_RESOLUTION module=%s qualname=%s file=%s"
+            % (
+                getattr(fused_q_norm_rope, "__module__", "?"),
+                getattr(fused_q_norm_rope, "__qualname__", "?"),
+                getattr(getattr(fused_q_norm_rope, "__code__", None), "co_filename", "?"),
+            ),
+            file=_sys.stderr,
+            flush=True,
+        )
+
+        torch._dsv4_qnorm_resolution_probed = True
+        print(
+            "DSV4_QNORM_RESOLUTION module=%s qualname=%s file=%s"
+            % (
+                getattr(fused_q_norm_rope, "__module__", "?"),
+                getattr(fused_q_norm_rope, "__qualname__", "?"),
+                getattr(getattr(fused_q_norm_rope, "__code__", None), "co_filename", "?"),
+            ),
+            file=_sys.stderr,
+            flush=True,
+        )
+
+        torch._dsv4_qnorm_resolution_probed = True
+        print(
+            "DSV4_QNORM_RESOLUTION module=%s qualname=%s file=%s"
+            % (
+                getattr(fused_q_norm_rope, "__module__", "?"),
+                getattr(fused_q_norm_rope, "__qualname__", "?"),
+                getattr(getattr(fused_q_norm_rope, "__code__", None), "co_filename", "?"),
+            ),
+            file=_sys.stderr,
+            flush=True,
+        )
+
+        torch._dsv4_qnorm_resolution_probed = True
+        print(
+            "DSV4_QNORM_RESOLUTION module=%s qualname=%s file=%s"
+            % (
+                getattr(fused_q_norm_rope, "__module__", "?"),
+                getattr(fused_q_norm_rope, "__qualname__", "?"),
+                getattr(getattr(fused_q_norm_rope, "__code__", None), "co_filename", "?"),
+            ),
+            file=_sys.stderr,
+            flush=True,
+        )
+
+        torch._dsv4_qnorm_resolution_probed = True
+        print(
+            "DSV4_QNORM_RESOLUTION module=%s qualname=%s file=%s"
+            % (
+                getattr(fused_q_norm_rope, "__module__", "?"),
+                getattr(fused_q_norm_rope, "__qualname__", "?"),
+                getattr(getattr(fused_q_norm_rope, "__code__", None), "co_filename", "?"),
+            ),
+            file=_sys.stderr,
+            flush=True,
+        )
+
+        torch._dsv4_qnorm_resolution_probed = True
+        print(
+            "DSV4_QNORM_RESOLUTION module=%s qualname=%s file=%s"
+            % (
+                getattr(fused_q_norm_rope, "__module__", "?"),
+                getattr(fused_q_norm_rope, "__qualname__", "?"),
+                getattr(getattr(fused_q_norm_rope, "__code__", None), "co_filename", "?"),
+            ),
+            file=_sys.stderr,
+            flush=True,
+        )
+
+        torch._dsv4_qnorm_resolution_probed = True
+        print(
+            "DSV4_QNORM_RESOLUTION module=%s qualname=%s file=%s"
+            % (
+                getattr(fused_q_norm_rope, "__module__", "?"),
+                getattr(fused_q_norm_rope, "__qualname__", "?"),
+                getattr(getattr(fused_q_norm_rope, "__code__", None), "co_filename", "?"),
+            ),
+            file=_sys.stderr,
+            flush=True,
+        )
+
+        torch._dsv4_qnorm_resolution_probed = True
+        print(
+            "DSV4_QNORM_RESOLUTION module=%s qualname=%s file=%s"
+            % (
+                getattr(fused_q_norm_rope, "__module__", "?"),
+                getattr(fused_q_norm_rope, "__qualname__", "?"),
+                getattr(getattr(fused_q_norm_rope, "__code__", None), "co_filename", "?"),
+            ),
+            file=_sys.stderr,
+            flush=True,
+        )
+
+        torch._dsv4_qnorm_resolution_probed = True
+        print(
+            "DSV4_QNORM_RESOLUTION module=%s qualname=%s file=%s"
+            % (
+                getattr(fused_q_norm_rope, "__module__", "?"),
+                getattr(fused_q_norm_rope, "__qualname__", "?"),
+                getattr(getattr(fused_q_norm_rope, "__code__", None), "co_filename", "?"),
+            ),
+            file=_sys.stderr,
+            flush=True,
+        )
+
+        torch._dsv4_qnorm_resolution_probed = True
+        print(
+            "DSV4_QNORM_RESOLUTION module=%s qualname=%s file=%s"
+            % (
+                getattr(fused_q_norm_rope, "__module__", "?"),
+                getattr(fused_q_norm_rope, "__qualname__", "?"),
+                getattr(getattr(fused_q_norm_rope, "__code__", None), "co_filename", "?"),
+            ),
+            file=_sys.stderr,
+            flush=True,
+        )
+
+        torch._dsv4_qnorm_resolution_probed = True
+        print(
+            "DSV4_QNORM_RESOLUTION module=%s qualname=%s file=%s"
+            % (
+                getattr(fused_q_norm_rope, "__module__", "?"),
+                getattr(fused_q_norm_rope, "__qualname__", "?"),
+                getattr(getattr(fused_q_norm_rope, "__code__", None), "co_filename", "?"),
+            ),
+            file=_sys.stderr,
+            flush=True,
+        )
+
+    _dsv4_dump(self, "self_attn.wq_b.input.q_norm", q)
     q, _ = self.wq_b(q)
+    _dsv4_dump(self, "self_attn.wq_b.output", q)
     q = q.view(-1, self.n_local_heads, self.head_dim)
     local_q_out = torch.empty_like(q)
     fused_q_norm_rope(q, local_q_out, self.eps, self.freqs_cis, positions)
+    _dsv4_dump(self, "self_attn.q_local_after_norm_rope", local_q_out)
     if q_out is None:
         return local_q_out
     q_out.copy_(local_q_out)
@@ -234,14 +458,25 @@ def mqa_forward_global_head_layout_kunlun(
     q_out = None
     local_sink = self.attn_sink
     if self.attn_tp_size > 1:
+        # Golden drives the operator with TP-global head slots: this rank owns
+        # [rank * n_local_heads, (rank + 1) * n_local_heads) and every other slot
+        # stays zero, for both Q and the attention sink. Per-rank dumps of the
+        # Golden operator boundary confirm this placement.
         start = self.attn_tp_rank * self.n_local_heads
         stop = start + self.n_local_heads
         tp_slice = slice(start, stop)
         q_global = x.new_zeros(x.shape[0], self.n_heads, self.head_dim)
         q_out = q_global[:, tp_slice, :]
 
-        local_sink = self.attn_sink.new_zeros(self.n_heads)
-        local_sink[tp_slice].copy_(self.attn_sink[tp_slice])
+        local_sink = getattr(self, "_attn_sink_local", None)
+        if (
+            local_sink is None
+            or local_sink.shape[0] != self.n_heads
+            or local_sink.device != self.attn_sink.device
+        ):
+            local_sink = self.attn_sink.new_zeros(self.n_heads)
+            local_sink[tp_slice].copy_(self.attn_sink[tp_slice])
+            self._attn_sink_local = local_sink
 
     if enable_multi_stream:
         if upstream._is_hip:
@@ -274,8 +509,12 @@ def mqa_forward_global_head_layout_kunlun(
         )
 
     attn_k = kv if kv is not None else q
+    _dsv4_dump(self, "self_attn.q_local_after_prepare", q)
+    if q_global is not None:
+        _dsv4_dump(self, "self_attn.q_global_after_prepare", q_global)
     if is_unified_kv_triton():
         attn_q = q_out if q_out is not None else q
+        _dsv4_dump(self, "self_attn.q_backend", attn_q)
         o = attn_backend.forward(
             q=attn_q,
             k=attn_k,
@@ -288,6 +527,7 @@ def mqa_forward_global_head_layout_kunlun(
         )
     else:
         attn_q = q_global if q_global is not None else q
+        _dsv4_dump(self, "self_attn.q_backend", attn_q)
         save_kv_cache = False
         if (
             forward_batch.forward_mode.is_extend()
@@ -336,6 +576,11 @@ def mqa_forward_global_head_layout_kunlun(
             inverse=True,
         )
 
+    _dsv4_dump(
+        self,
+        "self_attn.compressed_attention.output.out_local_post_rope",
+        o,
+    )
     o = o.view(o.shape[0], self.n_local_groups, -1)
     if upstream._FP8_WO_A_GEMM:
         import deep_gemm
@@ -370,9 +615,14 @@ def mqa_forward_global_head_layout_kunlun(
         o = output
     else:
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        _dsv4_dump(self, "self_attn.wo_a.input.o", o)
+        _dsv4_dump(self, "self_attn.wo_a.input.weight", wo_a)
         o = dsv4_mqa_wo_a_einsum_kunlun(o, wo_a)
+        _dsv4_dump(self, "self_attn.wo_a.output", o)
 
     o, _ = self.wo_b(o.flatten(1))
+    _dsv4_dump(self, "self_attn.wo_b.output", o)
     if self.attn_tp_size > 1 and self.attn_tp_size < upstream.get_parallel().tp_size:
         o = upstream.attn_tp_all_reduce(o)
+    _dsv4_dump(self, "self_attn.output", o)
     return o
