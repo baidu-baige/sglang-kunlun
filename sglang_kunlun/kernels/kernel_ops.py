@@ -807,6 +807,46 @@ def dsv4_expand_prefill_causally_torch(
     )
 
 
+import logging as _dsv4_logging
+
+_KERNEL_OPS_LOGGER = _dsv4_logging.getLogger(__name__)
+
+_DSV4_STATE_LOC_TRACE = {"lines": 0}
+
+
+def _dsv4_trace_state_loc(pos, raw_loc, swa_loc, ring_size):
+    """Count C4 state reads whose SWA translation is the invalid slot 0."""
+
+    import os
+
+    if os.environ.get("DSV4_C4_STATE_LOC_TRACE") != "1":
+        return
+    if _DSV4_STATE_LOC_TRACE["lines"] >= 200:
+        return
+    positive = pos > 0
+    if not bool(positive.any()):
+        return
+    if int(pos.max()) < 1000:
+        return
+    bad = positive & (swa_loc == 0)
+    num_bad = int(bad.sum())
+    _DSV4_STATE_LOC_TRACE["lines"] += 1
+    bad_pos = pos[bad][:8].tolist() if num_bad else []
+    swa_min = int(swa_loc.min())
+    _KERNEL_OPS_LOGGER.warning(
+        "[DSV4_C4_STATE_LOC] rows=%s pos_max=%s zero_mapped=%s sample_pos=%s "
+        "swa_min=%s swa_max=%s swa_min_mod_ring=%s raw_min=%s",
+        int(pos.numel()),
+        int(pos.max()),
+        num_bad,
+        bad_pos,
+        swa_min,
+        int(swa_loc.max()),
+        swa_min % ring_size,
+        int(raw_loc.min()),
+    )
+
+
 def _dsv4_state_loc_torch(
     compress_ratio: int,
     req_pool_indices: torch.Tensor,
@@ -827,6 +867,7 @@ def _dsv4_state_loc_torch(
     safe_pos = pos.clamp(min=0, max=req_to_token.shape[1] - 1)
     raw_loc = req_to_token[rid, safe_pos].to(torch.int64)
     swa_loc = full_to_state[raw_loc].to(torch.int64)
+    _dsv4_trace_state_loc(pos, raw_loc, swa_loc, ring_size)
     return (
         torch.div(swa_loc, swa_page_size, rounding_mode="floor") * ring_size
         + swa_loc.remainder(ring_size)
@@ -1763,6 +1804,50 @@ def dsv4_moe_fused_gate_kunlun(
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
+_DSV4_HASH_TOPK_GUARD_COUNTERS: dict = {}
+_DSV4_HASH_TOPK_GUARD_REPORTED: dict = {}
+
+
+def _dsv4_guard_hash_topk_input_ids(
+    input_ids: torch.Tensor, tid2eid: torch.Tensor
+) -> torch.Tensor:
+    """Return token ids clamped into the tid2eid domain, counting the clamps.
+
+    ``moe_hash_topk_fused`` looks the routing table up by token id, so a padded
+    row carrying -1 (the mask_topk_ids / draft buffer fill) or a stale id reads
+    outside the table and faults the device. Real token ids are untouched.
+    """
+    ids = input_ids.to(torch.int64)
+    table_size = tid2eid.shape[0]
+    invalid = (ids < 0) | (ids >= table_size)
+    counter = _DSV4_HASH_TOPK_GUARD_COUNTERS.get(ids.device)
+    if counter is None:
+        counter = torch.zeros((), dtype=torch.int32, device=ids.device)
+        _DSV4_HASH_TOPK_GUARD_COUNTERS[ids.device] = counter
+    # Captured into the graph so replay accumulates too; never read here, that
+    # would sync the host on the hot path.
+    counter.add_(invalid.sum().to(torch.int32))
+    return ids.masked_fill(invalid, 0)
+
+
+def _dsv4_report_hash_topk_guard(device) -> None:
+    """Log the clamp counter when it grows; env-gated because reading it syncs."""
+    import os
+
+    if os.getenv("DSV4_HASH_TOPK_GUARD_DEBUG", "0") != "1":
+        return
+    counter = _DSV4_HASH_TOPK_GUARD_COUNTERS.get(device)
+    if counter is None:
+        return
+    total = int(counter)
+    if total <= _DSV4_HASH_TOPK_GUARD_REPORTED.get(device, 0):
+        return
+    _DSV4_HASH_TOPK_GUARD_REPORTED[device] = total
+    logger.warning(
+        "[DSV4_HASH_TOPK_GUARD] device=%s clamped_token_ids_total=%s", device, total
+    )
+
+
 @register_jit_op("sglang.kernels.ops.attention.dsv4.moe", "hash_topk")
 def dsv4_hash_topk_kunlun(
     router_logits: torch.Tensor,
@@ -1777,9 +1862,11 @@ def dsv4_hash_topk_kunlun(
     if scoring_func != "sqrtsoftplus":
         raise ValueError(f"unsupported DSV4 hash top-k scoring: {scoring_func}")
 
+    safe_input_ids = _dsv4_guard_hash_topk_input_ids(input_ids, tid2eid)
+    _dsv4_report_hash_topk_guard(safe_input_ids.device)
     topk_ids, topk_weights = torch.ops.xspeedgate_ops.moe_hash_topk_fused(
         router_logits,
-        input_ids.to(torch.int64),
+        safe_input_ids,
         tid2eid,
         num_fused_shared_experts,
         routed_scaling_factor,
@@ -1824,12 +1911,31 @@ def fast_topk(values: torch.Tensor, topk: int, dim: int):
     return torch.topk(values, topk, dim=dim)
 
 
+# Set by mask_topk_ids so the MoE apply hook can drop the padded rows: the gate
+# runs immediately before it in the same forward, and the tensor is a stable
+# buffer under CUDA graph replay.
+_DSV4_LAST_NUM_TOKEN_NON_PADDED: dict = {}
+
+
 @register_jit_op("sglang.kernels.ops.attention.dsv4.moe", "mask_topk_ids")
 def mask_topk_ids(topk_ids: torch.Tensor, num_token_non_padded: torch.Tensor) -> None:
-    """Mask padded token rows in MoE top-k ids on Kunlun."""
+    """Mask padded token rows in MoE top-k ids on Kunlun.
 
-    indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
-    topk_ids[indices >= num_token_non_padded, :] = -1
+    Boolean-mask assignment is shape-dependent and therefore not capturable, so
+    the padded rows would keep stale gate output during graph replay. masked_fill_
+    over a static-shaped mask is capturable. The fill value is 0, not upstream's
+    -1: every Kunlun MoE kernel indexes per-expert buffers by id, and -1 is the
+    out-of-range value that faults them. Routing weights for padded rows are
+    irrelevant because their output rows are discarded; what matters is that the
+    ids are constant, so real rows always get the same expert grouping.
+    """
+
+    _DSV4_LAST_NUM_TOKEN_NON_PADDED[topk_ids.device] = num_token_non_padded
+    indices = torch.arange(
+        0, topk_ids.shape[0], device=topk_ids.device, dtype=torch.int64
+    )
+    padded = (indices >= num_token_non_padded.reshape(()).to(torch.int64)).unsqueeze(1)
+    topk_ids.masked_fill_(padded, 0)
 
 
 @register_jit_op("sglang.kernels.ops.moe.moe_fused_gate", "moe_fused_gate")
@@ -1961,6 +2067,75 @@ def get_mla_kv_buffer_kernel(
     torch.ops.xspeedgate_ops.get_mla_kv_buffer(kv_buffer, loc, cache_k_nope, cache_k_rope)
 
 
+def _dsv4_alloc_extend_torch(
+    prefix_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    last_loc: torch.Tensor,
+    free_pages: torch.Tensor,
+    out_indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Torch port of upstream ``alloc_extend_kernel``.
+
+    Slots come from three regions, in this order: the tail of the page the prefix
+    already occupies, whole freshly taken pages, and the head of one last fresh
+    page. Requests consume ``free_pages`` in batch order.
+    """
+    prefix_list = prefix_lens.to(torch.int64).tolist()
+    seq_list = seq_lens.to(torch.int64).tolist()
+    last_list = last_loc.to(torch.int64).tolist()
+    pages = free_pages.to(torch.int64)
+    device = out_indices.device
+    out_pos = 0
+    page_pos = 0
+
+    for index in range(len(seq_list)):
+        prefix_len = prefix_list[index]
+        seq_len = seq_list[index]
+        extend_len = seq_len - prefix_len
+        prefix_page_end = -(-prefix_len // page_size) * page_size
+        num_new_pages = -(-seq_len // page_size) * page_size // page_size - (
+            prefix_page_end // page_size
+        )
+        if extend_len <= 0:
+            page_pos += max(num_new_pages, 0)
+            continue
+
+        chunks = []
+        num_part1 = min(seq_len, prefix_page_end) - prefix_len
+        if num_part1 > 0:
+            chunks.append(
+                last_list[index]
+                + 1
+                + torch.arange(num_part1, dtype=torch.int64, device=device)
+            )
+        num_part2 = (seq_len // page_size) * page_size - prefix_page_end
+        if num_part2 > 0:
+            offsets = torch.arange(num_part2, dtype=torch.int64, device=device)
+            page_ids = pages.index_select(
+                0,
+                (page_pos + torch.div(offsets, page_size, rounding_mode="floor")),
+            )
+            chunks.append(page_ids * page_size + offsets.remainder(page_size))
+        num_part3 = 0
+        if num_part1 + max(num_part2, 0) < extend_len:
+            num_part3 = seq_len - (seq_len // page_size) * page_size
+            start_page = pages[page_pos + num_new_pages - 1]
+            chunks.append(
+                start_page * page_size
+                + torch.arange(num_part3, dtype=torch.int64, device=device)
+            )
+
+        allocated = torch.cat(chunks) if chunks else out_indices.new_empty((0,))
+        assert allocated.numel() == extend_len, (
+            f"alloc_extend torch mismatch: req={index} extend={extend_len} "
+            f"got={allocated.numel()} parts={(num_part1, num_part2, num_part3)}"
+        )
+        out_indices[out_pos : out_pos + extend_len] = allocated.to(out_indices.dtype)
+        out_pos += extend_len
+        page_pos += max(num_new_pages, 0)
+
+
 @register_triton_op("sglang.kernels.ops.memory.allocator", "alloc_extend_kernel")
 def alloc_extend_kernel(
     prefix_lens: torch.Tensor,
@@ -2021,6 +2196,14 @@ def alloc_extend_kernel(
             out_indices.shape[0],
         )
         out_indices.copy_(xdnn_out_indices.to(out_indices.dtype))
+        return
+
+    import os
+
+    if os.getenv("DSV4_TORCH_ALLOC_EXTEND", "0") == "1":
+        _dsv4_alloc_extend_torch(
+            prefix_lens, seq_lens, last_loc, free_pages, out_indices, page_size
+        )
         return
 
     ret_value = torch.zeros(1, dtype=torch.int64, device=out_indices.device)
@@ -2389,6 +2572,42 @@ def assign_hidden_states_pool_triton(
         )
 
 
+_DSV4_C128_CLEANUP_CALLS = [0]
+
+
+def _dsv4_trace_c128_cleanup(
+    state, req_pool_indices, seq_lens, accept_lens, ring_size, num_draft_tokens
+) -> None:
+    """Log the first few rejected-draft C128 resets, including how much state was live."""
+    import os
+
+    if os.getenv("DSV4_C128_CLEANUP_TRACE", "0") != "1":
+        return
+    seen = _DSV4_C128_CLEANUP_CALLS[0]
+    if seen >= 8:
+        return
+    _DSV4_C128_CLEANUP_CALLS[0] = seen + 1
+    half = state.shape[-1] // 2
+    rid = req_pool_indices.to(torch.int64)[:1]
+    seq = seq_lens.to(torch.int64)[:1]
+    offsets = torch.arange(num_draft_tokens, dtype=torch.int64, device=state.device)
+    rows = (rid.unsqueeze(1) * ring_size + (seq.unsqueeze(1) + offsets).remainder(ring_size)).reshape(-1)
+    sample = state.index_select(0, rows)
+    live = (sample[:, half:] > float("-inf")).any(dim=-1)
+    logger.warning(
+        "[DSV4_C128_CLEANUP] call=%s bs=%s ring=%s nd=%s accept_lens=%s "
+        "req0_rows=%s req0_live_before=%s state_rows=%s",
+        seen,
+        int(req_pool_indices.numel()),
+        ring_size,
+        num_draft_tokens,
+        accept_lens.to("cpu").tolist()[: min(8, accept_lens.numel())],
+        rows.to("cpu").tolist(),
+        live.to("cpu").tolist(),
+        int(state.shape[0]),
+    )
+
+
 @register_jit_op(
     "sglang.kernels.ops.attention.dsv4.c128_cleanup",
     "clear_unaccepted_c128_draft_states",
@@ -2407,6 +2626,9 @@ def clear_unaccepted_c128_draft_states_torch(
     batch_size = req_pool_indices.numel()
     if batch_size == 0 or num_draft_tokens == 0:
         return
+    _dsv4_trace_c128_cleanup(
+        state, req_pool_indices, seq_lens, accept_lens, ring_size, num_draft_tokens
+    )
 
     draft_offsets = torch.arange(
         num_draft_tokens,
@@ -2815,6 +3037,32 @@ def assign_extend_cache_locs(
 # the modern EAGLE v2 pipeline. No Triton kernel to replace.
 
 
+def _dsv4_assign_req_to_token_torch(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    start_offset: torch.Tensor,
+    end_offset: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+) -> None:
+    """Torch port of upstream ``assign_req_to_token_pool``.
+
+    Request i receives ``out_cache_loc`` slots for positions
+    [start_offset[i], end_offset[i]); the source offset is the running sum of the
+    preceding spans.
+    """
+    starts = start_offset.to(torch.int64).tolist()
+    ends = end_offset.to(torch.int64).tolist()
+    indices = req_pool_indices.to(torch.int64).tolist()
+    values = out_cache_loc.to(req_to_token.dtype)
+    source = 0
+    for row, (start, end) in enumerate(zip(starts, ends)):
+        span = end - start
+        if span <= 0:
+            continue
+        req_to_token[indices[row], start:end] = values[source : source + span]
+        source += span
+
+
 @register_triton_op("sglang.srt.mem_cache.allocation", "assign_req_to_token_pool")
 def assign_req_to_token_pool(
     req_pool_indices: torch.Tensor,
@@ -2827,9 +3075,16 @@ def assign_req_to_token_pool(
 ) -> None:
     """Write accepted cache locations into the request token pool."""
 
+    import os
+
     batch_size = req_pool_indices.shape[0]
     if out_cache_loc.dtype != req_to_token.dtype:
         out_cache_loc = out_cache_loc.to(req_to_token.dtype)
+    if os.getenv("DSV4_TORCH_ASSIGN_REQ_TO_TOKEN", "0") == "1":
+        _dsv4_assign_req_to_token_torch(
+            req_pool_indices, req_to_token, start_offset, end_offset, out_cache_loc
+        )
+        return
     torch.ops.xspeedgate_ops.assign_req_to_token_pool(
         req_pool_indices.to(torch.int32),
         req_to_token,
@@ -2858,6 +3113,62 @@ def align_evict_mask_to_page_size(
         num_draft_tokens,
         BLOCK_SIZE,
     )
+
+
+@register_jit_op("sglang.kernels.ops.speculative.topk1", "draft_topk1_postprocess")
+def draft_topk1_postprocess(
+    next_token_logits: torch.Tensor,
+    positions: torch.Tensor,
+    draft_tokens: Optional[torch.Tensor] = None,
+    draft_token_column: int = 0,
+):
+    """Torch greedy draft argmax replacement for the upstream Triton kernels.
+
+    The upstream helper splits the vocab reduction across two Triton kernels,
+    neither of which compiles on Kunlun, so EAGLE graph capture aborts. This
+    keeps every observable effect of that contract: constant 1.0 ``topk_p``, an
+    int64 argmax index, the in-place ``positions`` advance, and the optional
+    write into ``draft_tokens[:, draft_token_column]``. Shapes are static and no
+    value is read back to the host, so it stays CUDA-graph capturable.
+    """
+
+    assert next_token_logits.ndim == 2
+    assert positions.ndim == 1
+    assert positions.is_contiguous()
+    assert positions.shape[0] == next_token_logits.shape[0]
+    assert positions.device == next_token_logits.device
+    write_draft_token = draft_tokens is not None
+    if write_draft_token:
+        assert draft_tokens.ndim == 2
+        assert draft_tokens.dtype == torch.long
+        assert draft_tokens.device == next_token_logits.device
+        assert draft_tokens.shape[0] == next_token_logits.shape[0]
+        assert 0 <= draft_token_column < draft_tokens.shape[1]
+
+    bs, vocab_size = next_token_logits.shape
+    topk_p = torch.empty((bs, 1), dtype=torch.float32, device=next_token_logits.device)
+    topk_index = torch.empty(
+        (bs, 1), dtype=torch.int64, device=next_token_logits.device
+    )
+    # Upstream returns before advancing positions when the batch is empty.
+    if bs == 0:
+        return topk_p, topk_index
+
+    logits = next_token_logits.float()
+    # The Triton kernel demotes NaN lanes so they can never win the reduction.
+    logits = torch.where(logits == logits, logits, logits.new_full((), -1e30))
+    # Match the kernel's tie-break: the lowest vocab index among the maxima.
+    max_val = logits.max(dim=-1, keepdim=True).values
+    lane = torch.arange(vocab_size, device=logits.device).expand_as(logits)
+    index = torch.where(logits == max_val, lane, lane.new_full((), vocab_size))
+    index = index.min(dim=-1, keepdim=True).values.to(torch.int64)
+
+    topk_index.copy_(index)
+    topk_p.fill_(1.0)
+    if write_draft_token:
+        draft_tokens[:, draft_token_column : draft_token_column + 1].copy_(index)
+    positions.add_(1)
+    return topk_p, topk_index
 
 
 @register_jit_op("sglang.kernels.ops.speculative.gather_spec_extras", "gather_spec_extras")

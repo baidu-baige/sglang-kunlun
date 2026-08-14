@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import logging
+
 import torch
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+
+logger = logging.getLogger(__name__)
 
 
 @plugin_hook(
@@ -88,3 +92,43 @@ def initialize_non_online_compress_state_kunlun(
     if not online:
         self.kv_score_buffer.clear()
     return result
+
+
+_DSV4_VERIFY_MASK_DISABLED_LOGGED = False
+
+
+@plugin_hook(
+    "sglang.srt.layers.attention.verify_mask.maybe_create_verify_mask",
+    type=HookType.AROUND,
+)
+def _dsv4_disable_verify_mask(original_fn, *args, **kwargs):
+    """Kunlun verify attention reads a FULL_MASK tree mask, so never hand it one.
+
+    Upstream 0.5.17 lets the target backend own a preallocated verify mask
+    (`VerifyMask`, created only when graph runners exist) and, for DeepSeek-V4,
+    declares it write-only: mode=QLEN_ONLY, is_read=False. `build_eagle_verify_input`
+    then keys three decisions off that object, so the tree mask handed to verify is a
+    qlen-only buffer that nobody fills the prefix of. Upstream can afford this because
+    its DSV4 kernels never read the mask -- but the Kunlun verify path does, with
+    FULL_MASK indexing (`kunlun_backend.py:703`), and `generate_attn_arg_prefill`
+    pads the short buffer with True (`eagle_info.py:123`). Every draft row therefore
+    attends to its non-ancestors, and acceptance collapses at EAGLE 3/1/4 while the
+    score barely moves.
+
+    Returning None restores the 0.5.14 contract the Kunlun kernels were written
+    against: the caller allocates and fills a FULL_MASK tree mask each iteration.
+    Set DSV4_KUNLUN_VERIFY_MASK=1 to fall back to the upstream behaviour.
+    """
+    import os
+
+    if os.environ.get("DSV4_KUNLUN_VERIFY_MASK") == "1":
+        return original_fn(*args, **kwargs)
+    global _DSV4_VERIFY_MASK_DISABLED_LOGGED
+    if not _DSV4_VERIFY_MASK_DISABLED_LOGGED:
+        _DSV4_VERIFY_MASK_DISABLED_LOGGED = True
+        logger.warning(
+            "[DSV4_VERIFY_MASK] backend-owned verify mask disabled on Kunlun; "
+            "the caller fills a FULL_MASK tree mask each iteration "
+            "(set DSV4_KUNLUN_VERIFY_MASK=1 to restore upstream behaviour)"
+        )
+    return None
