@@ -35,7 +35,6 @@ from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 import kunlun_ops
-from sglang_kunlun.kernels.kernel_ops import dsv4_moe_fused_gate_kunlun
 
 
 class StandardTopKOutput(NamedTuple):
@@ -145,7 +144,9 @@ def select_experts_kunlun(
         )
     elif custom_routing_function is None:
         if scoring_func == "sqrtsoftplus":
-            topk_weights, topk_ids = dsv4_moe_fused_gate_kunlun(
+            from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
+
+            topk_weights, topk_ids = moe_fused_gate(
                 router_logits,
                 correction_bias,
                 topk=num_routed_topk if _use_aiter else top_k,
