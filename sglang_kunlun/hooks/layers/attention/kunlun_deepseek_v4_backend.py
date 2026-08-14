@@ -257,6 +257,18 @@ def _make_cp_prefill_lod(core_metadata, num_queries: int, device: torch.device):
     )
 
 
+def _graph_replay_bs(raw_bs: int, cached_bs_values) -> "int | None":
+    """Return the captured batch size a raw batch of ``raw_bs`` replays into.
+
+    The runner pads the batch up to the smallest captured bucket, so the host
+    length buffers that belong to that bucket -- not to ``raw_bs`` -- are the
+    ones the replayed graph reads.
+    """
+    candidates = sorted({bs for bs in cached_bs_values if bs >= raw_bs})
+    return candidates[0] if candidates else None
+
+
+
 def _refresh_graph_host_lengths(
     forward_batch, attention_decode_aux, c4_decode_aux, graph_extend_aux
 ) -> None:
@@ -265,29 +277,403 @@ def _refresh_graph_host_lengths(
     batch_size = forward_batch.batch_size
 
     if forward_batch.forward_mode.is_decode_or_idle():
-        attention_aux = attention_decode_aux.get(batch_size)
-        if attention_aux is not None:
+        # The runner replays the graph captured for the padded bucket, and the
+        # bucket is not observable here, so refresh every cached entry.
+        for cached_bs, attention_aux in attention_decode_aux.items():
+            if cached_bs < batch_size:
+                continue
             _copy_host_lengths_(attention_aux[2], seq_lens, fill_value=1)
             attention_aux[3].copy_(attention_aux[2])
 
         c4_context_lens = (seq_lens // 4) * 4
-        for (cached_bs, _, _), aux in c4_decode_aux.items():
-            if cached_bs == batch_size:
-                _copy_host_lengths_(aux[2], c4_context_lens, fill_value=4)
-                aux[3].copy_(aux[2])
+        for key, aux in c4_decode_aux.items():
+            cached_bs, _, _, rows_per_req = key
+            if rows_per_req != 1:
+                # TARGET_VERIFY per-row entry: its rows are draft rows, not
+                # requests, and _compute_c4_logits_kunlun refreshes it inline.
+                # Overwriting it here feeds request-shaped lengths to a
+                # row-shaped buffer on the next replay.
+                continue
+            if cached_bs < batch_size:
+                continue
+            _copy_host_lengths_(aux[2], c4_context_lens, fill_value=4)
+            aux[3].copy_(aux[2])
         return
 
     if not _is_graph_extend_mode(forward_batch.forward_mode):
         return
 
     for (cached_bs, _, _), aux in graph_extend_aux.items():
-        if cached_bs != batch_size:
+        if cached_bs < batch_size:
             continue
         _, _, kv_lens_cpu, kv_lens, query_lens = aux
         _copy_host_lengths_(kv_lens_cpu, seq_lens, fill_value=1)
         kv_lens.copy_(kv_lens_cpu)
         torch.maximum(kv_lens, query_lens, out=kv_lens)
 
+
+_MTP_ROW0_TRACE_CALLS: dict = {}
+
+
+_ROW0_SELFCHECK_CALLS: dict = {}
+
+
+_ROW0_DUMP_STEPS: dict = {}
+
+
+_CACHE_WRITE_TRACE_CALLS: dict = {}
+
+
+def _log_cache_write_slots(forward_batch, layer, save_kv_cache, backend=None) -> None:
+    """Log which cache slots each forward mode writes, once per mode per layer 0."""
+    import os
+
+    if os.getenv("DSV4_MTP_ROW0_TRACE", "0") != "1":
+        return
+    if getattr(layer, "layer_id", None) != 0:
+        return
+    mode = str(forward_batch.forward_mode)
+    seen = _CACHE_WRITE_TRACE_CALLS.get(mode, 0)
+    if seen >= 6:
+        return
+    _CACHE_WRITE_TRACE_CALLS[mode] = seen + 1
+    loc = forward_batch.out_cache_loc
+    pool = getattr(backend, "token_to_kv_pool", None)
+    swa_pool = getattr(pool, "swa_kv_pool", None)
+    swa_ptr = (
+        swa_pool.kv_buffer[0].data_ptr()
+        if swa_pool is not None and getattr(swa_pool, "kv_buffer", None) is not None
+        else None
+    )
+    logger.warning(
+        "[DSV4_CACHE_WRITE] call=%s mode=%s save_kv_cache=%s rows=%s loc=%s "
+        "seq_lens=%s backend=%s pool=%s swa_buf=%s",
+        seen,
+        mode,
+        save_kv_cache,
+        None if loc is None else int(loc.numel()),
+        None if loc is None else loc[: min(6, loc.numel())].tolist(),
+        forward_batch.seq_lens[: min(2, forward_batch.batch_size)].tolist(),
+        hex(id(backend)) if backend is not None else None,
+        hex(id(pool)) if pool is not None else None,
+        hex(swa_ptr) if swa_ptr is not None else None,
+    )
+
+
+def _dump_row0_layer_tensors(
+    forward_batch, layer, q, out, win_lengths, extra_lengths
+) -> None:
+    """Save row 0 per-layer attention tensors for the first post-prefill forward."""
+    import os
+
+    tag = os.getenv("DSV4_ROW0_DUMP_TAG")
+    if not tag:
+        return
+    mode = forward_batch.forward_mode
+    if not (mode.is_decode() or mode.is_target_verify()):
+        return
+    layer_id = getattr(layer, "layer_id", None)
+    if layer_id is None:
+        return
+    step = _ROW0_DUMP_STEPS.get(layer_id, 0)
+    _ROW0_DUMP_STEPS[layer_id] = step + 1
+    if step != 0:
+        return
+
+    directory = f"/tmp/dsv4_row0_{tag}"
+    os.makedirs(directory, exist_ok=True)
+    payload = {
+        "mode": str(mode),
+        "q_rows": int(q.shape[0]),
+        "q_row0": q[0].detach().float().cpu(),
+        "out_row0": out[0].detach().float().cpu(),
+        "win_len_row0": None if win_lengths is None else int(win_lengths[0]),
+        "extra_len_row0": None if extra_lengths is None else int(extra_lengths[0]),
+    }
+    torch.save(payload, f"{directory}/layer{layer_id:03d}.pt")
+
+
+def _check_verify_row0_independence(
+    *,
+    forward_batch,
+    layer,
+    reference_out,
+    q,
+    win_cache,
+    win_indices,
+    win_lengths,
+    softmax_scale,
+    attn_sink,
+    extra_cache,
+    extra_indices,
+    extra_lengths,
+) -> None:
+    """Recompute verify row 0 alone and compare with row 0 of the batched call."""
+    import os
+
+    if os.getenv("DSV4_VERIFY_ROW0_SELFCHECK", "0") != "1":
+        return
+    if not forward_batch.forward_mode.is_target_verify():
+        return
+    layer_id = getattr(layer, "layer_id", None)
+    if layer_id not in (0, 3):
+        return
+    seen = _ROW0_SELFCHECK_CALLS.get(layer_id, 0)
+    if seen >= 4:
+        return
+    _ROW0_SELFCHECK_CALLS[layer_id] = seen + 1
+
+    def row0(tensor):
+        return None if tensor is None else tensor[:1]
+
+    single = dsv4_compressed_attention_torch(
+        q=q[:1],
+        win_cache=win_cache,
+        win_indices=row0(win_indices),
+        win_lengths=row0(win_lengths),
+        softmax_scale=softmax_scale,
+        attn_sink=attn_sink,
+        extra_cache=extra_cache,
+        extra_indices=row0(extra_indices),
+        extra_lengths=row0(extra_lengths),
+    )
+    diff = (single.float() - reference_out[:1].float()).abs().max().item()
+    logger.warning(
+        "[DSV4_ROW0_SELFCHECK] layer=%s call=%s q_rows=%s max_abs_diff=%s "
+        "row0_norm=%s",
+        layer_id,
+        seen,
+        q.shape[0],
+        diff,
+        reference_out[:1].float().abs().max().item(),
+    )
+
+
+def _log_verify_row0_window(
+    forward_batch, core, layer, win_lengths, extra_lengths, win_indices
+) -> None:
+    """Log layer 0 row 0 window metadata for the first forwards of each mode."""
+    import os
+
+    if os.getenv("DSV4_MTP_ROW0_TRACE", "0") != "1":
+        return
+    layer_id = getattr(layer, "layer_id", None)
+    if layer_id not in (0, 3):
+        return
+    mode = f"{forward_batch.forward_mode}/L{layer_id}"
+    seen = _MTP_ROW0_TRACE_CALLS.get(mode, 0)
+    if seen >= 6:
+        return
+    _MTP_ROW0_TRACE_CALLS[mode] = seen + 1
+
+    def head(tensor, count):
+        if tensor is None:
+            return None
+        flat = tensor.reshape(-1)
+        return flat[: min(count, flat.numel())].tolist()
+
+    logger.warning(
+        "[DSV4_ROW0] call=%s mode=%s bs=%s q_rows=%s seq_lens=%s "
+        "seq_lens_casual=%s win_len_row0=%s win_idx_row0=%s extra_len_row0=%s",
+        seen,
+        mode,
+        forward_batch.batch_size,
+        win_indices.shape[0] if win_indices is not None else None,
+        head(forward_batch.seq_lens, 2),
+        head(getattr(core, "seq_lens_casual", None), 6),
+        head(win_lengths, 6),
+        win_indices[0, :8].tolist() if win_indices is not None else None,
+        head(extra_lengths, 6),
+    )
+
+
+_MTP_ROW_LEN_SEEN: set = set()
+
+
+def _log_row_lengths(
+    forward_batch, core, q_lod_cpu, kv_lens_cpu, win_lengths, extra_lengths
+) -> None:
+    """Dump the per-row causal/window lengths handed to the operator."""
+    import os
+
+    if os.getenv("DSV4_MTP_LOD_DEBUG", "0") != "1":
+        return
+    signature = (str(forward_batch.forward_mode), forward_batch.batch_size)
+    if signature in _MTP_ROW_LEN_SEEN:
+        return
+    _MTP_ROW_LEN_SEEN.add(signature)
+
+    def head(tensor, count=8):
+        if tensor is None:
+            return None
+        flat = tensor.reshape(-1)
+        return flat[: min(count, flat.numel())].tolist()
+
+    logger.warning(
+        "[DSV4_MTP_ROW_LEN] mode=%s bs=%s seq_lens=%s q_lod=%s kv_lens_cpu=%s "
+        "seq_lens_casual=%s win_lengths=%s extra_lengths=%s",
+        forward_batch.forward_mode,
+        forward_batch.batch_size,
+        head(forward_batch.seq_lens, 4),
+        head(q_lod_cpu, 5),
+        head(kv_lens_cpu, 4),
+        head(getattr(core, "seq_lens_casual", None)),
+        head(win_lengths),
+        head(extra_lengths),
+    )
+
+
+_MTP_LOD_ROUTE_SEEN: set = set()
+
+
+def _log_lod_route(forward_batch, num_queries: int) -> None:
+    """Record which lod branch each forward mode takes, once per signature."""
+    import os
+
+    if os.getenv("DSV4_MTP_LOD_DEBUG", "0") != "1":
+        return
+    signature = (
+        str(forward_batch.forward_mode),
+        forward_batch.batch_size,
+        num_queries,
+    )
+    if signature in _MTP_LOD_ROUTE_SEEN:
+        return
+    _MTP_LOD_ROUTE_SEEN.add(signature)
+    logger.warning(
+        "[DSV4_MTP_LOD_ROUTE] mode=%s bs=%s num_queries=%s ragged_draft=%s "
+        "seq_lens=%s extend_lens=%s",
+        forward_batch.forward_mode,
+        forward_batch.batch_size,
+        num_queries,
+        getattr(forward_batch, "_kunlun_ragged_draft_extend", None),
+        forward_batch.seq_lens[: min(4, forward_batch.batch_size)].tolist(),
+        forward_batch.extend_seq_lens_cpu,
+    )
+
+
+_MTP_LOD_DEBUG_SEEN: set = set()
+
+
+def _log_graph_extend_lod(
+    forward_batch, num_queries, q_lod_cpu, kv_lens_cpu, kv_lens, query_lens
+) -> None:
+    """Log the verify-extend lod once per (mode, bs, num_queries) signature."""
+    import os
+
+    if os.getenv("DSV4_MTP_LOD_DEBUG", "0") != "1":
+        return
+    signature = (
+        str(forward_batch.forward_mode),
+        forward_batch.batch_size,
+        num_queries,
+    )
+    if signature in _MTP_LOD_DEBUG_SEEN:
+        return
+    _MTP_LOD_DEBUG_SEEN.add(signature)
+    logger.warning(
+        "[DSV4_MTP_LOD] mode=%s bs=%s num_queries=%s seq_lens=%s q_lod=%s "
+        "query_lens=%s kv_lens_cpu=%s kv_lens_dev=%s",
+        forward_batch.forward_mode,
+        forward_batch.batch_size,
+        num_queries,
+        forward_batch.seq_lens[: min(4, forward_batch.batch_size)].tolist(),
+        q_lod_cpu[: min(5, q_lod_cpu.numel())].tolist(),
+        query_lens[: min(4, query_lens.numel())].tolist(),
+        kv_lens_cpu[: min(4, kv_lens_cpu.numel())].tolist(),
+        kv_lens[: min(4, kv_lens.numel())].tolist(),
+    )
+
+
+_DSV4_SWA_MAP_TRACE_CALLS = [0]
+
+
+def _dsv4_trace_swa_mapping(backend, seq_lens_casual, req_pool_indices_repeated,
+                            raw_indices, mapped) -> None:
+    """Log slot and SWA mapping for the newest positions near a page boundary."""
+    if os.environ.get("DSV4_SWA_LEN_TRACE", "0") != "1":
+        return
+    if seq_lens_casual.numel() == 0 or _DSV4_SWA_MAP_TRACE_CALLS[0] >= 40:
+        return
+    longest = int(seq_lens_casual.max().item())
+    phase = longest % 256
+    if not (phase <= 3 or phase >= 253):
+        return
+    _DSV4_SWA_MAP_TRACE_CALLS[0] += 1
+    row = int(torch.argmax(seq_lens_casual).item())
+    mapping = backend.token_to_kv_pool.full_to_swa_index_mapping
+    logger.warning(
+        "[DSV4_SWA_MAP] rows=%s row=%s causal=%s rid=%s raw_newest=%s "
+        "mapped_newest=%s mapping_len=%s mapping_at_raw=%s",
+        int(seq_lens_casual.numel()),
+        row,
+        longest,
+        int(req_pool_indices_repeated[row].item()),
+        raw_indices[row, :4].tolist(),
+        mapped[row, :4].tolist(),
+        None if mapping is None else int(mapping.numel()),
+        None
+        if mapping is None
+        else mapping.index_select(0, raw_indices[row, :4].to(torch.int64)).tolist(),
+    )
+
+
+_DSV4_SWA_TRACE_CALLS = [0]
+_DSV4_PAGE_TABLE_SPAN_LOGGED = False
+
+
+def _dsv4_trace_swa_window(
+    forward_mode_name, seq_lens_casual, swa_page_indices, effective_swa_len, clamped
+) -> None:
+    """Log window lengths for rows sitting near a page boundary."""
+    if os.environ.get("DSV4_SWA_LEN_TRACE", "0") != "1":
+        return
+    if seq_lens_casual.numel() == 0:
+        return
+    longest = int(seq_lens_casual.max().item())
+    phase = longest % 256
+    if not (phase <= 4 or phase >= 252):
+        return
+    if _DSV4_SWA_TRACE_CALLS[0] >= 40:
+        return
+    _DSV4_SWA_TRACE_CALLS[0] += 1
+    zeros = int((swa_page_indices == 0).sum().item())
+    logger.warning(
+        "[DSV4_SWA_LEN] mode=%s rows=%s seq_lens=%s effective=%s clamped=%s "
+        "zero_entries=%s width=%s",
+        forward_mode_name,
+        int(seq_lens_casual.numel()),
+        seq_lens_casual[: min(4, seq_lens_casual.numel())].tolist(),
+        effective_swa_len[: min(4, effective_swa_len.numel())].tolist(),
+        clamped[: min(4, clamped.numel())].tolist(),
+        zeros,
+        int(swa_page_indices.shape[1]),
+    )
+
+
+def _dsv4_page_table_span(max_seq_len: int, seq_lens_casual: torch.Tensor) -> int:
+    """Return a page-table span that covers every row's causal length.
+
+    TARGET_VERIFY passes the committed max_seq_len while its rows reach
+    committed + num_draft_tokens, so on a page boundary the draft positions land in
+    a page the table does not describe.
+    """
+    if os.environ.get("DSV4_PAGE_TABLE_COVER_CASUAL", "0") != "1":
+        return max_seq_len
+    if seq_lens_casual.numel() == 0:
+        return max_seq_len
+    needed = int(seq_lens_casual.max().item())
+    if needed <= max_seq_len:
+        return max_seq_len
+    global _DSV4_PAGE_TABLE_SPAN_LOGGED
+    if not _DSV4_PAGE_TABLE_SPAN_LOGGED:
+        _DSV4_PAGE_TABLE_SPAN_LOGGED = True
+        logger.warning(
+            "[DSV4_PAGE_TABLE] widening span: max_seq_len=%s needed=%s",
+            max_seq_len,
+            needed,
+        )
+    return needed
 
 
 class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
@@ -316,9 +702,13 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         raw_indices = self.req_to_token[
             req_pool_indices_repeated[:, None], offsets
         ]
-        return self.token_to_kv_pool.translate_loc_from_full_to_swa(
+        mapped = self.token_to_kv_pool.translate_loc_from_full_to_swa(
             raw_indices
         ).to(torch.int32)
+        _dsv4_trace_swa_mapping(
+            self, seq_lens_casual, req_pool_indices_repeated, raw_indices, mapped
+        )
+        return mapped
 
     def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
         """Initialize out-of-graph metadata and refresh replay lengths."""
@@ -626,8 +1016,16 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             torch.clamp(seq_lens_casual, max=upstream.SWA_WINDOW),
             effective_swa_len,
         )
+        _dsv4_trace_swa_window(
+            "prefill" if is_prefill else "other",
+            seq_lens_casual,
+            swa_page_indices,
+            effective_swa_len,
+            torch.clamp(seq_lens_casual, max=upstream.SWA_WINDOW),
+        )
         page_table = req_to_token[
-            req_pool_indices_repeated, :max_seq_len:self.page_size
+            req_pool_indices_repeated,
+            : _dsv4_page_table_span(max_seq_len, seq_lens_casual) : self.page_size,
         ]
         metadata = KunlunDSV4AttnMetadata(
             page_size=self.page_size,
@@ -679,6 +1077,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         return upstream._pad_tensor_to_size(tensor, size, value=value)
 
     def _make_lod(self, forward_batch, num_queries: int, device: torch.device):
+        _log_lod_route(forward_batch, num_queries)
         if forward_batch.forward_mode.is_decode_or_idle():
             batch_size = num_queries
             aux = self._attention_decode_aux.get(batch_size)
@@ -708,6 +1107,9 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             )
             kv_lens.copy_(forward_batch.seq_lens[:batch_size].to(torch.int32))
             torch.maximum(kv_lens, query_lens, out=kv_lens)
+            _log_graph_extend_lod(
+                forward_batch, num_queries, q_lod_cpu, kv_lens_cpu, kv_lens, query_lens
+            )
             return q_lod_cpu, q_lod, kv_lens_cpu, kv_lens
 
         if _dsa_cp_prefill_ranks(forward_batch) is not None:
@@ -807,6 +1209,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
             return q.new_empty(q.shape[0], q.shape[1], layer.v_head_dim)
         assert k is v, "DeepseekV4 shares k and v"
+        _log_cache_write_slots(forward_batch, layer, save_kv_cache, self)
         if save_kv_cache:
             self.store_cache(layer.layer_id, k, forward_batch)
 
@@ -851,6 +1254,12 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 local_sink = local_sink[:local_heads_probe].contiguous()
         original_dtype = q_3d.dtype
 
+        _log_row_lengths(
+            forward_batch, core, None, None, win_lengths, extra_lengths
+        )
+        _log_verify_row0_window(
+            forward_batch, core, layer, win_lengths, extra_lengths, win_indices
+        )
         if os.environ.get("DSV4_KUNLUN_REFERENCE_ONLY") == "1":
 
             if extra_cache is not None:
@@ -881,6 +1290,23 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             )
             _dsv4_dump_backend_tensor(
                 self, "compressed_attention.output.out", reference_out, layer
+            )
+            _dump_row0_layer_tensors(
+                forward_batch, layer, q_3d, reference_out, win_lengths, extra_lengths
+            )
+            _check_verify_row0_independence(
+                forward_batch=forward_batch,
+                layer=layer,
+                reference_out=reference_out,
+                q=q_3d,
+                win_cache=win_cache,
+                win_indices=win_indices,
+                win_lengths=win_lengths,
+                softmax_scale=self.softmax_scale,
+                attn_sink=local_sink,
+                extra_cache=extra_cache,
+                extra_indices=extra_indices,
+                extra_lengths=extra_lengths,
             )
             return reference_out
 
@@ -1219,6 +1645,90 @@ def _gather_c4_prefill_kv(cache, page_table, contract, device):
     return k_contiguous, k_scale_contiguous
 
 
+_C4_VERIFY_CHUNK_LOGGED = False
+
+
+def _c4_target_verify_logits_chunked(
+    *, q_fp8, kvcache_fp8, weight, seq_lens, page_table, max_seq_len, num_requests
+):
+    """Per-row C4 verify logits, computed one draft column at a time.
+
+    Each query row must select its own pages, but the reference implementation's
+    intermediates scale with the row count, so doing all draft rows in one call
+    exhausts device memory during graph capture. Rows of request r live at
+    r * nd + j, hence the strided column slices.
+    """
+    num_queries = q_fp8.shape[0]
+    global _C4_VERIFY_CHUNK_LOGGED
+    if not _C4_VERIFY_CHUNK_LOGGED:
+        _C4_VERIFY_CHUNK_LOGGED = True
+        logger.warning(
+            "[DSV4_C4_VERIFY] per-row path active: num_queries=%s num_requests=%s "
+            "page_rows=%s",
+            num_queries,
+            num_requests,
+            page_table.shape[0],
+        )
+    if num_requests <= 0 or num_queries % num_requests:
+        raise ValueError(
+            "Kunlun C4 TARGET_VERIFY requires uniform queries per request: "
+            f"num_requests={num_requests}, num_queries={num_queries}"
+        )
+    num_draft = num_queries // num_requests
+    seq_lens, page_table = _expand_c4_target_verify_rows(
+        q_fp8, seq_lens, page_table
+    )
+    if num_draft <= 1:
+        return dsv4_c4_paged_mqa_logits_torch(
+            q_int8=q_fp8,
+            kvcache_int8=kvcache_fp8,
+            weight=weight,
+            seq_lens=seq_lens,
+            page_table=page_table,
+            max_seq_len=max_seq_len,
+        )
+    logits = q_fp8.new_empty((num_queries, max_seq_len), dtype=torch.float32)
+    for column in range(num_draft):
+        rows = slice(column, num_queries, num_draft)
+        logits[rows] = dsv4_c4_paged_mqa_logits_torch(
+            q_int8=q_fp8[rows],
+            kvcache_int8=kvcache_fp8,
+            weight=weight[rows],
+            seq_lens=seq_lens[rows],
+            page_table=page_table[rows],
+            max_seq_len=max_seq_len,
+        )
+    return logits
+
+
+def _expand_c4_target_verify_rows(q_fp8, seq_lens, page_table):
+    """Give every TARGET_VERIFY query row its own C4 length and page-table row.
+
+    Upstream computes the sparse selection per draft row; collapsing to one
+    representative row makes row 0 attend to another row's pages, which is
+    exactly where the MTP output diverges from the DECODE path.
+    """
+    num_queries = q_fp8.shape[0]
+    seq_lens = seq_lens.reshape(-1)
+    if seq_lens.shape[0] != num_queries:
+        if num_queries % seq_lens.shape[0]:
+            raise ValueError(
+                "Kunlun C4 TARGET_VERIFY cannot expand lengths: "
+                f"num_queries={num_queries}, lengths={seq_lens.shape[0]}"
+            )
+        seq_lens = seq_lens.repeat_interleave(num_queries // seq_lens.shape[0], dim=0)
+    if page_table.shape[0] != num_queries:
+        if num_queries % page_table.shape[0]:
+            raise ValueError(
+                "Kunlun C4 TARGET_VERIFY cannot expand the page table: "
+                f"num_queries={num_queries}, page_rows={page_table.shape[0]}"
+            )
+        page_table = page_table.repeat_interleave(
+            num_queries // page_table.shape[0], dim=0
+        )
+    return seq_lens, page_table
+
+
 def _select_c4_target_verify_rows(
     q_fp8, weight, seq_lens, page_table, num_requests
 ):
@@ -1273,18 +1783,17 @@ def _compute_c4_logits_kunlun(
         and forward_batch.forward_mode.is_target_verify()
     )
     if os.environ.get("DSV4_KUNLUN_REFERENCE_ONLY") == "1":
-        num_queries_per_request = 1
         if is_target_verify:
-            q_fp8, weight, seq_lens, page_table, num_queries_per_request = (
-                _select_c4_target_verify_rows(
-                    q_fp8,
-                    weight,
-                    seq_lens,
-                    page_table,
-                    forward_batch.batch_size,
-                )
+            return _c4_target_verify_logits_chunked(
+                q_fp8=q_fp8,
+                kvcache_fp8=kvcache_fp8,
+                weight=weight,
+                seq_lens=seq_lens,
+                page_table=page_table,
+                max_seq_len=max_seq_len,
+                num_requests=forward_batch.batch_size,
             )
-        logits = dsv4_c4_paged_mqa_logits_torch(
+        return dsv4_c4_paged_mqa_logits_torch(
             q_int8=q_fp8,
             kvcache_int8=kvcache_fp8,
             weight=weight,
@@ -1292,14 +1801,6 @@ def _compute_c4_logits_kunlun(
             page_table=page_table,
             max_seq_len=max_seq_len,
         )
-        if is_target_verify:
-            logits = (
-                logits.unsqueeze(1)
-                .expand(-1, num_queries_per_request, -1)
-                .reshape(-1, max_seq_len)
-                .contiguous()
-            )
-        return logits
 
     import kunlun_ops
 
@@ -1360,20 +1861,27 @@ def _compute_c4_logits_kunlun(
         return logits
 
     num_queries_per_request = 1
-    is_target_verify = (
-        forward_batch is not None
-        and forward_batch.forward_mode.is_target_verify()
-    )
+    per_row_verify = False
     if is_target_verify:
-        q_fp8, weight, seq_lens, page_table, num_queries_per_request = (
-            _select_c4_target_verify_rows(
-                q_fp8,
-                weight,
-                seq_lens,
-                page_table,
-                forward_batch.batch_size,
+        if os.environ.get("DSV4_C4_VENDOR_PER_ROW", "1") != "0":
+            # The vendor kernel indexes one page-table row per q row, so keeping
+            # every draft row (with its own c4 length) makes the sparse selection
+            # per row, exactly like DECODE. Broadcasting one representative row
+            # instead makes draft rows attend to another row's pages.
+            per_row_verify = True
+            seq_lens, page_table = _expand_c4_target_verify_rows(
+                q_fp8, seq_lens, page_table
             )
-        )
+        else:
+            q_fp8, weight, seq_lens, page_table, num_queries_per_request = (
+                _select_c4_target_verify_rows(
+                    q_fp8,
+                    weight,
+                    seq_lens,
+                    page_table,
+                    forward_batch.batch_size,
+                )
+            )
 
     batch_size, _, num_heads, head_dim = q_fp8.shape
     block_size = kvcache_fp8.shape[1]
@@ -1407,7 +1915,10 @@ def _compute_c4_logits_kunlun(
         :, :max_seq_len
     ].contiguous()
 
-    key = (batch_size, q_fp8.device, max_seq_len)
+    rows_per_req = (
+        max(batch_size // forward_batch.batch_size, 1) if per_row_verify else 1
+    )
+    key = (batch_size, q_fp8.device, max_seq_len, rows_per_req)
     aux = backend._c4_decode_aux.get(key)
     if aux is None:
         qlod_cpu = torch.arange(batch_size + 1, dtype=torch.int32)
@@ -1422,6 +1933,14 @@ def _compute_c4_logits_kunlun(
         backend._c4_decode_aux[key] = aux
     qlod_cpu, qlod_xpu, context_lens_cpu, context_lens_xpu = aux
     raw_seq_lens_cpu = _seq_lens_cpu_i32(forward_batch)
+    if per_row_verify:
+        # batch_size is now bs*num_draft; the host lengths must line up row-wise
+        # with the expanded page table.
+        requests = raw_seq_lens_cpu.numel()
+        if requests and batch_size % requests == 0:
+            raw_seq_lens_cpu = raw_seq_lens_cpu.repeat_interleave(
+                batch_size // requests
+            )
     _copy_host_lengths_(
         context_lens_cpu,
         (raw_seq_lens_cpu // 4) * 4,
@@ -1452,7 +1971,7 @@ def _compute_c4_logits_kunlun(
         use_xfa_boost=False,
     )
     logits = logits.squeeze(1)
-    if is_target_verify:
+    if is_target_verify and not per_row_verify:
         logits = (
             logits.unsqueeze(1)
             .expand(-1, num_queries_per_request, -1)
@@ -1511,10 +2030,23 @@ class KunlunDeepseekV4MultiStepBackend(DeepseekV4MultiStepBackend):
                 backend.init_forward_metadata_out_graph(
                     inner_fb, in_capture=True
                 )
+        elif (
+            self.speculative_num_steps > 1
+            and os.environ.get("DSV4_MULTISTEP_PER_STEP_METADATA") == "1"
+        ):
+            # Each backend slices out_cache_loc by its own speculative_step_id, so
+            # let every step build its own metadata rather than inherit step 0's.
+            for backend in self.attn_backends:
+                backend.init_forward_metadata_out_graph(inner_fb)
         elif self.speculative_num_steps > 1:
             self.attn_backends[0].init_forward_metadata_out_graph(inner_fb)
             temp_metadata = self.attn_backends[0].forward_metadata
-            for i in range(1, self.speculative_num_steps - 1):
+            last_step = (
+                self.speculative_num_steps
+                if os.environ.get("DSV4_MULTISTEP_REFRESH_ALL_STEPS") == "1"
+                else self.speculative_num_steps - 1
+            )
+            for i in range(1, last_step):
                 backend = self.attn_backends[i]
                 backend.replay_cuda_graph_metadata_from(
                     bs=forward_batch.batch_size,

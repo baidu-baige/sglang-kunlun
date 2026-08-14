@@ -63,11 +63,20 @@ def verify_tree_greedy(
 ) -> None:
     """Verify an Eagle tree greedily in-place."""
 
+    import os
+
+    force_reject = os.getenv("DSV4_MTP_FORCE_REJECT", "0") == "1"
     batch_size = candidates.size(0)
     num_speculative_tokens = accept_index.size(1)
 
     if target_predict.dim() > 1:
         target_predict = target_predict.flatten()
+
+    trace = os.getenv("DSV4_MTP_VERIFY_TRACE", "0") == "1"
+    if trace:
+        import logging
+
+        logger = logging.getLogger(__name__)
 
     for batch_idx in range(batch_size):
         last_accepted_retrive_idx = retrive_index[batch_idx, 0].item()
@@ -83,7 +92,7 @@ def verify_tree_greedy(
                 draft_token_id = candidates[batch_idx, cur_index].item()
                 target_token_id = target_predict[last_accepted_retrive_idx].item()
 
-                if draft_token_id == target_token_id:
+                if draft_token_id == target_token_id and not force_reject:
                     predicts[last_accepted_retrive_idx] = target_token_id
                     num_accepted += 1
                     accept_index[batch_idx, num_accepted] = draft_index
@@ -96,3 +105,15 @@ def verify_tree_greedy(
 
         accept_token_num[batch_idx] = num_accepted
         predicts[last_accepted_retrive_idx] = target_predict[last_accepted_retrive_idx]
+        if trace:
+            base = retrive_index[batch_idx, 0].item()
+            span = slice(base, base + candidates.shape[1])
+            logger.warning(
+                "[DSV4_MTP_VERIFY] row=%s accepted=%s candidates=%s "
+                "target_argmax=%s bonus=%s",
+                batch_idx,
+                num_accepted,
+                candidates[batch_idx].tolist(),
+                target_predict[span].tolist(),
+                int(predicts[last_accepted_retrive_idx]),
+            )

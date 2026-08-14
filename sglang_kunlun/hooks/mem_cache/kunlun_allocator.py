@@ -75,7 +75,35 @@ def _alloc_extend_kunlun_kernel(
     return out_indices, ret_value
 
 
+def _alloc_extend_kunlun_torch(
+    page_size,
+    free_pages,
+    prefix_lens,
+    seq_lens,
+    last_loc,
+    extend_num_tokens,
+):
+    """Torch reference path, sharing the port of upstream's alloc_extend contract."""
+    from sglang_kunlun.kernels.kernel_ops import _dsv4_alloc_extend_torch
+
+    out_indices = torch.zeros(
+        extend_num_tokens, dtype=torch.int64, device=free_pages.device
+    )
+    _dsv4_alloc_extend_torch(
+        prefix_lens, seq_lens, last_loc, free_pages, out_indices, page_size
+    )
+    pages_after = -(-seq_lens.to(torch.int64) // page_size)
+    pages_before = -(-prefix_lens.to(torch.int64) // page_size)
+    num_new_pages = int((pages_after - pages_before).clamp_min(0).sum().item())
+    # alloc_extend packs the page count into the high half of the returned scalar.
+    return out_indices, torch.tensor(
+        [num_new_pages << 32], dtype=torch.int64, device=free_pages.device
+    )
+
+
 def _select_alloc_extend_func():
+    if get_bool_env_var("DSV4_TORCH_ALLOC_EXTEND", "false"):
+        return _alloc_extend_kunlun_torch
     if get_bool_env_var("USE_FAST_ALLOC_EXTEND_KUNLUN", "true"):
         return _alloc_extend_kunlun_xdnn
     return _alloc_extend_kunlun_kernel
