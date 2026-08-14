@@ -282,20 +282,19 @@ def resolve_spec_v2_tokens_kunlun(self, result, batch):
         row = next_token_ids[index * stride : (index + 1) * stride]
         accepted_tokens = row[: accept_lens[index]]
 
-        if request.is_retracted:
+        if request.is_retracted or request.finished():
+            # Nothing to settle: no worker pre-claims the bonus, so
+            # kv_committed_len already holds the committed prefix.
             pass
-        elif request.finished():
-            if not batch.spec_algorithm.is_dflash():
-                request.kv_committed_len -= 1
         else:
             if request.grammar is not None:
                 accepted_tokens = self._accept_grammar_tokens(request, accepted_tokens)
 
+            # Commit the full accepted run (drafts + bonus). Upstream keeps
+            # kv_committed_len honest; eagle_prepare_for_decode rounds the
+            # speculative reserve up from it, so any lag strands whole pages.
             num_accepted_tokens = len(accepted_tokens)
-            if batch.spec_algorithm.is_dflash():
-                request.kv_committed_len += num_accepted_tokens
-            else:
-                request.kv_committed_len += num_accepted_tokens - 1
+            request.kv_committed_len += num_accepted_tokens
             request.spec_verify_ct += 1
 
             num_correct_drafts = result.num_correct_drafts_per_req_cpu[index]

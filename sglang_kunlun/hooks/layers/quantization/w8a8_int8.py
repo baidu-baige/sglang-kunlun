@@ -146,6 +146,118 @@ def moe_process_weights_after_loading_kunlun(
     )
 
 
+
+_DSV4_MOE_SHAPE_DEBUG_SEEN: set = set()
+
+
+def _dsv4_log_moe_block_statistic_shapes(
+    layer, hidden_states, topk_ids, topk_weights, block_statistic, top_k, num_experts
+) -> None:
+    """Log the gen_block_statistic operand geometry once per distinct signature."""
+    import os
+
+    if os.getenv("DSV4_W8A8_MOE_SHAPE_DEBUG", "0") != "1":
+        return
+    signature = (
+        getattr(layer, "_dsv4_layer_id", None),
+        tuple(hidden_states.shape),
+        tuple(topk_ids.shape),
+        tuple(topk_ids.stride()),
+        str(topk_ids.dtype),
+        top_k,
+        num_experts,
+    )
+    if signature in _DSV4_MOE_SHAPE_DEBUG_SEEN:
+        return
+    _DSV4_MOE_SHAPE_DEBUG_SEEN.add(signature)
+    # These reductions synchronize; acceptable because the probe is env-gated and
+    # fires at most once per signature.
+    if topk_ids.numel():
+        id_min = int(topk_ids.min())
+        id_max = int(topk_ids.max())
+        out_of_range = int(((topk_ids < 0) | (topk_ids >= num_experts)).sum())
+    else:
+        id_min = id_max = out_of_range = -1
+    logger.warning(
+        "[DSV4_W8A8_SHAPE] layer=%s hidden_states=%s topk_ids=%s stride=%s "
+        "dtype=%s contiguous=%s topk_weights=%s block_statistic=%s "
+        "top_k=%s num_experts=%s id_min=%s id_max=%s out_of_range=%s",
+        getattr(layer, "_dsv4_layer_id", None),
+        tuple(hidden_states.shape),
+        tuple(topk_ids.shape),
+        tuple(topk_ids.stride()),
+        topk_ids.dtype,
+        topk_ids.is_contiguous(),
+        tuple(topk_weights.shape),
+        tuple(block_statistic.shape),
+        top_k,
+        num_experts,
+        id_min,
+        id_max,
+        out_of_range,
+    )
+
+
+
+_DSV4_MOE_TOPK_ID_GUARD_COUNTERS: dict = {}
+_DSV4_MOE_TOPK_ID_GUARD_REPORTED: dict = {}
+
+
+def _dsv4_guard_moe_topk_ids(topk_ids: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """Clamp expert ids into [0, num_experts) in place, counting the clamps.
+
+    The Kunlun MoE kernels index their per-expert buffers by id, so a single
+    out-of-range id stores out of bounds and faults the device. Padded rows of a
+    CUDA-graph verify batch can hold stale hidden states, so the gate is not a
+    trustworthy source of in-range ids on that path. Real rows are unaffected,
+    which keeps the arithmetic bitwise identical to the unguarded path.
+    """
+    invalid = (topk_ids < 0) | (topk_ids >= num_experts)
+    counter = _DSV4_MOE_TOPK_ID_GUARD_COUNTERS.get(topk_ids.device)
+    if counter is None:
+        counter = torch.zeros((), dtype=torch.int32, device=topk_ids.device)
+        _DSV4_MOE_TOPK_ID_GUARD_COUNTERS[topk_ids.device] = counter
+    # Captured into the graph so replay updates it too; never read here, reading
+    # would sync the host on the hot path.
+    counter.add_(invalid.sum().to(torch.int32))
+    topk_ids.masked_fill_(invalid, 0)
+    return topk_ids
+
+
+def _dsv4_report_moe_topk_id_guard(device) -> None:
+    """Log the clamp counter when it grows; env-gated because reading it syncs."""
+    import os
+
+    if os.getenv("DSV4_W8A8_MOE_SHAPE_DEBUG", "0") != "1":
+        return
+    counter = _DSV4_MOE_TOPK_ID_GUARD_COUNTERS.get(device)
+    if counter is None:
+        return
+    total = int(counter)
+    if total <= _DSV4_MOE_TOPK_ID_GUARD_REPORTED.get(device, 0):
+        return
+    _DSV4_MOE_TOPK_ID_GUARD_REPORTED[device] = total
+    logger.warning(
+        "[DSV4_W8A8_TOPK_GUARD] device=%s clamped_expert_ids_total=%s", device, total
+    )
+
+
+def _dsv4_drop_padded_moe_rows(hidden_states, topk_weights):
+    """Zero the padded rows so real rows cannot see their stale activations."""
+    from sglang_kunlun.kernels.kernel_ops import _DSV4_LAST_NUM_TOKEN_NON_PADDED
+
+    num_token_non_padded = _DSV4_LAST_NUM_TOKEN_NON_PADDED.get(hidden_states.device)
+    if num_token_non_padded is None:
+        return hidden_states, topk_weights
+    indices = torch.arange(
+        hidden_states.shape[0], device=hidden_states.device, dtype=torch.int64
+    )
+    keep = (
+        indices < num_token_non_padded.reshape(()).to(torch.int64)
+    ).unsqueeze(1)
+    return hidden_states * keep, topk_weights * keep
+
+
 @plugin_hook(
     "sglang.srt.layers.quantization.w8a8_int8.W8A8Int8MoEMethod.apply",
     type=HookType.REPLACE,
@@ -185,6 +297,20 @@ def moe_apply_kunlun(
     block_statistic = torch.zeros(
         12, num_experts, dtype=torch.int32, device=device
     )
+    _dsv4_log_moe_block_statistic_shapes(
+        layer,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        block_statistic,
+        top_k,
+        num_experts,
+    )
+    hidden_states, topk_weights = _dsv4_drop_padded_moe_rows(
+        hidden_states, topk_weights
+    )
+    topk_ids = _dsv4_guard_moe_topk_ids(topk_ids, num_experts)
+    _dsv4_report_moe_topk_id_guard(device)
     kunlun_ops.gen_block_statistic(topk_ids, block_statistic)
     moe_expand = torch.empty(
         num_tokens * top_k,
