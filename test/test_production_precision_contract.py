@@ -402,8 +402,14 @@ class ProductionPrecisionContractTest(unittest.TestCase):
                 forward_batch,
             )
 
-        self.assertEqual(backend.q.flatten().tolist(), [0.0, 0.0, 5.0, 6.0])
-        self.assertEqual(backend.sink.tolist(), [0.0, 0.0, 30.0, 40.0])
+        # Golden drives the operator with TP-global head slots, so rank 1 of 2
+        # owns slots [2:4] of a 4-head tensor and every other slot stays zero.
+        self.assertEqual(tuple(backend.q.shape), (1, 4, 1))
+        self.assertEqual(backend.q[0, 2:, 0].tolist(), [5.0, 6.0])
+        self.assertEqual(backend.q[0, :2, 0].abs().sum().item(), 0.0)
+        self.assertEqual(tuple(backend.sink.shape), (4,))
+        self.assertEqual(backend.sink[2:].tolist(), [30.0, 40.0])
+        self.assertEqual(backend.sink[:2].abs().sum().item(), 0.0)
         self.assertEqual(output.shape, (1, 1))
         self.assertEqual(output.item(), 11.0)
 

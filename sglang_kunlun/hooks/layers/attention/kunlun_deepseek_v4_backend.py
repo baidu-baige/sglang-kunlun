@@ -30,6 +30,42 @@ from sglang_kunlun.kernels.kernel_ops import (
     dsv4_set_k_and_s_with_mapping_kunlun,
 )
 
+_DSV4_TENSOR_DUMP_CALLBACK = None
+
+
+def set_dsv4_tensor_dump_callback(callback):
+    """Sets a callback to dump DSV4 attention tensors."""
+    global _DSV4_TENSOR_DUMP_CALLBACK
+    _DSV4_TENSOR_DUMP_CALLBACK = callback
+    setattr(torch, "_dsv4_tensor_dump_callback", callback)
+
+
+def _dsv4_dump_backend_layers():
+    raw = os.getenv("DSV4_DEBUG_TENSOR_DUMP_LAYERS", "")
+    layers = set()
+    for token in raw.replace(",", " ").split():
+        try:
+            layers.add(int(token))
+        except ValueError:
+            continue
+    return layers
+
+
+def _dsv4_dump_backend_tensor(backend, name, value, layer=None):
+    if os.getenv("TENSOR_DUMP_DSV4_ATTN_CHAIN", "0") != "1":
+        return
+    selected = _dsv4_dump_backend_layers()
+    layer_id = getattr(layer, "layer_id", None)
+    if selected and layer_id is not None and layer_id not in selected:
+        # Every DSV4 layer reaches this boundary; without the filter the last
+        # layer would overwrite the selected layer's keys under the same name.
+        return
+    callback = getattr(torch, "_dsv4_tensor_dump_callback", None)
+    if callback is None:
+        callback = _DSV4_TENSOR_DUMP_CALLBACK
+    if callback is not None and isinstance(value, torch.Tensor):
+        callback(name, value)
+
 
 logger = logging.getLogger(__name__)
 
@@ -798,6 +834,21 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         extra_indices = self._match_queries(extra_indices, q.shape[0], -1)
         extra_lengths = self._match_queries(extra_lengths, q.shape[0], 0)
         q_3d = q.squeeze(1) if q.ndim == 4 else q
+        local_sink = attn_sink
+        # Diagnostic: drop the padded TP head slots before the operator so a
+        # padded-head dependency inside the vendor kernel becomes observable.
+        padded_q_heads = None
+        local_heads_probe = getattr(layer, "tp_q_head_num", None)
+        if (
+            os.environ.get("DSV4_KUNLUN_LOCAL_Q_ONLY") == "1"
+            and q_3d.ndim == 3
+            and local_heads_probe
+            and q_3d.shape[1] > local_heads_probe
+        ):
+            padded_q_heads = q_3d.shape[1]
+            q_3d = q_3d[:, :local_heads_probe].contiguous()
+            if local_sink is not None and local_sink.numel() == padded_q_heads:
+                local_sink = local_sink[:local_heads_probe].contiguous()
         original_dtype = q_3d.dtype
 
         if os.environ.get("DSV4_KUNLUN_REFERENCE_ONLY") == "1":
@@ -807,17 +858,31 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 extra_cache = extra_cache[:, : page_width * cache_dim].reshape(
                     -1, cache_dim
                 )
-            return dsv4_compressed_attention_torch(
+            for name, value in (
+                ("compressed_attention.input.q", q_3d),
+                ("compressed_attention.input.win_cache", win_cache),
+                ("compressed_attention.input.win_indices", win_indices),
+                ("compressed_attention.input.extra_cache", extra_cache),
+                ("compressed_attention.input.extra_indices", extra_indices),
+                ("compressed_attention.input.win_lengths", win_lengths),
+                ("compressed_attention.input.extra_lengths", extra_lengths),
+            ):
+                _dsv4_dump_backend_tensor(self, name, value, layer)
+            reference_out = dsv4_compressed_attention_torch(
                 q=q_3d,
                 win_cache=win_cache,
                 win_indices=win_indices,
                 win_lengths=win_lengths,
                 softmax_scale=self.softmax_scale,
-                attn_sink=attn_sink,
+                attn_sink=local_sink,
                 extra_cache=extra_cache,
                 extra_indices=extra_indices,
                 extra_lengths=extra_lengths,
             )
+            _dsv4_dump_backend_tensor(
+                self, "compressed_attention.output.out", reference_out, layer
+            )
+            return reference_out
 
         if q_3d.dtype != win_cache.dtype:
             q_3d = q_3d.to(win_cache.dtype)
@@ -896,7 +961,80 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         q_lod_op = q_lod.contiguous()
         kv_lens_cpu_op = kv_lens_cpu.contiguous()
         kv_lens_op = kv_lens.contiguous()
-        attn_sink_op = attn_sink.contiguous() if attn_sink is not None else None
+        attn_sink_op = local_sink.contiguous() if local_sink is not None else None
+        # Mirror the Golden 0.5.14 device probe: local heads only, the
+        # index-selected cache rows actually consumed, and post-clamp indices.
+        local_q_heads = getattr(layer, "tp_q_head_num", q_op.shape[1])
+        local_q_heads = min(local_q_heads, q_op.shape[1])
+        for name, value in (
+            ("compressed_attention.input.q", q_op[:, :local_q_heads]),
+            ("compressed_attention.input.win_indices", win_indices_op),
+            (
+                "compressed_attention.input.win_cache",
+                win_cache_op.index_select(
+                    0, torch.unique(win_indices_op).to(torch.long)
+                ),
+            ),
+            ("compressed_attention.input.extra_indices", extra_indices_op),
+            (
+                "compressed_attention.input.extra_cache",
+                extra_cache_op.index_select(
+                    0, torch.unique(extra_indices_op).to(torch.long)
+                ),
+            ),
+            ("compressed_attention.input.attn_sink", attn_sink_op),
+            ("compressed_attention.input.q_lod_cpu", q_lod_cpu_op),
+            ("compressed_attention.input.q_lod", q_lod_op),
+            ("compressed_attention.input.kv_lens_cpu", kv_lens_cpu_op),
+            ("compressed_attention.input.kv_lens", kv_lens_op),
+            ("compressed_attention.input.causal", torch.tensor(not cp_prefill)),
+            (
+                "compressed_attention.input.compress_ratio",
+                torch.tensor(effective_ratio),
+            ),
+            (
+                "compressed_attention.input.compressed_topk",
+                torch.tensor(compressed_topk),
+            ),
+            (
+                "compressed_attention.input.max_window_size",
+                torch.tensor(win_indices_op.shape[1]),
+            ),
+            (
+                "compressed_attention.input.softmax_scale",
+                torch.tensor(self.softmax_scale, dtype=torch.float64),
+            ),
+            (
+                "compressed_attention.input.win_cache_rows_total",
+                torch.tensor(win_cache_op.shape[0]),
+            ),
+            (
+                "compressed_attention.input.extra_cache_rows_total",
+                torch.tensor(extra_cache_op.shape[0]),
+            ),
+        ):
+            _dsv4_dump_backend_tensor(self, name, value, layer)
+        if os.environ.get("DSV4_KUNLUN_COMPACT_CACHE") == "1":
+            # Diagnostic: rebuild the caches so they contain only the indexed
+            # rows. If the output then matches Golden, the kernel is sensitive
+            # to buffer content outside the indexed rows.
+            win_unique = torch.unique(win_indices_op)
+            win_cache_op = win_cache_op.index_select(
+                0, win_unique.to(torch.long)
+            ).contiguous()
+            win_indices_op = torch.searchsorted(
+                win_unique, win_indices_op.reshape(-1)
+            ).reshape(win_indices_op.shape).to(win_indices_op.dtype).contiguous()
+            if extra_cache_op.shape[0] > 0 and extra_indices_op.numel() > 0:
+                extra_unique = torch.unique(extra_indices_op)
+                extra_cache_op = extra_cache_op.index_select(
+                    0, extra_unique.to(torch.long)
+                ).contiguous()
+                extra_indices_op = torch.searchsorted(
+                    extra_unique, extra_indices_op.reshape(-1)
+                ).reshape(extra_indices_op.shape).to(
+                    extra_indices_op.dtype
+                ).contiguous()
         torch.ops.xspeedgate_ops.compressed_attention(
             q_op,
             win_cache_op,
@@ -923,6 +1061,19 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             # lifetime of the contiguous temporary inputs.
             side_stream=torch.cuda.current_stream().cuda_stream,
         )
+        for name, value in (
+            ("compressed_attention.output.out_pre_rope", out_op[:, :local_q_heads]),
+            (
+                "compressed_attention.output.max_logits",
+                max_logits_op[:, :local_q_heads],
+            ),
+            ("compressed_attention.output.lse", lse_op[:, :local_q_heads]),
+        ):
+            _dsv4_dump_backend_tensor(self, name, value, layer)
+        if padded_q_heads is not None:
+            padded_out = out.new_zeros(out.shape[0], padded_q_heads, out.shape[2])
+            padded_out[:, : out.shape[1]] = out
+            out = padded_out
         return out.to(original_dtype) if out.dtype != original_dtype else out
 
 
@@ -1376,3 +1527,71 @@ class KunlunDeepseekV4MultiStepBackend(DeepseekV4MultiStepBackend):
                     backend._c4_decode_aux,
                     backend._attention_graph_extend_aux,
                 )
+
+
+@plugin_hook(
+    "sglang.srt.layers.attention.dsv4.compressor."
+    "CompressorBackendMixin.forward_compress",
+    type=HookType.REPLACE,
+)
+def _forward_compress_zeroed_kunlun(
+    self,
+    *,
+    kv_score_buffer,
+    kv_score_input,
+    ape,
+    head_dim,
+    norm,
+    freqs_cis_cache,
+    rotate,
+    forward_batch,
+    compress_ratio,
+    is_paged=False,
+):
+    """Zero sparse-plan rows that the kernel leaves untouched before cache store."""
+    from sglang.kernels.ops.attention.dsv4.compress_old import (
+        compress_forward,
+        compress_fused_norm_rope_inplace,
+    )
+    from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
+    from sglang.srt.layers.attention.dsv4.compressor import (
+        is_overlap_compress,
+        make_compressor_plan,
+    )
+    from sglang.srt.environ import envs
+
+    assert compress_ratio in (4, 128)
+    if is_paged:
+        metadata = self.get_paged_compress_metadata(compress_ratio)
+        coff = 2 if is_overlap_compress(compress_ratio) else 1
+        if compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+            kv_score_buffer = kv_score_buffer.view(-1, 1, head_dim * 3)
+        else:
+            last_dim = 2 * head_dim * coff
+            assert kv_score_buffer.shape[-1] == last_dim
+            kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
+    else:
+        plan = make_compressor_plan(compress_ratio, forward_batch)
+        metadata = (forward_batch.req_pool_indices.to(torch.int32), None, plan)
+    indices, extra_data, plan = metadata
+
+    out = kv_score_input.new_zeros((kv_score_input.shape[0], head_dim))
+    kv_compressed = compress_forward(
+        kv_score_buffer=kv_score_buffer,
+        kv_score_input=kv_score_input,
+        ape=ape,
+        indices=indices,
+        plan=plan,
+        compress_ratio=compress_ratio,
+        head_dim=head_dim,
+        extra_data=extra_data,
+        out=out,
+    )
+    compress_fused_norm_rope_inplace(
+        kv_compressed,
+        norm.weight,
+        norm.variance_epsilon,
+        freqs_cis_cache,
+        plan,
+    )
+    return rotate_activation(kv_compressed) if rotate else kv_compressed
