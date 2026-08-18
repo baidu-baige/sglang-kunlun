@@ -16,6 +16,16 @@ class KunlunDeviceMixin(DeviceMixin):
         """Return the MultiPlatformOp forward_cuda"""
         return "cuda"
 
+    def get_torch_profiler_activity_str(self) -> str:
+        """xpytorch exposes the XPU as a CUDA device, so profile it as CUDA."""
+        return "CUDA"
+
+    def get_torch_profiler_activity(self):
+        """Activity matching :meth:`get_torch_profiler_activity_str`."""
+        import torch
+
+        return torch.profiler.ProfilerActivity.CUDA
+
     def get_device_total_memory(self, device_id: int = 0) -> int:
         """Get device total memory."""
         import torch

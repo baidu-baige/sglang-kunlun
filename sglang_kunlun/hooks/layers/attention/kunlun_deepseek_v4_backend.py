@@ -51,6 +51,15 @@ def _dsv4_dump_backend_layers():
     return layers
 
 
+def _dsv4_dump_enabled() -> bool:
+    """Whether the attention-chain dump is on.
+
+    Call sites must check this before building probe values: the values cost
+    `torch.unique` / `index_select` / scalar H2D pushes per layer per forward.
+    """
+    return os.getenv("TENSOR_DUMP_DSV4_ATTN_CHAIN", "0") == "1"
+
+
 def _dsv4_dump_backend_tensor(backend, name, value, layer=None):
     if os.getenv("TENSOR_DUMP_DSV4_ATTN_CHAIN", "0") != "1":
         return
@@ -1392,7 +1401,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         # index-selected cache rows actually consumed, and post-clamp indices.
         local_q_heads = getattr(layer, "tp_q_head_num", q_op.shape[1])
         local_q_heads = min(local_q_heads, q_op.shape[1])
-        for name, value in (
+        for name, value in () if not _dsv4_dump_enabled() else (
             ("compressed_attention.input.q", q_op[:, :local_q_heads]),
             ("compressed_attention.input.win_indices", win_indices_op),
             (
@@ -1487,7 +1496,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             # lifetime of the contiguous temporary inputs.
             side_stream=torch.cuda.current_stream().cuda_stream,
         )
-        for name, value in (
+        for name, value in () if not _dsv4_dump_enabled() else (
             ("compressed_attention.output.out_pre_rope", out_op[:, :local_q_heads]),
             (
                 "compressed_attention.output.max_logits",
