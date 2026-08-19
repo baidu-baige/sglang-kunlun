@@ -195,8 +195,13 @@ def dsv4_mqa_wo_a_einsum_kunlun(
     o: torch.Tensor, weight: torch.Tensor
 ) -> torch.Tensor:
     """Run the DSV4 wo_a reduction with the Torch reference contraction."""
+   
+    return torch.ops.xspeedgate_ops.einsum_tgd_grd_tgr(
+        o.contiguous(),
+        weight.contiguous(),
+    )
 
-    return torch.einsum("tgd,grd->tgr", o, weight)
+    # return torch.einsum("tgd,grd->tgr", o, weight)
 
 
 def dsv4_mqa_forward_with_full_sink_kunlun(original_fn, self, *args, **kwargs):
