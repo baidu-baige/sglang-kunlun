@@ -1891,16 +1891,9 @@ def dsv4_silu_and_mul_clamp_kunlun(
     output: torch.Tensor,
     swiglu_limit: float,
 ) -> None:
-    """Compute the clamped DSV4 SwiGLU contract with Torch operators."""
-
-    import kunlun_ops
-
-    gate, up = input.chunk(2, dim=-1)
-    limit = float(swiglu_limit)
-    clamped = torch.cat(
-        [gate.clamp(max=limit), up.clamp(min=-limit, max=limit)], dim=-1
+    output.copy_(
+        torch.ops.xspeedgate_ops.silu_and_mul_with_swiglu_limit(input, swiglu_limit)
     )
-    kunlun_ops.swiglu(x=clamped, y=output)
 
 
 @register_jit_op("sglang.srt.utils.common", "fast_topk")
