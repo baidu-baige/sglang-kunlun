@@ -749,6 +749,7 @@ def dsv4_init_compression_metadata_kunlun(
     )
 
 
+
 @plugin_hook(
     "sglang.kernels.ops.attention.dsv4_attn_metadata_kernels."
     "ExpandPrefillCausally.execute",
@@ -768,49 +769,43 @@ def dsv4_expand_prefill_causally_torch(
 ):
     """Expand target-verify metadata with graph-safe Torch tensor operations."""
 
-    del extend_start_loc, seq_lens_cpu, extend_seq_lens_cpu
-    total_tokens = max(num_tokens, padded_num_tokens or num_tokens)
-    device = req_pool_indices.device
+    del extend_start_loc
     from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
         ExpandPrefillCausallyResult,
     )
 
-    if req_pool_indices.shape[0] == 0:
-        return ExpandPrefillCausallyResult(
-            seq_lens_casual=torch.ones(
-                total_tokens, dtype=torch.int32, device=device
-            ),
-            req_pool_indices_repeated=torch.zeros(
-                total_tokens, dtype=req_pool_indices.dtype, device=device
-            ),
-        )
+    if seq_lens_cpu is None:
+        seq_lens_cpu = seq_lens.cpu().tolist()
 
-    token_ids = torch.arange(total_tokens, dtype=torch.int64, device=device)
-    real_tokens = token_ids < num_tokens
-    safe_token_ids = torch.where(real_tokens, token_ids, torch.zeros_like(token_ids))
-    extend_i64 = extend_seq_lens.to(torch.int64)
-    cumulative = torch.cumsum(extend_i64, dim=0)
-    batch_ids = torch.searchsorted(cumulative, safe_token_ids, right=True).clamp(
-        max=req_pool_indices.shape[0] - 1
+    if extend_seq_lens_cpu is None:
+        extend_seq_lens_cpu = extend_seq_lens.cpu().tolist()
+
+    if req_pool_indices.dtype != torch.int32:
+        req_pool_indices_i32 = req_pool_indices.to(torch.int32)
+    else:
+        req_pool_indices_i32 = req_pool_indices
+
+    if not req_pool_indices_i32.is_contiguous():
+        req_pool_indices_i32 = req_pool_indices_i32.contiguous()
+
+    padded_arg = None
+    if padded_num_tokens is not None and padded_num_tokens > num_tokens:
+        padded_arg = padded_num_tokens
+
+    seq_lens_casual, req_pool_indices_repeated = (
+        torch.ops.xspeedgate_ops.expand_prefill_casually(
+            num_tokens,
+            seq_lens_cpu,
+            extend_seq_lens_cpu,
+            req_pool_indices_i32,
+            padded_arg,
+        )
     )
-    batch_ids = torch.where(
-        real_tokens,
-        batch_ids,
-        torch.full_like(batch_ids, req_pool_indices.shape[0] - 1),
-    )
-    start_locs = torch.cat([cumulative.new_zeros(1), cumulative[:-1]])
-    starts = start_locs.index_select(0, batch_ids)
-    seq = seq_lens.to(torch.int64).index_select(0, batch_ids)
-    extend = extend_i64.index_select(0, batch_ids)
-    causal = seq - extend + 1 + safe_token_ids - starts
-    causal = torch.where(real_tokens, causal, torch.ones_like(causal)).to(torch.int32)
-    repeated = req_pool_indices.index_select(0, batch_ids)
 
     return ExpandPrefillCausallyResult(
-        seq_lens_casual=causal,
-        req_pool_indices_repeated=repeated,
+        seq_lens_casual=seq_lens_casual,
+        req_pool_indices_repeated=req_pool_indices_repeated,
     )
-
 
 import logging as _dsv4_logging
 
