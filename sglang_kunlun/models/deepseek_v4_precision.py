@@ -23,10 +23,10 @@ _FP16_DTYPE_NAMES = frozenset(("fp16", "float16", "half"))
 
 # Golden keeps this hook disabled so the upstream Torch hc_pre runs and the
 # mHC post/comb stay fp32; the Kunlun fused hc_pre returns fp16.
-# @plugin_hook(
-#     "sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayer.hc_pre",
-#     type=HookType.REPLACE,
-# )
+@plugin_hook(
+    "sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayer.hc_pre",
+    type=HookType.REPLACE,
+)
 def hc_pre_reference_sinkhorn_kunlun(
     self,
     x,
