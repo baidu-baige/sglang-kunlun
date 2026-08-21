@@ -755,7 +755,7 @@ def dsv4_init_compression_metadata_kunlun(
     "ExpandPrefillCausally.execute",
     type=HookType.REPLACE,
 )
-def dsv4_expand_prefill_causally_torch(
+def dsv4_expand_prefill_causally_kunlun(
     cls,
     *,
     req_pool_indices: torch.Tensor,
@@ -1862,7 +1862,8 @@ def dsv4_hash_topk_kunlun(
     if scoring_func != "sqrtsoftplus":
         raise ValueError(f"unsupported DSV4 hash top-k scoring: {scoring_func}")
 
-    safe_input_ids = _dsv4_guard_hash_topk_input_ids(input_ids, tid2eid)
+    # compared with v0.5.8, _dsv4_guard_hash_topk_input_ids can be moved.
+    safe_input_ids = input_ids.to(torch.int64)
     _dsv4_report_hash_topk_guard(safe_input_ids.device)
     topk_ids, topk_weights = torch.ops.xspeedgate_ops.moe_hash_topk_fused(
         router_logits,
