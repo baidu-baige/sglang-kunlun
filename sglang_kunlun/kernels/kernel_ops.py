@@ -674,79 +674,15 @@ def dsv4_init_compression_metadata_kunlun(
     page_size: int = 0,
     compute_page_indices: bool = True,
 ):
-    """Build the upstream DSV4 metadata contract with device Torch ops."""
-
-    if seq_lens.ndim != 1 or positions.shape != seq_lens.shape:
-        raise ValueError("seq_lens and positions must be one-dimensional and aligned")
-    if raw_out_loc.shape != seq_lens.shape:
-        raise ValueError("raw_out_loc must have the same shape as seq_lens")
-
-    seq_lens_i32 = seq_lens.to(torch.int32)
-    positions_i32 = positions.to(torch.int32)
-    raw_out_loc_i64 = raw_out_loc.to(torch.int64)
-
-    c4_seq_lens_raw = torch.div(seq_lens_i32, 4, rounding_mode="floor")
-    c4_out_loc = torch.where(
-        seq_lens_i32.remainder(4) == 0,
-        torch.div(raw_out_loc_i64, 4, rounding_mode="floor"),
-        torch.zeros_like(raw_out_loc_i64),
+    return torch.ops.xspeedgate_ops.init_compressed_attn_metadata_v2(
+        seq_lens,
+        positions,
+        raw_out_loc,
+        page_table,
+        page_size,
+        compute_page_indices,
     )
-    c4_positions = torch.bitwise_and(positions_i32, -4)
-    c4_seq_lens_clamp1 = c4_seq_lens_raw.clamp_min(1)
-
-    c128_seq_lens_raw = torch.div(seq_lens_i32, 128, rounding_mode="floor")
-    c128_out_loc = torch.where(
-        seq_lens_i32.remainder(128) == 0,
-        torch.div(raw_out_loc_i64, 128, rounding_mode="floor"),
-        torch.zeros_like(raw_out_loc_i64),
-    )
-    c128_positions = torch.bitwise_and(positions_i32, -128)
-    c128_seq_lens_clamp1 = c128_seq_lens_raw.clamp_min(1)
-
-    c128_page_indices = None
-    if compute_page_indices:
-        if page_table is None:
-            raise ValueError("page_table required when compute_page_indices=True")
-        if page_table.ndim != 2 or page_table.shape[0] < seq_lens.shape[0]:
-            raise ValueError("page_table must be [batch, max_pages]")
-        if page_size < 128 or page_size % 128:
-            raise ValueError(
-                "page_size must be a multiple of 128 when compute_page_indices=True"
-            )
-
-        c128_page_size = page_size // 128
-        max_pages = page_table.shape[1]
-        offsets = torch.arange(
-            max_pages * c128_page_size,
-            dtype=torch.int64,
-            device=seq_lens.device,
-        )
-        page_ids = torch.div(offsets, c128_page_size, rounding_mode="floor")
-        offsets_in_page = offsets.remainder(c128_page_size)
-        physical_pages = page_table[: seq_lens.shape[0]].to(torch.int64)
-        c128_page_indices_i64 = (
-            physical_pages.index_select(1, page_ids)
-            * c128_page_size
-            + offsets_in_page.unsqueeze(0)
-        )
-        valid = offsets.unsqueeze(0) < c128_seq_lens_raw.to(torch.int64).unsqueeze(1)
-        c128_page_indices = torch.where(
-            valid,
-            c128_page_indices_i64,
-            torch.full_like(c128_page_indices_i64, -1),
-        ).to(torch.int32)
-
-    return (
-        c4_out_loc,
-        c4_positions,
-        c4_seq_lens_raw,
-        c4_seq_lens_clamp1,
-        c128_out_loc,
-        c128_positions,
-        c128_seq_lens_raw,
-        c128_seq_lens_clamp1,
-        c128_page_indices,
-    )
+    
 
 
 
@@ -1320,7 +1256,7 @@ def _dsv4_norm_rope_torch(
 @register_jit_op(
     "sglang.kernels.ops.attention.dsv4.compress", "compress_norm_rope_store"
 )
-def dsv4_compress_norm_rope_store_v2_torch(
+def dsv4_compress_norm_rope_store_v2_kunlun(
     kv: torch.Tensor,
     plan,
     *,
@@ -1337,77 +1273,28 @@ def dsv4_compress_norm_rope_store_v2_torch(
 
     if use_fp4:
         raise NotImplementedError("FP4 indexer is not enabled for the Torch reference")
-    plan_raw = plan[1].contiguous().view(torch.int32)
+    plan_raw = plan[1].contiguous()
     if plan_raw.shape[0] == 0:
         return
-    if plan.is_decode:
-        valid = plan_raw[:, 0].remainder(plan.compress_ratio) == 0
-        ragged_ids = torch.arange(
-            plan_raw.shape[0], device=plan_raw.device, dtype=torch.int64
-        )
-    else:
-        valid = plan_raw[:, 0] != -1
-        ragged_ids = plan_raw[:, 1].bitwise_and(0xFFFF).to(torch.int64)
-    ragged_ids_safe = ragged_ids.clamp(min=0, max=max(out_loc.shape[0] - 1, 0))
-    positions = plan_raw[:, 0].to(torch.int64) - plan.compress_ratio
-    transformed = _dsv4_norm_rope_torch(
+    freq_real = (
+        torch.view_as_real(freq_cis).flatten(-2)
+        if freq_cis.is_complex()
+        else freq_cis
+    ).float()
+
+    torch.ops.xspeedgate_ops.dsv4_compress_norm_rope_store_v2(
         kv,
+        plan_raw,
         norm_weight,
         norm_eps,
-        freq_cis,
-        positions.clamp_min(0),
+        freq_real,
+        out_loc,
+        kvcache,
+        plan.is_decode,
+        plan.compress_ratio,
+        page_size,
+        bf16_store,
     )
-    locations = out_loc.index_select(0, ragged_ids_safe).to(torch.int64)
-
-    if kv.shape[-1] == 512:
-        store_dtype = torch.bfloat16 if bf16_store else torch.float16
-        cache = kvcache.view(store_dtype).reshape(kvcache.shape[0], page_size, 512)
-        flat_cache = cache.reshape(-1, 512)
-        sentinel = flat_cache.shape[0] - 1
-        safe_locations = torch.where(
-            valid & (locations >= 0) & (locations < sentinel),
-            locations,
-            torch.full_like(locations, sentinel),
-        )
-        values = torch.where(
-            valid.unsqueeze(1),
-            transformed.to(store_dtype),
-            torch.zeros_like(transformed, dtype=store_dtype),
-        )
-        flat_cache[safe_locations] = values
-        return
-
-    if kv.shape[-1] != 128:
-        raise ValueError(f"unsupported compressed head dimension: {kv.shape[-1]}")
-    transformed = _dsv4_hadamard_torch(transformed)
-    scale = transformed.abs().amax(dim=-1).clamp_min(1e-10)
-    quant_divisor = scale / 127.0
-    quantized = (
-        torch.round(transformed / quant_divisor.unsqueeze(1))
-        .clamp(-127, 127)
-        .to(torch.int8)
-    )
-    page_bytes = page_size * (128 + 4)
-    if kvcache.shape[1] < page_bytes:
-        raise ValueError("indexer cache page is smaller than the INT8+FP32 layout")
-    value_pages = kvcache[:, : page_size * 128].reshape(
-        kvcache.shape[0], page_size, 128
-    )
-    scale_pages = kvcache[:, page_size * 128 : page_bytes].view(torch.float32)
-    sentinel = kvcache.shape[0] * page_size - 1
-    safe_locations = torch.where(
-        valid & (locations >= 0) & (locations < sentinel),
-        locations,
-        torch.full_like(locations, sentinel),
-    )
-    quantized = torch.where(
-        valid.unsqueeze(1), quantized, torch.zeros_like(quantized)
-    )
-    scale = torch.where(valid, scale, torch.zeros_like(scale))
-    page_ids = torch.div(safe_locations, page_size, rounding_mode="floor")
-    offsets = safe_locations.remainder(page_size)
-    value_pages.view(torch.int8)[page_ids, offsets] = quantized
-    scale_pages[page_ids, offsets] = scale.to(torch.float32)
 
 
 @register_jit_op(
