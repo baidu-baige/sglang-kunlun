@@ -1492,9 +1492,9 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             effective_ratio,
             compressed_topk,
             attn_sink_op,
-            # Keep the C4 producer on the caller stream so PyTorch owns the
-            # lifetime of the contiguous temporary inputs.
-            side_stream=torch.cuda.current_stream().cuda_stream,
+            # # Keep the C4 producer on the caller stream so PyTorch owns the
+            # # lifetime of the contiguous temporary inputs.
+            # side_stream=torch.cuda.current_stream().cuda_stream,
         )
         for name, value in () if not _dsv4_dump_enabled() else (
             ("compressed_attention.output.out_pre_rope", out_op[:, :local_q_heads]),
@@ -1612,6 +1612,7 @@ def _build_c4_prefill_contract(
         "com_k_start_xpu": com_k_start_cpu.to(device),
         "per_req_k_lens": per_req_k_lens,
         "last_rows": last_rows,
+        "cp_ranks": cp_ranks,
         "max_seq_q": max(extend_lens) if extend_lens else 0,
         "max_seq_k": int(per_req_k_lens.max().item()) * 4 if per_req_k_lens.numel() else 0,
         "max_seq_k_compressed": int(per_req_k_lens.max().item()) if per_req_k_lens.numel() else 0,
@@ -1829,6 +1830,39 @@ def _compute_c4_logits_kunlun(
         contract = _build_c4_prefill_contract(
             forward_batch, seq_lens, page_table, q.device, q.shape[0]
         )
+        if (
+            contract["cp_ranks"] is None
+            and q.shape[1:] == (64, 128)
+            and weights.shape[1] == 64
+            and kvcache_fp8.shape[1:] == (64, 1, 132)
+        ):
+            pt_rows = (
+                contract["last_rows"]
+                .clamp(min=0, max=page_table.shape[0] - 1)
+                .to(torch.long)
+            )
+            logits = torch.ops.xspeedgate_ops.mqa_logits_paged(
+                q,
+                weights,
+                kvcache_fp8,
+                page_table[pt_rows].contiguous(),
+                contract["per_req_k_lens"].to(q.device),
+                contract["qlod_cpu"],
+                contract["qlod_xpu"],
+                max_seq_len,
+                contract["use_causal"],
+            )
+            pad_width = (logits.shape[1] + 3) & ~3
+            if logits.shape[1] < pad_width:
+                padded = torch.full(
+                    (q.shape[0], pad_width),
+                    float("-inf"),
+                    dtype=logits.dtype,
+                    device=q.device,
+                )
+                padded[:, : logits.shape[1]] = logits
+                logits = padded
+            return logits
         k, k_scale = _gather_c4_prefill_kv(
             kvcache_fp8, page_table, contract, q.device
         )
@@ -1858,9 +1892,16 @@ def _compute_c4_logits_kunlun(
             )
         else:
             logits.zero_()
-        if logits.shape[1] < max_seq_len:
+        # Pad only to a 4-aligned width: topk_transform_512_v2 requires
+        # score_stride % 4 == 0 for vectorized loads, and every topk variant
+        # reads exactly seq_lens[row] columns per row. Padding to the global
+        # max_c4_seq_len (page-table width, e.g. 262144 at 1M context) instead
+        # would allocate a batch-sized, context-width fp32 buffer on every
+        # prefill chunk and easily OOM when the GPU is already tight.
+        pad_width = (logits.shape[1] + 3) & ~3
+        if logits.shape[1] < pad_width:
             padded = torch.full(
-                (q.shape[0], max_seq_len),
+                (q.shape[0], pad_width),
                 float("-inf"),
                 dtype=torch.float32,
                 device=q.device,
