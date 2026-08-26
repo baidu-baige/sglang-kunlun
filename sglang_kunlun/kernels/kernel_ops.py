@@ -824,7 +824,7 @@ def _dsv4_pack_plan_i32(columns: List[torch.Tensor], width: int) -> torch.Tensor
     "sglang.kernels.ops.attention.dsv4.compress.CompressorDecodePlan.generate",
     type=HookType.REPLACE,
 )
-def dsv4_compressor_decode_plan_torch(
+def dsv4_compressor_decode_plan_kunlun(
     compress_ratio: int,
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -833,40 +833,18 @@ def dsv4_compressor_decode_plan_torch(
     swa_page_size: int,
     ring_size: int,
 ):
-    """Build a graph-safe v2 decode plan using device Torch operations."""
-
+    """dsv4_compressor_decode_plan_kunlun"""
     from sglang.kernels.ops.attention.dsv4.compress import CompressorDecodePlan
-
     if compress_ratio not in (4, 128):
         raise ValueError(f"unsupported compression ratio: {compress_ratio}")
-    seq_lens_i32 = seq_lens.to(torch.int32)
-    position_1 = seq_lens_i32.to(torch.int64) - 1
-    position_0 = (position_1 - compress_ratio).clamp_min(0)
-    write_loc = _dsv4_state_loc_torch(
-        compress_ratio,
+    plan_d = torch.ops.xspeedgate_ops.dsv4_compressor_decode_plan(
         req_pool_indices,
-        position_1,
         req_to_token,
         full_to_state,
+        seq_lens,
+        compress_ratio,
         swa_page_size,
         ring_size,
-    )
-    read_page_0 = torch.div(
-        _dsv4_state_loc_torch(
-            compress_ratio,
-            req_pool_indices,
-            position_0,
-            req_to_token,
-            full_to_state,
-            swa_page_size,
-            ring_size,
-        ),
-        compress_ratio,
-        rounding_mode="floor",
-    )
-    read_page_1 = torch.div(write_loc, compress_ratio, rounding_mode="floor")
-    plan_d = _dsv4_pack_plan_i32(
-        [seq_lens_i32, write_loc, read_page_0, read_page_1], 16
     )
     return CompressorDecodePlan(compress_ratio, plan_d)
 
@@ -875,7 +853,7 @@ def dsv4_compressor_decode_plan_torch(
     "sglang.kernels.ops.attention.dsv4.compress.CompressorPrefillPlan.generate",
     type=HookType.REPLACE,
 )
-def dsv4_compressor_prefill_plan_torch(
+def dsv4_compressor_prefill_plan_kunlun(
     compress_ratio: int,
     req_pool_indices: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -887,146 +865,30 @@ def dsv4_compressor_prefill_plan_torch(
     num_q_tokens: int,
     use_cuda_graph: bool = False,
 ):
-    """Build the v2 prefill plan ABI without a JIT or vendor planner."""
-
+    """dsv4_compressor_prefill_plan_kunlun"""
     from sglang.kernels.ops.attention.dsv4.compress import CompressorPrefillPlan
-
     if compress_ratio not in (4, 128):
         raise ValueError(f"unsupported compression ratio: {compress_ratio}")
     if num_q_tokens < req_pool_indices.shape[0]:
         raise ValueError("num_q_tokens must be at least the batch size")
+    pin_buffer = torch.empty(
+            0,
+            dtype=torch.uint8,
+        ) # plan_compress_prefill_v2 only use its dtype
     device = req_pool_indices.device
-    seq_lens_i64 = seq_lens.to(device=device, dtype=torch.int64)
-    extend_lens_i64 = extend_lens.to(device=device, dtype=torch.int64)
-    if seq_lens_i64.shape != extend_lens_i64.shape:
-        raise ValueError("seq_lens and extend_lens must have the same shape")
-    if num_q_tokens == 0:
-        return CompressorPrefillPlan(
-            compress_ratio,
-            torch.empty((0, 16), dtype=torch.uint8, device=device),
-            torch.empty((0, 8), dtype=torch.uint8, device=device),
-            None,
-        )
-
-    token_ids = torch.arange(num_q_tokens, dtype=torch.int64, device=device)
-    cumulative = torch.cumsum(extend_lens_i64, dim=0)
-    batch_ids = torch.searchsorted(cumulative, token_ids, right=True)
-    safe_batch_ids = batch_ids.clamp(max=max(req_pool_indices.shape[0] - 1, 0))
-    starts = torch.cat([cumulative.new_zeros(1), cumulative[:-1]])
-    token_in_request = token_ids - starts.index_select(0, safe_batch_ids)
-    prefix_lens = seq_lens_i64 - extend_lens_i64
-    positions = prefix_lens.index_select(0, safe_batch_ids) + token_in_request
-    real_token_mask = token_ids < cumulative[-1]
-
-    should_compress = real_token_mask & ((positions + 1).remainder(compress_ratio) == 0)
-    is_overlap = compress_ratio == 4
-    window_size = compress_ratio * (2 if is_overlap else 1)
-    last_compress_position = torch.div(
-        seq_lens_i64, compress_ratio, rounding_mode="floor"
-    ) * compress_ratio
-    first_write_position = last_compress_position - (compress_ratio if is_overlap else 0)
-    if seq_lens.device.type != "cpu":
-        mtp_pad = min(ring_size - compress_ratio, 4)
-        first_write_position = torch.minimum(
-            first_write_position, seq_lens_i64 - mtp_pad
-        )
-    should_write = real_token_mask & (
-        positions >= first_write_position.index_select(0, safe_batch_ids)
-    )
-    if is_overlap:
-        should_write |= real_token_mask & (
-            positions.remainder(swa_page_size) >= swa_page_size - compress_ratio
-        )
-
-    compress_order = torch.argsort(
-        torch.where(should_compress, token_ids, token_ids + num_q_tokens)
-    )
-    write_order = torch.argsort(torch.where(should_write, token_ids, token_ids + num_q_tokens))
-    compress_valid = should_compress.index_select(0, compress_order)
-    write_valid = should_write.index_select(0, write_order)
-    if not use_cuda_graph:
-        compress_order = compress_order[compress_valid]
-        write_order = write_order[write_valid]
-        compress_valid = compress_valid[compress_valid]
-        write_valid = write_valid[write_valid]
-
-    c_batch = safe_batch_ids.index_select(0, compress_order)
-    c_position = positions.index_select(0, compress_order)
-    c_ragged_id = token_ids.index_select(0, compress_order)
-    c_seq_len = c_position + 1
-    c_buffer_len = window_size - torch.minimum(
-        token_in_request.index_select(0, compress_order) + 1,
-        torch.full_like(c_seq_len, window_size),
-    )
-    position_0_unclamped = c_position - compress_ratio
-    position_0 = (
-        position_0_unclamped
-        if position_0_unclamped.numel() == 0
-        else torch.where(
-            position_0_unclamped >= 0,
-            position_0_unclamped,
-            torch.zeros_like(position_0_unclamped),
-        )
-    )
-    c_rid = req_pool_indices.to(torch.int64).index_select(0, c_batch)
-    c_page_0 = torch.div(
-        _dsv4_state_loc_torch(
-            compress_ratio,
-            c_rid,
-            position_0,
-            req_to_token,
-            full_to_state,
-            swa_page_size,
-            ring_size,
-        ),
-        compress_ratio,
-        rounding_mode="floor",
-    )
-    c_page_1 = torch.div(
-        _dsv4_state_loc_torch(
-            compress_ratio,
-            c_rid,
-            c_position,
-            req_to_token,
-            full_to_state,
-            swa_page_size,
-            ring_size,
-        ),
-        compress_ratio,
-        rounding_mode="floor",
-    )
-    c_page_0 = torch.where(c_buffer_len > 0, c_page_0, torch.full_like(c_page_0, -1))
-    c_page_1 = torch.where(c_buffer_len > 0, c_page_1, c_batch)
-    c_seq_len = torch.where(compress_valid, c_seq_len, torch.full_like(c_seq_len, -1))
-    c_ragged_buffer = (
-        c_ragged_id.to(torch.int32).bitwise_and(0xFFFF)
-        | c_buffer_len.to(torch.int32).bitwise_left_shift(16)
-    )
-    c_ragged_buffer = torch.where(
-        compress_valid, c_ragged_buffer, torch.zeros_like(c_ragged_buffer)
-    )
-    c_page_0 = torch.where(compress_valid, c_page_0, torch.full_like(c_page_0, -1))
-    c_page_1 = torch.where(compress_valid, c_page_1, torch.full_like(c_page_1, -1))
-    plan_c = _dsv4_pack_plan_i32(
-        [c_seq_len, c_ragged_buffer, c_page_0, c_page_1], 16
-    )
-
-    w_batch = safe_batch_ids.index_select(0, write_order)
-    w_position = positions.index_select(0, write_order)
-    w_rid = req_pool_indices.to(torch.int64).index_select(0, w_batch)
-    w_ragged_id = token_ids.index_select(0, write_order)
-    w_write_loc = _dsv4_state_loc_torch(
-        compress_ratio,
-        w_rid,
-        w_position,
+    plan_c, plan_w = torch.ops.xspeedgate_ops.plan_compress_prefill_v2(
+        req_pool_indices,
         req_to_token,
         full_to_state,
+        seq_lens,
+        extend_lens,
+        pin_buffer,
+        num_q_tokens,
+        compress_ratio,
         swa_page_size,
         ring_size,
+        use_cuda_graph,
     )
-    w_ragged_id = torch.where(write_valid, w_ragged_id, torch.full_like(w_ragged_id, -1))
-    w_write_loc = torch.where(write_valid, w_write_loc, torch.full_like(w_write_loc, -1))
-    plan_w = _dsv4_pack_plan_i32([w_ragged_id, w_write_loc], 8)
     return CompressorPrefillPlan(compress_ratio, plan_c, plan_w, None)
 
 
@@ -1140,7 +1002,7 @@ def _dsv4_compress_rows_torch(
 @register_jit_op(
     "sglang.kernels.ops.attention.dsv4.compress", "compress_forward"
 )
-def dsv4_compress_forward_v2_torch(
+def dsv4_compress_forward_v2_kunlun(
     kv_score_buffer: torch.Tensor,
     kv_score_input: torch.Tensor,
     ape: torch.Tensor,
@@ -1151,57 +1013,29 @@ def dsv4_compress_forward_v2_torch(
     out: Optional[torch.Tensor] = None,
     is_online: bool = False,
 ) -> torch.Tensor:
-    """Run compressor v2 with a device Torch reference implementation."""
-
+    """dsv4_compress_forward_v2_kunlun"""
     if is_online:
         raise NotImplementedError("online C128 is not enabled for the Torch reference")
     if compress_ratio not in (4, 128):
         raise ValueError(f"unsupported compression ratio: {compress_ratio}")
-    flat_buffer = kv_score_buffer.view(-1, kv_score_buffer.shape[-1])
+    plan_c = plan[1].contiguous()
     if plan.is_decode:
-        plan_raw = plan[1].contiguous().view(torch.int32)
-        write_locs = plan_raw[:, 1].to(torch.int64)
-        source_rows = torch.arange(
-            write_locs.shape[0], device=write_locs.device, dtype=torch.int64
-        )
+        plan_w = None
     else:
-        plan_w = plan[2].contiguous().view(torch.int32)
-        write_locs = plan_w[:, 1].to(torch.int64)
-        source_rows = plan_w[:, 0].to(torch.int64)
-    valid_write = (
-        (write_locs >= 0)
-        & (write_locs < flat_buffer.shape[0] - 1)
-        & (source_rows >= 0)
-        & (source_rows < kv_score_input.shape[0])
-    )
-    sentinel = flat_buffer.shape[0] - 1
-    safe_write_locs = torch.where(
-        valid_write, write_locs, torch.full_like(write_locs, sentinel)
-    )
-    safe_source_rows = source_rows.clamp(
-        min=0, max=max(kv_score_input.shape[0] - 1, 0)
-    )
-    write_values = kv_score_input.index_select(0, safe_source_rows).to(flat_buffer.dtype)
-    write_values = torch.where(
-        valid_write.unsqueeze(1), write_values, torch.zeros_like(write_values)
-    )
-    if plan.is_decode:
-        flat_buffer.index_copy_(0, safe_write_locs, write_values)
-
-    result = _dsv4_compress_rows_torch(
+        plan_w = plan[2].contiguous()
+    if out is None:
+        num_q_tokens = plan[1].shape[0]
+        out = kv_score_input.new_empty((num_q_tokens, head_dim))
+    torch.ops.xspeedgate_ops.dsv4_compress_forward_v2(
         kv_score_buffer,
         kv_score_input,
+        out,
         ape,
-        plan,
-        head_dim,
+        plan_c,
+        plan_w,
         compress_ratio,
     )
-    if not plan.is_decode:
-        flat_buffer.index_copy_(0, safe_write_locs, write_values)
-    if out is not None:
-        out.copy_(result)
-        return out
-    return result
+    return out
 
 
 def _dsv4_hadamard_torch(value: torch.Tensor) -> torch.Tensor:
