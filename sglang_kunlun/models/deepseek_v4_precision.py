@@ -11,7 +11,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 from sglang_kunlun.kernels.kernel_ops import dsv4_mqa_wo_a_einsum_kunlun
 
-
 def _dsv4_dump(self, name, value):
     callback = getattr(self, "_dsv4_tensor_dump_callback", None)
     if callback is not None and isinstance(value, torch.Tensor):
@@ -95,6 +94,9 @@ def hc_post_kunlun(
         self.hc_mult,
         x.shape[-1],
     )
+    if out.dtype is torch.float16:
+        # 融合 MHC-post 在长上下文下会溢出成 inf/NaN，fp16 必须兜一下
+        out = torch.nan_to_num(out)
     return out
 
 
@@ -163,13 +165,25 @@ def initialize_compressor_parameter_dtype_kunlun(result, self, *args, **kwargs):
 
 
 @plugin_hook(
+    "sglang.srt.models.deepseek_v4.MqaAttentionBase.__init__",
+    type=HookType.AFTER,
+)
+def initialize_mqa_attention_parameter_dtype_kunlun(result, self, *args, **kwargs):
+    """把 wo_a 恢复成请求的 dtype。
+
+    上游在共享基类里把 wo_a 的 params_dtype 硬编码成 bf16，而 target 的 MQALayer
+    和 DSpark draft 的 DSparkAttention 都是它的子类，所以必须挂在基类上。
+    """
+    _restore_requested_fp16_parameter_dtype(self.wo_a)
+    return result
+
+
+@plugin_hook(
     "sglang.srt.models.deepseek_v4.MQALayer.__init__",
     type=HookType.AFTER,
 )
 def initialize_mqa_rope_policy_kunlun(result, self, config, *args, **kwargs):
-    """Restore the FP16 wo_a and dense-layer RoPE contracts."""
-    _restore_requested_fp16_parameter_dtype(self.wo_a)
-
+    """Restore the dense-layer RoPE contract."""
     if self.compress_ratio:
         return result
 

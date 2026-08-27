@@ -7,7 +7,7 @@ Kunlun compressed-attention operator.
 
 from __future__ import annotations
 
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Tuple
 
 import logging
 import os
@@ -91,6 +91,114 @@ def _clamp_c128_prefill_topk(
     if chunk_start_pos <= 0:
         return compressed_topk
     return min(compressed_topk, max(chunk_start_pos // compress_ratio, 1))
+
+
+@plugin_hook(
+    "sglang.srt.layers.attention.deepseek_v4_backend._create_flashmla_metadata",
+    type=HookType.REPLACE,
+)
+@plugin_hook(
+    "sglang.srt.layers.attention.deepseek_v4_backend_hip_radix."
+    "_create_flashmla_metadata",
+    type=HookType.REPLACE,
+)
+def _create_flashmla_metadata_kunlun():
+    """Disable CUDA FlashMLA metadata on Kunlun."""
+
+    return None
+
+
+def _flash_mla_with_kvcache_reference(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    indices: torch.Tensor,
+    head_dim_v: int = 512,
+    softmax_scale: Optional[float] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    extra_k_cache: Optional[torch.Tensor] = None,
+    extra_indices_in_kvcache: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+    **_,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run sparse FlashMLA attention with a Torch implementation.
+
+    Kunlun does not provide the CUDA ``flash_mla_with_kvcache`` entrypoint.
+    The cache layout is already token-addressable after flattening, so this
+    follows the 0514 reference path and returns the same ``(output, lse)``
+    tuple as the original kernel.
+    """
+    batch_size, query_len, num_heads, head_dim_qk = q.shape
+    topk = indices.shape[-1]
+    if softmax_scale is None:
+        softmax_scale = head_dim_qk**-0.5
+
+    def gather_cache(cache, cache_indices, length):
+        cache_flat = cache.reshape(-1, head_dim_qk).float()
+        safe_indices = cache_indices.clamp_min(0).clamp_max(cache_flat.shape[0] - 1)
+        gathered = cache_flat[safe_indices.reshape(-1)].reshape(
+            batch_size, query_len, -1, head_dim_qk
+        )
+        invalid = cache_indices < 0
+        if length is not None:
+            positions = torch.arange(
+                cache_indices.shape[-1], device=q.device
+            ).view(1, 1, -1)
+            invalid = invalid | (positions >= length.view(batch_size, 1, 1))
+        return gathered, invalid
+
+    gathered_kv, invalid_mask = gather_cache(k_cache, indices, topk_length)
+    if extra_k_cache is not None and extra_indices_in_kvcache is not None:
+        extra_kv, extra_invalid = gather_cache(
+            extra_k_cache,
+            extra_indices_in_kvcache,
+            extra_topk_length,
+        )
+        gathered_kv = torch.cat((gathered_kv, extra_kv), dim=2)
+        invalid_mask = torch.cat((invalid_mask, extra_invalid), dim=2)
+
+    total_topk = gathered_kv.shape[2]
+    gathered_kv = torch.nan_to_num(gathered_kv).reshape(
+        batch_size * query_len, total_topk, head_dim_qk
+    )
+    q_float = q.float().reshape(batch_size * query_len, num_heads, head_dim_qk)
+    invalid_mask = invalid_mask.reshape(
+        batch_size * query_len, 1, total_topk
+    )
+
+    scores = torch.bmm(
+        q_float, gathered_kv.transpose(1, 2)
+    ) * softmax_scale
+    scores.masked_fill_(invalid_mask, float("-inf"))
+    lse = torch.logsumexp(scores, dim=-1)
+    weights = torch.exp(scores - lse.unsqueeze(-1))
+    output = torch.bmm(weights, gathered_kv[..., :head_dim_v])
+
+    output = output.reshape(batch_size, query_len, num_heads, head_dim_v)
+    lse = lse.reshape(batch_size, query_len, num_heads)
+    if attn_sink is not None:
+        sink_scale = torch.sigmoid(lse - attn_sink.view(1, 1, num_heads))
+        output = output * sink_scale.unsqueeze(-1)
+
+    lonely = lse == float("-inf")
+    output = output.masked_fill(lonely.unsqueeze(-1), 0.0)
+    lse = lse.masked_fill(lonely, float("inf"))
+    return output, lse.transpose(1, 2)
+
+
+@plugin_hook(
+    "sgl_kernel.flash_mla.flash_mla_with_kvcache",
+    type=HookType.REPLACE,
+)
+@plugin_hook(
+    "sgl_kernel.flash_mla_with_kvcache",
+    type=HookType.REPLACE,
+)
+def flash_mla_with_kvcache_kunlun(*args, **kwargs):
+    """Replace the unavailable sgl_kernel FlashMLA callable on Kunlun."""
+    if args:
+        raise TypeError("Kunlun FlashMLA replacement requires keyword arguments")
+    return _flash_mla_with_kvcache_reference(**kwargs)
 
 
 @plugin_hook(
@@ -182,6 +290,45 @@ def _get_graph_extend_aux(
     return aux
 
 
+def _verify_row_lod_enabled(forward_batch) -> bool:
+    """eager 的 TARGET_VERIFY 必须用 per-row LoD，和 sglang 0.5.8 一致。
+
+    ``xspeedgate_ops.compressed_attention`` 拿不到 ``win_lengths`` /
+    ``extra_lengths``，它唯一的 per-row 掩码来自 ``kv_lens`` 加 LoD 布局。把
+    gamma+1 个 query 行当成一个 item、共用一个 request 级 ``kv_len``，每一行就都能
+    读到整个窗口——包括后面几个 verify 位置上的草稿 token，于是 target 直接抄了它
+    本该校验的草稿。
+
+    0.5.8 的昆仑后端（该算子已验证可用）走的是 decode 型契约：
+    ``qlod = arange(n+1)``、``kvseqlen = seq_lens_casual``（每个 verify 位置的精确
+    因果长度 L+j+1）。``_make_cp_prefill_lod`` 正好构造这个，复用它。
+
+    capture 期走的是 graph 专用实现（见 ``_make_verify_row_lod_graph_safe``），因为
+    这里的构造需要 H2D，录不进图。``DSV4_VERIFY_ROW_LOD=0`` 可 A/B 回旧行为。
+    """
+    if forward_batch is None or not forward_batch.forward_mode.is_target_verify():
+        return False
+    if os.environ.get("DSV4_VERIFY_ROW_LOD", "1") != "1":
+        return False
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    return True
+
+
+_VERIFY_ROW_LOD_LOGGED = False
+
+
+def _log_verify_row_lod_once() -> None:
+    global _VERIFY_ROW_LOD_LOGGED
+    if _VERIFY_ROW_LOD_LOGGED:
+        return
+    _VERIFY_ROW_LOD_LOGGED = True
+    logger.warning(
+        "[DSV4_VERIFY_LOD] eager TARGET_VERIFY uses the per-row LoD "
+        "(qlod=arange, kv_lens=seq_lens_casual), matching sglang 0.5.8"
+    )
+
+
 def _seq_lens_cpu_i32(forward_batch) -> torch.Tensor:
     seq_lens_cpu = forward_batch.seq_lens_cpu
     if seq_lens_cpu is None:
@@ -266,20 +413,11 @@ def _make_cp_prefill_lod(core_metadata, num_queries: int, device: torch.device):
     )
 
 
-def _graph_replay_bs(raw_bs: int, cached_bs_values) -> "int | None":
-    """Return the captured batch size a raw batch of ``raw_bs`` replays into.
-
-    The runner pads the batch up to the smallest captured bucket, so the host
-    length buffers that belong to that bucket -- not to ``raw_bs`` -- are the
-    ones the replayed graph reads.
-    """
-    candidates = sorted({bs for bs in cached_bs_values if bs >= raw_bs})
-    return candidates[0] if candidates else None
-
-
-
 def _refresh_graph_host_lengths(
-    forward_batch, attention_decode_aux, c4_decode_aux, graph_extend_aux
+    forward_batch,
+    attention_decode_aux,
+    c4_decode_aux,
+    graph_extend_aux,
 ) -> None:
     """Refresh pointer-stable backend lengths before graph replay."""
     seq_lens = _seq_lens_cpu_i32(forward_batch)
@@ -319,345 +457,7 @@ def _refresh_graph_host_lengths(
         _copy_host_lengths_(kv_lens_cpu, seq_lens, fill_value=1)
         kv_lens.copy_(kv_lens_cpu)
         torch.maximum(kv_lens, query_lens, out=kv_lens)
-
-
-_MTP_ROW0_TRACE_CALLS: dict = {}
-
-
-_ROW0_SELFCHECK_CALLS: dict = {}
-
-
-_ROW0_DUMP_STEPS: dict = {}
-
-
-_CACHE_WRITE_TRACE_CALLS: dict = {}
-
-
-def _log_cache_write_slots(forward_batch, layer, save_kv_cache, backend=None) -> None:
-    """Log which cache slots each forward mode writes, once per mode per layer 0."""
-    import os
-
-    if os.getenv("DSV4_MTP_ROW0_TRACE", "0") != "1":
-        return
-    if getattr(layer, "layer_id", None) != 0:
-        return
-    mode = str(forward_batch.forward_mode)
-    seen = _CACHE_WRITE_TRACE_CALLS.get(mode, 0)
-    if seen >= 6:
-        return
-    _CACHE_WRITE_TRACE_CALLS[mode] = seen + 1
-    loc = forward_batch.out_cache_loc
-    pool = getattr(backend, "token_to_kv_pool", None)
-    swa_pool = getattr(pool, "swa_kv_pool", None)
-    swa_ptr = (
-        swa_pool.kv_buffer[0].data_ptr()
-        if swa_pool is not None and getattr(swa_pool, "kv_buffer", None) is not None
-        else None
-    )
-    logger.warning(
-        "[DSV4_CACHE_WRITE] call=%s mode=%s save_kv_cache=%s rows=%s loc=%s "
-        "seq_lens=%s backend=%s pool=%s swa_buf=%s",
-        seen,
-        mode,
-        save_kv_cache,
-        None if loc is None else int(loc.numel()),
-        None if loc is None else loc[: min(6, loc.numel())].tolist(),
-        forward_batch.seq_lens[: min(2, forward_batch.batch_size)].tolist(),
-        hex(id(backend)) if backend is not None else None,
-        hex(id(pool)) if pool is not None else None,
-        hex(swa_ptr) if swa_ptr is not None else None,
-    )
-
-
-def _dump_row0_layer_tensors(
-    forward_batch, layer, q, out, win_lengths, extra_lengths
-) -> None:
-    """Save row 0 per-layer attention tensors for the first post-prefill forward."""
-    import os
-
-    tag = os.getenv("DSV4_ROW0_DUMP_TAG")
-    if not tag:
-        return
-    mode = forward_batch.forward_mode
-    if not (mode.is_decode() or mode.is_target_verify()):
-        return
-    layer_id = getattr(layer, "layer_id", None)
-    if layer_id is None:
-        return
-    step = _ROW0_DUMP_STEPS.get(layer_id, 0)
-    _ROW0_DUMP_STEPS[layer_id] = step + 1
-    if step != 0:
-        return
-
-    directory = f"/tmp/dsv4_row0_{tag}"
-    os.makedirs(directory, exist_ok=True)
-    payload = {
-        "mode": str(mode),
-        "q_rows": int(q.shape[0]),
-        "q_row0": q[0].detach().float().cpu(),
-        "out_row0": out[0].detach().float().cpu(),
-        "win_len_row0": None if win_lengths is None else int(win_lengths[0]),
-        "extra_len_row0": None if extra_lengths is None else int(extra_lengths[0]),
-    }
-    torch.save(payload, f"{directory}/layer{layer_id:03d}.pt")
-
-
-def _check_verify_row0_independence(
-    *,
-    forward_batch,
-    layer,
-    reference_out,
-    q,
-    win_cache,
-    win_indices,
-    win_lengths,
-    softmax_scale,
-    attn_sink,
-    extra_cache,
-    extra_indices,
-    extra_lengths,
-) -> None:
-    """Recompute verify row 0 alone and compare with row 0 of the batched call."""
-    import os
-
-    if os.getenv("DSV4_VERIFY_ROW0_SELFCHECK", "0") != "1":
-        return
-    if not forward_batch.forward_mode.is_target_verify():
-        return
-    layer_id = getattr(layer, "layer_id", None)
-    if layer_id not in (0, 3):
-        return
-    seen = _ROW0_SELFCHECK_CALLS.get(layer_id, 0)
-    if seen >= 4:
-        return
-    _ROW0_SELFCHECK_CALLS[layer_id] = seen + 1
-
-    def row0(tensor):
-        return None if tensor is None else tensor[:1]
-
-    single = dsv4_compressed_attention_torch(
-        q=q[:1],
-        win_cache=win_cache,
-        win_indices=row0(win_indices),
-        win_lengths=row0(win_lengths),
-        softmax_scale=softmax_scale,
-        attn_sink=attn_sink,
-        extra_cache=extra_cache,
-        extra_indices=row0(extra_indices),
-        extra_lengths=row0(extra_lengths),
-    )
-    diff = (single.float() - reference_out[:1].float()).abs().max().item()
-    logger.warning(
-        "[DSV4_ROW0_SELFCHECK] layer=%s call=%s q_rows=%s max_abs_diff=%s "
-        "row0_norm=%s",
-        layer_id,
-        seen,
-        q.shape[0],
-        diff,
-        reference_out[:1].float().abs().max().item(),
-    )
-
-
-def _log_verify_row0_window(
-    forward_batch, core, layer, win_lengths, extra_lengths, win_indices
-) -> None:
-    """Log layer 0 row 0 window metadata for the first forwards of each mode."""
-    import os
-
-    if os.getenv("DSV4_MTP_ROW0_TRACE", "0") != "1":
-        return
-    layer_id = getattr(layer, "layer_id", None)
-    if layer_id not in (0, 3):
-        return
-    mode = f"{forward_batch.forward_mode}/L{layer_id}"
-    seen = _MTP_ROW0_TRACE_CALLS.get(mode, 0)
-    if seen >= 6:
-        return
-    _MTP_ROW0_TRACE_CALLS[mode] = seen + 1
-
-    def head(tensor, count):
-        if tensor is None:
-            return None
-        flat = tensor.reshape(-1)
-        return flat[: min(count, flat.numel())].tolist()
-
-    logger.warning(
-        "[DSV4_ROW0] call=%s mode=%s bs=%s q_rows=%s seq_lens=%s "
-        "seq_lens_casual=%s win_len_row0=%s win_idx_row0=%s extra_len_row0=%s",
-        seen,
-        mode,
-        forward_batch.batch_size,
-        win_indices.shape[0] if win_indices is not None else None,
-        head(forward_batch.seq_lens, 2),
-        head(getattr(core, "seq_lens_casual", None), 6),
-        head(win_lengths, 6),
-        win_indices[0, :8].tolist() if win_indices is not None else None,
-        head(extra_lengths, 6),
-    )
-
-
-_MTP_ROW_LEN_SEEN: set = set()
-
-
-def _log_row_lengths(
-    forward_batch, core, q_lod_cpu, kv_lens_cpu, win_lengths, extra_lengths
-) -> None:
-    """Dump the per-row causal/window lengths handed to the operator."""
-    import os
-
-    if os.getenv("DSV4_MTP_LOD_DEBUG", "0") != "1":
-        return
-    signature = (str(forward_batch.forward_mode), forward_batch.batch_size)
-    if signature in _MTP_ROW_LEN_SEEN:
-        return
-    _MTP_ROW_LEN_SEEN.add(signature)
-
-    def head(tensor, count=8):
-        if tensor is None:
-            return None
-        flat = tensor.reshape(-1)
-        return flat[: min(count, flat.numel())].tolist()
-
-    logger.warning(
-        "[DSV4_MTP_ROW_LEN] mode=%s bs=%s seq_lens=%s q_lod=%s kv_lens_cpu=%s "
-        "seq_lens_casual=%s win_lengths=%s extra_lengths=%s",
-        forward_batch.forward_mode,
-        forward_batch.batch_size,
-        head(forward_batch.seq_lens, 4),
-        head(q_lod_cpu, 5),
-        head(kv_lens_cpu, 4),
-        head(getattr(core, "seq_lens_casual", None)),
-        head(win_lengths),
-        head(extra_lengths),
-    )
-
-
-_MTP_LOD_ROUTE_SEEN: set = set()
-
-
-def _log_lod_route(forward_batch, num_queries: int) -> None:
-    """Record which lod branch each forward mode takes, once per signature."""
-    import os
-
-    if os.getenv("DSV4_MTP_LOD_DEBUG", "0") != "1":
-        return
-    signature = (
-        str(forward_batch.forward_mode),
-        forward_batch.batch_size,
-        num_queries,
-    )
-    if signature in _MTP_LOD_ROUTE_SEEN:
-        return
-    _MTP_LOD_ROUTE_SEEN.add(signature)
-    logger.warning(
-        "[DSV4_MTP_LOD_ROUTE] mode=%s bs=%s num_queries=%s ragged_draft=%s "
-        "seq_lens=%s extend_lens=%s",
-        forward_batch.forward_mode,
-        forward_batch.batch_size,
-        num_queries,
-        getattr(forward_batch, "_kunlun_ragged_draft_extend", None),
-        forward_batch.seq_lens[: min(4, forward_batch.batch_size)].tolist(),
-        forward_batch.extend_seq_lens_cpu,
-    )
-
-
-_MTP_LOD_DEBUG_SEEN: set = set()
-
-
-def _log_graph_extend_lod(
-    forward_batch, num_queries, q_lod_cpu, kv_lens_cpu, kv_lens, query_lens
-) -> None:
-    """Log the verify-extend lod once per (mode, bs, num_queries) signature."""
-    import os
-
-    if os.getenv("DSV4_MTP_LOD_DEBUG", "0") != "1":
-        return
-    signature = (
-        str(forward_batch.forward_mode),
-        forward_batch.batch_size,
-        num_queries,
-    )
-    if signature in _MTP_LOD_DEBUG_SEEN:
-        return
-    _MTP_LOD_DEBUG_SEEN.add(signature)
-    logger.warning(
-        "[DSV4_MTP_LOD] mode=%s bs=%s num_queries=%s seq_lens=%s q_lod=%s "
-        "query_lens=%s kv_lens_cpu=%s kv_lens_dev=%s",
-        forward_batch.forward_mode,
-        forward_batch.batch_size,
-        num_queries,
-        forward_batch.seq_lens[: min(4, forward_batch.batch_size)].tolist(),
-        q_lod_cpu[: min(5, q_lod_cpu.numel())].tolist(),
-        query_lens[: min(4, query_lens.numel())].tolist(),
-        kv_lens_cpu[: min(4, kv_lens_cpu.numel())].tolist(),
-        kv_lens[: min(4, kv_lens.numel())].tolist(),
-    )
-
-
-_DSV4_SWA_MAP_TRACE_CALLS = [0]
-
-
-def _dsv4_trace_swa_mapping(backend, seq_lens_casual, req_pool_indices_repeated,
-                            raw_indices, mapped) -> None:
-    """Log slot and SWA mapping for the newest positions near a page boundary."""
-    if os.environ.get("DSV4_SWA_LEN_TRACE", "0") != "1":
-        return
-    if seq_lens_casual.numel() == 0 or _DSV4_SWA_MAP_TRACE_CALLS[0] >= 40:
-        return
-    longest = int(seq_lens_casual.max().item())
-    phase = longest % 256
-    if not (phase <= 3 or phase >= 253):
-        return
-    _DSV4_SWA_MAP_TRACE_CALLS[0] += 1
-    row = int(torch.argmax(seq_lens_casual).item())
-    mapping = backend.token_to_kv_pool.full_to_swa_index_mapping
-    logger.warning(
-        "[DSV4_SWA_MAP] rows=%s row=%s causal=%s rid=%s raw_newest=%s "
-        "mapped_newest=%s mapping_len=%s mapping_at_raw=%s",
-        int(seq_lens_casual.numel()),
-        row,
-        longest,
-        int(req_pool_indices_repeated[row].item()),
-        raw_indices[row, :4].tolist(),
-        mapped[row, :4].tolist(),
-        None if mapping is None else int(mapping.numel()),
-        None
-        if mapping is None
-        else mapping.index_select(0, raw_indices[row, :4].to(torch.int64)).tolist(),
-    )
-
-
-_DSV4_SWA_TRACE_CALLS = [0]
 _DSV4_PAGE_TABLE_SPAN_LOGGED = False
-
-
-def _dsv4_trace_swa_window(
-    forward_mode_name, seq_lens_casual, swa_page_indices, effective_swa_len, clamped
-) -> None:
-    """Log window lengths for rows sitting near a page boundary."""
-    if os.environ.get("DSV4_SWA_LEN_TRACE", "0") != "1":
-        return
-    if seq_lens_casual.numel() == 0:
-        return
-    longest = int(seq_lens_casual.max().item())
-    phase = longest % 256
-    if not (phase <= 4 or phase >= 252):
-        return
-    if _DSV4_SWA_TRACE_CALLS[0] >= 40:
-        return
-    _DSV4_SWA_TRACE_CALLS[0] += 1
-    zeros = int((swa_page_indices == 0).sum().item())
-    logger.warning(
-        "[DSV4_SWA_LEN] mode=%s rows=%s seq_lens=%s effective=%s clamped=%s "
-        "zero_entries=%s width=%s",
-        forward_mode_name,
-        int(seq_lens_casual.numel()),
-        seq_lens_casual[: min(4, seq_lens_casual.numel())].tolist(),
-        effective_swa_len[: min(4, effective_swa_len.numel())].tolist(),
-        clamped[: min(4, clamped.numel())].tolist(),
-        zeros,
-        int(swa_page_indices.shape[1]),
-    )
 
 
 def _dsv4_page_table_span(max_seq_len: int, seq_lens_casual: torch.Tensor) -> int:
@@ -665,9 +465,13 @@ def _dsv4_page_table_span(max_seq_len: int, seq_lens_casual: torch.Tensor) -> in
 
     TARGET_VERIFY passes the committed max_seq_len while its rows reach
     committed + num_draft_tokens, so on a page boundary the draft positions land in
-    a page the table does not describe.
+    a page the table does not describe. The vendor paged kernels then read past
+    the last page-table column and pick up uninitialised ``req_to_token`` memory,
+    which surfaces as ``flash_attention_infer_decoder kernel error! block_id must
+    be non-negtive!`` followed by an illegal memory access. Widening the span is a
+    correctness requirement, so it is on by default; set the env to 0 to A/B it.
     """
-    if os.environ.get("DSV4_PAGE_TABLE_COVER_CASUAL", "0") != "1":
+    if os.environ.get("DSV4_PAGE_TABLE_COVER_CASUAL", "1") != "1":
         return max_seq_len
     if seq_lens_casual.numel() == 0:
         return max_seq_len
@@ -690,6 +494,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._verify_row_lod_aux = {}
         self._attention_decode_aux = {}
         self._attention_graph_extend_aux = {}
         self._c4_decode_aux = {}
@@ -709,14 +514,18 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             min=0,
         )
         raw_indices = self.req_to_token[
-            req_pool_indices_repeated[:, None], offsets
+            req_pool_indices_repeated[:, None].clamp(
+                min=0, max=self.req_to_token.shape[0] - 1
+            ),
+            offsets.clamp(min=0, max=self.req_to_token.shape[1] - 1),
         ]
-        mapped = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-            raw_indices
-        ).to(torch.int32)
-        _dsv4_trace_swa_mapping(
-            self, seq_lens_casual, req_pool_indices_repeated, raw_indices, mapped
-        )
+        # 上游 ``_causal_swa_page_indices_kernel`` 对每次 load 都做掩码，超出该行因果
+        # 长度的 lane 不会真的访存；这里是稠密改写，会读所有 lane，所以映射查表要手动
+        # clamp——越界 lane 由 ``swa_topk_lengths`` 掩掉。
+        mapping = self.token_to_kv_pool.full_to_swa_index_mapping
+        mapped = mapping[
+            raw_indices.clamp(min=0, max=mapping.shape[0] - 1)
+        ].to(torch.int32)
         return mapped
 
     def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
@@ -1001,7 +810,14 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
     ) -> KunlunDSV4AttnMetadata:
         """Build Kunlun core attention metadata for the current request."""
         if dspark_block_size is not None:
-            raise NotImplementedError("Kunlun DSV4 does not support DSpark draft metadata")
+            return self._make_dspark_draft_core_attn_metadata(
+                req_to_token=req_to_token,
+                req_pool_indices_repeated=req_pool_indices_repeated,
+                seq_lens_casual=seq_lens_casual,
+                max_seq_len=max_seq_len,
+                out_loc=out_loc,
+                dspark_block_size=dspark_block_size,
+            )
         assert self.swa_page_size == upstream.SWA_WINDOW
         seq_lens_casual = seq_lens_casual.to(torch.int32)
         swa_page_indices = self.get_swa_page_indices(
@@ -1024,13 +840,6 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         swa_topk_lengths = torch.minimum(
             torch.clamp(seq_lens_casual, max=upstream.SWA_WINDOW),
             effective_swa_len,
-        )
-        _dsv4_trace_swa_window(
-            "prefill" if is_prefill else "other",
-            seq_lens_casual,
-            swa_page_indices,
-            effective_swa_len,
-            torch.clamp(seq_lens_casual, max=upstream.SWA_WINDOW),
         )
         page_table = req_to_token[
             req_pool_indices_repeated,
@@ -1077,6 +886,61 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                     indices.masked_fill_(indices == -1, 0)
         return metadata
 
+
+    def _make_dspark_draft_core_attn_metadata(
+        self,
+        *,
+        req_to_token: torch.Tensor,
+        req_pool_indices_repeated: torch.Tensor,
+        seq_lens_casual: torch.Tensor,
+        max_seq_len: int,
+        out_loc: torch.Tensor,
+        dspark_block_size: int,
+    ) -> KunlunDSV4AttnMetadata:
+        """DSpark draft block 前向的 core metadata（只有窗口，没有压缩分支）。
+
+        ``init_forward_metadata_dspark_draft_block`` 以 ``need_compress=False``
+        走 prefill，draft 不碰 c4/c128，只用滑动窗口。上游
+        ``get_dspark_swa_page_indices`` 已经为 gamma 个 draft 行构造了 per-row 因果
+        窗口索引（相关 kernel 有昆仑替换实现），昆仑侧唯一要改的是无效 lane 的约定：
+        填 page 0 而不是 -1，尾部由 ``swa_topk_lengths`` 掩掉。
+        """
+        assert self.swa_page_size == upstream.SWA_WINDOW
+        seq_lens_casual = seq_lens_casual.to(torch.int32)
+        swa_page_indices, swa_topk_lengths = self.get_dspark_swa_page_indices(
+            seq_lens_casual=seq_lens_casual,
+            req_pool_indices_repeated=req_pool_indices_repeated,
+            out_loc=out_loc,
+            block_size=dspark_block_size,
+        )
+        page_table = req_to_token[
+            req_pool_indices_repeated,
+            : _dsv4_page_table_span(max_seq_len, seq_lens_casual) : self.page_size,
+        ]
+        metadata = KunlunDSV4AttnMetadata(
+            page_size=self.page_size,
+            raw_out_loc=out_loc,
+            seq_lens_casual=seq_lens_casual,
+            cuda_int32_kwargs=self.cuda_int32_kwargs,
+            positions_casual=seq_lens_casual - 1,
+            page_table=(page_table // self.page_size).to(torch.int32),
+            swa_page_indices=swa_page_indices,
+            swa_topk_lengths=swa_topk_lengths,
+            c4_sparse_topk=self.c4_topk,
+        )
+        metadata.swa_topk_lengths = swa_topk_lengths
+        metadata.c4_sparse_topk_lengths = None
+        metadata.c4_sparse_page_indices = None
+        metadata.c4_sparse_raw_indices = None
+        metadata.c1_flashmla_metadata = None
+        metadata.c4_flashmla_metadata = None
+        metadata.c128_flashmla_metadata = None
+        if os.environ.get("DSV4_KUNLUN_REFERENCE_ONLY") != "1":
+            indices = metadata.swa_page_indices
+            if indices is not None:
+                indices.masked_fill_(indices == -1, 0)
+        return metadata
+
     @staticmethod
     def _match_queries(tensor, size: int, value: int):
         if tensor is None or tensor.shape[0] == size:
@@ -1085,8 +949,42 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             return tensor[:size]
         return upstream._pad_tensor_to_size(tensor, size, value=value)
 
+    def _make_verify_row_lod_graph_safe(
+        self, core_metadata, num_queries: int, device: torch.device
+    ):
+        """capture 安全的 per-row TARGET_VERIFY LoD。
+
+        ``_make_cp_prefill_lod`` 表达的是同一个契约，但要走 D2H 再新建 CPU 张量，录不
+        进图（replay 时录下的 H2D 会读到已释放的 host 缓冲）。所以 capture 期原先退回
+        request-level LoD——正是让 verify 行 j 读到行 j+1.. 草稿 KV 的那个布局（见
+        ``_verify_row_lod_enabled``），这就是 CUDA graph 下退化成单 token 死循环、
+        accept len 钉在 gamma+1 而 eager 干净的原因。
+
+        这里 ``q_lod`` 是常量 ``arange``（可以烘死），``kv_lens`` 由录进图的设备端 op
+        从 ``seq_lens_casual`` 填充，而该缓冲每次 replay 前由 ``copy_`` 原地刷新；
+        ``kv_lens_cpu`` 保持占位符，与 request-level capture 路径原本的假设一致。
+        ``DSV4_VERIFY_ROW_LOD_GRAPH=0`` 可 A/B 回旧行为。
+        """
+        aux = self._verify_row_lod_aux.get(num_queries)
+        if aux is None:
+            q_lod_cpu = torch.arange(num_queries + 1, dtype=torch.int32)
+            aux = (
+                q_lod_cpu,
+                q_lod_cpu.to(device, non_blocking=False),
+                torch.ones(num_queries, dtype=torch.int32),
+                torch.ones(num_queries, dtype=torch.int32, device=device),
+            )
+            self._verify_row_lod_aux[num_queries] = aux
+        q_lod_cpu, q_lod, kv_lens_cpu, kv_lens = aux
+        casual = core_metadata.seq_lens_casual.reshape(-1)
+        count = min(casual.shape[0], num_queries)
+        if count:
+            kv_lens[:count].copy_(torch.clamp(casual[:count].to(torch.int32), min=1))
+        if count < num_queries:
+            kv_lens[count:].fill_(1)
+        return q_lod_cpu, q_lod, kv_lens_cpu, kv_lens
+
     def _make_lod(self, forward_batch, num_queries: int, device: torch.device):
-        _log_lod_route(forward_batch, num_queries)
         if forward_batch.forward_mode.is_decode_or_idle():
             batch_size = num_queries
             aux = self._attention_decode_aux.get(batch_size)
@@ -1104,6 +1002,18 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         if _is_graph_extend_mode(forward_batch.forward_mode) and not getattr(
             forward_batch, "_kunlun_ragged_draft_extend", False
         ):
+            if _verify_row_lod_enabled(forward_batch):
+                _log_verify_row_lod_once()
+                return _make_cp_prefill_lod(
+                    self.forward_metadata.core_attn_metadata, num_queries, device
+                )
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                and os.environ.get("DSV4_VERIFY_ROW_LOD_GRAPH", "1") == "1"
+            ):
+                return self._make_verify_row_lod_graph_safe(
+                    self.forward_metadata.core_attn_metadata, num_queries, device
+                )
             batch_size = forward_batch.batch_size
             aux = _get_graph_extend_aux(
                 self._attention_graph_extend_aux, batch_size, num_queries, device
@@ -1116,9 +1026,6 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             )
             kv_lens.copy_(forward_batch.seq_lens[:batch_size].to(torch.int32))
             torch.maximum(kv_lens, query_lens, out=kv_lens)
-            _log_graph_extend_lod(
-                forward_batch, num_queries, q_lod_cpu, kv_lens_cpu, kv_lens, query_lens
-            )
             return q_lod_cpu, q_lod, kv_lens_cpu, kv_lens
 
         if _dsa_cp_prefill_ranks(forward_batch) is not None:
@@ -1218,7 +1125,6 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
             return q.new_empty(q.shape[0], q.shape[1], layer.v_head_dim)
         assert k is v, "DeepseekV4 shares k and v"
-        _log_cache_write_slots(forward_batch, layer, save_kv_cache, self)
         if save_kv_cache:
             self.store_cache(layer.layer_id, k, forward_batch)
 
@@ -1232,6 +1138,24 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         win_indices = self._match_queries(core.swa_page_indices, q.shape[0], 0)
         win_indices = win_indices[:, :swa_size].contiguous()
         win_lengths = self._match_queries(core.swa_topk_lengths, q.shape[0], 0)
+        if self.is_dspark_draft:
+            # draft 窗口构造器把 ``swa_topk_lengths`` 之后的 lane 标成 -1，而
+            # ``compressed_attention`` 没有 window-length 参数。所以 -1 不能简单
+            # clamp 成 page 0——算子会把它当成真 KV 参与 softmax（实测 192 个 lane 里
+            # 有 59 个无效，约 31% 权重落在无关 token 上）。它的窗口循环上界是
+            # ``min(kv_len, max_window_size)``，因此掩掉尾部的办法是把 kv_len 夹到
+            # 窗口长度，见下面的 clamp。
+            if (
+                win_lengths.numel()
+                and os.environ.get("DSV4_KUNLUN_DRAFT_WINDOW_COMPACT", "0") == "1"
+            ):
+                # DSV4_KUNLUN_DRAFT_WINDOW_KVLEN=0 时的旧退路：压缩 lane 维度让
+                # ``max_window_size`` 自己成为掩码。但 ``valid`` 是设备端取值、
+                # 结果 shape 依赖数据，录不进 CUDA graph。
+                valid = int(win_lengths.max().item())
+                valid = max(1, min(valid, win_indices.shape[1]))
+                win_indices = win_indices[:, :valid].contiguous()
+            win_indices.masked_fill_(win_indices < 0, 0)
         extra_cache = None
         extra_indices = None
         extra_lengths = None
@@ -1247,29 +1171,13 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         extra_lengths = self._match_queries(extra_lengths, q.shape[0], 0)
         q_3d = q.squeeze(1) if q.ndim == 4 else q
         local_sink = attn_sink
-        # Diagnostic: drop the padded TP head slots before the operator so a
-        # padded-head dependency inside the vendor kernel becomes observable.
         padded_q_heads = None
-        local_heads_probe = getattr(layer, "tp_q_head_num", None)
-        if (
-            os.environ.get("DSV4_KUNLUN_LOCAL_Q_ONLY") == "1"
-            and q_3d.ndim == 3
-            and local_heads_probe
-            and q_3d.shape[1] > local_heads_probe
-        ):
-            padded_q_heads = q_3d.shape[1]
-            q_3d = q_3d[:, :local_heads_probe].contiguous()
-            if local_sink is not None and local_sink.numel() == padded_q_heads:
-                local_sink = local_sink[:local_heads_probe].contiguous()
         original_dtype = q_3d.dtype
 
-        _log_row_lengths(
-            forward_batch, core, None, None, win_lengths, extra_lengths
-        )
-        _log_verify_row0_window(
-            forward_batch, core, layer, win_lengths, extra_lengths, win_indices
-        )
-        if os.environ.get("DSV4_KUNLUN_REFERENCE_ONLY") == "1":
+        if (
+            os.environ.get("DSV4_KUNLUN_REFERENCE_ONLY") == "1"
+            or os.environ.get("DSV4_KUNLUN_REFERENCE_ATTN") == "1"
+        ):
 
             if extra_cache is not None:
                 page_width = pool.page_size // compress_ratio
@@ -1300,23 +1208,6 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             _dsv4_dump_backend_tensor(
                 self, "compressed_attention.output.out", reference_out, layer
             )
-            _dump_row0_layer_tensors(
-                forward_batch, layer, q_3d, reference_out, win_lengths, extra_lengths
-            )
-            _check_verify_row0_independence(
-                forward_batch=forward_batch,
-                layer=layer,
-                reference_out=reference_out,
-                q=q_3d,
-                win_cache=win_cache,
-                win_indices=win_indices,
-                win_lengths=win_lengths,
-                softmax_scale=self.softmax_scale,
-                attn_sink=local_sink,
-                extra_cache=extra_cache,
-                extra_indices=extra_indices,
-                extra_lengths=extra_lengths,
-            )
             return reference_out
 
         if q_3d.dtype != win_cache.dtype:
@@ -1324,6 +1215,19 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         q_lod_cpu, q_lod, kv_lens_cpu, kv_lens = self._make_lod(
             forward_batch, q_3d.shape[0], q_3d.device
         )
+        if (
+            self.is_dspark_draft
+            and win_lengths.numel()
+            and os.environ.get("DSV4_KUNLUN_DRAFT_WINDOW_KVLEN", "1") == "1"
+        ):
+            # ``compressed_attention`` 的窗口循环上界是 ``min(kv_len,
+            # max_window_size)``，而 draft 的 kv_len 是整个序列长度，远超
+            # ``swa_topk_lengths``，无效 lane 会全被 attend。把 kv_len 夹到窗口长度
+            # 等价于 lane 压缩，但 shape 不依赖数据，能被 capture。draft 各行共用同一
+            # 个窗口长度，所以这里取 ``max()`` 是精确的。
+            # 只夹设备端张量：``kv_lens_cpu`` 在 capture 期是占位符。实测同时夹它
+            # 产生逐字节相同的 836 token 输出。
+            kv_lens = torch.minimum(kv_lens, win_lengths.max().to(kv_lens.dtype))
         cp_prefill = _dsa_cp_prefill_ranks(forward_batch) is not None
         if int(q_lod_cpu[-1].item()) != q_3d.shape[0]:
             raise ValueError(
@@ -1347,9 +1251,12 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             page_width = pool.page_size // compress_ratio
             extra_cache = extra_cache[:, : page_width * cache_dim].reshape(-1, cache_dim)
             if (
-                forward_batch.forward_mode.is_decode_or_idle()
-                or _is_graph_extend_mode(forward_batch.forward_mode)
-            ) and torch.cuda.is_current_stream_capturing():
+                (
+                    forward_batch.forward_mode.is_decode_or_idle()
+                    or _is_graph_extend_mode(forward_batch.forward_mode)
+                )
+                and torch.cuda.is_current_stream_capturing()
+            ):
                 # During graph capture (decode, TARGET_VERIFY, DRAFT_EXTEND_V2),
                 # kv_lens_cpu holds dummy placeholder values. Use the full static
                 # stride so replay can consume the actual indices produced in-graph,
@@ -1357,6 +1264,19 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 compressed_topk = extra_indices.shape[1]
             else:
                 max_seq_len = int(kv_lens_cpu.max().item()) if kv_lens_cpu.numel() else 0
+                if (
+                    forward_batch.forward_mode.is_target_verify()
+                    and kv_lens_cpu.numel()
+                    and os.environ.get("DSV4_VERIFY_PREFIX_TOPK", "1") == "1"
+                ):
+                    # ``compressed_topk`` 是作用于所有 query 行的单个标量，原先取自
+                    # 最长的那一行。TARGET_VERIFY 里最长的是最后一个草稿位置，于是每
+                    # 一行（包括只有它是已提交的第 0 行）都被允许读到覆盖草稿块的那条
+                    # 压缩项，而这条项就是本次前向里发布的。改成按最短行（即已提交
+                    # 前缀）来定上界：0..K-1 项只覆盖 < K*ratio <= 前缀的位置，任何行
+                    # 都到不了未提交位置。信息没丢——被排除的 token 本来就在精确 SWA
+                    # 窗口（>=128）里。
+                    max_seq_len = int(kv_lens_cpu.min().item())
                 compressed_topk = min(
                     max(max_seq_len // compress_ratio, 1), extra_indices.shape[1]
                 )
@@ -1792,7 +1712,10 @@ def _compute_c4_logits_kunlun(
         forward_batch is not None
         and forward_batch.forward_mode.is_target_verify()
     )
-    if os.environ.get("DSV4_KUNLUN_REFERENCE_ONLY") == "1":
+    if (
+        os.environ.get("DSV4_KUNLUN_REFERENCE_ONLY") == "1"
+        or os.environ.get("DSV4_KUNLUN_REFERENCE_C4") == "1"
+    ):
         if is_target_verify:
             return _c4_target_verify_logits_chunked(
                 q_fp8=q_fp8,
