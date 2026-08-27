@@ -605,6 +605,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
             + self.num_experts
         ) // self.num_experts
+        # low-latency dispatch 算子只吃 bf16；后面 expert GEMM 会在需要时转回 fp16。
+        if hidden_states.dtype is torch.float16:
+            hidden_states = hidden_states.to(torch.bfloat16)
         hidden_states, masked_m, hook = self._dispatch_core(
             hidden_states,
             topk_ids,

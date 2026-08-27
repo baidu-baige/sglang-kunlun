@@ -7,9 +7,12 @@ import logging
 import sys
 import types
 
+import torch
+
 from sglang_kunlun.kernels.kernel_ops import register_jit_op
 
 logger = logging.getLogger(__name__)
+_WARNED_PAGED_MQA_METADATA = False
 
 
 def _get_or_create_deep_gemm_module():
@@ -55,7 +58,14 @@ def get_num_sms() -> int:
 
 @_register_deep_gemm_stub("get_paged_mqa_logits_metadata")
 def get_paged_mqa_logits_metadata(seqlens=None, *args, **kwargs):
-    """Return the no-op paged MQA schedule the Kunlun indexer ignores."""
+    """Return placeholder paged MQA metadata until Kunlun provides an equivalent."""
 
-    return _NoopPagedMqaSchedule()
-
+    global _WARNED_PAGED_MQA_METADATA
+    if not _WARNED_PAGED_MQA_METADATA:
+        logger.warning(
+            "deep_gemm.get_paged_mqa_logits_metadata is not supported on Kunlun; "
+            "returning an empty placeholder tensor"
+        )
+        _WARNED_PAGED_MQA_METADATA = True
+    device = seqlens.device if isinstance(seqlens, torch.Tensor) else None
+    return torch.empty(0, dtype=torch.int32, device=device)

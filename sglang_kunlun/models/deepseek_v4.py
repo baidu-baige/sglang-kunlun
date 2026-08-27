@@ -171,9 +171,7 @@ def moe_gate_forward_kunlun(
     if hidden_states.dtype not in (torch.bfloat16, torch.float16):
         raise TypeError(f"unsupported Kunlun MoE gate input dtype: {hidden_states.dtype}")
     if self.weight.dtype != hidden_states.dtype:
-        raise TypeError(
-            f"Kunlun MoE gate dtype mismatch: {hidden_states.dtype} != {self.weight.dtype}"
-        )
+        hidden_states = hidden_states.to(dtype=self.weight.dtype)
     return hidden_states @ self.weight.T
 
 

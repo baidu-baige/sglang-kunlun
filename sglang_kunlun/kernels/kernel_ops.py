@@ -1253,6 +1253,67 @@ def _dsv4_norm_rope_torch(
     return value
 
 
+@register_triton_op(
+    "sglang.kernels.ops.speculative.ragged_verify_kernels",
+    "_qo_indptr_kernel",
+)
+def qo_indptr_kernel(
+    verify_lens_ptr: torch.Tensor,
+    qo_indptr_ptr: torch.Tensor,
+    extend_start_loc_ptr: torch.Tensor,
+    bs: int,
+    BLOCK: int,
+) -> None:
+    """Build inclusive and exclusive verify-length prefix sums."""
+
+    verify_lens = verify_lens_ptr[:bs].to(torch.int32)
+    inclusive = torch.cumsum(verify_lens, dim=0, dtype=torch.int32)
+    exclusive = inclusive - verify_lens
+
+    qo_indptr_ptr[0] = 0
+    qo_indptr_ptr[1 : bs + 1].copy_(inclusive.to(qo_indptr_ptr.dtype))
+    extend_start_loc_ptr[:bs].copy_(exclusive.to(extend_start_loc_ptr.dtype))
+
+
+@register_triton_op(
+    "sglang.kernels.ops.speculative.ragged_verify_kernels",
+    "_padded_to_bucket_kernel",
+)
+def padded_to_bucket_kernel(
+    verify_lens_ptr: torch.Tensor,
+    out_ptr: torch.Tensor,
+    bs: int,
+    padded_bs: int,
+    graph_num_tokens: int,
+    BLOCK: int,
+) -> None:
+    """Pad verify lengths to a CUDA-graph bucket using Torch operations."""
+
+    assert padded_bs >= bs, (
+        f"padded_bs {padded_bs} < bs {bs}: the captured tier cannot hold "
+        "this batch's requests"
+    )
+    verify_lens = verify_lens_ptr[:bs].to(torch.int64)
+    leftover = graph_num_tokens - verify_lens.sum()
+    num_pad = padded_bs - bs
+
+    if num_pad > 0:
+        base = leftover // num_pad
+        rem = leftover - base * num_pad
+        pad_idx = torch.arange(
+            num_pad, device=verify_lens.device, dtype=torch.int64
+        )
+        pad_lens = base + (pad_idx < rem).to(torch.int64)
+        final = torch.cat((verify_lens, pad_lens))
+    else:
+        final = verify_lens.clone()
+        if bs > 0:
+            final[-1] += leftover
+
+    out_ptr[:padded_bs].copy_(final.to(out_ptr.dtype))
+
+
+
 @register_jit_op(
     "sglang.kernels.ops.attention.dsv4.compress", "compress_norm_rope_store"
 )
@@ -1514,6 +1575,650 @@ def seqlens_expand_kernel(
     starts = (seq_lens - extend_seq_lens + 1).to(output.dtype)
     request_starts = torch.repeat_interleave(starts, extend_seq_lens)
     output.copy_(request_starts + token_offsets - request_offsets)
+
+
+@register_triton_op(
+    "sglang.kernels.ops.attention.dsv4_attn_metadata_kernels",
+    "_page_table_positions_kernel",
+)
+def page_table_positions_kernel(
+    req_to_token_ptr: torch.Tensor,
+    req_pool_ptr: torch.Tensor,
+    seq_lens_ptr: torch.Tensor,
+    seq_lens_out_ptr: torch.Tensor,
+    positions_out_ptr: torch.Tensor,
+    page_table_ptr: torch.Tensor,
+    topk_out_ptr: torch.Tensor,
+    rt_stride: int,
+    num_pages: int,
+    page_size: int,
+    swa_window: int,
+    BLOCK_P: int,
+) -> None:
+    """Build DeepSeek-V4 page-table metadata without Triton."""
+
+    del BLOCK_P
+    seq_lens = seq_lens_ptr.to(torch.int32)
+    seq_lens_out_ptr.copy_(seq_lens)
+    positions_out_ptr.copy_(seq_lens - 1)
+    topk_out_ptr.copy_(torch.clamp(seq_lens, max=swa_window))
+
+    request_indices = req_pool_ptr.to(torch.int64)
+    token_pool = req_to_token_ptr.as_strided(
+        req_to_token_ptr.shape, (rt_stride, 1)
+    )
+    
+    page_tokens = token_pool[
+        request_indices, : num_pages * page_size : page_size
+    ]
+    page_table_ptr.copy_((page_tokens // page_size).to(page_table_ptr.dtype))
+
+
+@register_triton_op(
+    "sglang.kernels.ops.speculative.dspark.dspark_attn_metadata",
+    "_window_gather_kernel",
+)
+def window_gather_kernel(
+    seq_lens_casual_ptr: torch.Tensor,
+    req_pool_rep_ptr: torch.Tensor,
+    context_lens_ptr: torch.Tensor,
+    req_pool_out_ptr: torch.Tensor,
+    offsets_ptr: torch.Tensor,
+    invalid_ptr: torch.Tensor,
+    block_size: int,
+    swa_window: int,
+    W_BLOCK: int,
+) -> None:
+    """Build DSpark sliding-window metadata without Triton."""
+
+    del W_BLOCK
+    bs = context_lens_ptr.numel()
+    first_token = (
+        torch.arange(bs, device=seq_lens_casual_ptr.device, dtype=torch.int64)
+        * block_size
+    )
+    prefix = seq_lens_casual_ptr.index_select(0, first_token).to(torch.int64) - 1
+    context_lens_ptr.copy_(
+        torch.clamp(prefix, max=swa_window).to(context_lens_ptr.dtype)
+    )
+    req_pool_out_ptr.copy_(
+        req_pool_rep_ptr.index_select(0, first_token).to(req_pool_out_ptr.dtype)
+    )
+
+    columns = torch.arange(
+        swa_window, device=seq_lens_casual_ptr.device, dtype=torch.int64
+    )
+    window_offsets = prefix[:, None] - swa_window + columns[None, :]
+    invalid_ptr.copy_(window_offsets.lt(0).to(invalid_ptr.dtype))
+    offsets_ptr.copy_(window_offsets.clamp(min=0).to(offsets_ptr.dtype))
+
+
+@register_triton_op(
+    "sglang.kernels.ops.speculative.dspark.dspark_attn_metadata",
+    "_swa_page_indices_kernel",
+)
+def swa_page_indices_kernel(
+    req_to_token_ptr: torch.Tensor,
+    full_to_swa_ptr: torch.Tensor,
+    req_pool_ptr: torch.Tensor,
+    offsets_ptr: torch.Tensor,
+    out_loc_ptr: torch.Tensor,
+    context_lens_ptr: torch.Tensor,
+    out_ptr: torch.Tensor,
+    topk_ptr: torch.Tensor,
+    rt_stride: int,
+    swa_window: int,
+    block_size: int,
+    target_width: int,
+    TW_BLOCK: int,
+) -> None:
+    """Build DSpark SWA page indices without Triton.
+
+    The upstream Triton kernel masks every load (``tl.load(..., mask=..., other=``
+    ``0/-1)``), so a lane outside the window / draft block never dereferences
+    memory. This dense rewrite reads every lane first and drops the invalid ones
+    afterwards with ``torch.where``, so every index expression must be clamped
+    into its tensor bounds by hand -- otherwise CUDA-graph bs padding (whose
+    extra rows have small ``context_lens`` and an ``out_loc`` that no longer
+    spans ``bs * block_size``) walks off the end of ``out_loc`` /
+    ``full_to_swa``. That surfaces as ``index_select_mt<int, long>`` in dmesg and
+    an error-700 illegal memory access at the next sync. Clamping is semantically
+    free: the clamped lanes are exactly the ones ``torch.where`` discards.
+    """
+
+    del TW_BLOCK
+    n_q = out_ptr.shape[0]
+    device = out_ptr.device
+    rows = torch.arange(n_q, device=device, dtype=torch.int64)
+    request_rows = rows // block_size
+    context_lens = context_lens_ptr.index_select(0, request_rows).to(torch.int64)
+    request_pool = req_pool_ptr.index_select(0, request_rows).to(torch.int64)
+    columns = torch.arange(target_width, device=device, dtype=torch.int64)
+
+    source_columns = (
+        swa_window - context_lens[:, None] + columns[None, :]
+    ).clamp(min=0, max=swa_window - 1)
+    window_mask = columns[None, :] < context_lens[:, None]
+    request_offsets = offsets_ptr.index_select(0, request_rows).to(torch.int64)
+    window_offsets = torch.gather(request_offsets, 1, source_columns)
+    token_pool = req_to_token_ptr.as_strided(
+        req_to_token_ptr.shape, (rt_stride, 1)
+    )
+    swa_limit = full_to_swa_ptr.shape[0] - 1
+    window_full = token_pool[
+        request_pool[:, None].clamp(min=0, max=token_pool.shape[0] - 1),
+        window_offsets.clamp(min=0, max=token_pool.shape[1] - 1),
+    ]
+    window_swa = full_to_swa_ptr[
+        window_full.clamp(min=0, max=swa_limit)
+    ].to(torch.int32)
+
+    block_mask = (columns[None, :] >= context_lens[:, None]) & (
+        columns[None, :] < context_lens[:, None] + block_size
+    )
+    block_columns = (columns[None, :] - context_lens[:, None]).clamp(
+        min=0, max=block_size - 1
+    )
+    block_full = out_loc_ptr[
+        (request_rows[:, None] * block_size + block_columns).clamp(
+            min=0, max=out_loc_ptr.shape[0] - 1
+        )
+    ].to(torch.int64)
+    block_swa = full_to_swa_ptr[
+        block_full.clamp(min=0, max=swa_limit)
+    ].to(torch.int32)
+    values = torch.where(
+        window_mask,
+        window_swa,
+        torch.where(block_mask, block_swa, -1),
+    )
+    out_ptr.copy_(values.to(out_ptr.dtype))
+    topk_ptr.copy_(
+        (context_lens + block_size).to(topk_ptr.dtype)
+    )
+
+
+@register_triton_op(
+    "sglang.kernels.ops.speculative.dspark.dspark_attn_metadata",
+    "_block_seq_lens_casual_kernel",
+)
+def block_seq_lens_casual_kernel(
+    seq_lens_ptr: torch.Tensor,
+    out_ptr: torch.Tensor,
+    block_size: int,
+    n_out: int,
+    BLOCK: int,
+) -> None:
+    """Build causal sequence lengths for each DSpark block."""
+
+    del BLOCK
+    offsets = torch.arange(n_out, device=out_ptr.device, dtype=torch.int64)
+    rows = offsets // block_size
+    columns = offsets % block_size
+    values = seq_lens_ptr.index_select(0, rows).to(torch.int64) + columns + 1
+    out_ptr.copy_(values.to(out_ptr.dtype))
+
+
+@register_triton_op(
+    "sglang.kernels.ops.speculative.dspark.dspark_accept",
+    "_softmax_temp_kernel",
+)
+def softmax_temp_kernel(
+    logits_ptr: torch.Tensor,
+    temp_ptr: torch.Tensor,
+    out_ptr: torch.Tensor,
+    vocab: int,
+    rows_per_request: int,
+    logits_row_stride: int,
+    BLOCK_V: int,
+) -> None:
+    """Apply per-request temperatures and compute row-wise softmax."""
+    del logits_row_stride, BLOCK_V
+    num_rows = out_ptr.shape[0]
+    bs = num_rows // rows_per_request
+    assert (
+        bs * rows_per_request == num_rows
+    ), f"num_rows {num_rows} not divisible by rows_per_request {rows_per_request}"
+
+    logits = logits_ptr[:num_rows, :vocab].to(torch.float32)
+    temperatures = temp_ptr[:bs].reshape(bs).to(torch.float32)
+    temperatures = torch.repeat_interleave(
+        temperatures, rows_per_request, dim=0
+    ).unsqueeze(-1)
+    out_ptr.copy_(torch.softmax(logits / temperatures, dim=-1).to(out_ptr.dtype))
+
+
+@register_triton_op(
+    "sglang.kernels.ops.speculative.dspark.dspark_accept",
+    "_gather_two_level_bonus_kernel",
+)
+def gather_two_level_bonus_kernel(
+    accept_index_ptr: torch.Tensor,
+    predicts_ptr: torch.Tensor,
+    correct_len_ptr: torch.Tensor,
+    out_ptr: torch.Tensor,
+    cols: int,
+    n: int,
+    BLOCK: int,
+) -> None:
+    """Gather accepted bonus tokens from the two-level accept index."""
+    del BLOCK
+    rows = torch.arange(n, device=out_ptr.device, dtype=torch.int64)
+    correct_len = correct_len_ptr[:n].to(torch.int64)
+    accept_index = accept_index_ptr.reshape(-1, cols)
+    accept_pos = accept_index[rows, correct_len].to(torch.int64)
+    out_ptr[:n].copy_(predicts_ptr[accept_pos].to(out_ptr.dtype))
+
+
+@register_triton_op(
+    "sglang.kernels.ops.speculative.dspark.dspark_accept",
+    "_gather_row_bonus_kernel",
+)
+def gather_row_bonus_kernel(
+    table_ptr: torch.Tensor,
+    idx_ptr: torch.Tensor,
+    out_ptr: torch.Tensor,
+    cols: int,
+    n: int,
+    BLOCK: int,
+) -> None:
+    """Gather one bonus token from each row using per-row column indices."""
+
+    del BLOCK
+    rows = torch.arange(n, device=out_ptr.device, dtype=torch.int64)
+    indices = idx_ptr[:n].to(device=out_ptr.device, dtype=torch.int64)
+    flat_offsets = rows * cols + indices
+    values = table_ptr.reshape(-1).index_select(0, flat_offsets)
+    out_ptr[:n].copy_(values.to(torch.int64))
+
+
+@register_triton_op(
+    "sglang.kernels.ops.speculative.dspark.dspark_accept",
+    "_mixed_accept_select_kernel",
+)
+def mixed_accept_select_kernel(
+    greedy_mask_ptr: torch.Tensor,
+    greedy_len_ptr: torch.Tensor,
+    greedy_bonus_ptr: torch.Tensor,
+    greedy_trim_ptr: torch.Tensor,
+    sampling_len_ptr: torch.Tensor,
+    sampling_bonus_ptr: torch.Tensor,
+    sampling_trim_ptr: torch.Tensor,
+    correct_len_ptr: torch.Tensor,
+    bonus_ptr: torch.Tensor,
+    cap_trim_ptr: torch.Tensor,
+    bs: int,
+    BLOCK: int,
+) -> None:
+    """Select greedy or sampling accept results row by row."""
+    del BLOCK
+    is_greedy = greedy_mask_ptr[:bs].to(torch.bool)
+    correct_len = torch.where(
+        is_greedy,
+        greedy_len_ptr[:bs].to(correct_len_ptr.dtype),
+        sampling_len_ptr[:bs],
+    )
+    bonus = torch.where(
+        is_greedy, greedy_bonus_ptr[:bs], sampling_bonus_ptr[:bs]
+    )
+    cap_trim = torch.where(
+        is_greedy,
+        greedy_trim_ptr[:bs].to(cap_trim_ptr.dtype),
+        sampling_trim_ptr[:bs],
+    )
+    correct_len_ptr[:bs].copy_(correct_len)
+    bonus_ptr[:bs].copy_(bonus)
+    cap_trim_ptr[:bs].copy_(cap_trim)
+
+
+@register_triton_op(
+    "sglang.kernels.ops.speculative.dspark.dspark_draft_model",
+    "_online_partial_kernel",
+)
+def online_partial_kernel(
+    logits_ptr: torch.Tensor,
+    temperatures_ptr: torch.Tensor,
+    greedy_mask_ptr: torch.Tensor,
+    exp_noise_ptr: torch.Tensor,
+    tile_max_ptr: torch.Tensor,
+    partial_key_ptr: torch.Tensor,
+    partial_idx_ptr: torch.Tensor,
+    V: int,
+    stride_row: int,
+    n_tiles: int,
+    BLOCK_V: int,
+) -> None:
+    """Compute per-tile sampling maxima and token candidates."""
+
+    del stride_row
+    bs = logits_ptr.shape[0]
+    tile_ids = torch.arange(n_tiles, device=logits_ptr.device, dtype=torch.int64)
+    columns = torch.arange(BLOCK_V, device=logits_ptr.device, dtype=torch.int64)
+    indices = tile_ids[:, None] * BLOCK_V + columns[None, :]
+    mask = indices < V
+    safe_indices = indices.clamp(max=max(V - 1, 0))
+    logits = logits_ptr[:, safe_indices].to(torch.float32)
+    logits = logits.masked_fill(~mask[None, :, :], float("-inf"))
+    temperatures = temperatures_ptr[:bs, None].to(torch.float32)
+    scaled = logits / temperatures[:, None, :]
+    tile_max = scaled.amax(dim=-1)
+    greedy = greedy_mask_ptr[:bs].to(torch.bool)[:, None, None]
+    noise = exp_noise_ptr[:bs, safe_indices].to(torch.float32)
+    denominator = torch.where(greedy, torch.ones_like(noise), noise)
+    keys = torch.exp(scaled - tile_max[:, :, None]) / denominator
+    keys = keys.masked_fill(~mask[None, :, :], -1.0)
+    best = keys.amax(dim=-1)
+    candidates = torch.where(
+        keys == best[:, :, None],
+        indices[None, :, :],
+        torch.iinfo(torch.int32).max,
+    )
+    tile_max_ptr.copy_(tile_max.to(tile_max_ptr.dtype))
+    partial_key_ptr.copy_(best.to(partial_key_ptr.dtype))
+    partial_idx_ptr.copy_(candidates.amin(dim=-1).to(partial_idx_ptr.dtype))
+
+
+@register_triton_op(
+    "sglang.kernels.ops.speculative.dspark.dspark_draft_model",
+    "_online_combine_kernel",
+)
+def online_combine_kernel(
+    tile_max_ptr: torch.Tensor,
+    partial_key_ptr: torch.Tensor,
+    partial_idx_ptr: torch.Tensor,
+    next_tokens_ptr: torch.Tensor,
+    n_tiles: int,
+    BLOCK_TILES: int,
+) -> None:
+    """Combine online sampling tile results into next-token indices."""
+
+    del BLOCK_TILES
+    tile_max = tile_max_ptr[:, :n_tiles].to(torch.float32)
+    keys = partial_key_ptr[:, :n_tiles].to(torch.float32)
+    indices = partial_idx_ptr[:, :n_tiles]
+    global_max = tile_max.amax(dim=-1, keepdim=True)
+    rescaled = keys * torch.exp(tile_max - global_max)
+    best = rescaled.amax(dim=-1, keepdim=True)
+    sentinel = torch.iinfo(torch.int32).max
+    candidates = torch.where(
+        rescaled == best,
+        indices,
+        torch.full_like(indices, sentinel),
+    )
+    next_tokens = candidates.amin(dim=-1).masked_fill(
+        candidates.amin(dim=-1) == sentinel, 0
+    )
+    next_tokens_ptr.copy_(next_tokens.to(next_tokens_ptr.dtype))
+
+
+@register_triton_op(
+    "sglang.kernels.ops.speculative.dspark.dspark_draft_model",
+    "_build_step_local_kernel",
+)
+def build_step_local_kernel(
+    bias_ptr: torch.Tensor,
+    base_ptr: torch.Tensor,
+    out_ptr: torch.Tensor,
+    org_width: int,
+    per_partition: int,
+    BLOCK: int,
+) -> None:
+    """Add padded DSpark step-local bias to the base logits."""
+
+    del BLOCK
+    bias = bias_ptr[:, :org_width].to(torch.float32)
+    base = base_ptr[:, :per_partition].to(torch.float32)
+    if org_width < per_partition:
+        bias = torch.nn.functional.pad(bias, (0, per_partition - org_width))
+    else:
+        bias = bias[:, :per_partition]
+    out_ptr.copy_((base + bias).to(out_ptr.dtype))
+
+
+@register_triton_op(
+    "sglang.kernels.ops.speculative.dspark.dspark_accept",
+    "_finalize_accept_lens_kernel",
+)
+def finalize_accept_lens_kernel(
+    correct_len_ptr: torch.Tensor,
+    cap_trim_ptr: torch.Tensor,
+    prefix_lens_ptr: torch.Tensor,
+    commit_lens_ptr: torch.Tensor,
+    new_seq_lens_ptr: torch.Tensor,
+    cap_trim_out_ptr: torch.Tensor,
+    bs: int,
+    BLOCK: int,
+) -> None:
+    """Finalize DSpark accepted lengths without Triton."""
+    del BLOCK
+    correct_len = correct_len_ptr[:bs].to(torch.int32)
+    commit_lens_ptr[:bs].copy_(correct_len + 1)
+    new_seq_lens_ptr[:bs].copy_(
+        prefix_lens_ptr[:bs] + (correct_len + 1).to(prefix_lens_ptr.dtype)
+    )
+    cap_trim_out_ptr[:bs].copy_(cap_trim_ptr[:bs].to(cap_trim_out_ptr.dtype))
+
+
+@register_triton_op(
+    "sglang.kernels.ops.speculative.dspark.dspark_accept",
+    "_cap_correct_len_kernel",
+)
+def cap_correct_len_kernel(
+    correct_len_ptr: torch.Tensor,
+    verify_lens_ptr: torch.Tensor,
+    capped_ptr: torch.Tensor,
+    trim_ptr: torch.Tensor,
+    n: int,
+    BLOCK: int,
+) -> None:
+    """Cap accepted lengths to the available verification window."""
+    del BLOCK
+    correct_len = correct_len_ptr[:n]
+    limit = (verify_lens_ptr[:n].to(correct_len.device) - 1).to(
+        correct_len.dtype
+    )
+    capped = torch.minimum(correct_len, limit)
+    capped_ptr[:n].copy_(capped)
+    trim_ptr[:n].copy_((correct_len - capped).to(trim_ptr.dtype))
+
+
+@register_triton_op(
+    "sglang.kernels.ops.speculative.dspark.dspark_verify_window",
+    "_ragged_finalize_kernel",
+)
+def ragged_finalize_kernel(
+    req_ptr: torch.Tensor,
+    within_ptr: torch.Tensor,
+    prefix_ptr: torch.Tensor,
+    cache_ptr: torch.Tensor,
+    pos_out_ptr: torch.Tensor,
+    cache_out_ptr: torch.Tensor,
+    bs: int,
+    n: int,
+    real_len: int,
+    BLOCK: int,
+) -> None:
+    """Finalize padded ragged verification positions and cache locations."""
+    del BLOCK
+    offsets = torch.arange(n, device=pos_out_ptr.device, dtype=torch.int64)
+    req = req_ptr[:n].to(torch.int64)
+    within = within_ptr[:n].to(torch.int64)
+    valid = req < bs
+    safe_req = req.clamp(min=0, max=max(bs - 1, 0))
+    prefix = prefix_ptr[safe_req].to(torch.int64)
+    positions = torch.where(valid, prefix + within, torch.zeros_like(within))
+
+    safe_cache_offset = offsets.clamp(min=0, max=max(real_len - 1, 0))
+    cache_values = cache_ptr[safe_cache_offset]
+    cache_valid = valid & (offsets < real_len)
+    cache_values = torch.where(
+        cache_valid, cache_values, torch.zeros_like(cache_values)
+    )
+    pos_out_ptr[:n].copy_(positions.to(pos_out_ptr.dtype))
+    cache_out_ptr[:n].copy_(cache_values.to(cache_out_ptr.dtype))
+
+
+@register_triton_op(
+    "sglang.kernels.ops.speculative.dspark.dspark_verify_window",
+    "_compact_row_index_kernel",
+)
+def compact_row_index_kernel(
+    incl_ptr: torch.Tensor,
+    req_out_ptr: torch.Tensor,
+    within_out_ptr: torch.Tensor,
+    valid_out_ptr: torch.Tensor,
+    bs: int,
+    n: int,
+    BLOCK: int,
+    NBITS: int,
+) -> None:
+    """Map padded rows to compact request/within-row indices."""
+    del BLOCK, NBITS
+    incl = incl_ptr[:bs].to(torch.int64)
+    rows = torch.arange(n, device=req_out_ptr.device, dtype=torch.int64)
+    real_total = incl[-1] if bs else torch.zeros((), device=rows.device)
+    valid = rows < real_total
+    req = torch.searchsorted(incl, rows, right=True)
+    safe_req = req.clamp(min=0, max=max(bs - 1, 0))
+    starts = torch.where(req > 0, incl[safe_req - 1], torch.zeros_like(req))
+    within = torch.where(valid, rows - starts, torch.zeros_like(rows))
+    req = torch.where(valid, req, torch.full_like(req, bs))
+    req_out_ptr[:n].copy_(req.to(req_out_ptr.dtype))
+    within_out_ptr[:n].copy_(within.to(within_out_ptr.dtype))
+    valid_out_ptr[:n].copy_(valid.to(valid_out_ptr.dtype))
+
+
+@register_triton_op(
+    "sglang.kernels.ops.speculative.dspark.dspark_verify_window",
+    "_compact_verify_ids_gather_kernel",
+)
+def compact_verify_ids_gather_kernel(
+    req_ptr: torch.Tensor,
+    within_ptr: torch.Tensor,
+    draft_block_ids_ptr: torch.Tensor,
+    draft_tokens_ptr: torch.Tensor,
+    out_ptr: torch.Tensor,
+    bs: int,
+    gamma: int,
+    n: int,
+    BLOCK: int,
+) -> None:
+    """Gather compact verification token ids from ragged row indices."""
+    del BLOCK
+    req = req_ptr[:n].to(torch.int64)
+    within = within_ptr[:n].to(torch.int64)
+    valid = req < bs
+    safe_req = req.clamp(min=0, max=max(bs - 1, 0))
+    draft_block_ids = draft_block_ids_ptr.reshape(-1, gamma)
+    draft_tokens = draft_tokens_ptr.reshape(-1, gamma)
+    anchor = draft_block_ids[safe_req, 0]
+    draft_col = (within - 1).clamp(min=0, max=max(gamma - 1, 0))
+    draft = draft_tokens[safe_req, draft_col]
+    values = torch.where(within == 0, anchor, draft)
+    values = torch.where(valid, values, torch.zeros_like(values))
+    out_ptr[:n].copy_(values.to(out_ptr.dtype))
+
+
+@register_triton_op(
+    "sglang.kernels.ops.speculative.dspark.dspark_verify_window",
+    "_scatter_compact_to_strided_kernel",
+)
+def scatter_compact_to_strided_kernel(
+    compact_ptr: torch.Tensor,
+    verify_lens_ptr: torch.Tensor,
+    start_ptr: torch.Tensor,
+    out_ptr: torch.Tensor,
+    stride: int,
+    dim: int,
+    fill_value,
+    BLOCK_D: int,
+) -> None:
+    """Scatter compact ragged rows into fixed-stride output rows."""
+    del dim, BLOCK_D
+    n_out = out_ptr.shape[0]
+    rows = torch.arange(n_out, device=out_ptr.device, dtype=torch.int64)
+    bs = verify_lens_ptr.numel()
+    request = rows // stride
+    column = rows % stride
+    valid_request = request < bs
+    safe_request = request.clamp(min=0, max=max(bs - 1, 0))
+    verify_lens = verify_lens_ptr[safe_request].to(torch.int64)
+    valid = valid_request & (column < verify_lens)
+    starts = start_ptr[safe_request].to(torch.int64)
+    source = (starts + column).clamp(min=0, max=max(compact_ptr.shape[0] - 1, 0))
+    values = compact_ptr[source]
+    values = torch.where(
+        valid[:, None],
+        values,
+        torch.full_like(values, fill_value),
+    )
+    out_ptr[:n_out].copy_(values.to(out_ptr.dtype))
+
+
+@register_triton_op(
+    "sglang.kernels.ops.speculative.dspark.dspark_verify_window",
+    "_commit_inject_layout_kernel",
+)
+def commit_inject_layout_kernel(
+    req_pool_ptr: torch.Tensor,
+    req_to_token_ptr: torch.Tensor,
+    prefix_lens_ptr: torch.Tensor,
+    block_pos_offsets_ptr: torch.Tensor,
+    full_to_swa_ptr: torch.Tensor,
+    commit_lens_ptr: torch.Tensor,
+    swa_loc_ptr: torch.Tensor,
+    positions_ptr: torch.Tensor,
+    rt_stride: int,
+    stride: int,
+    n: int,
+    BLOCK: int,
+) -> None:
+    """Build committed SWA locations and absolute positions."""
+    del BLOCK
+    offsets = torch.arange(n, device=swa_loc_ptr.device, dtype=torch.int64)
+    request = offsets // stride
+    column = offsets % stride
+    prefix = prefix_lens_ptr[request].to(torch.int64)
+    position_offset = block_pos_offsets_ptr[column].to(torch.int64)
+    request_pool = req_pool_ptr[request].to(torch.int64)
+    token_pool = req_to_token_ptr.as_strided(
+        req_to_token_ptr.shape, (rt_stride, 1)
+    )
+    full_loc = token_pool[request_pool, prefix + position_offset].to(torch.int64)
+    swa_loc = full_to_swa_ptr[full_loc].to(torch.int32)
+    commit = column < commit_lens_ptr[request].to(torch.int64)
+    swa_loc = torch.where(commit, swa_loc, torch.full_like(swa_loc, -1))
+    swa_loc_ptr[:n].copy_(swa_loc.to(swa_loc_ptr.dtype))
+    positions_ptr[:n].copy_((prefix + position_offset).to(positions_ptr.dtype))
+
+
+@register_triton_op(
+    "sglang.kernels.ops.speculative.dspark.dspark_verify_window",
+    "_build_out_tokens_kernel",
+)
+def build_out_tokens_kernel(
+    draft_tokens_ptr: torch.Tensor,
+    correct_len_ptr: torch.Tensor,
+    bonus_ptr: torch.Tensor,
+    out_ptr: torch.Tensor,
+    gamma: int,
+    T: int,
+    n_out: int,
+    BLOCK: int,
+) -> None:
+    """Build draft tokens plus the accepted-token bonus."""
+    del BLOCK
+    offsets = torch.arange(n_out, device=out_ptr.device, dtype=torch.int64)
+    batch = offsets // T
+    column = offsets % T
+    correct_len = correct_len_ptr[batch].to(torch.int64)
+    bonus = bonus_ptr[batch]
+    draft_tokens = draft_tokens_ptr.reshape(-1, gamma)
+    safe_column = column.clamp(min=0, max=max(gamma - 1, 0))
+    draft = draft_tokens[batch, safe_column]
+    values = torch.where(column < gamma, draft, torch.zeros_like(draft))
+    values = torch.where(column == correct_len, bonus, values)
+    out_ptr.reshape(-1)[:n_out].copy_(values.to(out_ptr.dtype))
 
 
 @register_triton_op(
@@ -3184,34 +3889,30 @@ def _dsv4_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
         _DSV4_FREQS_REAL_CACHE[key] = cached
     return cached
 
-
 def _dsv4_rotate_gptj_tail(
     value: torch.Tensor,
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
-    inverse: bool = False,
 ) -> torch.Tensor:
-    rope_dim = freqs_cis.shape[-1] * 2
+    freqs_real = _dsv4_cos_sin_cache(freqs_cis)
+    rope_dim = freqs_real.shape[-1]
     rope_tail = value[..., -rope_dim:].contiguous()
-    rope_complex = torch.view_as_complex(
-        rope_tail.float().reshape(*rope_tail.shape[:-1], -1, 2)
+    rope_shape = rope_tail.shape
+    rope_tail_3d = rope_tail.reshape(rope_shape[0], -1, rope_dim)
+    rotated, _ = torch.ops.xspeedgate_ops.flashinfer_rotary_embedding(
+        positions=positions.flatten(),
+        rotary_dim=rope_dim,
+        head_size=rope_dim,
+        cos_sin_cache=freqs_real,
+        is_neox_style=False,
+        query=rope_tail_3d,
+        key=None,
+        offsets=None,
+        inverse=False,
     )
-    freqs_real = torch.view_as_real(freqs_cis)
-    gather_indices = positions.reshape(-1, 1, 1).long().expand(
-        -1, freqs_real.shape[1], freqs_real.shape[2]
-    )
-    token_freqs = torch.view_as_complex(
-        torch.gather(freqs_real, 0, gather_indices).contiguous()
-    )
-    if inverse:
-        token_freqs = token_freqs.conj()
-    while token_freqs.ndim < rope_complex.ndim:
-        token_freqs = token_freqs.unsqueeze(1)
-    rotated = torch.view_as_real(rope_complex * token_freqs).flatten(-2)
     result = value.clone()
-    result[..., -rope_dim:].copy_(rotated.to(value.dtype))
+    result[..., -rope_dim:].copy_(rotated.reshape(rope_shape))
     return result
-
 
 @register_jit_op(
     "sglang.kernels.ops.attention.dsv4.elementwise", "fused_rope_inplace"
@@ -3421,7 +4122,21 @@ def dsv4_fused_k_norm_rope_flashmla_kunlun(
     )
     rotated = _dsv4_rotate_gptj_tail(normalized, freqs_cis, positions)
     max_valid_loc = kvcache.shape[0] * page_size - 1
-    loc = out_loc.contiguous().clamp(min=0, max=max_valid_loc)
+    # A negative out_loc means "this row is not committed, do not write it"
+    # (DSpark's verify commit passes -1 for the rejected tail). Clamping it to 0
+    # would write the row into cache slot 0 instead of skipping it.
+    loc_flat = out_loc.reshape(-1)
+    skip_rows = loc_flat < 0
+    if bool(skip_rows.any()):
+        keep = (~skip_rows).nonzero(as_tuple=True)[0]
+        if keep.numel() == 0:
+            return
+        loc = loc_flat.index_select(0, keep).contiguous().clamp(
+            min=0, max=max_valid_loc
+        )
+        rotated = rotated.index_select(0, keep)
+    else:
+        loc = out_loc.contiguous().clamp(min=0, max=max_valid_loc)
     dump_layer0_k = (
         _ENABLE_DSV4_ACCURACY_DUMPS
         and kv.shape[0] == 8192
@@ -3431,6 +4146,13 @@ def dsv4_fused_k_norm_rope_flashmla_kunlun(
         and torch.distributed.get_rank() == 0
         and not getattr(dsv4_fused_k_norm_rope_flashmla_kunlun, "_dumped", False)
     )
+    rotated_rows = rotated.reshape(rotated.shape[0], -1)
+    if rotated_rows.dtype != kvcache.dtype:
+        # ``set_k_and_s_v4_with_mapping`` copies 2-byte elements without
+        # converting, so handing it bf16 rows for an fp16 cache
+        # (--kv-cache-dtype fp16) reinterprets the bits: the sign survives and
+        # the magnitude is scrambled. Convert explicitly.
+        rotated_rows = rotated_rows.to(kvcache.dtype)
     identity_key = (kvcache.device, max_valid_loc + 1)
     identity_mapping = _DSV4_IDENTITY_MAPPING_CACHE.get(identity_key)
     if identity_mapping is None:
@@ -3442,11 +4164,13 @@ def dsv4_fused_k_norm_rope_flashmla_kunlun(
         kvcache,
         loc,
         identity_mapping,
-        rotated.reshape(rotated.shape[0], -1).contiguous(),
+        rotated_rows.contiguous(),
         page_size,
     )
     if dump_layer0_k:
-        cache_rows = kvcache.view(-1, rotated.shape[-1])[loc.long()]
+        cache_rows = kvcache.view(-1, page_size, rotated_rows.shape[1]).reshape(
+            -1, rotated_rows.shape[1]
+        )[loc.long()]
         torch.save(
             {
                 "kv.raw": kv.detach().cpu(),
