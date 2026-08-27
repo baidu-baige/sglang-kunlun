@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import torch
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph as is_in_piecewise_cuda_graph,
 )
@@ -54,6 +56,8 @@ from kunlun_ops import (
     silu_and_mul_mask_fwd,
 )
 logger = logging.getLogger(__name__)
+
+_FP16_DTYPE_NAMES = frozenset(("fp16", "float16", "half"))
 
 
 class ReusedBuffer:
@@ -413,6 +417,13 @@ class DeepEPMoE(FusedMoE):
         hidden_states = self.dispatcher.combine(
             combine_input=combine_input,
         )
+        if get_global_server_args().dtype in _FP16_DTYPE_NAMES:
+            # DeepEP combine 返回 bf16，收窄到 fp16 前先 clamp，避免累加后的 MoE
+            # 输出超出 fp16 范围。
+            limit = int(os.environ.get("SGLANG_FP16_LIMIT_IN_MOE", "10"))
+            hidden_states = hidden_states.clamp(min=-limit, max=limit).to(
+                torch.float16
+            )
 
         return hidden_states
 
@@ -778,6 +789,11 @@ class DeepEPMoE(FusedMoE):
             if self.use_block_quant
             else self.w13_weight_scale
         )
+        if hidden_states_fp8[0].dtype == torch.float16:
+            hidden_states_fp8 = (
+                hidden_states_fp8[0].to(torch.int8),
+                hidden_states_fp8[1],
+            )
         kunlun_ops.m_grouped_gemm_I8_I8_bf16_nt_masked(
             hidden_states_fp8,
             (self.w13_weight, w13_scale),
