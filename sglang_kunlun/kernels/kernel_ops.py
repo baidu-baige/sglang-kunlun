@@ -1432,20 +1432,55 @@ def page_table_positions_kernel(
     """Build DeepSeek-V4 page-table metadata without Triton."""
 
     del BLOCK_P
-    seq_lens = seq_lens_ptr.to(torch.int32)
-    seq_lens_out_ptr.copy_(seq_lens)
-    positions_out_ptr.copy_(seq_lens - 1)
-    topk_out_ptr.copy_(torch.clamp(seq_lens, max=swa_window))
-
-    request_indices = req_pool_ptr.to(torch.int64)
-    token_pool = req_to_token_ptr.as_strided(
-        req_to_token_ptr.shape, (rt_stride, 1)
+    num_q = seq_lens_ptr.shape[0]
+    op = "page_table_positions"
+    _dspark_require(num_pages > 0 and page_size > 0, op, "num_pages/page_size must be > 0")
+    _dspark_require(
+        req_to_token_ptr.dim() == 2 and req_to_token_ptr.dtype == torch.int32,
+        op,
+        f"req_to_token must be 2D int32, got dim={req_to_token_ptr.dim()} "
+        f"dtype={req_to_token_ptr.dtype}",
     )
-    
-    page_tokens = token_pool[
-        request_indices, : num_pages * page_size : page_size
-    ]
-    page_table_ptr.copy_((page_tokens // page_size).to(page_table_ptr.dtype))
+    # 算子内部用 stride(0)/ceil(max_seq_len/page_size) 推导，必须与入参一致
+    _dspark_require(
+        req_to_token_ptr.stride(0) == rt_stride and req_to_token_ptr.stride(1) == 1,
+        op,
+        f"req_to_token strides {req_to_token_ptr.stride()} do not match "
+        f"rt_stride={rt_stride} with row-contiguous rows",
+    )
+    _dspark_require(
+        (num_pages - 1) * page_size < req_to_token_ptr.shape[1],
+        op,
+        f"last sampled column {(num_pages - 1) * page_size} is out of range for "
+        f"req_to_token width {req_to_token_ptr.shape[1]}",
+    )
+    _dspark_require(
+        req_pool_ptr.dim() == 1
+        and seq_lens_ptr.dim() == 1
+        and req_pool_ptr.shape[0] == num_q,
+        op,
+        "req_pool/seq_lens must be 1D with the same length",
+    )
+    _dspark_require(
+        tuple(page_table_ptr.shape) == (num_q, num_pages),
+        op,
+        f"page_table shape {tuple(page_table_ptr.shape)} != {(num_q, num_pages)}",
+    )
+
+    seq_lens, positions, page_table, topk = (
+        torch.ops.xspeedgate_ops.page_table_positions(
+            req_to_token_ptr,
+            req_pool_ptr.contiguous(),
+            seq_lens_ptr.to(torch.int32).contiguous(),
+            (num_pages - 1) * page_size + 1,
+            page_size,
+            swa_window,
+        )
+    )
+    seq_lens_out_ptr.copy_(seq_lens)
+    positions_out_ptr.copy_(positions)
+    page_table_ptr.copy_(page_table)
+    topk_out_ptr.copy_(topk)
 
 
 def _dspark_kernel_out(
@@ -1469,6 +1504,37 @@ def _dspark_kernel_out(
     ):
         return tensor
     return torch.empty(shape, dtype=dtype, device=tensor.device)
+
+
+def _dspark_require(condition: bool, op: str, message: str) -> None:
+    """Fail loudly when a DSpark call site breaks an XSpeedGate input contract.
+
+    Used for the dtype/shape/stride expectations that every upstream Triton call
+    site already satisfies. Degrading to the torch path there would silently
+    give up the vendor kernel, so a broken contract must surface instead.
+    Capacity ceilings the upstream genuinely can exceed (e.g. the bs<=64 limit of
+    ``mixed_accept_select_kernel``) keep their torch fallback.
+    """
+
+    if not condition:
+        raise AssertionError(f"xspeedgate_ops.{op}: {message}")
+
+
+_DSPARK_FALLBACK_WARNED: set = set()
+
+
+def _dspark_warn_fallback(op: str, reason: str) -> None:
+    """Log the first time an op degrades to torch so it is never silent."""
+
+    if op in _DSPARK_FALLBACK_WARNED:
+        return
+    _DSPARK_FALLBACK_WARNED.add(op)
+    _KERNEL_OPS_LOGGER.warning(
+        "sglang-kunlun: %s runs the torch path instead of the XSpeedGate "
+        "kernel (%s)",
+        op,
+        reason,
+    )
 
 
 @register_triton_op(
@@ -1597,11 +1663,25 @@ def block_seq_lens_casual_kernel(
     """Build causal sequence lengths for each DSpark block."""
 
     del BLOCK
-    offsets = torch.arange(n_out, device=out_ptr.device, dtype=torch.int64)
-    rows = offsets // block_size
-    columns = offsets % block_size
-    values = seq_lens_ptr.index_select(0, rows).to(torch.int64) + columns + 1
-    out_ptr.copy_(values.to(out_ptr.dtype))
+    op = "block_seq_lens_casual"
+    _dspark_require(block_size > 0, op, f"block_size must be > 0, got {block_size}")
+    n_rows = n_out // block_size
+    _dspark_require(
+        n_out == n_rows * block_size,
+        op,
+        f"n_out={n_out} is not a multiple of block_size={block_size}",
+    )
+    _dspark_require(
+        seq_lens_ptr.dim() == 1 and n_rows <= seq_lens_ptr.numel(),
+        op,
+        f"seq_lens must be 1D with at least {n_rows} rows, got "
+        f"shape {tuple(seq_lens_ptr.shape)}",
+    )
+
+    values = torch.ops.xspeedgate_ops.block_seq_lens_casual(
+        seq_lens_ptr[:n_rows], block_size, str(out_ptr.device)
+    )
+    out_ptr[:n_out].copy_(values.to(out_ptr.dtype))
 
 
 @register_triton_op(
@@ -1659,12 +1739,26 @@ def gather_two_level_bonus_kernel(
     BLOCK: int,
 ) -> None:
     """Gather accepted bonus tokens from the two-level accept index."""
-    del BLOCK
-    rows = torch.arange(n, device=out_ptr.device, dtype=torch.int64)
-    correct_len = correct_len_ptr[:n].to(torch.int64)
-    accept_index = accept_index_ptr.reshape(-1, cols)
-    accept_pos = accept_index[rows, correct_len].to(torch.int64)
-    out_ptr[:n].copy_(predicts_ptr[accept_pos].to(out_ptr.dtype))
+    if n == 0:
+        return
+    accept_index = accept_index_ptr.reshape(-1)
+    if accept_index.dtype not in (torch.int32, torch.int64):
+        accept_index = accept_index.to(torch.int64)
+    predicts = predicts_ptr.reshape(-1)
+    if predicts.dtype not in (torch.int32, torch.int64):
+        predicts = predicts.to(torch.int64)
+    out = _dspark_kernel_out(out_ptr, torch.int64, (n,))
+    torch.ops.xspeedgate_ops.gather_two_level_bonus_kernel(
+        accept_index.contiguous(),
+        predicts.contiguous(),
+        correct_len_ptr.reshape(-1)[:n].to(torch.int64).contiguous(),
+        out,
+        cols,
+        n,
+        max(int(BLOCK), 1),
+    )
+    if out is not out_ptr:
+        out_ptr[:n].copy_(out)
 
 
 @register_triton_op(
@@ -1721,24 +1815,75 @@ def mixed_accept_select_kernel(
     BLOCK: int,
 ) -> None:
     """Select greedy or sampling accept results row by row."""
-    del BLOCK
-    is_greedy = greedy_mask_ptr[:bs].to(torch.bool)
-    correct_len = torch.where(
-        is_greedy,
-        greedy_len_ptr[:bs].to(correct_len_ptr.dtype),
-        sampling_len_ptr[:bs],
+    op = "mixed_accept_select_kernel"
+    bonus_dtype = greedy_bonus_ptr.dtype
+    _dspark_require(
+        greedy_len_ptr.dtype == greedy_trim_ptr.dtype
+        and greedy_len_ptr.dtype in (torch.int32, torch.int64),
+        op,
+        f"greedy len/trim must share one int32/int64 dtype, got "
+        f"{greedy_len_ptr.dtype}/{greedy_trim_ptr.dtype}",
     )
-    bonus = torch.where(
-        is_greedy, greedy_bonus_ptr[:bs], sampling_bonus_ptr[:bs]
+    _dspark_require(
+        sampling_len_ptr.dtype == torch.int32
+        and sampling_trim_ptr.dtype == torch.int32,
+        op,
+        f"sampling len/trim must be int32, got "
+        f"{sampling_len_ptr.dtype}/{sampling_trim_ptr.dtype}",
     )
-    cap_trim = torch.where(
-        is_greedy,
-        greedy_trim_ptr[:bs].to(cap_trim_ptr.dtype),
-        sampling_trim_ptr[:bs],
+    _dspark_require(
+        sampling_bonus_ptr.dtype == bonus_dtype,
+        op,
+        f"bonus dtypes differ: greedy={bonus_dtype} sampling="
+        f"{sampling_bonus_ptr.dtype}",
     )
-    correct_len_ptr[:bs].copy_(correct_len)
-    bonus_ptr[:bs].copy_(bonus)
-    cap_trim_ptr[:bs].copy_(cap_trim)
+
+    # vendor 算子把 bs 行整表缓存到 SM，硬性 bs <= 64；running bs 可以超过它。
+    if bs > 64:
+        _dspark_warn_fallback(op, f"bs={bs} exceeds the vendor limit of 64")
+        is_greedy = greedy_mask_ptr[:bs].to(torch.bool)
+        correct_len_ptr[:bs].copy_(
+            torch.where(
+                is_greedy,
+                greedy_len_ptr[:bs].to(correct_len_ptr.dtype),
+                sampling_len_ptr[:bs],
+            )
+        )
+        bonus_ptr[:bs].copy_(
+            torch.where(is_greedy, greedy_bonus_ptr[:bs], sampling_bonus_ptr[:bs])
+        )
+        cap_trim_ptr[:bs].copy_(
+            torch.where(
+                is_greedy,
+                greedy_trim_ptr[:bs].to(cap_trim_ptr.dtype),
+                sampling_trim_ptr[:bs],
+            )
+        )
+        return
+
+    correct_len = _dspark_kernel_out(correct_len_ptr, torch.int32, (bs,))
+    bonus = _dspark_kernel_out(bonus_ptr, bonus_dtype, (bs,))
+    cap_trim = _dspark_kernel_out(cap_trim_ptr, torch.int32, (bs,))
+    torch.ops.xspeedgate_ops.mixed_accept_select_kernel(
+        greedy_mask_ptr[:bs].to(torch.bool).contiguous(),
+        greedy_len_ptr[:bs].contiguous(),
+        greedy_bonus_ptr[:bs].contiguous(),
+        greedy_trim_ptr[:bs].contiguous(),
+        sampling_len_ptr[:bs].contiguous(),
+        sampling_bonus_ptr[:bs].contiguous(),
+        sampling_trim_ptr[:bs].contiguous(),
+        correct_len,
+        bonus,
+        cap_trim,
+        bs,
+        max(int(BLOCK), 1),
+    )
+    if correct_len is not correct_len_ptr:
+        correct_len_ptr[:bs].copy_(correct_len)
+    if bonus is not bonus_ptr:
+        bonus_ptr[:bs].copy_(bonus)
+    if cap_trim is not cap_trim_ptr:
+        cap_trim_ptr[:bs].copy_(cap_trim)
 
 
 @register_triton_op(
@@ -1835,14 +1980,43 @@ def build_step_local_kernel(
 ) -> None:
     """Add padded DSpark step-local bias to the base logits."""
 
-    del BLOCK
-    bias = bias_ptr[:, :org_width].to(torch.float32)
-    base = base_ptr[:, :per_partition].to(torch.float32)
-    if org_width < per_partition:
-        bias = torch.nn.functional.pad(bias, (0, per_partition - org_width))
-    else:
-        bias = bias[:, :per_partition]
-    out_ptr.copy_((base + bias).to(out_ptr.dtype))
+    rows = bias_ptr.shape[0]
+    op = "build_step_local_kernel"
+    _dspark_require(
+        bias_ptr.dim() == 2 and base_ptr.dim() == 2 and out_ptr.dim() == 2,
+        op,
+        "bias/base/out must all be 2D",
+    )
+    _dspark_require(
+        bias_ptr.shape[1] == org_width
+        and base_ptr.shape == (rows, per_partition)
+        and out_ptr.shape == (rows, per_partition),
+        op,
+        f"shapes {tuple(bias_ptr.shape)}/{tuple(base_ptr.shape)}/"
+        f"{tuple(out_ptr.shape)} do not match org_width={org_width} "
+        f"per_partition={per_partition}",
+    )
+    _dspark_require(
+        out_ptr.dtype == torch.float32 and out_ptr.is_contiguous(),
+        op,
+        f"out must be contiguous float32, got {out_ptr.dtype} "
+        f"contiguous={out_ptr.is_contiguous()}",
+    )
+
+    if org_width > per_partition:
+        # 上游 triton 用 mask=offs<org_width 截断，允许 bias 宽于本地分区；
+        # vendor 算子 TORCH_CHECK(org_width <= per_partition)，只能走 torch。
+        _dspark_warn_fallback(op, f"org_width={org_width} > per_partition={per_partition}")
+        bias = bias_ptr[:, :per_partition].to(torch.float32)
+        base = base_ptr.to(torch.float32)
+        out_ptr.copy_((base + bias).to(out_ptr.dtype))
+        return
+
+    bias = bias_ptr.to(torch.float32).contiguous()
+    base = base_ptr.to(torch.float32).contiguous()
+    torch.ops.xspeedgate_ops.build_step_local_kernel(
+        bias, base, out_ptr, org_width, per_partition, BLOCK
+    )
 
 
 @register_triton_op(
@@ -1899,13 +2073,27 @@ def cap_correct_len_kernel(
 ) -> None:
     """Cap accepted lengths to the available verification window."""
     del BLOCK
+    op = "cap_correct_len"
     correct_len = correct_len_ptr[:n]
-    limit = (verify_lens_ptr[:n].to(correct_len.device) - 1).to(
-        correct_len.dtype
+    _dspark_require(
+        correct_len.dtype == torch.int32
+        and capped_ptr.dtype == torch.int32
+        and trim_ptr.dtype == torch.int32,
+        op,
+        f"correct_len/capped/trim must be int32, got {correct_len.dtype}/"
+        f"{capped_ptr.dtype}/{trim_ptr.dtype}",
     )
-    capped = torch.minimum(correct_len, limit)
+    if n == 0:
+        return
+
+    capped, trim = torch.ops.xspeedgate_ops.cap_correct_len(
+        correct_len.contiguous(),
+        verify_lens_ptr[:n]
+        .to(device=correct_len.device, dtype=torch.int32)
+        .contiguous(),
+    )
     capped_ptr[:n].copy_(capped)
-    trim_ptr[:n].copy_((correct_len - capped).to(trim_ptr.dtype))
+    trim_ptr[:n].copy_(trim)
 
 
 @register_triton_op(
@@ -1925,23 +2113,37 @@ def ragged_finalize_kernel(
     BLOCK: int,
 ) -> None:
     """Finalize padded ragged verification positions and cache locations."""
-    del BLOCK
-    offsets = torch.arange(n, device=pos_out_ptr.device, dtype=torch.int64)
-    req = req_ptr[:n].to(torch.int64)
-    within = within_ptr[:n].to(torch.int64)
-    valid = req < bs
-    safe_req = req.clamp(min=0, max=max(bs - 1, 0))
-    prefix = prefix_ptr[safe_req].to(torch.int64)
-    positions = torch.where(valid, prefix + within, torch.zeros_like(within))
-
-    safe_cache_offset = offsets.clamp(min=0, max=max(real_len - 1, 0))
-    cache_values = cache_ptr[safe_cache_offset]
-    cache_valid = valid & (offsets < real_len)
-    cache_values = torch.where(
-        cache_valid, cache_values, torch.zeros_like(cache_values)
+    op = "ragged_finalize"
+    _dspark_require(bs > 0, op, f"bs must be > 0, got {bs}")
+    _dspark_require(
+        0 <= real_len <= n, op, f"real_len={real_len} must be within [0, n={n}]"
     )
-    pos_out_ptr[:n].copy_(positions.to(pos_out_ptr.dtype))
-    cache_out_ptr[:n].copy_(cache_values.to(cache_out_ptr.dtype))
+    _dspark_require(
+        bs <= 8192, op, f"bs={bs} exceeds the vendor prefix-cache limit of 8192"
+    )
+
+    req = req_ptr[:n].to(torch.int64).contiguous()
+    within = within_ptr[:n].to(torch.int64).contiguous()
+    prefix = prefix_ptr[:bs].to(torch.int64).contiguous()
+    cache = cache_ptr[:real_len].to(torch.int64).contiguous()
+    pos_out = _dspark_kernel_out(pos_out_ptr, torch.int64, (n,))
+    cache_out = _dspark_kernel_out(cache_out_ptr, torch.int64, (n,))
+    torch.ops.xspeedgate_ops.ragged_finalize(
+        req,
+        within,
+        prefix,
+        cache,
+        pos_out,
+        cache_out,
+        bs,
+        n,
+        real_len,
+        max(int(BLOCK), 1),
+    )
+    if pos_out is not pos_out_ptr:
+        pos_out_ptr[:n].copy_(pos_out)
+    if cache_out is not cache_out_ptr:
+        cache_out_ptr[:n].copy_(cache_out)
 
 
 @register_triton_op(
@@ -1960,15 +2162,14 @@ def compact_row_index_kernel(
 ) -> None:
     """Map padded rows to compact request/within-row indices."""
     del BLOCK, NBITS
+    # 上游 triton 也是 tl.load(incl_ptr + bs - 1)，bs==0 本来就不是合法输入
+    _dspark_require(bs > 0, "compact_row_index", f"bs must be > 0, got {bs}")
     incl = incl_ptr[:bs].to(torch.int64)
-    rows = torch.arange(n, device=req_out_ptr.device, dtype=torch.int64)
-    real_total = incl[-1] if bs else torch.zeros((), device=rows.device)
-    valid = rows < real_total
-    req = torch.searchsorted(incl, rows, right=True)
-    safe_req = req.clamp(min=0, max=max(bs - 1, 0))
-    starts = torch.where(req > 0, incl[safe_req - 1], torch.zeros_like(req))
-    within = torch.where(valid, rows - starts, torch.zeros_like(rows))
-    req = torch.where(valid, req, torch.full_like(req, bs))
+    # vendor 算子收 verify_lens 并在内部做 cumsum，这里从 incl 还原
+    verify_lens = torch.diff(incl, prepend=incl.new_zeros(1))
+    req, within, valid = torch.ops.xspeedgate_ops.compact_row_index(
+        verify_lens, n, str(req_out_ptr.device)
+    )
     req_out_ptr[:n].copy_(req.to(req_out_ptr.dtype))
     within_out_ptr[:n].copy_(within.to(within_out_ptr.dtype))
     valid_out_ptr[:n].copy_(valid.to(valid_out_ptr.dtype))
@@ -2003,6 +2204,63 @@ def compact_verify_ids_gather_kernel(
     values = torch.where(within == 0, anchor, draft)
     values = torch.where(valid, values, torch.zeros_like(values))
     out_ptr[:n].copy_(values.to(out_ptr.dtype))
+
+
+@register_jit_op(
+    "sglang.kernels.ops.speculative.dspark.dspark_verify_window",
+    "compact_verify_ids_triton",
+)
+def compact_verify_ids_triton(
+    *,
+    draft_block_ids: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    layout,
+    device,
+) -> torch.Tensor:
+    """Build the compact verify-token ids for a ragged verify layout."""
+
+    # vendor 算子对齐上层 python 函数（行索引 + gather 一次算完），
+    # 因此这里替换 host 函数而不是 _compact_verify_ids_gather_kernel。
+    op = "compact_verify_ids"
+    verify_lens = layout.verify_lens.to(device=device)
+    if verify_lens.dtype not in (torch.int32, torch.int64):
+        verify_lens = verify_lens.to(torch.int32)
+    block_ids = draft_block_ids.to(device=device, dtype=torch.int64).contiguous()
+    tokens = draft_tokens.to(device=device, dtype=torch.int64).contiguous()
+    bs = verify_lens.shape[0]
+    _dspark_require(bs > 0, op, f"bs must be > 0, got {bs}")
+    _dspark_require(
+        tokens.dim() == 2 and tokens.shape[1] >= 1,
+        op,
+        f"draft_tokens must be [bs, gamma>=1], got {tuple(tokens.shape)}",
+    )
+    _dspark_require(
+        block_ids.shape == tokens.shape,
+        op,
+        f"draft_block_ids {tuple(block_ids.shape)} != draft_tokens "
+        f"{tuple(tokens.shape)}",
+    )
+
+    if bs <= 1024:  # vendor 硬性上限
+        return torch.ops.xspeedgate_ops.compact_verify_ids(
+            block_ids,
+            tokens,
+            verify_lens.contiguous(),
+            layout.graph_num_tokens,
+            str(tokens.device),
+        )
+
+    _dspark_warn_fallback(op, f"bs={bs} exceeds the vendor limit of 1024")
+    from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
+        compact_verify_ids,
+    )
+
+    return compact_verify_ids(
+        draft_block_ids=block_ids,
+        draft_tokens=tokens,
+        layout=layout,
+        device=device,
+    )
 
 
 @register_triton_op(
@@ -2061,21 +2319,33 @@ def commit_inject_layout_kernel(
 ) -> None:
     """Build committed SWA locations and absolute positions."""
     del BLOCK
-    offsets = torch.arange(n, device=swa_loc_ptr.device, dtype=torch.int64)
-    request = offsets // stride
-    column = offsets % stride
-    prefix = prefix_lens_ptr[request].to(torch.int64)
-    position_offset = block_pos_offsets_ptr[column].to(torch.int64)
-    request_pool = req_pool_ptr[request].to(torch.int64)
-    token_pool = req_to_token_ptr.as_strided(
-        req_to_token_ptr.shape, (rt_stride, 1)
+    # vendor 算子要求 req_to_token 为 int64，而线上 req_to_token 是 int32；
+    # 这里只把本次用到的那几行取出来转成 int64（整表 cast 太贵），
+    # 并把 req_pool 重映射成 0..n_req-1。
+    n_req = (n + stride - 1) // stride
+    request_rows = req_pool_ptr[:n_req].to(torch.int64)
+    token_pool = req_to_token_ptr.as_strided(req_to_token_ptr.shape, (rt_stride, 1))
+    token_pool_i64 = token_pool.index_select(0, request_rows).to(torch.int64)
+    swa_loc = _dspark_kernel_out(swa_loc_ptr, torch.int32, (n_req * stride,))
+    positions = _dspark_kernel_out(positions_ptr, torch.int64, (n_req * stride,))
+    torch.ops.xspeedgate_ops.commit_inject_layout_kernel(
+        torch.arange(n_req, dtype=torch.int64, device=swa_loc_ptr.device),
+        token_pool_i64,
+        prefix_lens_ptr[:n_req].to(torch.int64).contiguous(),
+        block_pos_offsets_ptr[:stride].contiguous(),
+        full_to_swa_ptr.to(torch.int64).contiguous(),
+        commit_lens_ptr[:n_req].to(torch.int32).contiguous(),
+        swa_loc,
+        positions,
+        token_pool_i64.stride(0),
+        stride,
+        n,
+        256,
     )
-    full_loc = token_pool[request_pool, prefix + position_offset].to(torch.int64)
-    swa_loc = full_to_swa_ptr[full_loc].to(torch.int32)
-    commit = column < commit_lens_ptr[request].to(torch.int64)
-    swa_loc = torch.where(commit, swa_loc, torch.full_like(swa_loc, -1))
-    swa_loc_ptr[:n].copy_(swa_loc.to(swa_loc_ptr.dtype))
-    positions_ptr[:n].copy_((prefix + position_offset).to(positions_ptr.dtype))
+    if swa_loc is not swa_loc_ptr:
+        swa_loc_ptr[:n].copy_(swa_loc[:n])
+    if positions is not positions_ptr:
+        positions_ptr[:n].copy_(positions[:n])
 
 
 @register_triton_op(
