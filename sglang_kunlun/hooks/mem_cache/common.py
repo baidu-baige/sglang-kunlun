@@ -9,9 +9,56 @@ from contextlib import nullcontext
 import torch
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+from sglang.srt.utils import get_num_new_pages, next_power_of_2
 
 
 logger = logging.getLogger(__name__)
+
+
+@plugin_hook(
+    "sglang.srt.mem_cache.allocator.paged.PagedTokenToKVPoolAllocator.alloc_decode",
+    type=HookType.REPLACE,
+)
+def paged_alloc_decode_kunlun(self, seq_lens, seq_lens_cpu, last_loc):
+    """Decode allocation with a CPU-side page-count gate and zero-page fast path."""
+    if self.debug_mode:
+        assert torch.all(
+            (last_loc + 2) % self.page_size == seq_lens % self.page_size
+        )
+    bs = len(seq_lens)
+    if self.need_sort and bs > len(self.free_pages):
+        self.merge_and_sort_free()
+
+    num_new_pages = get_num_new_pages(
+        seq_lens=seq_lens_cpu,
+        page_size=self.page_size,
+        decode=True,
+    )
+    if num_new_pages > len(self.free_pages):
+        self.merge_and_sort_free()
+    if num_new_pages > len(self.free_pages):
+        return None
+
+    out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
+    if num_new_pages == 0:
+        out_indices.copy_(last_loc.to(out_indices.dtype).contiguous() + 1)
+        return out_indices
+
+    torch.ops.xspeedgate_ops.alloc_decode_kernel(
+        seq_lens,
+        last_loc.to(torch.int32).contiguous(),
+        self.free_pages,
+        out_indices,
+        next_power_of_2(bs),
+        self.page_size,
+        bs,
+    )
+
+    if self.debug_mode:
+        assert len(torch.unique(out_indices)) == len(out_indices)
+
+    self.free_pages = self.free_pages[num_new_pages:]
+    return out_indices
 
 
 @plugin_hook(
