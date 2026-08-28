@@ -3728,6 +3728,14 @@ def _dsv4_rotate_gptj_tail(
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
 ) -> torch.Tensor:
+    if value.ndim == 3 and value.shape[1:] == (64, 128):
+        return torch.ops.xspeedgate_ops.dsv4_rotate_gptj_tail(
+            value=value.contiguous(),
+            freqs_cis=freqs_cis.contiguous(),
+            positions=positions.flatten().to(dtype=torch.int32).contiguous(),
+            inverse=False,
+        )
+
     freqs_real = _dsv4_cos_sin_cache(freqs_cis)
     rope_dim = freqs_real.shape[-1]
     rope_tail = value[..., -rope_dim:].contiguous()
