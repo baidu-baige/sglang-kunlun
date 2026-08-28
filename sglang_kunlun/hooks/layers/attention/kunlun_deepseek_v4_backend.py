@@ -315,20 +315,6 @@ def _verify_row_lod_enabled(forward_batch) -> bool:
     return True
 
 
-_VERIFY_ROW_LOD_LOGGED = False
-
-
-def _log_verify_row_lod_once() -> None:
-    global _VERIFY_ROW_LOD_LOGGED
-    if _VERIFY_ROW_LOD_LOGGED:
-        return
-    _VERIFY_ROW_LOD_LOGGED = True
-    logger.warning(
-        "[DSV4_VERIFY_LOD] eager TARGET_VERIFY uses the per-row LoD "
-        "(qlod=arange, kv_lens=seq_lens_casual), matching sglang 0.5.8"
-    )
-
-
 def _seq_lens_cpu_i32(forward_batch) -> torch.Tensor:
     seq_lens_cpu = forward_batch.seq_lens_cpu
     if seq_lens_cpu is None:
@@ -1003,7 +989,6 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             forward_batch, "_kunlun_ragged_draft_extend", False
         ):
             if _verify_row_lod_enabled(forward_batch):
-                _log_verify_row_lod_once()
                 return _make_cp_prefill_lod(
                     self.forward_metadata.core_attn_metadata, num_queries, device
                 )

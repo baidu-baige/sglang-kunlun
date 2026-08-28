@@ -1448,6 +1448,29 @@ def page_table_positions_kernel(
     page_table_ptr.copy_((page_tokens // page_size).to(page_table_ptr.dtype))
 
 
+def _dspark_kernel_out(
+    tensor: torch.Tensor, dtype: torch.dtype, shape=None
+) -> torch.Tensor:
+    """Return the buffer an XSpeedGate DSpark kernel should write ``tensor`` into.
+
+    The kernels pin the dtype/layout of every output they write, while the
+    upstream Triton call sites allocate a few of them differently (e.g.
+    ``offsets`` as int64, or a buffer longer than the rows the kernel touches).
+    In that case a scratch buffer is returned and the caller must copy it back --
+    check with ``buf is not tensor``. Otherwise ``tensor`` itself is returned and
+    the kernel writes into it directly.
+    """
+
+    shape = tuple(tensor.shape) if shape is None else tuple(shape)
+    if (
+        tensor.dtype == dtype
+        and tensor.is_contiguous()
+        and tuple(tensor.shape) == shape
+    ):
+        return tensor
+    return torch.empty(shape, dtype=dtype, device=tensor.device)
+
+
 @register_triton_op(
     "sglang.kernels.ops.speculative.dspark.dspark_attn_metadata",
     "_window_gather_kernel",
@@ -1463,28 +1486,41 @@ def window_gather_kernel(
     swa_window: int,
     W_BLOCK: int,
 ) -> None:
-    """Build DSpark sliding-window metadata without Triton."""
+    """Build DSpark sliding-window metadata via xspeedgate_ops.
 
-    del W_BLOCK
+    The XPU kernel writes int32 offsets while the Triton call site allocates
+    them as int64, so that output goes through a scratch buffer.
+    """
+
     bs = context_lens_ptr.numel()
-    first_token = (
-        torch.arange(bs, device=seq_lens_casual_ptr.device, dtype=torch.int64)
-        * block_size
-    )
-    prefix = seq_lens_casual_ptr.index_select(0, first_token).to(torch.int64) - 1
-    context_lens_ptr.copy_(
-        torch.clamp(prefix, max=swa_window).to(context_lens_ptr.dtype)
-    )
-    req_pool_out_ptr.copy_(
-        req_pool_rep_ptr.index_select(0, first_token).to(req_pool_out_ptr.dtype)
+    if bs == 0:
+        return
+
+    context_lens = _dspark_kernel_out(context_lens_ptr, torch.int32)
+    req_pool_out = _dspark_kernel_out(req_pool_out_ptr, torch.int32)
+    offsets = _dspark_kernel_out(offsets_ptr, torch.int32)
+    invalid = _dspark_kernel_out(invalid_ptr, torch.bool)
+
+    torch.ops.xspeedgate_ops.window_gather_kernel(
+        seq_lens_casual_ptr.to(torch.int32).contiguous(),
+        req_pool_rep_ptr.to(torch.int32).contiguous(),
+        context_lens,
+        req_pool_out,
+        offsets,
+        invalid,
+        block_size,
+        swa_window,
+        W_BLOCK,
     )
 
-    columns = torch.arange(
-        swa_window, device=seq_lens_casual_ptr.device, dtype=torch.int64
-    )
-    window_offsets = prefix[:, None] - swa_window + columns[None, :]
-    invalid_ptr.copy_(window_offsets.lt(0).to(invalid_ptr.dtype))
-    offsets_ptr.copy_(window_offsets.clamp(min=0).to(offsets_ptr.dtype))
+    if context_lens is not context_lens_ptr:
+        context_lens_ptr.copy_(context_lens)
+    if req_pool_out is not req_pool_out_ptr:
+        req_pool_out_ptr.copy_(req_pool_out)
+    if offsets is not offsets_ptr:
+        offsets_ptr.copy_(offsets)
+    if invalid is not invalid_ptr:
+        invalid_ptr.copy_(invalid)
 
 
 @register_triton_op(
@@ -1506,70 +1542,45 @@ def swa_page_indices_kernel(
     target_width: int,
     TW_BLOCK: int,
 ) -> None:
-    """Build DSpark SWA page indices without Triton.
+    """Build DSpark SWA page indices via xspeedgate_ops.
 
-    The upstream Triton kernel masks every load (``tl.load(..., mask=..., other=``
-    ``0/-1)``), so a lane outside the window / draft block never dereferences
-    memory. This dense rewrite reads every lane first and drops the invalid ones
-    afterwards with ``torch.where``, so every index expression must be clamped
-    into its tensor bounds by hand -- otherwise CUDA-graph bs padding (whose
-    extra rows have small ``context_lens`` and an ``out_loc`` that no longer
-    spans ``bs * block_size``) walks off the end of ``out_loc`` /
-    ``full_to_swa``. That surfaces as ``index_select_mt<int, long>`` in dmesg and
-    an error-700 illegal memory access at the next sync. Clamping is semantically
-    free: the clamped lanes are exactly the ones ``torch.where`` discards.
+    The XPU op allocates its own ``[n_q, target_width]`` / ``[n_q]`` outputs and
+    dispatches on a single int32 dtype, so the int64 ``offsets`` produced upstream
+    is cast and the results are copied into the caller's buffers.
+
+    ``out_loc`` is zero-padded up to ``n_q`` when needed: under CUDA graph bs
+    padding the sliced ``out_loc`` can be shorter than the padded batch demands,
+    which would trip the op's ``out_loc.numel() >= bs * block_size`` check. Those
+    rows are discarded downstream, so pointing them at slot 0 is as harmless as
+    the index clamping the previous dense torch path did.
     """
 
-    del TW_BLOCK
+    del TW_BLOCK, rt_stride
     n_q = out_ptr.shape[0]
-    device = out_ptr.device
-    rows = torch.arange(n_q, device=device, dtype=torch.int64)
-    request_rows = rows // block_size
-    context_lens = context_lens_ptr.index_select(0, request_rows).to(torch.int64)
-    request_pool = req_pool_ptr.index_select(0, request_rows).to(torch.int64)
-    columns = torch.arange(target_width, device=device, dtype=torch.int64)
+    if n_q == 0:
+        return
 
-    source_columns = (
-        swa_window - context_lens[:, None] + columns[None, :]
-    ).clamp(min=0, max=swa_window - 1)
-    window_mask = columns[None, :] < context_lens[:, None]
-    request_offsets = offsets_ptr.index_select(0, request_rows).to(torch.int64)
-    window_offsets = torch.gather(request_offsets, 1, source_columns)
-    token_pool = req_to_token_ptr.as_strided(
-        req_to_token_ptr.shape, (rt_stride, 1)
-    )
-    swa_limit = full_to_swa_ptr.shape[0] - 1
-    window_full = token_pool[
-        request_pool[:, None].clamp(min=0, max=token_pool.shape[0] - 1),
-        window_offsets.clamp(min=0, max=token_pool.shape[1] - 1),
-    ]
-    window_swa = full_to_swa_ptr[
-        window_full.clamp(min=0, max=swa_limit)
-    ].to(torch.int32)
+    out_loc = out_loc_ptr.to(torch.int32).contiguous()
+    if out_loc.numel() < n_q:
+        padded = out_loc.new_zeros(n_q)
+        padded[: out_loc.numel()] = out_loc
+        out_loc = padded
 
-    block_mask = (columns[None, :] >= context_lens[:, None]) & (
-        columns[None, :] < context_lens[:, None] + block_size
-    )
-    block_columns = (columns[None, :] - context_lens[:, None]).clamp(
-        min=0, max=block_size - 1
-    )
-    block_full = out_loc_ptr[
-        (request_rows[:, None] * block_size + block_columns).clamp(
-            min=0, max=out_loc_ptr.shape[0] - 1
+    swa_page_indices, swa_topk_lengths = (
+        torch.ops.xspeedgate_ops.swa_page_indices_kernel(
+            req_to_token_ptr.to(torch.int32),
+            full_to_swa_ptr.to(torch.int32).contiguous(),
+            req_pool_ptr.to(torch.int32).contiguous(),
+            offsets_ptr.to(torch.int32).contiguous(),
+            out_loc,
+            context_lens_ptr.to(torch.int32).contiguous(),
+            swa_window,
+            block_size,
+            target_width,
         )
-    ].to(torch.int64)
-    block_swa = full_to_swa_ptr[
-        block_full.clamp(min=0, max=swa_limit)
-    ].to(torch.int32)
-    values = torch.where(
-        window_mask,
-        window_swa,
-        torch.where(block_mask, block_swa, -1),
     )
-    out_ptr.copy_(values.to(out_ptr.dtype))
-    topk_ptr.copy_(
-        (context_lens + block_size).to(topk_ptr.dtype)
-    )
+    out_ptr.copy_(swa_page_indices)
+    topk_ptr.copy_(swa_topk_lengths)
 
 
 @register_triton_op(
@@ -1607,19 +1618,31 @@ def softmax_temp_kernel(
     BLOCK_V: int,
 ) -> None:
     """Apply per-request temperatures and compute row-wise softmax."""
-    del logits_row_stride, BLOCK_V
+
     num_rows = out_ptr.shape[0]
+    if num_rows == 0:
+        return
     bs = num_rows // rows_per_request
     assert (
         bs * rows_per_request == num_rows
     ), f"num_rows {num_rows} not divisible by rows_per_request {rows_per_request}"
 
-    logits = logits_ptr[:num_rows, :vocab].to(torch.float32)
-    temperatures = temp_ptr[:bs].reshape(bs).to(torch.float32)
-    temperatures = torch.repeat_interleave(
-        temperatures, rows_per_request, dim=0
-    ).unsqueeze(-1)
-    out_ptr.copy_(torch.softmax(logits / temperatures, dim=-1).to(out_ptr.dtype))
+    # The op reads rows with logits.stride(0), so only the last dim has to be
+    # packed; a row-padded logits view is fine.
+    logits = logits_ptr if logits_ptr.stride(-1) == 1 else logits_ptr.contiguous()
+    out = _dspark_kernel_out(out_ptr, out_ptr.dtype)
+
+    torch.ops.xspeedgate_ops.softmax_temp(
+        logits,
+        temp_ptr.reshape(-1)[:bs].to(torch.float32).contiguous(),
+        out,
+        vocab,
+        rows_per_request,
+        logits_row_stride,
+        BLOCK_V,
+    )
+    if out is not out_ptr:
+        out_ptr.copy_(out)
 
 
 @register_triton_op(
@@ -1658,12 +1681,25 @@ def gather_row_bonus_kernel(
 ) -> None:
     """Gather one bonus token from each row using per-row column indices."""
 
-    del BLOCK
-    rows = torch.arange(n, device=out_ptr.device, dtype=torch.int64)
-    indices = idx_ptr[:n].to(device=out_ptr.device, dtype=torch.int64)
-    flat_offsets = rows * cols + indices
-    values = table_ptr.reshape(-1).index_select(0, flat_offsets)
-    out_ptr[:n].copy_(values.to(torch.int64))
+    if n == 0:
+        return
+    table = (
+        table_ptr
+        if table_ptr.dtype in (torch.int32, torch.int64)
+        else table_ptr.to(torch.int64)
+    )
+    out = _dspark_kernel_out(out_ptr, torch.int64, shape=(n,))
+
+    torch.ops.xspeedgate_ops.gather_row_bonus_kernel(
+        table,
+        idx_ptr.reshape(-1)[:n].to(torch.int64).contiguous(),
+        out,
+        cols,
+        n,
+        max(int(BLOCK), 1),
+    )
+    if out is not out_ptr:
+        out_ptr[:n].copy_(out)
 
 
 @register_triton_op(
@@ -1823,14 +1859,30 @@ def finalize_accept_lens_kernel(
     bs: int,
     BLOCK: int,
 ) -> None:
-    """Finalize DSpark accepted lengths without Triton."""
-    del BLOCK
-    correct_len = correct_len_ptr[:bs].to(torch.int32)
-    commit_lens_ptr[:bs].copy_(correct_len + 1)
-    new_seq_lens_ptr[:bs].copy_(
-        prefix_lens_ptr[:bs] + (correct_len + 1).to(prefix_lens_ptr.dtype)
+    """Finalize DSpark accepted lengths via xspeedgate_ops."""
+
+    if bs == 0:
+        return
+    commit_lens = _dspark_kernel_out(commit_lens_ptr, torch.int32, shape=(bs,))
+    new_seq_lens = _dspark_kernel_out(new_seq_lens_ptr, torch.int64, shape=(bs,))
+    cap_trim_out = _dspark_kernel_out(cap_trim_out_ptr, torch.int32, shape=(bs,))
+
+    torch.ops.xspeedgate_ops.finalize_accept_lens_kernel(
+        correct_len_ptr.reshape(-1)[:bs].to(torch.int32).contiguous(),
+        cap_trim_ptr.reshape(-1)[:bs].to(torch.int32).contiguous(),
+        prefix_lens_ptr.reshape(-1)[:bs].to(torch.int64).contiguous(),
+        commit_lens,
+        new_seq_lens,
+        cap_trim_out,
+        bs,
+        max(int(BLOCK), 1),
     )
-    cap_trim_out_ptr[:bs].copy_(cap_trim_ptr[:bs].to(cap_trim_out_ptr.dtype))
+    if commit_lens is not commit_lens_ptr:
+        commit_lens_ptr[:bs].copy_(commit_lens)
+    if new_seq_lens is not new_seq_lens_ptr:
+        new_seq_lens_ptr[:bs].copy_(new_seq_lens)
+    if cap_trim_out is not cap_trim_out_ptr:
+        cap_trim_out_ptr[:bs].copy_(cap_trim_out)
 
 
 @register_triton_op(
@@ -2041,18 +2093,28 @@ def build_out_tokens_kernel(
     BLOCK: int,
 ) -> None:
     """Build draft tokens plus the accepted-token bonus."""
-    del BLOCK
-    offsets = torch.arange(n_out, device=out_ptr.device, dtype=torch.int64)
-    batch = offsets // T
-    column = offsets % T
-    correct_len = correct_len_ptr[batch].to(torch.int64)
-    bonus = bonus_ptr[batch]
-    draft_tokens = draft_tokens_ptr.reshape(-1, gamma)
-    safe_column = column.clamp(min=0, max=max(gamma - 1, 0))
-    draft = draft_tokens[batch, safe_column]
-    values = torch.where(column < gamma, draft, torch.zeros_like(draft))
-    values = torch.where(column == correct_len, bonus, values)
-    out_ptr.reshape(-1)[:n_out].copy_(values.to(out_ptr.dtype))
+
+    if n_out == 0:
+        return
+    draft_tokens = draft_tokens_ptr.to(torch.int64).contiguous()
+    if draft_tokens.dim() != 2:
+        draft_tokens = draft_tokens.reshape(-1, gamma)
+    out = _dspark_kernel_out(
+        out_ptr, torch.int64, shape=(out_ptr.numel() // T, T)
+    )
+
+    torch.ops.xspeedgate_ops.build_out_tokens_kernel(
+        draft_tokens,
+        correct_len_ptr.reshape(-1).to(torch.int64).contiguous(),
+        bonus_ptr.reshape(-1).to(torch.int64).contiguous(),
+        out,
+        gamma,
+        T,
+        n_out,
+        max(int(BLOCK), 1),
+    )
+    if out is not out_ptr:
+        out_ptr.reshape(-1)[:n_out].copy_(out.reshape(-1)[:n_out])
 
 
 @register_triton_op(
@@ -2992,42 +3054,6 @@ def assign_hidden_states_pool_triton(
         )
 
 
-_DSV4_C128_CLEANUP_CALLS = [0]
-
-
-def _dsv4_trace_c128_cleanup(
-    state, req_pool_indices, seq_lens, accept_lens, ring_size, num_draft_tokens
-) -> None:
-    """Log the first few rejected-draft C128 resets, including how much state was live."""
-    import os
-
-    if os.getenv("DSV4_C128_CLEANUP_TRACE", "0") != "1":
-        return
-    seen = _DSV4_C128_CLEANUP_CALLS[0]
-    if seen >= 8:
-        return
-    _DSV4_C128_CLEANUP_CALLS[0] = seen + 1
-    half = state.shape[-1] // 2
-    rid = req_pool_indices.to(torch.int64)[:1]
-    seq = seq_lens.to(torch.int64)[:1]
-    offsets = torch.arange(num_draft_tokens, dtype=torch.int64, device=state.device)
-    rows = (rid.unsqueeze(1) * ring_size + (seq.unsqueeze(1) + offsets).remainder(ring_size)).reshape(-1)
-    sample = state.index_select(0, rows)
-    live = (sample[:, half:] > float("-inf")).any(dim=-1)
-    logger.warning(
-        "[DSV4_C128_CLEANUP] call=%s bs=%s ring=%s nd=%s accept_lens=%s "
-        "req0_rows=%s req0_live_before=%s state_rows=%s",
-        seen,
-        int(req_pool_indices.numel()),
-        ring_size,
-        num_draft_tokens,
-        accept_lens.to("cpu").tolist()[: min(8, accept_lens.numel())],
-        rows.to("cpu").tolist(),
-        live.to("cpu").tolist(),
-        int(state.shape[0]),
-    )
-
-
 @register_jit_op(
     "sglang.kernels.ops.attention.dsv4.c128_cleanup",
     "clear_unaccepted_c128_draft_states",
@@ -3046,9 +3072,6 @@ def clear_unaccepted_c128_draft_states_torch(
     batch_size = req_pool_indices.numel()
     if batch_size == 0 or num_draft_tokens == 0:
         return
-    _dsv4_trace_c128_cleanup(
-        state, req_pool_indices, seq_lens, accept_lens, ring_size, num_draft_tokens
-    )
 
     draft_offsets = torch.arange(
         num_draft_tokens,
