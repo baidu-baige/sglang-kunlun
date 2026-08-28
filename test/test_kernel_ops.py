@@ -535,6 +535,38 @@ class KernelOpsTest(unittest.TestCase):
         torch.testing.assert_close(q, expected_q, rtol=0, atol=0)
         torch.testing.assert_close(k, expected_k, rtol=0, atol=0)
 
+    def test_dsv4_indexer_rope_uses_xspeedgate_fixed_layout_op(self):
+        from sglang_kunlun.kernels import kernel_ops
+
+        value = torch.randn(2, 64, 128)
+        freqs_cis = torch.polar(
+            torch.ones(16, 32),
+            torch.randn(16, 32),
+        )
+        positions = torch.tensor([1, 3], dtype=torch.int64)
+        rotated = value + 1
+        vendor_op = mock.Mock(return_value=rotated)
+
+        with mock.patch.object(
+            torch.ops.xspeedgate_ops,
+            "dsv4_rotate_gptj_tail",
+            vendor_op,
+        ):
+            actual = kernel_ops._dsv4_rotate_gptj_tail(
+                value, freqs_cis, positions
+            )
+
+        torch.testing.assert_close(actual, rotated, rtol=0, atol=0)
+        kwargs = vendor_op.call_args.kwargs
+        self.assertEqual(kwargs["value"].device, value.device)
+        self.assertEqual(kwargs["value"].shape, (2, 64, 128))
+        self.assertEqual(kwargs["freqs_cis"].dtype, torch.complex64)
+        self.assertEqual(kwargs["positions"].dtype, torch.int32)
+        self.assertTrue(kwargs["value"].is_contiguous())
+        self.assertTrue(kwargs["freqs_cis"].is_contiguous())
+        self.assertTrue(kwargs["positions"].is_contiguous())
+        self.assertFalse(kwargs["inverse"])
+
     def test_dsv4_q_norm_rope_is_pure_torch(self):
         from sglang_kunlun.kernels import kernel_ops
 
