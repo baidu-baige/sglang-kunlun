@@ -17,7 +17,12 @@ for _name in ("dspark_worker_v2",):
         _name,
         importlib.import_module(f"sglang.srt.speculative.dspark_components.{_name}"),
     )
+# dflash_info_v2 同样要挂成 sglang.srt.speculative 的属性才能被解析。
+upstream_speculative.dflash_info_v2 = importlib.import_module(
+    "sglang.srt.speculative.dflash_info_v2"
+)
 
+from . import dflash_info_v2  # noqa: E402,F401
 from . import draft_utils  # noqa: E402,F401
 from . import dspark_draft_backend  # noqa: E402,F401
 from . import dspark_precision  # noqa: E402,F401
