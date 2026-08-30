@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import os
 
 import torch
 
@@ -33,25 +34,51 @@ _DSPARK_EXTRA_QUANT_IGNORE = (
 )
 
 
+#: 0=完全不清（默认，与 H20 上验证通过的配置一致），非 0=清。默认关掉是因为 DSPARK
+#: 那条不确定性的真正根因是 state ring 的 MTP 余量不足（``mtp_pad``），被拒草稿的残留
+#: 由上游 ``_clear_unaccepted_c128_states_after_verify`` 处理，这条 c4 路径在 H20 的
+#: 验证里是关闭状态，开启反而有害。留着开关是为了以后能单独复验这条路径。
+_C4_CLEAR_MODE = int(os.environ.get("DSV4_C4_CLEAR_MODE", "0"))
+
+
 def _clear_unaccepted_c4_states(self, rejected_locs: torch.Tensor) -> None:
     """把被拒草稿 token 对应的 ratio-4 compress-state 行置为无效。
 
     c4 不像 c128 那样按 request 寻址，行号来自 token 的 SWA slot。置无效的方式是
     kv 半边写 0、score 半边写 -inf，即把该 slot 从组内 pooling softmax 里剔除。
+
+    行号的 ground truth 是 ``c_plan.cuh`` 的 ``compute_loc``：
+    ``swa_page * ring_size + swa_loc % ring_size``，**不除** ``compress_ratio``。
+    那个 ``/ compress_ratio`` 只属于 ``plan_c.read_page``（压缩页索引），不属于
+    raw state ring。多除一次会把 4 个 slot 折叠到同一行、且只覆盖 buffer 前 1/4。
+
+    默认不清，见 ``_C4_CLEAR_MODE``。
     """
+    if _C4_CLEAR_MODE == 0:
+        return
     if rejected_locs is None or rejected_locs.numel() == 0:
         return
-    pools = [p for p in self.compress_state_pools if p is not None and p.ratio == 4]
+    pools = [
+        p
+        for p in list(self.compress_state_pools)
+        + list(getattr(self, "indexer_compress_state_pools", []) or [])
+        if p is not None and p.ratio == 4
+    ]
     if not pools:
         return
     swa_loc = self.translate_loc_from_full_to_swa(rejected_locs).to(torch.int64)
+    swa_loc = swa_loc.reshape(-1)
     for pool in pools:
         kv_score = getattr(getattr(pool, "kv_score_buffer", None), "kv_score", None)
         if kv_score is None:
             continue
         ring_size = pool.ring_size
         rows = swa_loc // self.swa_page_size * ring_size + swa_loc % ring_size
-        rows = torch.unique(rows.clamp_(min=0, max=kv_score.shape[0] - 1))
+        # 未映射的 slot（swa_loc < 0）折到 row 0 会破坏合法状态，直接丢掉。
+        keep = (swa_loc >= 0) & (rows >= 0) & (rows < kv_score.shape[0])
+        rows = torch.unique(rows[keep])
+        if rows.numel() == 0:
+            continue
         half = kv_score.shape[-1] // 2
         flat = (
             kv_score.reshape(kv_score.shape[0], -1)
@@ -91,7 +118,13 @@ def clear_unaccepted_compress_states_kunlun(result, self, *args, **kwargs):
     挂在 mamba 提交之后，是因为这里能同时拿到 batch、verify 前的 seq_lens 和
     commit_lens，且 batch.seq_lens 还没被 accept 结果覆盖。EAGLE/MTP 在
     ``eagle_worker_common.verify_target_output`` 里做的是同一件事。
+
+    上游 ``DSparkWorkerV2._clear_unaccepted_c128_states_after_verify`` 现在自己会
+    清 c128，所以这个 hook 默认关闭，避免同一批行清两遍、也避免和上游的口径打架。
+    要单独用它时设 ``DSV4_KUNLUN_CLEAR_COMPRESS=1``。
     """
+    if os.environ.get("DSV4_KUNLUN_CLEAR_COMPRESS", "0") != "1":
+        return result
     batch = kwargs.get("batch")
     seq_lens_pre_verify = kwargs.get("seq_lens_pre_verify")
     commit_lens = kwargs.get("commit_lens")

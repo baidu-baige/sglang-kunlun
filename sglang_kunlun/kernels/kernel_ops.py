@@ -849,6 +849,90 @@ def dsv4_compressor_decode_plan_kunlun(
     return CompressorDecodePlan(compress_ratio, plan_d)
 
 
+#: c4/c128 state ring 为「尚未提交的投机位置」预留的余量。XSpeedGate 的
+#: ``plan_compress_prefill_v2`` 把它写死成 ``min(ring_size - cr, 4)``（对应上游
+#: ``c_plan.cuh`` 老版本的 ``kMaxMTPDraftTokens = 4``），而 DSPARK 的 verify window 是 6，
+#: 于是最后几个 query 位置的 state 没落进 ring，下一步读到的是别人的历史 —— 同一请求多次
+#: 发送结果不一致。上游 H20 侧的修复是把常量改成 8；算子签名不暴露 mtp_pad，也没有本地
+#: xtdk 工具链重编，所以这里在框架侧按 pad=8 补出算子少给的那几行 plan_w。
+_DSV4_MTP_PAD = int(os.environ.get("DSV4_MTP_PAD", "8"))
+
+
+def _dsv4_augment_prefill_plan_w(
+    plan_w: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    full_to_state: torch.Tensor,
+    seq_lens: torch.Tensor,
+    extend_lens: torch.Tensor,
+    compress_ratio: int,
+    swa_page_size: int,
+    ring_size: int,
+    mtp_pad: int,
+) -> torch.Tensor:
+    """按更大的 ``mtp_pad`` 补齐 plan_w 缺的行。
+
+    算子用的是 ``first_w_pos = min(last_c_pos - (overlap ? cr : 0), seq_len - vendor_pad)``，
+    我们要的是同一公式换成 ``new_pad``。两者只差 ``[fw_new, fw_old)`` 这一小段位置，
+    每个请求最多 ``new_pad - vendor_pad`` 行，所以直接补行、不用重算整张表。
+
+    plan_w 是 ``[num_q_tokens, 8] uint8`` = ``(uint32 ragged_id, int32 write_loc)``，
+    有效行在前、尾部填 ``(-1, -1)`` 哨兵；有效行数上界是 ``sum(extend_lens) <= num_q_tokens``，
+    而每个位置最多产生一行，所以补的行一定放得进哨兵区。全程只用张量算子（无 D2H），
+    可以被 CUDA graph 捕获。
+    """
+
+    num_rows = int(plan_w.shape[0])
+    cr = compress_ratio
+    is_overlap = cr == 4
+    vendor_pad = 0 if seq_lens.device.type == "cpu" else min(ring_size - cr, 4)
+    new_pad = min(ring_size - cr, mtp_pad)
+    if num_rows == 0 or new_pad <= vendor_pad:
+        return plan_w
+
+    device = req_to_token.device
+    seq = seq_lens.to(device=device, dtype=torch.int64)
+    ext = extend_lens.to(device=device, dtype=torch.int64)
+    rid = req_pool_indices.to(device=device, dtype=torch.int64)
+    prefix = seq - ext
+    shift = seq.new_full((), cr if is_overlap else 0)
+    last_w = (seq // cr) * cr - shift
+    lo = torch.clamp(torch.maximum(torch.minimum(last_w, seq - new_pad), prefix), min=0)
+    hi = torch.maximum(torch.minimum(last_w, seq - vendor_pad), prefix)
+
+    offsets = torch.arange(new_pad - vendor_pad, device=device, dtype=torch.int64)
+    position = lo.unsqueeze(1) + offsets.unsqueeze(0)
+    valid = position < hi.unsqueeze(1)
+    ragged = (torch.cumsum(ext, 0) - ext).unsqueeze(1) + (position - prefix.unsqueeze(1))
+    valid &= (ragged >= 0) & (ragged < num_rows)
+
+    if cr == 128:
+        write_loc = rid.unsqueeze(1) * ring_size + position % ring_size
+    else:
+        raw = req_to_token[rid.unsqueeze(1), position].to(torch.int64)
+        swa = full_to_state[torch.clamp(raw, min=0)].to(torch.int64)
+        # r2t / f2s 里的空洞是负数，这些位置还没有 state，补出来只会写坏别人的行
+        valid &= (raw >= 0) & (swa >= 0)
+        write_loc = (swa // swa_page_size) * ring_size + swa % ring_size
+
+    invalid = torch.full_like(ragged, -1)
+    extra = torch.stack(
+        [torch.where(valid, ragged, invalid), torch.where(valid, write_loc, invalid)],
+        dim=-1,
+    ).reshape(-1, 2)
+
+    rows = plan_w.contiguous().view(torch.int32).reshape(num_rows, 2)
+    combined = torch.cat([rows, extra.to(torch.int32)], dim=0)
+    keep = combined[:, 0] >= 0
+    total = int(combined.shape[0])
+    # 有效行按原序压到前面；无效行全丢到最后一行（一定在 num_rows 之外，且此时它必然空闲）
+    dest = torch.cumsum(keep.to(torch.int64), 0) - 1
+    dest = torch.where(keep, dest, torch.full_like(dest, total - 1))
+    packed = torch.full((total, 2), -1, dtype=torch.int32, device=combined.device)
+    packed.index_copy_(0, dest, combined)
+    return packed[:num_rows].contiguous().view(torch.uint8).reshape(num_rows, 8)
+
+
 @plugin_hook(
     "sglang.kernels.ops.attention.dsv4.compress.CompressorPrefillPlan.generate",
     type=HookType.REPLACE,
@@ -888,6 +972,18 @@ def dsv4_compressor_prefill_plan_kunlun(
         swa_page_size,
         ring_size,
         use_cuda_graph,
+    )
+    plan_w = _dsv4_augment_prefill_plan_w(
+        plan_w,
+        req_pool_indices,
+        req_to_token,
+        full_to_state,
+        seq_lens,
+        extend_lens,
+        compress_ratio,
+        swa_page_size,
+        ring_size,
+        _DSV4_MTP_PAD,
     )
     return CompressorPrefillPlan(compress_ratio, plan_c, plan_w, None)
 
@@ -1494,6 +1590,14 @@ def _dspark_kernel_out(
     In that case a scratch buffer is returned and the caller must copy it back --
     check with ``buf is not tensor``. Otherwise ``tensor`` itself is returned and
     the kernel writes into it directly.
+
+    The scratch is never left uninitialized. Several XPU kernels skip writes for
+    rows they consider empty (see the ``new_full(-1)`` prefill in
+    ``dsv4_topk_transform_kunlun``), and a ``torch.empty`` scratch would then copy
+    the previous tenant of that allocation back into the caller's buffer --
+    reproducible for a fixed request order, but different for every request, which
+    is exactly the non-determinism signature we are chasing. Seeding the scratch
+    from ``tensor`` keeps untouched rows at the value the call site allocated.
     """
 
     shape = tuple(tensor.shape) if shape is None else tuple(shape)
@@ -1503,7 +1607,15 @@ def _dspark_kernel_out(
         and tuple(tensor.shape) == shape
     ):
         return tensor
-    return torch.empty(shape, dtype=dtype, device=tensor.device)
+    if tuple(tensor.shape) == shape:
+        return tensor.to(dtype=dtype).contiguous()
+    numel = 1
+    for dim in shape:
+        numel *= dim
+    flat = tensor.reshape(-1)
+    if flat.numel() >= numel:
+        return flat[:numel].to(dtype=dtype).contiguous().view(shape)
+    return torch.zeros(shape, dtype=dtype, device=tensor.device)
 
 
 def _dspark_require(condition: bool, op: str, message: str) -> None:
@@ -4257,21 +4369,23 @@ def dsv4_fused_k_norm_rope_flashmla_kunlun(
     )
     rotated = _dsv4_rotate_gptj_tail(normalized, freqs_cis, positions)
     max_valid_loc = kvcache.shape[0] * page_size - 1
-    # A negative out_loc means "this row is not committed, do not write it"
-    # (DSpark's verify commit passes -1 for the rejected tail). Clamping it to 0
-    # would write the row into cache slot 0 instead of skipping it.
+    # A negative out_loc means "this row is not committed" (DSpark's verify commit
+    # passes -1 for the rejected tail, routinely 5 of 6 rows). Those rows are
+    # neutralised by writing zeros into the padded slot 0, which the paged
+    # allocator reserves for dummy writes and never hands to a request
+    # (allocator/paged.py::clear starts free pages at 1), so page 0 stays zero
+    # just like before anything wrote to it.
+    #
+    # Selecting the committed rows instead -- ``.any()`` plus ``.nonzero()`` --
+    # needs a host sync and a data-dependent output shape. Inside a CUDA graph
+    # capture both read unsynchronized memory: the reported number of negatives
+    # varies between calls of the same forward, so the capture either asks the
+    # allocator for a garbage-sized buffer ("Tried to allocate more than 1EB")
+    # or, worse, silently freezes an arbitrary row count into the graph and
+    # replays it forever. Keep this path fixed-shape and sync-free.
     loc_flat = out_loc.reshape(-1)
-    skip_rows = loc_flat < 0
-    if bool(skip_rows.any()):
-        keep = (~skip_rows).nonzero(as_tuple=True)[0]
-        if keep.numel() == 0:
-            return
-        loc = loc_flat.index_select(0, keep).contiguous().clamp(
-            min=0, max=max_valid_loc
-        )
-        rotated = rotated.index_select(0, keep)
-    else:
-        loc = out_loc.contiguous().clamp(min=0, max=max_valid_loc)
+    committed = (loc_flat >= 0).unsqueeze(-1)
+    loc = loc_flat.contiguous().clamp(min=0, max=max_valid_loc)
     dump_layer0_k = (
         _ENABLE_DSV4_ACCURACY_DUMPS
         and kv.shape[0] == 8192
@@ -4288,6 +4402,11 @@ def dsv4_fused_k_norm_rope_flashmla_kunlun(
         # (--kv-cache-dtype fp16) reinterprets the bits: the sign survives and
         # the magnitude is scrambled. Convert explicitly.
         rotated_rows = rotated_rows.to(kvcache.dtype)
+    rotated_rows = torch.where(
+        committed,
+        rotated_rows,
+        torch.zeros((), dtype=rotated_rows.dtype, device=rotated_rows.device),
+    )
     identity_key = (kvcache.device, max_valid_loc + 1)
     identity_mapping = _DSV4_IDENTITY_MAPPING_CACHE.get(identity_key)
     if identity_mapping is None:
