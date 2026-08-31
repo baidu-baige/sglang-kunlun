@@ -11,7 +11,7 @@ upstream_speculative.eagle_worker_v2 = importlib.import_module(
 _dspark_components = importlib.import_module(
     "sglang.srt.speculative.dspark_components"
 )
-for _name in ("dspark_worker_v2",):
+for _name in ("dspark_worker_v2", "dspark_draft_sampler"):
     setattr(
         _dspark_components,
         _name,
@@ -25,6 +25,7 @@ upstream_speculative.dflash_info_v2 = importlib.import_module(
 from . import dflash_info_v2  # noqa: E402,F401
 from . import draft_utils  # noqa: E402,F401
 from . import dspark_draft_backend  # noqa: E402,F401
+from . import dspark_draft_sampler  # noqa: E402,F401
 from . import dspark_precision  # noqa: E402,F401
 from . import eagle_worker_v2  # noqa: E402,F401
 from . import multi_layer_eagle_worker_v2  # noqa: E402,F401
