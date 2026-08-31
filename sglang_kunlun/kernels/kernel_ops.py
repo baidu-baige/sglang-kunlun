@@ -855,7 +855,65 @@ def dsv4_compressor_decode_plan_kunlun(
 #: 于是最后几个 query 位置的 state 没落进 ring，下一步读到的是别人的历史 —— 同一请求多次
 #: 发送结果不一致。上游 H20 侧的修复是把常量改成 8；算子签名不暴露 mtp_pad，也没有本地
 #: xtdk 工具链重编，所以这里在框架侧按 pad=8 补出算子少给的那几行 plan_w。
-_DSV4_MTP_PAD = int(os.environ.get("DSV4_MTP_PAD", "8"))
+#: 0（默认）= 按 ring 几何推导，见 ``_dsv4_compress_state_write_pad``；非 0 = 强制覆盖，
+#: 仅用于复验。原来这里写死 8：能盖住当前 6 的 verify window，但和上游语义不一致，
+#: draft token 数一调大就会重新踩坑。
+_DSV4_MTP_PAD_OVERRIDE = int(os.environ.get("DSV4_MTP_PAD", "0"))
+
+_DSV4_MTP_PAD_LOGGED: set[tuple[int, int]] = set()
+
+
+def _dsv4_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
+    """state ring 能服务的最大 draft token 数，即 plan 的 ``mtp_pad``。
+
+    与社区a1fe4e3一致：``ring_size > window_size ? ring_size - window_size + 2 : 0``
+    （``c_plan.cuh`` 的 mtp_pad、``deepseek_v4_memory_pool.get_compress_state_write_pad``）。
+    v0.5.17 kernel 里还是 ``min(ring_size - cr, kMaxMTPDraftTokens=4)``，4 小于
+    DSPARK 的 6-token verify window，尾部位置进不了 ring，下一步读到的是上一个占用者的
+    state —— 同一请求多次发送结果不一致。投机配置下本公式给出 c4=10、c128=130。
+
+    升级到带这个修复的 sglang / 重编算子之后，本函数和
+    ``_dsv4_augment_prefill_plan_w`` 一起删掉。
+    """
+
+    window_size = compress_ratio * (2 if compress_ratio == 4 else 1)
+    pad = ring_size - window_size + 2 if ring_size > window_size else 0
+    if _DSV4_MTP_PAD_OVERRIDE:
+        pad = _DSV4_MTP_PAD_OVERRIDE
+    key = (compress_ratio, ring_size)
+    if key not in _DSV4_MTP_PAD_LOGGED:
+        _DSV4_MTP_PAD_LOGGED.add(key)
+        num_draft = _dsv4_num_draft_tokens()
+        logger.info(
+            "dsv4 compress state ring: ratio=%d ring_size=%d window=%d mtp_pad=%d "
+            "(vendor kernel uses %d, num_draft_tokens=%s)",
+            compress_ratio,
+            ring_size,
+            window_size,
+            pad,
+            min(ring_size - compress_ratio, 4),
+            num_draft,
+        )
+        if num_draft is not None and pad < num_draft:
+            raise AssertionError(
+                f"compress state ring cannot serve the verify window: mtp_pad={pad} < "
+                f"num_draft_tokens={num_draft} (ratio={compress_ratio}, "
+                f"ring_size={ring_size}). Rejected draft state would be read back from "
+                f"whatever the ring held before, which shows up as non-reproducible "
+                f"output rather than an error. Raise ring_size or lower the window."
+            )
+    return pad
+
+
+def _dsv4_num_draft_tokens() -> int | None:
+    """投机的 draft token 数；拿不到就返回 None（不阻塞启动）。"""
+
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        return get_global_server_args().speculative_num_draft_tokens
+    except Exception:  # pragma: no cover - 仅用于日志与断言
+        return None
 
 
 def _dsv4_augment_prefill_plan_w(
@@ -983,7 +1041,7 @@ def dsv4_compressor_prefill_plan_kunlun(
         compress_ratio,
         swa_page_size,
         ring_size,
-        _DSV4_MTP_PAD,
+        _dsv4_compress_state_write_pad(compress_ratio, ring_size),
     )
     return CompressorPrefillPlan(compress_ratio, plan_c, plan_w, None)
 
