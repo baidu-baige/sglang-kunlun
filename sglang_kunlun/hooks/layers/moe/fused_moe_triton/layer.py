@@ -58,3 +58,40 @@ def create_moe_dispatcher_kunlun(moe_runner_config):
             params_dtype=moe_runner_config.params_dtype,
         )
     raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
+
+
+@plugin_hook(
+    "sglang.srt.layers.moe.fused_moe_triton.layer.FusedMoE._weight_loader_impl",
+    type=HookType.AROUND,
+)
+def weight_loader_impl_kunlun(
+    original_fn, self, param, loaded_weight, weight_name, shard_id, expert_id
+):
+    """Compressed-tensors stores expert projections as ``[out, in // pack]`` with
+    ``[out, num_groups]`` scales, while the Kunlun packed-INT4 schemes register
+    ``is_transposed=True`` params (``[in // pack, out]`` / ``[num_groups, out]``).
+    Upstream bridges the two by transposing ``loaded_weight``, but only when the
+    scheme class name is exactly one of its own ``CompressedTensorsWNA16*MoE``
+    (see ``_weight_loader_impl`` in the upstream module), so the Kunlun
+    subclasses never got the flip and per-channel scales failed to copy
+    (``[4096, 1]`` into ``[1, 4096]``).
+    """
+    from sglang_kunlun.hooks.layers.quantization.compressed_tensors.schemes import (
+        KunlunCompressedTensorsWNA16MoE,
+    )
+
+    if (
+        isinstance(getattr(self, "scheme", None), KunlunCompressedTensorsWNA16MoE)
+        and "zero" not in weight_name
+        and loaded_weight.dim() == 2
+    ):
+        loaded_weight = loaded_weight.t().contiguous()
+
+    return original_fn(
+        self,
+        param=param,
+        loaded_weight=loaded_weight,
+        weight_name=weight_name,
+        shard_id=shard_id,
+        expert_id=expert_id,
+    )
