@@ -1,18 +1,4 @@
-"""REPLACE ``UnquantizedFusedMoEMethod.apply`` with a kunlun_ops moe path.
-
-Source: kunlun-0.5.10-mimo: sgl-kernel/.../patch/layers/quantization/unquant.py.
-
-The mimo branch monkey-patches ``UnquantizedFusedMoEMethod.apply`` to a
-kunlun_ops-backed pipeline (gen_block_statistic -> moe_pre_sorted ->
-moe_fc -> swiglu -> moe_fc -> moe_post). Here we surface the same
-behaviour through a method-level ``REPLACE`` plugin hook.
-
-The hook expects ``dispatch_output.topk_output`` to be a 4-tuple
-``(topk_weights, topk_ids, router_logits, block_statistic)`` as produced
-by the kunlun ``select_experts`` REPLACE in ``layers/moe/topk.py``
-(Wave 3). On a non-Kunlun host the original upstream apply is used, so
-nothing changes there.
-"""
+"""unquant"""
 
 from __future__ import annotations
 
