@@ -369,6 +369,30 @@ def _dsa_cp_local_extend_lens(extend_seq_lens_cpu, cp_rank: int, cp_size: int):
     return local_lens
 
 
+def _cp_short_prompt_needs_reference(forward_batch) -> bool:
+    """True for extend batches that CP leaves unsplit.
+
+    ``can_dsa_prefill_cp_round_robin_split`` bails out when the batch has fewer
+    tokens than ``cp_size``, so such a batch keeps the pre-CP request-level LoD
+    while its query rows are still padded to the CP/page alignment. Feeding those
+    padding rows to ``compressed_attention`` wedges the device (observed with the
+    one-token internal health check, which pads to a full 256-row page and never
+    returns). Real traffic is long enough to be CP-split and stays on the
+    operator; only these degenerate batches take the Torch reference path.
+    ``DSV4_KUNLUN_CP_SHORT_REFERENCE=0`` restores the previous behaviour.
+    """
+    if forward_batch is None or os.environ.get(
+        "DSV4_KUNLUN_CP_SHORT_REFERENCE", "1"
+    ) != "1":
+        return False
+    if not _dsa_prefill_cp_enabled():
+        return False
+    mode = forward_batch.forward_mode
+    if not mode.is_extend() or _is_graph_extend_mode(mode):
+        return False
+    return _dsa_cp_prefill_ranks(forward_batch) is None
+
+
 def _make_cp_prefill_lod(core_metadata, num_queries: int, device: torch.device):
     """CP round-robin contract: every local Q token is its own batch item.
 
@@ -1162,6 +1186,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         if (
             os.environ.get("DSV4_KUNLUN_REFERENCE_ONLY") == "1"
             or os.environ.get("DSV4_KUNLUN_REFERENCE_ATTN") == "1"
+            or _cp_short_prompt_needs_reference(forward_batch)
         ):
 
             if extra_cache is not None:
@@ -1700,6 +1725,7 @@ def _compute_c4_logits_kunlun(
     if (
         os.environ.get("DSV4_KUNLUN_REFERENCE_ONLY") == "1"
         or os.environ.get("DSV4_KUNLUN_REFERENCE_C4") == "1"
+        or _cp_short_prompt_needs_reference(forward_batch)
     ):
         if is_target_verify:
             return _c4_target_verify_logits_chunked(

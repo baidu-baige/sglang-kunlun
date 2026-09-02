@@ -351,6 +351,14 @@ def _dsv4_topk_torch_fallback(*args, **kwargs) -> None:
     topk_transform_512_pytorch_vectorized(*args, **kwargs)
 
 
+_C4_LOGITS_CHUNK_BYTES_ENV = "SGLANG_KUNLUN_C4_LOGITS_CHUNK_BYTES"
+# Peak device bytes allowed for one row tile of the reference C4 logits path.
+# The (rows, kv_len, num_heads) FP32 score tile dominates, so an unbounded row
+# count OOMs on long context; 512 MiB keeps the tile small while still giving
+# the BMM enough rows to stay efficient.
+_DEFAULT_C4_LOGITS_CHUNK_BYTES = 512 * 1024 * 1024
+
+
 def dsv4_c4_paged_mqa_logits_torch(
     q_int8: torch.Tensor,
     kvcache_int8: torch.Tensor,
@@ -359,7 +367,22 @@ def dsv4_c4_paged_mqa_logits_torch(
     page_table: torch.Tensor,
     max_seq_len: int,
 ) -> torch.Tensor:
-    """Compute C4 indexer logits from Kunlun's INT8 plus FP32-scale cache."""
+    """Compute C4 indexer logits from Kunlun's INT8 plus FP32-scale cache.
+
+    Memory, not compute, is the binding constraint: the score tile is
+    ``rows * kv_len * num_heads`` FP32 and the dequantised key tile is
+    ``rows * kv_len * head_dim`` FP32, so a full-batch long-context call needs
+    tens of GiB. Three things keep the peak bounded:
+
+    * only the page columns the caller can consume are gathered (everything
+      past ``max_seq_len`` used to be computed and then sliced off);
+    * rows are processed in tiles sized by a byte budget
+      (``SGLANG_KUNLUN_C4_LOGITS_CHUNK_BYTES``);
+    * relu / weight / mask run in place, and each tile is written straight into
+      the zero-filled output instead of building padded copies.
+
+    Results are bit-identical to the unchunked formulation.
+    """
 
     batch_size, _, num_heads, head_dim = q_int8.shape
     block_size = kvcache_int8.shape[1]
@@ -378,33 +401,66 @@ def dsv4_c4_paged_mqa_logits_torch(
             f"got {tuple(weight.shape)}"
         )
 
+    out = q_int8.new_zeros((batch_size, max_seq_len), dtype=torch.float32)
+    if batch_size == 0 or max_seq_len <= 0:
+        return out
+
+    # Columns beyond max_seq_len are dropped by the caller: never gather them.
+    num_pages = min(page_table.shape[1], -(-max_seq_len // block_size))
+    if num_pages == 0:
+        return out
+    kv_len = min(num_pages * block_size, max_seq_len)
+
     page_count = kvcache_int8.shape[0]
     page_bytes = block_size * (head_dim + 4)
     scale_offset = block_size * head_dim
     cache_flat = kvcache_int8.reshape(page_count, page_bytes).view(torch.int8)
-    safe_pages = page_table.to(torch.int64).clamp(min=0, max=max(page_count - 1, 0))
-    gathered = cache_flat.index_select(0, safe_pages.reshape(-1)).reshape(
-        batch_size, page_table.shape[1], page_bytes
+    safe_pages = (
+        page_table[:, :num_pages]
+        .to(torch.int64)
+        .clamp(min=0, max=max(page_count - 1, 0))
     )
-
-    keys = gathered[..., :scale_offset].contiguous().float()
-    keys = keys.reshape(batch_size, -1, head_dim)
-    scales = gathered[..., scale_offset:].contiguous().view(torch.float32)
-    scales = scales.reshape(batch_size, -1)
     queries = q_int8[:, 0].view(torch.int8).float()
+    weights = weight.float()
+    positions = torch.arange(kv_len, device=out.device).unsqueeze(0)
 
-    scores = torch.bmm(keys, queries.transpose(1, 2))
-    scores = torch.relu(scores) * weight.float().unsqueeze(1)
-    scores = scores.sum(dim=2) * scales
+    # FP32 keys + FP32 scores + INT8 gather + FP32 row logits + bool mask.
+    row_bytes = kv_len * (head_dim * 4 + num_heads * 4 + (head_dim + 4) + 4 + 1)
+    budget = int(
+        os.environ.get(_C4_LOGITS_CHUNK_BYTES_ENV, _DEFAULT_C4_LOGITS_CHUNK_BYTES)
+    )
+    chunk = max(1, budget // max(row_bytes, 1))
 
-    padded_seq_len = scores.shape[1]
-    positions = torch.arange(padded_seq_len, device=scores.device).unsqueeze(0)
-    scores = scores.masked_fill(positions >= seq_lens.unsqueeze(1), 0.0)
-    if padded_seq_len < max_seq_len:
-        scores = torch.nn.functional.pad(
-            scores, (0, max_seq_len - padded_seq_len), value=0.0
+    for lo in range(0, batch_size, chunk):
+        hi = min(lo + chunk, batch_size)
+        rows = hi - lo
+
+        gathered = cache_flat.index_select(0, safe_pages[lo:hi].reshape(-1)).reshape(
+            rows, num_pages, page_bytes
         )
-    return scores[:, :max_seq_len]
+        # ``.float()`` on the strided slice fuses the contiguous copy with the
+        # cast, so the INT8 key tile is never materialised separately.
+        keys = gathered[..., :scale_offset].float().reshape(rows, -1, head_dim)
+        scales = (
+            gathered[..., scale_offset:]
+            .contiguous()
+            .view(torch.float32)
+            .reshape(rows, -1)
+        )
+        del gathered
+
+        scores = torch.bmm(keys, queries[lo:hi].transpose(1, 2))
+        del keys
+        scores.relu_().mul_(weights[lo:hi].unsqueeze(1))
+        row_logits = scores.sum(dim=2)
+        del scores
+
+        row_logits.mul_(scales)
+        row_logits = row_logits[:, :kv_len]
+        row_logits.masked_fill_(positions >= seq_lens[lo:hi].unsqueeze(1), 0.0)
+        out[lo:hi, :kv_len] = row_logits
+
+    return out
 
 
 def dsv4_compressed_attention_torch(
