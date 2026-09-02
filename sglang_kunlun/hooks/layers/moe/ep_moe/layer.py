@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 import torch
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph as is_in_piecewise_cuda_graph,
 )
@@ -27,8 +26,8 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var, dispose_tensor
 from sglang.srt.layers.activation import SiluAndMul
 
@@ -41,6 +40,10 @@ if TYPE_CHECKING:
 
 
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config, W8A8Int8MoEMethod
+from sglang_kunlun.hooks.layers.quantization.compressed_tensors.compressed_tensors import (
+    KunlunCompressedTensorsConfig,
+    KunlunCompressedTensorsWNA16MoE,
+)
 from kunlun_ops import (
     dequant2d_per_token,
     m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_v3,
@@ -49,15 +52,39 @@ from kunlun_ops import (
     m_grouped_gemm_fp16_fp16_bf16_nt_contiguous_v3,
     m_grouped_gemm_fp16_fp16_bf16_nt_masked_castte_v3,
     m_grouped_gemm_fp16_fp16_bf16_nt_masked_v3,
+    m_grouped_gemm_fp16_I4_bf16_nt_contiguous_v3,
+    m_grouped_gemm_fp16_I4_bf16_nt_masked_v3,
+    m_grouped_gemm_I8_I4_bf16_nt_contiguous_v3,
+    m_grouped_gemm_I8_I4_bf16_nt_masked_v3,
     m_grouped_gemm_I8_I8_bf16_nt_contiguous_v3,
     m_grouped_gemm_I8_I8_bf16_nt_masked,
     m_grouped_gemm_I8_I8_bf16_nt_masked_v3,
     per_token_dequant2d_with_mask,
     silu_and_mul_mask_fwd,
+    silu_and_per_token_group_quant_I8,
 )
 logger = logging.getLogger(__name__)
 
-_FP16_DTYPE_NAMES = frozenset(("fp16", "float16", "half"))
+
+class _DSV4ClampedSiluAndMul(torch.nn.Module):
+    """SiluAndMul with the DeepSeek-V4 swiglu_limit clamp on the gate/up inputs.
+
+    DSV4 requires clamping routed-expert SwiGLU inputs to ``swiglu_limit`` (the shared
+    expert and the reference implementation already do this). Without the clamp, the
+    BOS/attention-sink token activations grow across layers into an fp16 Inf/NaN cascade
+    and greedy decoding collapses to repeating token 0. No-op when |g|, |u| < limit.
+    """
+
+    def __init__(self, limit: float):
+        super().__init__()
+        self.limit = float(limit)
+
+    def forward(self, x):
+        """Clamp the SwiGLU gate/up to swiglu_limit, then SiLU-multiply."""
+        gate, up = x.chunk(2, dim=-1)
+        gate = gate.clamp(max=self.limit)
+        up = up.clamp(min=-self.limit, max=self.limit)
+        return (torch.nn.functional.silu(gate.float()) * up.float()).to(x.dtype)
 
 
 class ReusedBuffer:
@@ -136,11 +163,16 @@ class Bfp16orFp16NormalMoeBuffer:
         )
         buffer1_size = max(self.M * self.H * 2, self.M * self.F * 2)
         try:
+            # Zero-initialised: the buffers are reinterpreted as bf16/fp16 and the
+            # grouped GEMMs only write the rows of the experts that actually got
+            # tokens. Uninitialised bytes read back as NaN, and a single NaN row
+            # poisons the shared-scale int8 quantisation (and therefore every
+            # token) on the first forward, before any expert has filled them.
             self.buffer0 = ReusedBuffer(
-                torch.empty(buffer0_size, dtype=torch.uint8, device=self.device)
+                torch.zeros(buffer0_size, dtype=torch.uint8, device=self.device)
             )
             self.buffer1 = ReusedBuffer(
-                torch.empty(buffer1_size, dtype=torch.uint8, device=self.device)
+                torch.zeros(buffer1_size, dtype=torch.uint8, device=self.device)
             )
         except Exception as e:
             logger.info(
@@ -237,11 +269,12 @@ class W8A8NormalMoeBuffer:
             self.M * self.H * 1, self.M * self.F * 2, self.N * self.H * 2
         )
         buffer1_size = max(self.M * 2 * self.F * 2, self.M * self.H * 2)
+        # Zero-initialised for the same reason as Bfp16orFp16NormalMoeBuffer.
         self.buffer0 = ReusedBuffer(
-            torch.empty(buffer0_size, dtype=torch.uint8, device=self.device)
+            torch.zeros(buffer0_size, dtype=torch.uint8, device=self.device)
         )
         self.buffer1 = ReusedBuffer(
-            torch.empty(buffer1_size, dtype=torch.uint8, device=self.device)
+            torch.zeros(buffer1_size, dtype=torch.uint8, device=self.device)
         )
 
     @property
@@ -345,8 +378,11 @@ class DeepEPMoE(FusedMoE):
         else:
             self.deprecate_flag = False
 
-        # if self.deprecate_flag:
-        #     return self.dispatcher
+        if self.deprecate_flag:
+            return
+
+        self.use_w4a16 = False
+        self.use_w4a8 = False
 
         if isinstance(quant_config, Fp8Config):
             self.use_block_quant = getattr(self.quant_method, "block_quant", False)
@@ -367,6 +403,26 @@ class DeepEPMoE(FusedMoE):
             )
             self.activation_scheme = None
             self.fp8_dtype = torch.int8
+        elif isinstance(quant_config, KunlunCompressedTensorsConfig):
+            scheme = getattr(self, "scheme", None)
+            packed_int4 = isinstance(scheme, KunlunCompressedTensorsWNA16MoE)
+            self.use_w4a8 = packed_int4 and bool(
+                getattr(scheme, "quantize_activations", False)
+            )
+            self.use_w4a16 = packed_int4 and not self.use_w4a8
+            self.use_fp8_w8a8 = not packed_int4
+            self.use_block_quant = False
+            self.block_shape = None
+            self.activation_scheme = None
+            self.fp8_dtype = torch.int8
+            self.use_w4afp8 = False
+            if packed_int4 and layer_id == 0:
+                logger.info(
+                    "[DeepEPMoE] packed INT4 experts detected, using %s",
+                    "W4A8 (INT8 activations)"
+                    if self.use_w4a8
+                    else "W4A16 (FP16 activations)",
+                )
         else:
             self.use_w4afp8 = False
             self.use_fp8_w8a8 = False
@@ -375,6 +431,13 @@ class DeepEPMoE(FusedMoE):
 
         self.deepep_mode = get_deepep_mode()
         self.act_fn = SiluAndMul()
+        # DSV4 routed-expert SwiGLU swiglu_limit clamp (see _DSV4ClampedSiluAndMul).
+        _swiglu_limit = getattr(self.moe_runner_config, "swiglu_limit", None)
+        if _swiglu_limit is not None:
+            self.act_fn = _DSV4ClampedSiluAndMul(_swiglu_limit)
+        # Same clamp for the mask-aware kunlun_ops activations, which take the
+        # limit as an argument (<= 0.0 disables it).
+        self.swiglu_limit = 0.0 if _swiglu_limit is None else float(_swiglu_limit)
  
     def forward(
         self,
@@ -417,13 +480,9 @@ class DeepEPMoE(FusedMoE):
         hidden_states = self.dispatcher.combine(
             combine_input=combine_input,
         )
-        if get_global_server_args().dtype in _FP16_DTYPE_NAMES:
-            # DeepEP combine 返回 bf16，收窄到 fp16 前先 clamp，避免累加后的 MoE
-            # 输出超出 fp16 范围。
+        if get_global_server_args().dtype in ["float16", "fp16", "half"]:
             limit = int(os.environ.get("SGLANG_FP16_LIMIT_IN_MOE", "10"))
-            hidden_states = hidden_states.clamp(min=-limit, max=limit).to(
-                torch.float16
-            )
+            hidden_states = hidden_states.clamp(min=-limit, max=limit).to(torch.float16)
 
         return hidden_states
 
@@ -546,13 +605,20 @@ class DeepEPMoE(FusedMoE):
                         num_recv_tokens_per_expert_list_start[expert] += 1
         else:
             recv_x_all_int8 = moe_buffer.recv_x_all_int8
-            input_scale = torch.empty(
+            # ``dispatch_convert`` only fills the rows that actually received a
+            # token; ``num_all_tokens`` is padded up to the expert alignment, so
+            # the tail rows stay untouched. Zero-initialise (like the
+            # XSGL_NATIVE_DEEPEP_NORMAL branch above) — with torch.empty those
+            # rows carry uninitialised bytes, which read back as NaN scales /
+            # weights / group ids on the first forward after start-up and poison
+            # the grouped GEMM output for the real tokens as well.
+            input_scale = torch.zeros(
                 num_all_tokens, 1, device=device, dtype=torch.float32
             )
-            m_indices = torch.empty(num_all_tokens, dtype=torch.int32, device=device)
-            token_counts = torch.empty(num_tokens, dtype=torch.int32, device=device)
-            token_to_m = torch.empty(num_tokens, topk, dtype=torch.int32, device=device)
-            token_weights = torch.empty(
+            m_indices = torch.zeros(num_all_tokens, dtype=torch.int32, device=device)
+            token_counts = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+            token_to_m = torch.zeros(num_tokens, topk, dtype=torch.int32, device=device)
+            token_weights = torch.zeros(
                 num_all_tokens, dtype=torch.bfloat16, device=device
             )
             torch.ops.custom_ops.dispatch_convert(
@@ -656,7 +722,402 @@ class DeepEPMoE(FusedMoE):
                 y=x_to_combine,
             )
 
+        # DSV4_ROUTED_NORM_CAP: fp16 overflow guard for attention-sink (BOS) tokens.
+        # The reference (same deepep+int8+fp16 config) keeps the BOS routed output
+        # bounded; our int8 routed path is ~2%/layer larger and compounds on the BOS
+        # attention-sink token until the fp16 residual overflows (>65504) -> Inf/NaN ->
+        # greedy repeats token 0. Direction-preserving per-token rescale, applied only to
+        # tokens whose L2 norm exceeds the cap; normal tokens are untouched. No-op when
+        # the env var is unset/0. Keeps the int8 path (no dtype change).
+        _norm_cap = float(os.environ.get("DSV4_ROUTED_NORM_CAP", "0"))
+        if _norm_cap > 0.0 and x_to_combine.numel() > 0:
+            _xf = x_to_combine.float()
+            _norm = _xf.norm(dim=-1, keepdim=True)
+            _scale = torch.clamp(_norm_cap / torch.clamp(_norm, min=1e-6), max=1.0)
+            x_to_combine = (_xf * _scale).to(x_to_combine.dtype)
         return x_to_combine
+
+    def _w4_scatter_tokens(self, dispatch_output, *, int8_activations: bool):
+        """Scatter dispatched INT8 tokens into per-expert contiguous rows.
+
+        Shared prologue of the two packed-INT4 contiguous paths: it mirrors
+        ``forward_deepgemm_contiguous`` but returns the per-expert token counts
+        the INT4 grouped GEMMs expect as ``m_indices``.
+        """
+        (
+            hidden_states,
+            hidden_states_scale,
+            topk_idx,
+            topk_weights,
+            num_recv_tokens_per_expert,
+        ) = dispatch_output
+        device = hidden_states.device
+        num_tokens, hidden_size = hidden_states.shape
+        ffn_hidden_size = self.w13_weight_packed.shape[1] // 2
+        num_all_tokens = sum(num_recv_tokens_per_expert)
+        assert num_all_tokens >= num_tokens, f"{num_all_tokens} >= {num_tokens}"
+        topk = topk_idx.shape[1]
+
+        num_recv_tokens_per_expert_cpu_tensor = torch.tensor(
+            num_recv_tokens_per_expert,
+            dtype=torch.int32,
+            device="cpu",
+        )
+        num_recv_tokens_per_expert_list_start_cpu = torch.zeros(
+            len(num_recv_tokens_per_expert) + 1, dtype=torch.int32
+        )
+        num_recv_tokens_per_expert_list_start_cpu[1:] = torch.cumsum(
+            num_recv_tokens_per_expert_cpu_tensor,
+            dim=0,
+            dtype=torch.int32,
+        )
+
+        if int8_activations:
+            moe_buffer = W8A8NormalMoeBuffer(
+                num_tokens, num_all_tokens, hidden_size, ffn_hidden_size, device
+            )
+        else:
+            # INT8 activations land in buffer0, their FP16 dequant in buffer1.
+            moe_buffer = Bfp16orFp16NormalMoeBuffer(
+                num_tokens,
+                num_all_tokens,
+                hidden_size,
+                ffn_hidden_size,
+                device,
+                is_bfp16=False,
+            )
+        # ``dispatch_convert`` only fills the rows that actually received a
+        # token, so every metadata tensor must be zero-initialised (see
+        # forward_deepgemm_contiguous for what uninitialised rows do).
+        recv_x_all_int8 = moe_buffer.recv_x_all_int8
+        input_scale = torch.zeros(
+            num_all_tokens, 1, device=device, dtype=torch.float32
+        )
+        m_indices = torch.zeros(num_all_tokens, dtype=torch.int32, device=device)
+        token_counts = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+        token_to_m = torch.zeros(num_tokens, topk, dtype=torch.int32, device=device)
+        token_weights = torch.zeros(
+            num_all_tokens, dtype=torch.bfloat16, device=device
+        )
+        torch.ops.custom_ops.dispatch_convert(
+            hidden_states,
+            hidden_states_scale,
+            topk_idx,
+            topk_weights,
+            num_recv_tokens_per_expert_list_start_cpu.to(device, non_blocking=True),
+            num_tokens,
+            num_all_tokens,
+            hidden_size,
+            self.num_local_experts,
+            recv_x_all=recv_x_all_int8,
+            recv_x_all_scale=input_scale,
+            m_indices=m_indices,
+            token_counts=token_counts,
+            token_to_m=token_to_m,
+            token_weights=token_weights,
+        )
+        return (
+            moe_buffer,
+            recv_x_all_int8,
+            input_scale,
+            # the INT4 grouped GEMMs take per-expert token counts, not per-token ids
+            num_recv_tokens_per_expert_cpu_tensor.to(device, non_blocking=True),
+            (token_counts, token_to_m, token_weights),
+            num_all_tokens,
+        )
+
+    def _w4_combine_tokens(
+        self,
+        down_output: torch.Tensor,
+        scatter_meta,
+        num_tokens: int,
+        num_all_tokens: int,
+        hidden_size: int,
+    ):
+        """Reduce the expert-sorted rows back to one row per token."""
+        token_counts, token_to_m, token_weights = scatter_meta
+        x_to_combine = torch.zeros(
+            (num_tokens, hidden_size), dtype=torch.bfloat16, device=down_output.device
+        )
+        torch.ops.custom_ops.combine_convert(
+            down_output,
+            token_counts,
+            token_to_m.to(torch.int64),
+            token_weights,
+            num_tokens,
+            num_all_tokens,
+            hidden_size,
+            algo=0,
+            y=x_to_combine,
+        )
+        return x_to_combine
+    def forward_w4a16_contiguous(
+        self,
+        dispatch_output: "DeepEPNormalDispatchOutput",
+    ):
+        """Contiguous (normal) MoE over compressed-tensors packed INT4 weights.
+
+        Token scatter/gather is the same as ``forward_deepgemm_contiguous``;
+        the grouped GEMMs are Kunlun's FP16 x INT4 kernels instead. The normal
+        dispatcher always hands us per-token INT8 activations, so they are
+        dequantized to FP16 first (there is no BF16 x INT4 grouped GEMM).
+        """
+        hidden_states, _, _, _, num_recv_tokens_per_expert = dispatch_output
+        num_tokens, hidden_size = hidden_states.shape
+        if num_tokens == 0:
+            return torch.empty_like(hidden_states, dtype=torch.bfloat16)
+        if num_recv_tokens_per_expert is None:
+            return hidden_states.bfloat16()
+        assert isinstance(num_recv_tokens_per_expert, list)
+
+        w13_weight, w2_weight = self.w13_weight_packed, self.w2_weight_packed
+        (
+            moe_buffer,
+            recv_x_all_int8,
+            input_scale,
+            m_indices,
+            scatter_meta,
+            num_all_tokens,
+        ) = self._w4_scatter_tokens(dispatch_output, int8_activations=False)
+
+        # GroupGemm-0
+        recv_x_all = moe_buffer.recv_x_all
+        dequant2d_per_token(recv_x_all_int8, input_scale, recv_x_all, is_absmax=True)
+        gateup_output = moe_buffer.gateup_output
+        m_grouped_gemm_fp16_I4_bf16_nt_contiguous_v3(
+            recv_x_all,
+            (w13_weight, self.w13_weight_scale),
+            gateup_output.view(num_all_tokens, w13_weight.shape[1]),
+            m_indices,
+        )
+
+        # Act
+        down_input = self.act_fn(gateup_output)
+        # reuse buffer1 (recv_x_all is dead by now) for the FP16 down input
+        down_input_fp16 = moe_buffer.down_inp_bfp16
+        down_input_fp16.copy_(down_input)
+        del down_input
+
+        # GroupGemm-1
+        down_output = moe_buffer.down_output
+        m_grouped_gemm_fp16_I4_bf16_nt_contiguous_v3(
+            down_input_fp16,
+            (w2_weight, self.w2_weight_scale),
+            down_output.view(num_all_tokens, w2_weight.shape[1]),
+            m_indices,
+        )
+
+        return self._w4_combine_tokens(
+            down_output, scatter_meta, num_tokens, num_all_tokens, hidden_size
+        )
+    def forward_w4a8_contiguous(
+        self,
+        dispatch_output: "DeepEPNormalDispatchOutput",
+    ):
+        """Contiguous MoE over packed INT4 weights with INT8 activations.
+
+        Same scatter/gather as ``forward_w4a16_contiguous``, but the dispatched
+        per-token INT8 activations feed Kunlun's INT8 x INT4 grouped GEMM
+        directly (no FP16 dequant) and the SwiGLU output is re-quantized to
+        per-token INT8 before the down projection.
+        """
+        import kunlun_ops
+
+        hidden_states, _, _, _, num_recv_tokens_per_expert = dispatch_output
+        num_tokens, hidden_size = hidden_states.shape
+        if num_tokens == 0:
+            return torch.empty_like(hidden_states, dtype=torch.bfloat16)
+        if num_recv_tokens_per_expert is None:
+            return hidden_states.bfloat16()
+        assert isinstance(num_recv_tokens_per_expert, list)
+
+        w13_weight, w2_weight = self.w13_weight_packed, self.w2_weight_packed
+        (
+            moe_buffer,
+            recv_x_all_int8,
+            input_scale,
+            m_indices,
+            scatter_meta,
+            num_all_tokens,
+        ) = self._w4_scatter_tokens(dispatch_output, int8_activations=True)
+
+        # GroupGemm-0
+        gateup_output = moe_buffer.gateup_output
+        m_grouped_gemm_I8_I4_bf16_nt_contiguous_v3(
+            (recv_x_all_int8, input_scale),
+            (w13_weight, self.w13_weight_scale),
+            gateup_output.view(num_all_tokens, w13_weight.shape[1]),
+            m_indices,
+        )
+
+        # Act, then per-token INT8 requant. ``input_scale`` is dead after
+        # GroupGemm-0 and is reused for the down input scales.
+        down_input = self.act_fn(gateup_output)
+        down_input_int8 = moe_buffer.down_input_int8
+        kunlun_ops.quant2d(down_input, down_input_int8, input_scale)
+        del down_input
+
+        # GroupGemm-1
+        down_output = moe_buffer.down_output
+        m_grouped_gemm_I8_I4_bf16_nt_contiguous_v3(
+            (down_input_int8, input_scale),
+            (w2_weight, self.w2_weight_scale),
+            down_output.view(num_all_tokens, w2_weight.shape[1]),
+            m_indices,
+        )
+
+        return self._w4_combine_tokens(
+            down_output, scatter_meta, num_tokens, num_all_tokens, hidden_size
+        )
+    def forward_w4a16_masked(
+        self,
+        dispatch_output: "DeepEPLLDispatchOutput",
+    ):
+        """Masked (low-latency) MoE over packed INT4 weights, FP16 activations.
+
+        Kunlun only provides an FP16-activation INT4 grouped GEMM, so the
+        dispatched activations are materialized as FP16 while the GEMM outputs
+        stay BF16.
+        """
+        hidden_states, hidden_states_scale, _, _, masked_m, expected_m = dispatch_output
+        w13_weight, w2_weight = self.w13_weight_packed, self.w2_weight_packed
+
+        if hidden_states_scale is None:
+            # BF16 dispatch (SGLANG_DEEPEP_BF16_DISPATCH).
+            hidden_states_fp16 = hidden_states.to(torch.float16)
+        else:
+            hidden_states_fp16 = torch.empty_like(
+                hidden_states, dtype=torch.float16
+            )
+            per_token_dequant2d_with_mask(
+                hidden_states,
+                hidden_states_scale,
+                masked_m,
+                hidden_states_fp16,
+                is_absmax=True,
+            )
+        if hidden_states_fp16 is not hidden_states:
+            dispose_tensor(hidden_states)
+
+        num_groups, m, _ = hidden_states_fp16.size()
+        expected_m = min(expected_m, m)
+
+        # GroupGemm-0
+        n = w13_weight.size(1)
+        gateup_output = torch.empty(
+            (num_groups, m, n),
+            device=hidden_states_fp16.device,
+            dtype=torch.bfloat16,
+        )
+        m_grouped_gemm_fp16_I4_bf16_nt_masked_v3(
+            hidden_states_fp16,
+            (w13_weight, self.w13_weight_scale),
+            gateup_output,
+            masked_m,
+            expected_m,
+        )
+        dispose_tensor(hidden_states_fp16)
+
+        # Act (silu_and_mul_mask_fwd requires matching in/out dtypes)
+        down_input = torch.empty(
+            (num_groups, m, n // 2),
+            device=gateup_output.device,
+            dtype=gateup_output.dtype,
+        )
+        silu_and_mul_mask_fwd(
+            gateup_output.view(-1, n),
+            down_input.view(-1, n // 2),
+            masked_m,
+            limit=self.swiglu_limit,
+        )
+        del gateup_output
+
+        # GroupGemm-1
+        down_output = torch.empty(
+            (num_groups, m, w2_weight.size(1)),
+            device=down_input.device,
+            dtype=torch.bfloat16,
+        )
+        m_grouped_gemm_fp16_I4_bf16_nt_masked_v3(
+            down_input.to(torch.float16),
+            (w2_weight, self.w2_weight_scale),
+            down_output,
+            masked_m,
+            expected_m,
+        )
+        return down_output
+    def forward_w4a8_masked(
+        self,
+        dispatch_output: "DeepEPLLDispatchOutput",
+    ):
+        """Masked (low-latency) MoE over packed INT4 weights, INT8 activations.
+
+        Mirrors the INT8 branch of ``forward_deepgemm_masked``, but swaps the
+        grouped GEMMs for Kunlun's INT8 x INT4 masked kernels and uses the
+        packed INT4 weights.
+        """
+        hidden_states, hidden_states_scale, _, _, masked_m, expected_m = dispatch_output
+        assert self.quant_method is not None
+        assert self.moe_runner_config.activation == "silu"
+        assert hidden_states_scale is not None, (
+            "W4A8 DeepEP low-latency needs INT8 dispatch; unset "
+            "SGLANG_DEEPEP_BF16_DISPATCH or run W4A16 instead."
+        )
+        w13_weight, w2_weight = self.w13_weight_packed, self.w2_weight_packed
+
+        # GroupGemm-0
+        num_groups, m, _ = hidden_states.size()
+        n = w13_weight.size(1)
+        expected_m = min(expected_m, m)
+        gateup_output = torch.empty(
+            (num_groups, m, n), device=hidden_states.device, dtype=torch.bfloat16
+        )
+        m_grouped_gemm_I8_I4_bf16_nt_masked_v3(
+            (hidden_states, hidden_states_scale),
+            (w13_weight, self.w13_weight_scale),
+            gateup_output,
+            masked_m,
+            expected_m,
+        )
+        dispose_tensor(hidden_states)
+
+        # Act: SwiGLU + per-token INT8 quant.
+        half = n // 2
+        down_input = torch.empty(
+            (num_groups, m, half),
+            device=gateup_output.device,
+            dtype=torch.int8,
+        )
+        scale_block_size = half  # per-token quant (one scale per row)
+        down_input_scale = torch.empty(
+            (num_groups, m, half // scale_block_size),
+            device=gateup_output.device,
+            dtype=torch.float32,
+        )
+        silu_and_per_token_group_quant_I8(
+            gateup_output,
+            down_input,
+            down_input_scale,
+            masked_m,
+            limit=self.swiglu_limit,
+        )
+        del gateup_output
+
+        # GroupGemm-1
+        down_output = torch.empty(
+            (num_groups, m, w2_weight.size(1)),
+            device=down_input.device,
+            dtype=torch.bfloat16,
+        )
+        m_grouped_gemm_I8_I4_bf16_nt_masked_v3(
+            (down_input, down_input_scale),
+            (w2_weight, self.w2_weight_scale),
+            down_output,
+            masked_m,
+            expected_m,
+        )
+        return down_output
+
 
     def forward_deepgemm_masked_bfp16(
         self,
@@ -789,11 +1250,6 @@ class DeepEPMoE(FusedMoE):
             if self.use_block_quant
             else self.w13_weight_scale
         )
-        if hidden_states_fp8[0].dtype == torch.float16:
-            hidden_states_fp8 = (
-                hidden_states_fp8[0].to(torch.int8),
-                hidden_states_fp8[1],
-            )
         kunlun_ops.m_grouped_gemm_I8_I8_bf16_nt_masked(
             hidden_states_fp8,
             (self.w13_weight, w13_scale),
@@ -867,14 +1323,22 @@ class DeepEPMoE(FusedMoE):
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
         if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
-            if self.use_fp8_w8a8:
+            if self.use_w4a8:
+                output = self.forward_w4a8_contiguous(dispatch_output)
+            elif self.use_w4a16:
+                output = self.forward_w4a16_contiguous(dispatch_output)
+            elif self.use_fp8_w8a8:
                 output = self.forward_deepgemm_contiguous(dispatch_output)
             elif self.use_w4afp8:
                 output = self.forward_cutlass_w4afp8(dispatch_output)
             else:
                 output = self.forward_deepgemm_contiguous(dispatch_output)
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
-            if self.use_fp8_w8a8:
+            if self.use_w4a8:
+                output = self.forward_w4a8_masked(dispatch_output)
+            elif self.use_w4a16:
+                output = self.forward_w4a16_masked(dispatch_output)
+            elif self.use_fp8_w8a8:
                 output = self.forward_deepgemm_masked(dispatch_output)
             elif (
                 get_moe_runner_backend().is_flashinfer_cutedsl()

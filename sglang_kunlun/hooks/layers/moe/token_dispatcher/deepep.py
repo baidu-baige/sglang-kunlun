@@ -36,16 +36,8 @@ from sglang.srt.utils import (
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
 
-try:
-    from deep_ep import Config
-    from deep_ep.buffer_v2 import BufferV2 as Buffer
-    from sglang.kernels.ops.quantization.fp8_kernel import (
-        sglang_per_token_group_quant_fp8,
-    )
-
-    use_deepep = True
-except ImportError:
-    use_deepep = False
+from deep_ep import Config
+from deep_ep.buffer_v2 import BufferV2 as Buffer
 
 from enum import Enum, IntEnum, auto
 
@@ -139,8 +131,6 @@ class DeepEPDispatchMode(IntEnum):
 class DeepEPBuffer:
     """DeepEPBuffer"""
     _buffer = None
-    _normal_buffer = None
-    _low_latency_buffer = None
     _dispatch_mode: Optional[DeepEPDispatchMode] = None
     _hidden_size: Optional[int] = None
     _num_max_dispatch_tokens_per_rank: Optional[int] = None
@@ -157,29 +147,15 @@ class DeepEPBuffer:
         num_experts: int = -1,
     ):
         """get_deepep_buffer"""
-        if deepep_mode == DeepEPMode.AUTO:
-            buffer_attr = (
-                "_low_latency_buffer"
-                if cls._dispatch_mode == DeepEPDispatchMode.LOW_LATENCY
-                else "_normal_buffer"
-            )
-            enable_normal = cls._dispatch_mode == DeepEPDispatchMode.NORMAL
-            enable_low_latency = cls._dispatch_mode == DeepEPDispatchMode.LOW_LATENCY
-        else:
-            buffer_attr = "_buffer"
-            enable_normal = deepep_mode.enable_normal()
-            enable_low_latency = deepep_mode.enable_low_latency()
-
-        buffer = getattr(cls, buffer_attr)
-        if buffer is not None:
-            return buffer
+        if cls._buffer is not None:
+            return cls._buffer
 
         cls._hidden_size = hidden_size
         cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         cls._num_experts = num_experts
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
-        if enable_normal:
+        if deepep_mode.enable_normal():
             hidden_bytes = hidden_size * param_bytes
             for config in (
                 DeepEPConfig.get_instance().normal_dispatch_config
@@ -195,7 +171,7 @@ class DeepEPBuffer:
                     config.get_rdma_buffer_size_hint(hidden_bytes, group.size()),
                     num_rdma_bytes,
                 )
-        if enable_low_latency:
+        if deepep_mode.enable_low_latency():
             assert num_max_dispatch_tokens_per_rank != -1
             assert num_experts != -1 and num_experts % group.size() == 0
             num_rdma_bytes = max(
@@ -239,27 +215,25 @@ class DeepEPBuffer:
                 f"Consider using --deepep-config to change the behavior."
             )
         
-        buffer = Buffer(
+        cls._buffer = Buffer(
             group,
             num_nvl_bytes,
             num_rdma_bytes,
-            low_latency_mode=enable_low_latency,
+            low_latency_mode=deepep_mode.enable_low_latency(),
             num_qps_per_rank=num_qps_per_rank,
             # TODO can be false when unneeded
             allow_mnnvl=True,
             num_experts=num_experts,
         )
-        setattr(cls, buffer_attr, buffer)
-
-        return buffer
+        
+        return cls._buffer
 
     @classmethod
     def clean_buffer(cls):
         """clean_buffer"""
-        buffer = cls._low_latency_buffer or cls._buffer
-        if buffer is None or not buffer.low_latency_mode:
+        if not cls._buffer.low_latency_mode:
             return
-        buffer.clean_low_latency_buffer(
+        cls._buffer.clean_low_latency_buffer(
             cls._num_max_dispatch_tokens_per_rank,
             cls._hidden_size,
             cls._num_experts,
@@ -336,12 +310,7 @@ class _DeepEPDispatcherImplBase:
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
     ):
-        if not use_deepep:
-            raise ImportError(
-                "DeepEP is not installed. Please install DeepEP package from "
-                "https://github.com/deepseek-ai/deepep."
-            )
-
+        """__init__"""
         self.group = group
         self.router_topk = router_topk
         self.permute_fusion = permute_fusion
@@ -455,6 +424,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
     def dispatch_b(self, hidden_states, topk_ids, topk_weights, previous_event):
         """dispatch_b"""
+        if topk_weights.dtype != torch.float32:
+            topk_weights = topk_weights.to(torch.float32)
         (
             hidden_states,
             topk_ids,
@@ -601,13 +572,19 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
+        # KUNLUN_LL_IDLE_PAD: the native low_latency dispatch/combine faults -714 when a
+        # dp-attention DP rank is idle (0 tokens). Pad to a single dummy token so this rank
+        # still joins the collective with a valid shape; combine_b drops the dummy row.
+        self._ll_orig_num_tokens = hidden_states.shape[0]
+        if self._ll_orig_num_tokens == 0:
+            hidden_states = hidden_states.new_zeros((1, hidden_states.shape[1]))
+            topk_ids = topk_ids.new_zeros((1, topk_ids.shape[1]))
+            topk_weights = topk_weights.new_zeros((1, topk_weights.shape[1]))
+
         expected_m = (
             hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
             + self.num_experts
         ) // self.num_experts
-        # low-latency dispatch 算子只吃 bf16；后面 expert GEMM 会在需要时转回 fp16。
-        if hidden_states.dtype is torch.float16:
-            hidden_states = hidden_states.to(torch.bfloat16)
         hidden_states, masked_m, hook = self._dispatch_core(
             hidden_states,
             topk_ids,
@@ -666,6 +643,12 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             use_fp8 = True
 
         buffer = self._get_buffer()
+        # Kunlun deep_ep low_latency_dispatch asserts a 2-D contiguous bfloat16
+        # input; the float16 model hidden_states must be cast to bf16 first.
+        if isinstance(hidden_states, torch.Tensor):
+            if hidden_states.dtype != torch.bfloat16:
+                hidden_states = hidden_states.to(torch.bfloat16)
+            hidden_states = hidden_states.contiguous()
         packed_recv_hidden, self.packed_recv_count, self.handle, _, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
@@ -704,6 +687,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         if overlap_args is not None:
             self.device_module.current_stream().wait_stream(overlap_args.stream)
 
+        # KUNLUN_LL_IDLE_PAD: drop the dummy row added for an idle rank in dispatch_a.
+        if getattr(self, "_ll_orig_num_tokens", None) == 0:
+            hidden_states = hidden_states[:0]
         return hidden_states
 
     def _combine_core(
@@ -741,6 +727,12 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             overlap_args_dict = {}
 
         with ctx:
+            if isinstance(hidden_states, torch.Tensor):
+                if hidden_states.dtype != torch.bfloat16:
+                    hidden_states = hidden_states.to(torch.bfloat16)
+                hidden_states = hidden_states.contiguous()
+            if topk_weights.dtype != torch.float32:
+                topk_weights = topk_weights.to(torch.float32)
             combined_hidden_states, _, hook = buffer.low_latency_combine(
                 x=hidden_states,
                 topk_idx=topk_ids,
@@ -752,6 +744,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             )
 
         self.packed_recv_count = self.handle = None
+        if self.params_dtype is not None and isinstance(combined_hidden_states, torch.Tensor) \
+                and combined_hidden_states.dtype != self.params_dtype:
+            combined_hidden_states = combined_hidden_states.to(self.params_dtype)
         return combined_hidden_states, hook
 
     def _get_buffer(self):
@@ -809,6 +804,13 @@ class DeepEPDispatcher(BaseDispatcher):
             deepep_mode=deepep_mode,
         )
 
+        # KUNLUN_LL_NORMAL_FALLBACK: stash kwargs so we can lazily build the NORMAL dispatcher even when
+        # --deepep-mode low_latency was requested (Kunlun native low_latency_combine faults
+        # -714 on dp-attention idle ranks; we fall back to idle-tolerant NORMAL).
+        self._normal_common_kwargs = common_kwargs
+        self._normal_async_finish = async_finish
+        self._normal_dispatcher = None
+        self._low_latency_dispatcher = None
         if self.deepep_mode.enable_low_latency():
             self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatency(
                 return_recv_hook=return_recv_hook,
@@ -885,8 +887,25 @@ class DeepEPDispatcher(BaseDispatcher):
         del self._combine_intermediate_state
         return self._get_impl().combine_b(*inner_state)
 
+    def _ensure_normal_dispatcher(self) -> _DeepEPDispatcherImplBase:
+        """KUNLUN_LL_NORMAL_FALLBACK: lazily build the NORMAL dispatcher (not created when mode==low_latency)."""
+        if self._normal_dispatcher is None:
+            self._normal_dispatcher = _DeepEPDispatcherImplNormal(
+                async_finish=self._normal_async_finish,
+                **self._normal_common_kwargs,
+            )
+        return self._normal_dispatcher
+
     def _get_impl(self) -> _DeepEPDispatcherImplBase:
         """_get_impl"""
+        # KUNLUN_LL_IDLE_PAD: use the NORMAL dispatcher only for AUTO/NORMAL modes. An explicit
+        # --deepep-mode low_latency decode MUST use the capturable LL path: NORMAL dispatch calls
+        # bkcl_notify_dispatch_standard (dynamic, blocking) which deadlocks inside the decode
+        # CUDA-graph capture -> notify_dispatch timeout. Idle DP ranks (the reason the old code
+        # force-fell-back to NORMAL under dp-attention) are handled by the 1-token padding in
+        # _DeepEPDispatcherImplLowLatency.dispatch_a/combine_b above, so LL is now idle-tolerant.
+        if self.deepep_mode.enable_normal():
+            return self._ensure_normal_dispatcher()
         is_extend_in_batch = get_is_extend_in_batch()
         resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
         if resolved_deepep_mode == DeepEPMode.NORMAL:
