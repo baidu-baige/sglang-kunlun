@@ -101,11 +101,10 @@ def dsv4_create_buffer_kunlun(original_fn, self, *, num_pages: int):
             dim_per_token,
         )
         dsv4_create_buffer_kunlun._probe_logged = True
-    return torch.zeros(
-        num_pages,
-        self.page_size * dim_per_token,
-        dtype=self.store_dtype,
-        device=self.device,
+    dim_per_page = self.page_size * dim_per_token
+    total_bytes = num_pages * dim_per_page * self.store_dtype.itemsize
+    return _alloc_2m_aligned(total_bytes, self.store_dtype, self.device).reshape(
+        num_pages, dim_per_page
     )
 
 
@@ -113,6 +112,16 @@ _ALIGNMENT_2M = 2 * 1024 * 1024
 
 
 def _alloc_2m_aligned(total_bytes: int, dtype: torch.dtype, device: str):
+    """Allocate a tensor whose ``data_ptr()`` is 2MB-aligned with 2MB-aligned
+    backing pages.
+
+    The Kunlun peermem/XDR path maps device memory at 2MB granularity, so
+    ``ibv_reg_mr`` on a host VA that is not 2MB-aligned fails with EINVAL(22).
+    Allocating ``ALIGN_2M(total_bytes) + 2MB`` guarantees both that the returned
+    view starts on a 2MB boundary and that physical pages cover the full
+    ``ALIGN_2M(total_bytes)`` MR registration range from that boundary. The view
+    itself exposes exactly ``total_bytes`` so callers can reshape as expected.
+    """
     element_size = torch.tensor([], dtype=dtype).element_size()
     assert total_bytes % element_size == 0
     aligned_bytes = (total_bytes + _ALIGNMENT_2M - 1) // _ALIGNMENT_2M * _ALIGNMENT_2M
@@ -154,3 +163,56 @@ def dsv4_indexer_pool_create_buffer_kunlun(original_fn, self):
                 )
                 for _ in range(self.layer_num)
             ]
+
+
+@plugin_hook(
+    "sglang.srt.mem_cache.deepseek_v4_compress_state.CompressStatePool."
+    "_alloc_kv_score_buffer",
+    type=HookType.AROUND,
+)
+def compress_state_alloc_kv_score_buffer_kunlun(
+    original_fn, self, *, dtype, device, enable_memory_saver
+):
+    """Allocate the compress-state kv+score buffer with RDMA-safe 2MB pages.
+
+    ``kv_score_buffer.kv_score`` is published to the PD peer through
+    ``DeepSeekV4TokenToKVPool.get_state_buf_infos()``, so it has to satisfy the
+    same 2MB alignment constraint as the KV and indexer pools.
+    """
+    from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+    from sglang.srt.mem_cache.deepseek_v4_compress_state import KVAndScore
+    from sglang.srt.mem_cache.memory_pool import (
+        TorchMemorySaverAdapter,
+        maybe_init_custom_mem_pool,
+    )
+    from sglang_kunlun.hooks.utils.common import _is_kunlun
+
+    if not _is_kunlun():
+        return original_fn(
+            self,
+            dtype=dtype,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+        )
+
+    self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+        enable=enable_memory_saver
+    )
+    self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
+        maybe_init_custom_mem_pool(device=device)
+    )
+    total_bytes = (
+        self._size * self.last_dim * torch.tensor([], dtype=dtype).element_size()
+    )
+    with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+        with (
+            torch.cuda.use_mem_pool(self.custom_mem_pool)
+            if self.custom_mem_pool
+            else nullcontext()
+        ):
+            self.kv_score_buffer = KVAndScore(
+                _alloc_2m_aligned(total_bytes, dtype, device).reshape(
+                    self._size, self.last_dim
+                )
+            )
+    self.kv_score_buffer.clear()
