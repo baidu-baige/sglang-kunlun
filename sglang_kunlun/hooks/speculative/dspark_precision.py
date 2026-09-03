@@ -2,13 +2,16 @@
 
 原先这些改动直接落在 sglang/ 里，现全部收敛到插件：
 
-1. ``clear_unaccepted_c4_states``：上游只清 ratio-128 的 compress-state ring，
-   ratio-4 的没人清。这里给 pool 补上该方法，行号按 c4 的寻址方式算：
+1. ``clear_unaccepted_c4_states``：上游只为 ratio-128 提供了 ring 清理
+   （``deepseek_v4_memory_pool.clear_unaccepted_c128_draft_states``），ratio-4
+   连方法都没有。这里给 pool 补上，行号按 c4 的寻址方式算：
    ``row = swa_loc // swa_page_size * ring_size + swa_loc % ring_size``
-   （一行是一个 slot，不是 ratio 个 slot 的组）。
-2. verify 之后调用 c128 + c4 两个清理：上游 DSpark 路径压根没调 c128 那个方法，
-   被拒草稿会留在压缩历史里被后续步骤当作已提交上下文读到，表现为输出重复退化、
-   accept len 虚高（钉在 gamma+1）。
+   （一行是一个 slot，不是 ratio 个 slot 的组）。这一条上游没有对应实现。
+2. verify 之后调用 c128 + c4 两个清理：上游那个 c128 清理只在
+   ``eagle_worker_common`` 的 verify 里被调用，而 ``DSparkWorkerV2`` 继承
+   ``BaseSpecWorker``、不走那条路径，自己也只提交 mamba state，所以 DSpark 下
+   两个 ring 都没人清。被拒草稿会留在压缩历史里被后续步骤当作已提交上下文
+   读到，表现为输出重复退化、accept len 虚高（钉在 gamma+1）。
 3. draft 权重前缀 ``stages.N`` -> ``mtp.N``，并把 checkpoint 里假设已融合的
    ``wq_a`` / ``wkv`` 补进量化 ignore：否则 draft 的 bf16 权重会被当成 int8
    量化目标而截断成全 0，main_proj 输出 0 -> RMSNorm(0) -> NaN，草稿全被拒。
@@ -17,7 +20,6 @@
 from __future__ import annotations
 
 import logging
-import os
 
 import torch
 
@@ -34,13 +36,6 @@ _DSPARK_EXTRA_QUANT_IGNORE = (
 )
 
 
-#: 0=完全不清（默认，与 H20 上验证通过的配置一致），非 0=清。默认关掉是因为 DSPARK
-#: 那条不确定性的真正根因是 state ring 的 MTP 余量不足（``mtp_pad``），被拒草稿的残留
-#: 由上游 ``_clear_unaccepted_c128_states_after_verify`` 处理，这条 c4 路径在 H20 的
-#: 验证里是关闭状态，开启反而有害。留着开关是为了以后能单独复验这条路径。
-_C4_CLEAR_MODE = int(os.environ.get("DSV4_C4_CLEAR_MODE", "0"))
-
-
 def _clear_unaccepted_c4_states(self, rejected_locs: torch.Tensor) -> None:
     """把被拒草稿 token 对应的 ratio-4 compress-state 行置为无效。
 
@@ -51,11 +46,7 @@ def _clear_unaccepted_c4_states(self, rejected_locs: torch.Tensor) -> None:
     ``swa_page * ring_size + swa_loc % ring_size``，**不除** ``compress_ratio``。
     那个 ``/ compress_ratio`` 只属于 ``plan_c.read_page``（压缩页索引），不属于
     raw state ring。多除一次会把 4 个 slot 折叠到同一行、且只覆盖 buffer 前 1/4。
-
-    默认不清，见 ``_C4_CLEAR_MODE``。
     """
-    if _C4_CLEAR_MODE == 0:
-        return
     if rejected_locs is None or rejected_locs.numel() == 0:
         return
     pools = [
@@ -119,12 +110,10 @@ def clear_unaccepted_compress_states_kunlun(result, self, *args, **kwargs):
     commit_lens，且 batch.seq_lens 还没被 accept 结果覆盖。EAGLE/MTP 在
     ``eagle_worker_common.verify_target_output`` 里做的是同一件事。
 
-    上游 ``DSparkWorkerV2._clear_unaccepted_c128_states_after_verify`` 现在自己会
-    清 c128，所以这个 hook 默认关闭，避免同一批行清两遍、也避免和上游的口径打架。
-    要单独用它时设 ``DSV4_KUNLUN_CLEAR_COMPRESS=1``。
+    上游的 ``clear_unaccepted_c128_draft_states`` 只在 ``eagle_worker_common`` 的
+    verify 里被调用，而 ``DSparkWorkerV2`` 直接继承 ``BaseSpecWorker``、不走那条
+    路径，所以 DSpark 下 c128 和 c4 两个 ring 都没有人清。
     """
-    if os.environ.get("DSV4_KUNLUN_CLEAR_COMPRESS", "0") != "1":
-        return result
     batch = kwargs.get("batch")
     seq_lens_pre_verify = kwargs.get("seq_lens_pre_verify")
     commit_lens = kwargs.get("commit_lens")
