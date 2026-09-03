@@ -4184,7 +4184,15 @@ def chain_speculative_sampling_triton(
         if continue_verifying:
             residual = target_row
         else:
-            residual = torch.clamp(target_row - draft_probs[bid, cur_prob_row], min=0)
+            draft_row = draft_probs[bid, cur_prob_row]
+            # A degenerate draft row can carry NaN. clamp() propagates NaN, which
+            # would make norm_sum NaN, every cumsum comparison False, and the
+            # fallback emit vocab_size - 1 (a reserved id) instead of a token
+            # drawn from the target. Upstream's kernel treats NaN q as 0 so the
+            # residual falls back to p; match that.
+            # 对应triton算子的q_val = tl.where(q_val == q_val, q_val, 0.0)
+            draft_row = torch.where(torch.isnan(draft_row), 0.0, draft_row)
+            residual = torch.clamp(target_row - draft_row, min=0)
 
         norm_sum = residual.sum()
         if bool((norm_sum <= 0).item()):
