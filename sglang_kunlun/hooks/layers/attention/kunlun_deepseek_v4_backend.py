@@ -983,6 +983,15 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 self._attention_decode_aux[batch_size] = aux
             q_lod_cpu, q_lod, kv_lens_cpu, kv_lens = aux
             kv_lens.copy_(forward_batch.seq_lens[:batch_size].to(torch.int32))
+            if os.environ.get("DSV4_KUNLUN_DECODE_HOST_KVLEN", "1") == "1":
+                # ``kv_lens_cpu`` 原先一直保持 ``ones`` 初值（只有设备端被回填），于是
+                # ``compressed_topk = max(kv_lens_cpu.max() // ratio, 1)`` 恒为 1：
+                # 压缩分支只读到 1 条 entry，而 257 token 时 c4 应该是 64 条。prefill
+                # 的 host 长度是真值所以不受影响，这也是与 CUDA 参考实现的分歧只从
+                # decode 的第一个 c4 层（layer 2）开始的原因。
+                _copy_host_lengths_(
+                    kv_lens_cpu, _seq_lens_cpu_i32(forward_batch), fill_value=1
+                )
             return q_lod_cpu, q_lod, kv_lens_cpu, kv_lens
 
         if _is_graph_extend_mode(forward_batch.forward_mode) and not getattr(
