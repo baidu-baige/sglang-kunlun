@@ -25,6 +25,8 @@ HOOK_MODULES = (
     "sglang_kunlun.hooks.production_precision",
     "sglang_kunlun.hooks.mtp_production",
     "sglang_kunlun.hooks.ragged_draft_extend",
+    "sglang_kunlun.hooks.function_call",
+    "sglang_kunlun.hooks.parser",
 )
 
 # Diagnostics live outside ``sglang_kunlun``. They register last so that no
