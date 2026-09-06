@@ -250,59 +250,11 @@ def publish_verify_stride_kunlun(result, self, batch, grammar_barrier=None):
     return result
 
 
-@plugin_hook(
-    "sglang.srt.managers.scheduler_components.batch_result_processor."
-    "SchedulerBatchResultProcessor._resolve_spec_v2_tokens",
-    type=HookType.REPLACE,
-)
-def resolve_spec_v2_tokens_kunlun(self, result, batch):
-    """Resolve each request from its fixed-width result row without leakage."""
-    assert result.next_token_ids.is_cpu
-    assert result.accept_lens.is_cpu
-
-    next_token_ids = result.next_token_ids.tolist()
-    accept_lens = result.accept_lens.tolist()
-    result.num_correct_drafts = sum(accept_lens) - len(batch.reqs)
-    result.num_correct_drafts_per_req_cpu = [length - 1 for length in accept_lens]
-
-    on_verify_complete = getattr(self.model_worker, "on_verify_complete_cpu", None)
-    if on_verify_complete is not None:
-        on_verify_complete(
-            result.num_correct_drafts_per_req_cpu,
-            batch_size=len(batch.reqs),
-        )
-
-    stride = getattr(result, "speculative_num_draft_tokens", None)
-    assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
-    assert stride > 0
-    assert len(next_token_ids) >= len(batch.reqs) * stride
-
-    predict_tokens = []
-    for index, request in enumerate(batch.reqs):
-        row = next_token_ids[index * stride : (index + 1) * stride]
-        accepted_tokens = row[: accept_lens[index]]
-
-        if request.is_retracted or request.finished():
-            # Nothing to settle: no worker pre-claims the bonus, so
-            # kv_committed_len already holds the committed prefix.
-            pass
-        else:
-            if request.grammar is not None:
-                accepted_tokens = self._accept_grammar_tokens(request, accepted_tokens)
-
-            # Commit the full accepted run (drafts + bonus). Upstream keeps
-            # kv_committed_len honest; eagle_prepare_for_decode rounds the
-            # speculative reserve up from it, so any lag strands whole pages.
-            num_accepted_tokens = len(accepted_tokens)
-            request.kv_committed_len += num_accepted_tokens
-            request.spec_verify_ct += 1
-
-            num_correct_drafts = result.num_correct_drafts_per_req_cpu[index]
-            request.spec_num_correct_drafts += num_correct_drafts
-            request.update_spec_correct_drafts_histogram(num_correct_drafts)
-
-        predict_tokens.append(accepted_tokens)
-    return predict_tokens
+# NOTE: 0.5.19 上游 ``_resolve_spec_v2_tokens`` 已经等价于原先昆仑替换的实现
+# （按 stride 定宽切行 + accept_lens 截断），并且额外维护
+# ``result.num_block_accept_tokens`` / ``num_cap_tokens``（``process_batch_result_decode``
+# 会无条件读取）以及 ``req.kv.kv_committed_len``（0.5.17 是 ``req.kv_committed_len``）。
+# 继续替换只会丢掉这些新账本，所以这里不再挂 hook，直接用上游实现。
 
 
 @plugin_hook(

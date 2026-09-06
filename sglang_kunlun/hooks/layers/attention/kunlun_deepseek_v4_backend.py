@@ -817,6 +817,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         need_compress: bool = True,
         is_prefill: bool = False,
         dspark_block_size: Optional[int] = None,
+        num_tokens: Optional[int] = None,
     ) -> KunlunDSV4AttnMetadata:
         """Build Kunlun core attention metadata for the current request."""
         if dspark_block_size is not None:
@@ -870,7 +871,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         # this keeps the value correct if upstream metadata initialization resets it.
         metadata.swa_topk_lengths = swa_topk_lengths
         if need_compress:
-            metadata.init_compression_metadata()
+            metadata.init_compression_metadata(num_tokens=num_tokens)
             metadata.init_flashmla_related(is_prefill=is_prefill)
         else:
             metadata.c4_sparse_topk_lengths = None
@@ -1451,14 +1452,12 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         return out.to(original_dtype) if out.dtype != original_dtype else out
 
 
-@plugin_hook(
-    "sglang.srt.layers.attention.dsv4.compressor.Compressor.forward_cuda",
-    type=HookType.REPLACE,
-)
-def _compressor_forward_cuda_kunlun(self, x, forward_batch, attn_backend=None):
-    """Restore the Compressor.forward path for Kunlun's CUDA dispatch key."""
+# NOTE: 0.5.17 needed a REPLACE hook on ``Compressor.forward_cuda`` because
+# ``MultiPlatformOp`` declared it as ``raise NotImplementedError``. In 0.5.19
+# ``Compressor`` derives from ``BaseFusedOp``, which defines no platform
+# forwards at all — an undefined ``forward_cuda`` now falls back to
+# ``forward_native`` on its own, which is exactly what the hook restored.
 
-    return self.forward_native(x, forward_batch, attn_backend=attn_backend)
 
 
 def _build_c4_prefill_contract(

@@ -128,13 +128,6 @@ class ProductionPrecisionContractTest(unittest.TestCase):
                 ("self", "x", "positions", "forward_batch", "x_quant"),
             ),
             (
-                "sglang.srt.managers.scheduler_components.batch_result_processor."
-                "SchedulerBatchResultProcessor._resolve_spec_v2_tokens",
-                HookType.REPLACE,
-                mtp.resolve_spec_v2_tokens_kunlun,
-                ("self", "result", "batch"),
-            ),
-            (
                 "sglang_kunlun.hooks.layers.attention."
                 "kunlun_deepseek_v4_backend.KunlunDeepseekV4AttnBackend._make_lod",
                 HookType.AROUND,
@@ -681,47 +674,14 @@ class ProductionPrecisionContractTest(unittest.TestCase):
         )
         original.assert_not_called()
 
-    def test_scheduler_fixed_stride_has_no_cross_request_leakage(self):
-        class Request:
-            def __init__(self):
-                self.is_retracted = False
-                self.grammar = None
-                self.kv_committed_len = 10
-                self.spec_verify_ct = 0
-                self.spec_num_correct_drafts = 0
-                self.histogram = []
-
-            def finished(self):
-                return False
-
-            def update_spec_correct_drafts_histogram(self, value):
-                self.histogram.append(value)
-
-        requests = [Request(), Request()]
-        result = types.SimpleNamespace(
-            next_token_ids=torch.tensor(
-                [10, 11, 12, 13, 20, 21, 22, 23], dtype=torch.int64
-            ),
-            accept_lens=torch.tensor([1, 3], dtype=torch.int32),
-            speculative_num_draft_tokens=4,
-            num_correct_drafts=None,
-            num_correct_drafts_per_req_cpu=None,
-        )
-        model_worker = types.SimpleNamespace(on_verify_complete_cpu=mock.Mock())
-        processor = types.SimpleNamespace(model_worker=model_worker)
-        batch = types.SimpleNamespace(
-            reqs=requests,
-            spec_algorithm=types.SimpleNamespace(is_dflash=lambda: False),
-        )
-
-        resolved = mtp.resolve_spec_v2_tokens_kunlun(processor, result, batch)
-
-        self.assertEqual(resolved, [[10], [20, 21, 22]])
-        self.assertNotIn(13, resolved[1])
-        self.assertEqual([request.kv_committed_len for request in requests], [10, 12])
-        self.assertEqual([request.histogram for request in requests], [[0], [2]])
-        model_worker.on_verify_complete_cpu.assert_called_once_with(
-            [0, 2], batch_size=2
+    def test_scheduler_spec_v2_resolution_is_left_to_upstream(self):
+        # 0.5.19 上游 _resolve_spec_v2_tokens 自己按 stride 定宽切行（无跨请求泄漏），
+        # 还维护 num_block_accept_tokens / num_cap_tokens / req.kv.kv_committed_len，
+        # 所以插件不再替换它；替换会丢账本。
+        self.assertFalse(hasattr(mtp, "resolve_spec_v2_tokens_kunlun"))
+        self.assertNotIn(
+            "SchedulerBatchResultProcessor._resolve_spec_v2_tokens",
+            MTP_HOOKS.read_text(),
         )
 
     def test_capture_admits_kunlun_backend_without_class_rebinding(self):
@@ -862,13 +822,12 @@ class ProductionPrecisionContractTest(unittest.TestCase):
             for node in tree.body
             if isinstance(node, ast.FunctionDef)
         }
-        expected = {
-            "_compressor_forward_cuda_kunlun": (
-                "sglang.srt.layers.attention.dsv4.compressor."
-                "Compressor.forward_cuda",
-                "REPLACE",
-            ),
-        }
+        # 0.5.19 ``Compressor`` derives from ``BaseFusedOp``, which declares no
+        # platform forwards, so an undefined ``forward_cuda`` already falls back
+        # to ``forward_native``: the old REPLACE hook must stay removed.
+        expected = {}
+        self.assertNotIn("_compressor_forward_cuda_kunlun", functions)
+        self.assertNotIn("Compressor.forward_cuda\"", source)
         for name, (target, hook_type) in expected.items():
             function = functions[name]
             decorators = [

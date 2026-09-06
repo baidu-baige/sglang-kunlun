@@ -34,6 +34,29 @@ _ensure_flashinfer_symbol("flashinfer.prefill", "cudnn_batch_prefill_with_kv_cac
 _ensure_flashinfer_symbol("flashinfer.gemm", "mm_M1_16_K7168_N256")
 
 
+def _disable_flashinfer_softmax_dispatch() -> None:
+    """Force DSpark ``SoftmaxTemp`` off the flashinfer path.
+
+    ``SoftmaxTemp.execute`` prefers ``flashinfer.sampling.softmax`` whenever that
+    import succeeded (``_flashinfer_softmax is not None``). The installed wheel
+    imports fine, but its OnlineSoftmax kernel is CUDA-only, so on Kunlun the
+    launch dies with ``invalid device function``. 0.5.17 handled this by
+    hardcoding ``_flashinfer_softmax = None`` in the main repo; the plugin now
+    does it instead, which drops dispatch to the triton branch that
+    ``kernel_ops`` replaces with the Kunlun ``softmax_temp`` op.
+    """
+    try:
+        module = importlib.import_module(
+            "sglang.kernels.ops.speculative.dspark.dspark_accept"
+        )
+    except ImportError:
+        return
+    module._flashinfer_softmax = None
+
+
+_disable_flashinfer_softmax_dispatch()
+
+
 @register_jit_op("flashinfer.prefill", "cudnn_batch_prefill_with_kv_cache")
 def cudnn_batch_prefill_with_kv_cache(*args, **kwargs):
     """Raise for unsupported flashinfer batch prefill helper on Kunlun."""
