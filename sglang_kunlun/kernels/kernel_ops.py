@@ -2945,6 +2945,28 @@ def dsv4_silu_and_mul_clamp_kunlun(
     )
 
 
+@register_jit_op(
+    "sglang.srt.model_executor.runner_utils.shared_read_event",
+    "make_external_event",
+)
+def make_external_event(device_module):
+    """No external CUDA-graph events on Kunlun.
+
+    0.5.19's decode graph runner records an ``Event(external=True)`` inside the
+    replayed graph and hands it to the scheduler's WAR barrier
+    (``Scheduler._apply_war_barrier`` -> ``schedule_stream.wait_event``). The
+    Kunlun runtime accepts the creation but fails the cross-stream wait with
+    ``CUDA error: invalid argument`` (seen on PD decode with overlap schedule).
+
+    Upstream already handles the "no external-event support" case: returning None
+    keeps ``in_graph_metadata_prep_done`` unset, so ``_resolve_shared_read_ends``
+    downgrades IN_REPLAY to PRE_REPLAY and ``_publish_read_done`` records a plain
+    device event instead.
+    """
+    del device_module
+    return None
+
+
 @register_jit_op("sglang.srt.utils.common", "fast_topk")
 def fast_topk(values: torch.Tensor, topk: int, dim: int):
     """Patch speculative fast_topk aliases onto a torch implementation on Kunlun."""
