@@ -27,5 +27,6 @@ from . import draft_utils  # noqa: E402,F401
 from . import dspark_draft_backend  # noqa: E402,F401
 from . import dspark_draft_sampler  # noqa: E402,F401
 from . import dspark_precision  # noqa: E402,F401
+from . import dspark_worker_compat  # noqa: E402,F401
 from . import eagle_worker_v2  # noqa: E402,F401
 from . import multi_layer_eagle_worker_v2  # noqa: E402,F401

@@ -2023,6 +2023,47 @@ def gather_row_bonus_kernel(
 
 
 @register_triton_op(
+    "sglang.srt.speculative.dflash_utils",
+    "_fused_correct_drafts_and_bonus_kernel",
+)
+def fused_correct_drafts_and_bonus_kernel(
+    candidates_ptr: torch.Tensor,
+    target_predict_ptr: torch.Tensor,
+    num_correct_drafts_ptr: torch.Tensor,
+    bonus_tokens_ptr: torch.Tensor,
+    block_size: int,
+    BLOCK: int = 0,
+) -> None:
+    """Greedy DFlash/DSpark accept lengths + bonus tokens, in plain torch.
+
+    0.5.19 added a Triton fast path to
+    ``dflash_utils.compute_dflash_correct_drafts_and_bonus`` that is taken for
+    any ``candidates.is_cuda`` tensor, which includes Kunlun XPU (dispatch key
+    ``cuda``); Triton has no Kunlun backend, so the launch fails with
+    ``0 compatible backends for target (cuda)``. This replacement reproduces the
+    kernel contract with the same reduction the upstream CPU branch uses: accept
+    while ``candidates[:, 1:] == target_predict[:, :-1]`` consecutively (leading
+    match count, capped at ``block_size - 1``), then read the bonus token at
+    that index.
+    """
+    candidates = candidates_ptr.reshape(-1, block_size)
+    target_predict = target_predict_ptr.reshape(-1, block_size)
+    bs = candidates.shape[0]
+    if bs == 0:
+        return
+
+    matches = candidates[:, 1:] == target_predict[:, :-1]
+    correct_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
+    rows = torch.arange(bs, device=target_predict.device)
+    bonus = target_predict[rows, correct_len.to(torch.int64)]
+
+    num_correct_drafts_ptr.reshape(-1)[:bs].copy_(
+        correct_len.to(num_correct_drafts_ptr.dtype)
+    )
+    bonus_tokens_ptr.reshape(-1)[:bs].copy_(bonus.to(bonus_tokens_ptr.dtype))
+
+
+@register_triton_op(
     "sglang.kernels.ops.speculative.dspark.dspark_accept",
     "_mixed_accept_select_kernel",
 )
@@ -2110,6 +2151,30 @@ def mixed_accept_select_kernel(
         bonus_ptr[:bs].copy_(bonus)
     if cap_trim is not cap_trim_ptr:
         cap_trim_ptr[:bs].copy_(cap_trim)
+
+
+@register_jit_op(
+    "sglang.kernels.ops.speculative.dspark.dspark_draft_model",
+    "markov_greedy_step_triton",
+)
+def markov_greedy_step_triton(
+    *,
+    base_logits: torch.Tensor,
+    prev_embeds: torch.Tensor,
+    w2_weight: torch.Tensor,
+) -> torch.Tensor:
+    """Markov draft head greedy step in plain torch.
+
+    ``MarkovGreedyStep.execute`` routes every ``base_logits.is_cuda`` tensor to
+    the Triton tiled argmax (new in 0.5.19), which cannot compile on Kunlun.
+    Replace the whole triton entry point instead of its two kernels: the upstream
+    torch reference (``markov_greedy_step``) is the same math, and the kernel
+    already accumulates in fp32 with first-index tie-break.
+    """
+    step_logits = base_logits.to(torch.float32) + torch.nn.functional.linear(
+        prev_embeds.to(torch.float32), w2_weight.to(torch.float32)
+    )
+    return torch.argmax(step_logits, dim=-1).to(torch.int64)
 
 
 @register_triton_op(
