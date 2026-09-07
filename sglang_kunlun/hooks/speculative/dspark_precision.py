@@ -217,3 +217,155 @@ def align_dspark_stage_prefix_kunlun(original_fn, self, *args, **kwargs):
     if isinstance(prefix, str) and "stages." in prefix:
         kwargs["prefix"] = prefix.replace("stages.", "mtp.")
     return original_fn(self, *args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# R1（QuaRot）旋转补偿
+#
+# 量化时对权重做了旋转，旋转后 draft 私有的 RMSNorm gamma 和折进共享（target）权重里的
+# 旋转对不上，checkpoint 里因此额外带了 4 个补偿矩阵：
+#   mtp.{0,1,2}.context_correction.blocks   [4, 1024, 1024] bf16
+#   mtp.2.final_correction.blocks           [4, 1024, 1024] bf16
+# 内容是 C = Q @ diag(g) @ Q.T 的块对角残差（hc_mult=4、hidden=4096 => 4 块 1024×1024）。
+# 上游 sglang 0.5.17 没有这两个模块，权重被 load_weights 里的
+# "DSpark V4 draft: unexpected weight" 直接丢弃 => draft 质量偏低、accept rate 偏低。
+# 实测补上后 300 条评测里 accept len 3.06 -> 3.63、accept rate 0.412 -> 0.527，三个
+# 测试集分数基本持平。
+#
+# 参考实现来自 vLLM 侧的同一改动（scripts/vllm-dsv4-w4a8-changes.patch）。
+# 非旋转 checkpoint（如 fp16 那份 W8A8）不带这些张量，所有 hook 自动退化成 identity。
+# ---------------------------------------------------------------------------
+_CORRECTION_RE = re.compile(r"^mtp\.(\d+)\.(context_correction|final_correction)\.blocks$")
+
+
+def apply_block_correction(x: torch.Tensor, blocks: torch.Tensor) -> torch.Tensor:
+    """``x @ block_diag(blocks)``，按块右乘。
+
+    ``blocks`` 是 ``[n_blocks, b, b]``，要求 ``x`` 最后一维 == n_blocks * b。
+    用 fp32 运算再 cast 回 ``x`` 的 dtype（gamma 解析上会相消，量级 ~O(1)）。
+    """
+    n_blocks, b, _ = blocks.shape
+    orig_dtype = x.dtype
+    lead = x.shape[:-1]
+    xr = x.reshape(-1, n_blocks, b).to(torch.float32)
+    out = torch.einsum("tnb,nbc->tnc", xr, blocks.to(torch.float32))
+    return out.reshape(*lead, n_blocks * b).to(orig_dtype)
+
+
+class _BlockCorrection(torch.nn.Module):
+    """只用来持有一份 ``blocks`` 缓冲，按需挂到 stage 上。"""
+
+    def __init__(self, weight: torch.Tensor) -> None:
+        super().__init__()
+        self.register_buffer("blocks", weight.detach().clone(), persistent=False)
+
+
+class _NormWithBlockCorrection(torch.nn.Module):
+    """``norm`` 之后紧接一次块对角补偿。
+
+    final_correction 的作用点是 ``_logits_from_x_post_hc`` 里
+    ``x = last.norm(x_post_hc)`` 之后、乘 lm_head 之前。``last.norm`` 全文件只有那一处
+    调用点，所以把 norm 包一层等价于在中间插一步，比 REPLACE 整个 logits 函数更稳
+    （不用把 fp32 lm_head / markov TP 分片那些分支抄一遍、跟着上游漂移）。
+    注意不能把补偿折进 lm_head 权重：lm_head 是和 target 共享的。
+    """
+
+    def __init__(self, norm: torch.nn.Module, weight: torch.Tensor) -> None:
+        super().__init__()
+        self.norm = norm
+        self.register_buffer("blocks", weight.detach().clone(), persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """forward"""
+        return apply_block_correction(self.norm(x), self.blocks)
+
+
+def _attach_correction(model, stage_id: int, kind: str, weight: torch.Tensor) -> None:
+    """把补偿矩阵挂到对应位置。找不到目标就直接抛，不静默跳过。"""
+    stage = model.stages[stage_id]
+    # 只有最后一个 stage 有 norm，所以设备要从任意一个已存在的参数上取，
+    # 否则前面的 stage 会留在 CPU 上，einsum 时报 "mat2 is on cpu"。
+    device = next(stage.parameters()).device
+    weight = weight.to(device)
+    if kind == "context_correction":
+        stage.context_correction = _BlockCorrection(weight)
+    else:
+        norm = stage.norm
+        if isinstance(norm, _NormWithBlockCorrection):
+            raise RuntimeError("final_correction 被加载了两次")
+        stage.norm = _NormWithBlockCorrection(norm, weight)
+
+
+def _strip_correction_blocks(model, weights):
+    """从权重流里摘出补偿矩阵并就地挂上，其余原样透传。"""
+    found = []
+    for name, tensor in weights:
+        m = _CORRECTION_RE.match(name)
+        if m is None:
+            yield name, tensor
+            continue
+        _attach_correction(model, int(m.group(1)), m.group(2), tensor)
+        found.append(name)
+    if found:
+        logger.info(
+            "[DSPARK_R1] 已挂上 %d 个旋转补偿矩阵: %s", len(found), ", ".join(sorted(found))
+        )
+
+
+@plugin_hook(
+    "sglang.srt.models.deepseek_v4_dspark.DeepseekV4ForCausalLMDSpark.load_weights",
+    type=HookType.AROUND,
+)
+def load_dspark_correction_blocks_kunlun(original_fn, self, weights, *args, **kwargs):
+    """补偿矩阵不是注册参数，先从权重流里摘出来挂好，剩下的交给上游 loader。"""
+    return original_fn(self, _strip_correction_blocks(self, weights), *args, **kwargs)
+
+
+@plugin_hook(
+    "sglang.srt.models.deepseek_v4_dspark.DeepseekV4ForCausalLMDSpark."
+    "write_target_hidden_kv",
+    type=HookType.REPLACE,
+)
+def write_target_hidden_kv_with_correction_kunlun(
+    self, *, main_hidden, swa_loc, positions, pool
+):
+    """写 target hidden 的 KV 时按 stage 施加 context_correction。
+
+    这条路径的输入是 main_x（走 main_proj + main_norm，**没有 attn_norm**），所以要撤掉
+    折进旋转后 wkv 的 attn_norm gamma、重新施加 main_norm gamma，即
+    C_k = Q @ diag(gamma_main_norm / gamma_attn_norm_k) @ Q.T。每个 stage 的 C_k 不同，
+    而上游 ``CommitKvProj.execute`` 是三个 stage 共享一个 main_x 的融合实现，用不了；
+    有补偿时退回逐 stage 投影（复用已有的 ``kv_proj_only``），没有补偿时保持融合路径。
+    """
+    from sglang.kernels.ops.speculative.dspark.dspark_draft_model import CommitKvProj
+
+    main_x = self.project_target_hidden(main_hidden)
+    swa_loc = swa_loc.to(torch.int32)
+    corrections = [getattr(stage, "context_correction", None) for stage in self.stages]
+    if any(corr is not None for corr in corrections):
+        kvs = [
+            stage.self_attn.kv_proj_only(
+                main_x
+                if corr is None
+                else apply_block_correction(main_x, corr.blocks)
+            )
+            for stage, corr in zip(self.stages, corrections)
+        ]
+    else:
+        kvs = CommitKvProj.execute(
+            main_x=main_x,
+            wkv_linears=[stage.self_attn.wkv for stage in self.stages],
+        )
+    for stage, kv in zip(self.stages, kvs):
+        attn = stage.self_attn
+        pool.set_swa_key_buffer_radix_fused_norm_rope(
+            layer_id=attn.layer_id,
+            swa_loc=swa_loc,
+            kv=kv,
+            kv_weight=attn.kv_norm.weight.data,
+            eps=attn.eps,
+            freqs_cis=attn.freqs_cis,
+            positions=positions,
+        )
+
+
