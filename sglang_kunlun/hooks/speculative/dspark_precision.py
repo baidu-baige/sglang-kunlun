@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 import torch
 
@@ -156,6 +157,30 @@ def clear_unaccepted_compress_states_kunlun(result, self, *args, **kwargs):
     return result
 
 
+def _quant_config_targets_draft_attn(quant_config) -> bool:
+    """checkpoint 是否真的量化了 draft 的 wq_a/wkv。
+
+    W8A8 那份 checkpoint 里 ``mtp.N.attn.wq_a`` 只有 ``.weight``、没有
+    ``weight_scale``，必须补进 ignore 才不会被截断成 0（就是下面那个 hook 的由来）。
+    但 W4A8 那份是真的按 int8 量化了这两层、带 weight_scale，此时补 ignore 会反过来
+    把它们当未量化权重加载。所以先看 target_scheme_map 里有没有命中它们。
+    """
+    targets = getattr(quant_config, "target_scheme_map", None)
+    if not targets:
+        return False
+    probes = ("model.mtp.0.self_attn.wq_a", "model.mtp.0.self_attn.wkv")
+    for target in targets:
+        if not isinstance(target, str) or not target.startswith("re:"):
+            continue
+        try:
+            pattern = re.compile(target[3:])
+        except re.error:
+            continue
+        if any(pattern.fullmatch(name) for name in probes):
+            return True
+    return False
+
+
 @plugin_hook(
     "sglang.srt.models.deepseek_v4_dspark.DeepseekV4ForCausalLMDSpark.__init__",
     type=HookType.AROUND,
@@ -170,10 +195,16 @@ def align_dspark_quant_ignore_kunlun(original_fn, self, *args, **kwargs):
                 break
     ignore = getattr(quant_config, "ignore", None)
     if isinstance(ignore, list):
-        for pattern in _DSPARK_EXTRA_QUANT_IGNORE:
-            if pattern not in ignore:
-                ignore.append(pattern)
+        if _quant_config_targets_draft_attn(quant_config):
+            logger.info(
+                "[DSPARK_QUANT_IGNORE] checkpoint 已量化 draft 的 wq_a/wkv，跳过补 ignore"
+            )
+        else:
+            for pattern in _DSPARK_EXTRA_QUANT_IGNORE:
+                if pattern not in ignore:
+                    ignore.append(pattern)
     return original_fn(self, *args, **kwargs)
+
 
 
 @plugin_hook(
