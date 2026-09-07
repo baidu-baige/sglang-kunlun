@@ -358,3 +358,59 @@ def _install_dsv4_quant_name_mapper() -> None:
 
 _install_dsv4_quant_name_mapper()
 
+
+# 融合后的 wqkv_a 拿不到 per-channel weight_scale 的问题。
+#
+# 上游的 wq_a+wkv 融合分支（sglang/srt/models/deepseek_v4.py 的 `elif fuse_wqa_wkv and (...)`）
+# 只认 ``.weight`` 和 ``.weight_scale_inv``（fp8 块量化命名），不认 compressed-tensors 的
+# per-channel ``.weight_scale``。于是这两份 scale 掉进通用分支、被改名成
+# ``self_attn.wq_a.weight_scale``，而模型里只有融合后的 ``wqkv_a.weight_scale``，
+# 日志报 "not found in params_dict"、融合模块的 scale 保持初值 => int8 反量化出垃圾
+# => logits 变垃圾 => 解码出空串。注意 ``.weight`` 本身是被正确 cat 融合的，只有 scale 缺失，
+# 加载阶段不报错，很难发现。
+#
+# 这里不改上游，而是在进 load_weights 之前把权重流里的两份 scale 先合并、直接以融合后的名字
+# ``...wqkv_a.weight_scale`` 交出去，上游的通用分支就能在 params_dict 里找到它、正常加载。
+# 合并方式和 ``.weight`` 完全一致：per-channel scale 是 per-output-channel，
+# 融合就是把输出通道按 q、kv 顺序接起来，所以同样是 ``torch.cat([q, kv], dim=0)``。
+_WQKV_A_SCALE_SHARDS = {".wq_a.weight_scale": "q", ".wkv.weight_scale": "kv"}
+
+
+def _fuse_wqkv_a_weight_scales(weights):
+    """把 wq_a / wkv 的 weight_scale 合并成融合后 wqkv_a 的那一份。"""
+    pending: dict = {}
+    for name, tensor in weights:
+        shard = next(
+            (s for suffix, s in _WQKV_A_SCALE_SHARDS.items() if name.endswith(suffix)),
+            None,
+        )
+        if shard is None:
+            yield name, tensor
+            continue
+        fused = name.replace(".wq_a.", ".wqkv_a.").replace(".wkv.", ".wqkv_a.")
+        bucket = pending.setdefault(fused, {})
+        assert shard not in bucket, f"duplicate shard {shard} for {fused}"
+        bucket[shard] = tensor
+        if len(bucket) == 2:
+            yield fused, torch.cat([bucket["q"], bucket["kv"]], dim=0)
+            del pending[fused]
+    # 只凑到一半的按原名交回去，让上游按原逻辑报 not found，不要静默吞掉。
+    for fused, bucket in pending.items():
+        for shard, tensor in bucket.items():
+            back = ".wq_a." if shard == "q" else ".wkv."
+            yield fused.replace(".wqkv_a.", back), tensor
+
+
+@plugin_hook(
+    "sglang.srt.models.deepseek_v4.DeepseekV4ForCausalLM.load_weights",
+    type=HookType.AROUND,
+)
+def fuse_wqkv_a_weight_scale_kunlun(original_fn, self, weights, *args, **kwargs):
+    """开融合时，先把 wq_a/wkv 的 weight_scale 合并再交给上游 loader。"""
+    from sglang.srt import environ as _environ
+
+    if not _environ.envs.SGLANG_OPT_FUSE_WQA_WKV.get():
+        return original_fn(self, weights, *args, **kwargs)
+    return original_fn(self, _fuse_wqkv_a_weight_scales(weights), *args, **kwargs)
+
+
