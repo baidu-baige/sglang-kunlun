@@ -291,3 +291,70 @@ def hc_post_kunlun(
     )
     return out
 
+
+# ---------------------------------------------------------------------------
+# compressed-tensors 量化配置的命名对齐
+#
+# W4A8 那份 checkpoint 的 quantization_config 是按 **checkpoint 原始命名** 导出的
+# （``layers.N.attn.*`` / ``layers.N.ffn.*``、wq_a 与 wkv 未融合），而 sglang 的模块
+# 路径是 ``layers.N.self_attn.*`` / ``layers.N.mlp.*``、且默认把 wq_a+wkv 融合成
+# wqkv_a。两者对不上时 find_matched_target 会直接抛
+# "Unable to find matching target for model.layers.0.self_attn.wqkv_a"。
+#
+# sglang 本来就有这个对齐通道：loader.py 里
+# ``hf_to_sglang_mapper = getattr(model_class, "hf_to_sglang_mapper", None)``，
+# 拿到后调 ``quant_config.apply_weight_name_mapper()``。但 DSV4 的模型类没有定义这个
+# 属性，于是通道是空的。这里把它补上。
+#
+# 规则写成正则模式串上的子串替换（WeightsMapper 按 key 长度倒序匹配、命中一条即停），
+# 所以更长的 wq_a/wkv→wqkv_a 规则会先于通用的 attn→self_attn 规则生效。
+# 对已经用 sglang 命名导出的 W8A8 checkpoint 这些规则全部不命中，是无害的空操作
+# （``layers\.\d+\.self_attn\.`` 里不含 ``layers\.\d+\.attn\.``）。
+# ---------------------------------------------------------------------------
+_DSV4_QUANT_NAME_MAP_BASE = {
+    # DSpark draft 用 fuse_wqa_wkv=False，mtp 侧本来就不融合。
+    r"mtp\.\d+\.attn\.": r"mtp\.\d+\.self_attn\.",
+    r"layers\.\d+\.attn\.": r"layers\.\d+\.self_attn\.",
+    r"layers\.\d+\.ffn\.": r"layers\.\d+\.mlp\.",
+    r"mtp\.\d+\.ffn\.": r"mtp\.\d+\.mlp\.",
+}
+
+# 开融合时才把 wq_a/wkv 折到 wqkv_a 上（两者 scheme 相同，映射后合并成一个 key）。
+# 关融合时必须不折，否则模型里是分开的 wq_a / wkv 两个模块、反而匹配不上。
+_DSV4_QUANT_NAME_MAP_FUSED = {
+    r"layers\.\d+\.attn\.wq_a$": r"layers\.\d+\.self_attn\.wqkv_a$",
+    r"layers\.\d+\.attn\.wkv$": r"layers\.\d+\.self_attn\.wqkv_a$",
+}
+
+
+def _build_dsv4_quant_name_map(fuse_wqa_wkv: bool) -> dict:
+    mapping = dict(_DSV4_QUANT_NAME_MAP_BASE)
+    if fuse_wqa_wkv:
+        mapping.update(_DSV4_QUANT_NAME_MAP_FUSED)
+    return mapping
+
+
+def _install_dsv4_quant_name_mapper() -> None:
+    from sglang.srt import environ as _environ
+    from sglang.srt.models.utils import WeightsMapper
+
+    fuse = bool(_environ.envs.SGLANG_OPT_FUSE_WQA_WKV.get())
+    mapper = WeightsMapper(orig_to_new_substr=_build_dsv4_quant_name_map(fuse))
+    targets = []
+    from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+    targets.append(DeepseekV4ForCausalLM)
+    try:
+        from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
+
+        targets.append(DeepseekV4ForCausalLMDSpark)
+    except ImportError:
+        pass
+    for cls in targets:
+        # 已经自带 mapper 的话不覆盖（上游若后续补上，以上游为准）。
+        if getattr(cls, "hf_to_sglang_mapper", None) is None:
+            cls.hf_to_sglang_mapper = mapper
+
+
+_install_dsv4_quant_name_mapper()
+

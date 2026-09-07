@@ -25,7 +25,23 @@ from .device import KunlunDeviceMixin
 
 
 class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
-    supported_quantization = ["int8"]
+    supported_quantization = ["int8", "w8a8_int8", "compressed-tensors"]
+
+    def get_quantization_config(self, quantization: str):
+        """返回昆仑自己的量化配置类。
+
+        上游在 ``layers/quantization/__init__.py`` 里对 out-of-tree 平台会先问
+        ``current_platform.get_quantization_config(quantization)``，返回 None 才回落到
+        ``QUANTIZATION_METHODS``。不接这个口子的话 compressed-tensors 会走上游实现，
+        W4A8/W8A8 的 int8 fused MoE 在那边只有 NPU 分支、直接抛 NotImplementedError。
+        """
+        if quantization == "compressed-tensors":
+            from sglang_kunlun.hooks.layers.quantization.compressed_tensors import (
+                KunlunCompressedTensorsConfig,
+            )
+
+            return KunlunCompressedTensorsConfig
+        return None
 
     def __init__(self) -> None:
         super().__init__()
