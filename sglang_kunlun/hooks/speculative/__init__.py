@@ -21,6 +21,10 @@ for _name in ("dspark_worker_v2", "dspark_draft_sampler"):
 upstream_speculative.dflash_info_v2 = importlib.import_module(
     "sglang.srt.speculative.dflash_info_v2"
 )
+# reject_sampling 挂的是 sglang.kernels 下的模块，同样先 import 让
+# pkgutil.resolve_name 能解析到。
+importlib.import_module("sglang.kernels.ops.speculative.reject_sampling")
+importlib.import_module("sglang.kernels.ops.speculative.dspark.dspark_accept")
 
 from . import dflash_info_v2  # noqa: E402,F401
 from . import draft_utils  # noqa: E402,F401
@@ -29,3 +33,4 @@ from . import dspark_draft_sampler  # noqa: E402,F401
 from . import dspark_precision  # noqa: E402,F401
 from . import eagle_worker_v2  # noqa: E402,F401
 from . import multi_layer_eagle_worker_v2  # noqa: E402,F401
+from . import reject_sampling  # noqa: E402,F401
