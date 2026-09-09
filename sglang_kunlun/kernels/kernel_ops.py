@@ -3095,15 +3095,31 @@ def set_mla_kv_buffer_kernel(
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
     loc: torch.Tensor,
-    buffer_stride: int,
-    nope_stride: int,
-    rope_stride: int,
-    nope_dim: int,
-    rope_dim: int,
+    reserved_skip_index: int = -1,
+    buffer_stride: int = 0,
+    nope_stride: int = 0,
+    rope_stride: int = 0,
+    nope_dim: int = 0,
+    rope_dim: int = 0,
     *,
-    BLOCK: int,
+    BLOCK: int = 0,
+    DCP_RANK: int = 0,
+    DCP_WORLD_SIZE: int = 1,
+    USE_GDC: bool = False,
 ) -> None:
-    """Store MLA KV tensors into the paged KV buffer."""
+    """Store MLA KV tensors into the paged KV buffer.
+
+    0.5.19 added ``reserved_skip_index`` (slot-0 padding sink) plus the decode
+    context-parallel ``DCP_RANK`` / ``DCP_WORLD_SIZE`` constexprs. The Kunlun op
+    writes every ``loc`` unconditionally: the reserved slot is a padding sink that
+    is never read back, so clobbering it is harmless, but a real DCP split cannot
+    be emulated and is rejected.
+    """
+    if DCP_WORLD_SIZE != 1:
+        raise NotImplementedError(
+            "set_mla_kv_buffer_kernel: decode context parallel (DCP_WORLD_SIZE="
+            f"{DCP_WORLD_SIZE}) is not supported on Kunlun"
+        )
 
     from kunlun_ops import set_mla_kv_buffer_triton as impl
 
@@ -4741,8 +4757,18 @@ def _set_k_and_s_triton_kernel(
     BUF_NUMEL_PER_PAGE: int,
     NUM_K_ELEMS_PER_TOKEN: int,
     S_OFFSET_NBYTES_IN_PAGE: int,
+    PRESHUFFLE_TILE: int = 0,
 ) -> None:
-    """_set_k_and_s_triton_kernel"""
+    """_set_k_and_s_triton_kernel
+
+    0.5.19 added ``PRESHUFFLE_TILE`` for the AITER preshuffled indexer-K layout.
+    The Kunlun op writes the plain layout, so only the disabled value is accepted.
+    """
+    if PRESHUFFLE_TILE:
+        raise NotImplementedError(
+            "_set_k_and_s_triton_kernel: preshuffled indexer-K cache "
+            f"(PRESHUFFLE_TILE={PRESHUFFLE_TILE}) is not supported on Kunlun"
+        )
     from kunlun_ops import set_k_and_s_triton
 
     set_k_and_s_triton(
@@ -4880,3 +4906,279 @@ def _w8a8_block_int8_matmul(
     """w8a8 block int8 matmul kernel replacement."""
 
     raise NotImplementedError("w8a8_block_int8_matmul is not supported on Kunlun.")
+
+
+@register_jit_op("sglang.kernels.ops.layernorm.fused_eh_norm", "fused_eh_norm")
+def fused_eh_norm(
+    inputs_embeds: torch.Tensor,
+    previous_hidden: torch.Tensor,
+    enorm_weight: torch.Tensor,
+    hnorm_weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """MTP embed/hidden norm + concat, without the nvcc-JIT CUDA kernel.
+
+    ``deepseek_nextn`` takes the ``_is_cuda`` branch on Kunlun and calls the JIT
+    ``fused_eh_norm``, whose source is compiled with ``-std=c++20`` (rejected by
+    the Kunlun nvcc 11.7 toolchain). The two RMSNorms run through
+    ``kunlun_ops.rmsnorm`` and are concatenated, which is what upstream's non-CUDA
+    branch does.
+    """
+    from sglang_kunlun.kernels.sgl_kernel_kunlun.layernorm import rmsnorm
+
+    if inputs_embeds.shape[0] == 0:
+        return torch.empty(
+            (0, inputs_embeds.shape[1] * 2),
+            dtype=inputs_embeds.dtype,
+            device=inputs_embeds.device,
+        )
+    return torch.cat(
+        (
+            rmsnorm(inputs_embeds.contiguous(), enorm_weight, eps),
+            rmsnorm(previous_hidden.contiguous(), hnorm_weight, eps),
+        ),
+        dim=-1,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# DSA graph metadata (0.5.19 fused Triton builders)
+#
+# 0.5.19 replaced the per-field Python metadata construction with three fused
+# Triton kernels in ``sglang.kernels.ops.attention.dsa_metadata``. Triton has no
+# Kunlun backend, so the *wrapper functions* are replaced with Torch equivalents
+# (replacing wrappers instead of kernels keeps stride/grid plumbing out of the
+# plugin). Semantics follow the kernels exactly, including the "a page-table row
+# is written only over its live prefix" contract: the tail keeps stale values
+# across graph replays and consumers bound their reads by ``cache_seqlens``.
+# --------------------------------------------------------------------------- #
+
+
+def _dsa_write_page_tables(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    req_row: torch.Tensor,
+    kv_lens: torch.Tensor,
+    page_table_1: Optional[torch.Tensor],
+    real_page_table: Optional[torch.Tensor],
+    max_cols: int,
+    real_page_size: int,
+) -> None:
+    """Scatter ``req_to_token`` rows into the page-1 / real page tables.
+
+    ``req_row[i]`` is the request owning output row ``i`` (output rows are always
+    the contiguous range ``[0, len(req_row))``) and ``kv_lens[i]`` is that row's
+    live kv length.
+    """
+    rows = req_row.numel()
+    if max_cols <= 0 or rows == 0:
+        return
+
+    device = req_to_token.device
+    req_idx = req_pool_indices.index_select(0, req_row).long()
+    vals = req_to_token.index_select(0, req_idx)[:, :max_cols].to(torch.int32)
+    cols = torch.arange(max_cols, device=device, dtype=torch.int32)
+    live = cols.unsqueeze(0) < kv_lens.unsqueeze(1)
+
+    if page_table_1 is not None:
+        view = page_table_1[:rows, :max_cols]
+        view.copy_(torch.where(live, vals, view))
+
+    if real_page_size > 1 and real_page_table is not None:
+        sub_vals = vals[:, ::real_page_size] // real_page_size
+        sub_live = live[:, ::real_page_size]
+        view = real_page_table[:rows, : sub_vals.shape[1]]
+        view.copy_(torch.where(sub_live, sub_vals, view))
+
+
+def _dsa_store_lens_and_cu(
+    lengths: torch.Tensor, out_lengths: torch.Tensor, out_cu: torch.Tensor
+) -> None:
+    """Write ``lengths`` plus its cumulative sum prefixed with a zero."""
+    n = lengths.numel()
+    out_lengths[:n].copy_(lengths)
+    out_cu[:1].zero_()
+    out_cu[1 : n + 1].copy_(torch.cumsum(lengths, dim=0, dtype=torch.int32))
+
+
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsa_metadata", "fused_dsa_decode_metadata"
+)
+def fused_dsa_decode_metadata(
+    seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    page_table_1: Optional[torch.Tensor],
+    dsa_cache_seqlens: torch.Tensor,
+    dsa_cu_seqlens_k: torch.Tensor,
+    real_page_table: torch.Tensor,
+    bs: int,
+    max_len: int,
+    dsa_index_topk: int,
+    real_page_size: int,
+) -> None:
+    """Torch port of ``_fused_dsa_decode_metadata_kernel``."""
+    if bs == 0:
+        cu_seqlens_k[:1].zero_()
+        dsa_cu_seqlens_k[:1].zero_()
+        return
+
+    seq = seq_lens[:bs].to(torch.int32)
+    _dsa_store_lens_and_cu(seq, cache_seqlens, cu_seqlens_k)
+    _dsa_store_lens_and_cu(
+        torch.clamp(seq, max=dsa_index_topk), dsa_cache_seqlens, dsa_cu_seqlens_k
+    )
+
+    if real_page_size <= 1:
+        real_page_table = None
+    _dsa_write_page_tables(
+        req_to_token=req_to_token,
+        req_pool_indices=req_pool_indices,
+        req_row=torch.arange(bs, device=seq.device),
+        kv_lens=seq,
+        page_table_1=page_table_1,
+        real_page_table=real_page_table,
+        max_cols=max_len,
+        real_page_size=real_page_size,
+    )
+
+
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsa_metadata", "fused_dsa_target_verify_metadata"
+)
+def fused_dsa_target_verify_metadata(
+    seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    page_table_1: Optional[torch.Tensor],
+    seqlens_expanded: torch.Tensor,
+    dsa_cache_seqlens: torch.Tensor,
+    dsa_cu_seqlens_k: torch.Tensor,
+    real_page_table: torch.Tensor,
+    bs: int,
+    max_seqlen_k: int,
+    dsa_index_topk: int,
+    real_page_size: int,
+    next_n: int,
+    paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None,
+) -> None:
+    """Torch port of ``_fused_dsa_target_verify_metadata_kernel``."""
+    if bs == 0:
+        cu_seqlens_k[:1].zero_()
+        dsa_cu_seqlens_k[:1].zero_()
+        return
+    assert next_n > 0
+
+    device = seq_lens.device
+    seq = seq_lens[:bs].to(torch.int32)
+    cache_seq = seq + next_n
+    _dsa_store_lens_and_cu(cache_seq, cache_seqlens, cu_seqlens_k)
+
+    expanded_size = bs * next_n
+    offs_e = torch.arange(expanded_size, device=device)
+    req_row = offs_e // next_n
+    draft_off = (offs_e - req_row * next_n).to(torch.int32)
+    base_seq = seq.index_select(0, req_row)
+    expanded_seq = base_seq + draft_off + 1
+    seqlens_expanded[:expanded_size].copy_(expanded_seq)
+    _dsa_store_lens_and_cu(
+        torch.clamp(expanded_seq, max=dsa_index_topk),
+        dsa_cache_seqlens,
+        dsa_cu_seqlens_k,
+    )
+    if paged_mqa_ctx_lens_2d is not None:
+        paged_mqa_ctx_lens_2d.copy_(cache_seq.unsqueeze(1).expand(bs, next_n))
+
+    if real_page_size <= 1:
+        real_page_table = None
+    _dsa_write_page_tables(
+        req_to_token=req_to_token,
+        req_pool_indices=req_pool_indices,
+        req_row=req_row,
+        kv_lens=cache_seq.index_select(0, req_row),
+        page_table_1=page_table_1,
+        real_page_table=real_page_table,
+        max_cols=max_seqlen_k,
+        real_page_size=real_page_size,
+    )
+
+
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsa_metadata", "fused_dsa_draft_extend_metadata"
+)
+def fused_dsa_draft_extend_metadata(
+    seq_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    page_table_1: Optional[torch.Tensor],
+    seqlens_expanded: torch.Tensor,
+    dsa_cache_seqlens: torch.Tensor,
+    dsa_cu_seqlens_k: torch.Tensor,
+    real_page_table: torch.Tensor,
+    bs: int,
+    total_len: int,
+    max_seqlen_k: int,
+    dsa_index_topk: int,
+    real_page_size: int,
+    max_extend_len: int,
+    max_total_len: int,
+    static_extend_len: bool = False,
+) -> None:
+    """Torch port of ``_fused_dsa_draft_extend_metadata_kernel``."""
+    if bs == 0:
+        cu_seqlens_k[:1].zero_()
+        dsa_cu_seqlens_k[:1].zero_()
+        return
+
+    seq = seq_lens[:bs].to(torch.int32)
+    if total_len == 0:
+        _dsa_store_lens_and_cu(seq, cache_seqlens, cu_seqlens_k)
+        dsa_cu_seqlens_k[:1].zero_()
+        return
+
+    device = seq_lens.device
+    _dsa_store_lens_and_cu(seq, cache_seqlens, cu_seqlens_k)
+
+    ext = extend_seq_lens[:bs].to(torch.int32)
+    # ``output_size`` keeps repeat_interleave from reading the lengths back to
+    # the host, which would sync in the replay hot path.
+    req_row = torch.repeat_interleave(
+        torch.arange(bs, device=device), ext.long(), output_size=total_len
+    )
+    prefix = torch.cumsum(ext, dim=0, dtype=torch.int32) - ext
+    local_off = torch.arange(total_len, device=device, dtype=torch.int32) - (
+        prefix.index_select(0, req_row)
+    )
+    # Padded / idle rows carry the graph seq_len fill value, which can make the
+    # visible kv length negative; consumers read these lengths as unsigned, so
+    # clamp at 0 to keep such rows on the trivial all-(-1) top-k path.
+    expanded_seq = torch.clamp(
+        seq.index_select(0, req_row) - ext.index_select(0, req_row) + local_off + 1,
+        min=0,
+    )
+    seqlens_expanded[:total_len].copy_(expanded_seq)
+    _dsa_store_lens_and_cu(
+        torch.clamp(expanded_seq, max=dsa_index_topk),
+        dsa_cache_seqlens,
+        dsa_cu_seqlens_k,
+    )
+
+    if real_page_size <= 1:
+        real_page_table = None
+    _dsa_write_page_tables(
+        req_to_token=req_to_token,
+        req_pool_indices=req_pool_indices,
+        req_row=req_row,
+        kv_lens=seq.index_select(0, req_row),
+        page_table_1=page_table_1,
+        real_page_table=real_page_table,
+        max_cols=max_seqlen_k,
+        real_page_size=real_page_size,
+    )

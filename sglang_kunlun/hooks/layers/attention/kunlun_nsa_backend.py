@@ -39,7 +39,7 @@ from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     compute_cu_seqlens,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
-from sglang.srt.layers.attention.dsa.transform_index import (
+from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
@@ -122,19 +122,41 @@ class KunlunDSAMetadata(DSAMetadata):
     # expanded/per-token space for verify/draft-extend).
     cum_q_lod: Optional[torch.Tensor] = None
 
+    # (host mirror attribute, device field) pairs.
+    _MIRRORED = (
+        ("cache_seqlens_int32_cpu", "cache_seqlens_int32"),
+        ("cu_seqlens_q_cpu", "cu_seqlens_q"),
+        ("cu_seqlens_k_cpu", "cu_seqlens_k"),
+        ("dsa_seqlens_expanded_cpu", "dsa_seqlens_expanded"),
+        ("dsa_cu_seqlens_q_cpu", "dsa_cu_seqlens_q"),
+        ("dsa_cu_seqlens_k_cpu", "dsa_cu_seqlens_k"),
+        ("cum_q_lod_cpu", "cum_q_lod"),
+    )
+
     def __post_init__(self):
-        """Cache the host mirrors used by the Kunlun kernels."""
+        """Materialize the host mirrors used by the Kunlun kernels."""
+        for host_name, dev_name in self._MIRRORED:
+            dev = getattr(self, dev_name, None)
+            object.__setattr__(self, host_name, None if dev is None else dev.cpu())
 
-        def _to_cpu(name: str, tensor: Optional[torch.Tensor]):
-            object.__setattr__(self, name, None if tensor is None else tensor.cpu())
+    def refresh_host_mirrors(self) -> None:
+        """Update the host mirrors *in place*, keeping their storage stable.
 
-        _to_cpu("cache_seqlens_int32_cpu", self.cache_seqlens_int32)
-        _to_cpu("cu_seqlens_q_cpu", self.cu_seqlens_q)
-        _to_cpu("cu_seqlens_k_cpu", self.cu_seqlens_k)
-        _to_cpu("dsa_seqlens_expanded_cpu", self.dsa_seqlens_expanded)
-        _to_cpu("dsa_cu_seqlens_q_cpu", self.dsa_cu_seqlens_q)
-        _to_cpu("dsa_cu_seqlens_k_cpu", self.dsa_cu_seqlens_k)
-        _to_cpu("cum_q_lod_cpu", self.cum_q_lod)
+        On the cuda-graph path this object is reused across replays and the
+        Kunlun kernels were recorded against these host buffers, so a fresh
+        ``.cpu()`` tensor per replay would leave the graph reading capture-time
+        lengths. Copy into the existing storage instead, and only reallocate when
+        the shape/dtype actually changes.
+        """
+        for host_name, dev_name in self._MIRRORED:
+            dev = getattr(self, dev_name, None)
+            if dev is None:
+                continue
+            host = getattr(self, host_name, None)
+            if host is None or host.shape != dev.shape or host.dtype != dev.dtype:
+                object.__setattr__(self, host_name, dev.cpu())
+            else:
+                host.copy_(dev)
 
 
 @dataclass(frozen=True)
@@ -153,6 +175,10 @@ class KunlunDSAIndexerMetadata(DSAIndexerMetadata):
     def get_cu_seqlens_k_cpu(self) -> torch.Tensor:
         """Host mirror of ``cu_seqlens_k``."""
         return self.attn_metadata.cu_seqlens_k_cpu
+
+    def get_cu_seqlens_k(self) -> torch.Tensor:
+        """Device ``cu_seqlens_k`` (used by the ragged prefill top-k path)."""
+        return self.attn_metadata.cu_seqlens_k
 
     def get_cu_seqlens_q(self) -> torch.Tensor:
         """Device ``cu_seqlens_q``."""
@@ -253,7 +279,9 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
             return compute_cu_seqlens(extend_seq_lens)
         # draft_extend (v1/v2) and plain extend
         assert forward_batch.extend_seq_lens is not None
-        return compute_cu_seqlens(forward_batch.extend_seq_lens)
+        # ``compute_cu_seqlens`` asserts int32; the prefill cuda-graph capture path
+        # (0.5.19) hands us int64 extend_seq_lens.
+        return compute_cu_seqlens(forward_batch.extend_seq_lens.to(torch.int32))
 
     def _cum_q_lod_for_graph(self, bs: int, forward_mode: ForwardMode) -> torch.Tensor:
         """cum_q_lod for the cuda-graph paths (fixed draft token count)."""
@@ -335,17 +363,60 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
         )
         self._rewrap_graph_metadata(bs, forward_mode)
 
+    def init_forward_metadata_replay_cuda_graph_from_precomputed(
+        self,
+        bs: int,
+        precomputed,
+        forward_mode: ForwardMode,
+    ):
+        """Replay-prep fast path (0.5.19): refresh the Kunlun host mirrors.
+
+        The multi-step draft backend copies precomputed metadata into
+        ``decode_cuda_graph_metadata[bs]`` through this method instead of
+        ``_apply_cuda_graph_metadata``, so without this override the wrapper's
+        host mirrors would keep the previous step's lengths.
+        """
+        super().init_forward_metadata_replay_cuda_graph_from_precomputed(
+            bs, precomputed, forward_mode
+        )
+        self._rewrap_graph_metadata(bs, forward_mode)
+
     def _rewrap_graph_metadata(self, bs: int, forward_mode: ForwardMode) -> None:
-        """Upgrade ``self.forward_metadata`` (and the per-bs cache) in place."""
-        if isinstance(self.forward_metadata, KunlunDSAMetadata):
-            # already wrapped (apply() can run right after build())
+        """Install the Kunlun metadata wrapper for this batch size.
+
+        The wrapper is created once per bs and then reused: the cuda graph is
+        recorded against its host mirrors, so their storage must stay stable
+        across replays (see ``KunlunDSAMetadata.refresh_host_mirrors``). It is
+        also written back into ``decode_cuda_graph_metadata`` so that upstream's
+        replay-prep updates the very object the forward path reads.
+        """
+        cache = self.decode_cuda_graph_metadata
+        metadata = self.forward_metadata
+
+        if isinstance(metadata, KunlunDSAMetadata):
+            # Upstream already handed back the wrapper (it lives in the cache);
+            # refresh the Kunlun-owned tensors in place. cum_q_lod is per forward
+            # mode, and one wrapper is shared by the decode and verify graphs of
+            # the same bs, so it has to be recomputed every time.
+            new_lod = self._cum_q_lod_for_graph(bs, forward_mode)
+            cur_lod = metadata.cum_q_lod
+            if (
+                cur_lod is None
+                or cur_lod.shape != new_lod.shape
+                or cur_lod.dtype != new_lod.dtype
+                or cur_lod.data_ptr() == new_lod.data_ptr()
+            ):
+                object.__setattr__(metadata, "cum_q_lod", new_lod)
+            else:
+                cur_lod.copy_(new_lod)
+            metadata.refresh_host_mirrors()
             return
+
         metadata = self._to_kunlun_metadata(
-            self.forward_metadata, self._cum_q_lod_for_graph(bs, forward_mode)
+            metadata, self._cum_q_lod_for_graph(bs, forward_mode)
         )
         self.forward_metadata = metadata
-        cache = getattr(self, "graph_metadata", None)
-        if isinstance(cache, dict) and bs in cache:
+        if isinstance(cache, dict) and cache.get(bs) is not None:
             cache[bs] = metadata
 
     def get_indexer_metadata(
@@ -719,7 +790,11 @@ class KunlunDSAMultiStepBackend(DeepseekSparseAttnMultiStepBackend):
     """
 
     def __init__(
-        self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
+        self,
+        model_runner: ModelRunner,
+        topk: int,
+        speculative_num_steps: int,
+        seed_dsa_topk_from_draft_extend: bool = False,
     ):
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
@@ -731,5 +806,6 @@ class KunlunDSAMultiStepBackend(DeepseekSparseAttnMultiStepBackend):
                     speculative_step_id=i,
                     topk=self.topk,
                     speculative_num_steps=self.speculative_num_steps,
+                    seed_dsa_topk_from_draft_extend=seed_dsa_topk_from_draft_extend,
                 )
             )

@@ -30,7 +30,7 @@ import torch
 import kunlun_ops
 from einops import rearrange
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
@@ -184,6 +184,7 @@ def _get_logits_head_gate(indexer, x: torch.Tensor, q_scale: torch.Tensor):
     weights = weights * q_scale * indexer.softmax_scale
     return weights
 
+
 def _get_topk_paged(
     indexer,
     forward_batch: ForwardBatch,
@@ -209,6 +210,11 @@ def _get_topk_paged(
     block_kv = 64
     num_heads_kv = 1
     
+    # One context length per q row. Decode has exactly one q row per request, so
+    # ``cache_seqlens`` is the per-row length there; target-verify /
+    # draft-extend-v2 contribute several q rows per request and use the expanded
+    # lengths. NOTE: ``dsa_seqlens_expanded`` is *not* refreshed by the decode
+    # graph metadata builder, so decode must not read it.
     if (
         forward_batch.forward_mode.is_target_verify()
         or forward_batch.forward_mode.is_draft_extend_v2()
@@ -218,6 +224,12 @@ def _get_topk_paged(
     else:
         seqlens_32 = metadata.get_seqlens_int32()
         seqlens_32_cpu = metadata.get_seqlens_int32_cpu()
+
+    # DRAFT_EXTEND_V2 pads the page table to ``bs * speculative_num_draft_tokens``
+    # rows while only the accepted prefix is live, and the Kunlun ops require
+    # exactly one page-table row per context length.
+    if block_tables.shape[0] > seqlens_32.shape[0]:
+        block_tables = block_tables[: seqlens_32.shape[0]]
 
     assert len(q_fp8.shape) == 3, f"q_fp8.shape: {q_fp8.shape}"
     q_fp8 = q_fp8.unsqueeze(1)
@@ -442,94 +454,88 @@ def _get_topk_ragged(
 
         return topk_result
 
-    # Chunk path
-    bytes_per_elem = 4  # float32
-    bytes_per_row = k_offset * bytes_per_elem
+    # Chunk path: split only the *query rows*; every row still scores its full K
+    # range. Layout, masking and top-k are identical to the non-chunk branch above
+    # (max_k layout, local ks/ke, page-table transform) so the two paths cannot
+    # drift apart.
+    #
+    # NOTE: an earlier version also ran ``chunk_cu_seqlens`` over the *K* lengths
+    # with the query chunk size, which handed each query chunk only a
+    # ``max_rows``-wide slice of K. On a 24k-token prompt that limited the indexer
+    # to the first ~3k tokens of the document and the answers silently degraded.
+    max_k = int(indexer_seq_lens_cpu.max().item())
+    bytes_per_row = max_k * 4  # float32 logits
     # Reserve 50% of free memory for logits
     max_rows = max(1, int((free_mem * 0.5) // max(bytes_per_row, 1)))
     max_rows = min(max_rows, q_offset)
 
-    global_topk_offset = metadata.attn_metadata.topk_indices_offset
+    page_table_1 = metadata.get_page_table_1()
+    cu_q_cpu = context_q_lens_cpu.reshape(-1)
+    cu_k_cpu = context_k_lens_cpu.reshape(-1)
+    cu_k_xpu = context_k_lens_xpu.reshape(-1)
 
-    assert (
-        seq_lens_expanded.shape[0] == q_offset
-    ), f"seq_lens_expanded length mismatch: {seq_lens_expanded.shape[0]} != {q_offset}"
-    if global_topk_offset is not None:
-        assert (
-            global_topk_offset.shape[0] >= q_offset
-        ), f"topk_indices_offset too short: {global_topk_offset.shape[0]} < {q_offset}"
-
-    start = 0
     q_interval_cpu = chunk_cu_seqlens(context_q_lens_cpu, chunk_size=max_rows)
-    # 重新计算，避免H2D
     q_interval_xpu = chunk_cu_seqlens(context_q_lens_xpu, chunk_size=max_rows)
-    k_interval_cpu = chunk_cu_seqlens(context_k_lens_cpu, chunk_size=max_rows)
-    k_interval_xpu = chunk_cu_seqlens(context_k_lens_xpu, chunk_size=max_rows)
-    for i in range(0, len(q_interval_cpu)):
-        chunk_context_q_lens_cpu, _, chunk_range = q_interval_cpu[i]
-        chunk_context_k_lens_cpu, _, _ = k_interval_cpu[i]
-        start = chunk_range[0].item()
-        end   = chunk_range[1].item()
+    for i in range(len(q_interval_cpu)):
+        chunk_q_cpu, _, chunk_range = q_interval_cpu[i]
+        chunk_q_xpu, _, _ = q_interval_xpu[i]
+        start = int(chunk_range[0].item())
+        end = int(chunk_range[1].item())
+
+        # Requests this row window belongs to; K stays addressed by the original
+        # (absolute) cu_seqlens_k so each row keeps its whole context.
+        b0 = int(torch.searchsorted(cu_q_cpu, torch.tensor(start), right=True)) - 1
+        b1 = int(torch.searchsorted(cu_q_cpu, torch.tensor(end - 1), right=True)) - 1
+        chunk_k_cpu = cu_k_cpu[b0 : b1 + 2].contiguous()
+        chunk_k_xpu = cu_k_xpu[b0 : b1 + 2].contiguous()
+        chunk_max_k = int(
+            (chunk_k_cpu[1:] - chunk_k_cpu[:-1]).max().item()
+        )
 
         logits_chunk = torch.full(
-            (end - start, k_fp8.shape[0]),
+            (end - start, chunk_max_k),
             -1.0,
             dtype=torch.float32,
-            device=q_fp8.device
+            device=device,
         )
-        chunk_context_q_lens_xpu, _, _ = q_interval_xpu[i]
-        chunk_context_k_lens_xpu, _, _ = k_interval_xpu[i]
         kunlun_ops.I8_mqa_logits(
             q=q_fp8[start:end],
             fused_kv_cache=(k_fp8.contiguous(), k_scale.contiguous()),
             weights=weights[start:end],
-            context_q_lens=(chunk_context_q_lens_cpu, chunk_context_q_lens_xpu),
-            context_k_lens=(chunk_context_k_lens_cpu, chunk_context_k_lens_xpu),
+            context_q_lens=(chunk_q_cpu, chunk_q_xpu),
+            context_k_lens=(chunk_k_cpu, chunk_k_xpu),
             logits=logits_chunk,
             clean_logits=True,
             use_xfa_boost=False,
         )
 
-        # Mask logits outside [ks, ke) to prevent fused topk from selecting
-        # invalid entries (fused kernel searches from col 0, not from ks)
-        seq_len_kv = k_fp8.shape[0]
-        torch.ops.xspeedgate_ops.mask_for_I8_mqa_logits(
-            seq_len_kv=seq_len_kv,
-            cu_seqlen_ks=ks[start:end],
-            cu_seqlen_ke=ke[start:end],
-            logits=logits_chunk
-        )
-
+        # max_k layout: each request's K starts at column 0, so the causal bound
+        # is [0, seq_lens_expanded) for every row.
         lengths_chunk = seq_lens_expanded[start:end]
-
-        # RAGGED: use global offset; PAGED: construct local cu_seqlens_q per chunk
-        if global_topk_offset is not None:
-            # RAGGED path
-            topk_offset_chunk = global_topk_offset[start:end]
-            cu_seqlens_q_chunk = None
-            batch_idx_chunk = None
-        else:
-            # PAGED path: treat each token as a length-1 sequence
-            topk_offset_chunk = None
-            B_chunk = logits_chunk.shape[0]
-            cu_seqlens_q_chunk = torch.ones(
-                B_chunk, dtype=torch.int32, device=device
-            )
-            batch_idx_chunk = token_to_batch_idx[start:end]
-
-        raw_topk_chunk = metadata.topk_transform(
-            logits_chunk,
-            indexer.index_topk,
-            ks=ks[start:end],
-            cu_seqlens_q=cu_seqlens_q_chunk,
-            ke_offset=ke[start:end],
-            batch_idx_list=batch_idx_chunk,
-            topk_indices_offset_override=topk_offset_chunk,
+        ks_local = torch.zeros(end - start, dtype=ks.dtype, device=ks.device)
+        ke_local = lengths_chunk.to(dtype=ks.dtype)
+        torch.ops.xspeedgate_ops.mask_for_I8_mqa_logits(
+            seq_len_kv=chunk_max_k,
+            cu_seqlen_ks=ks_local.contiguous(),
+            cu_seqlen_ke=ke_local.contiguous(),
+            logits=logits_chunk,
         )
+
+        dst_page_table = logits_chunk.new_empty(
+            (logits_chunk.size(0), indexer.index_topk), dtype=torch.int32
+        )
+        torch.ops.xspeedgate_ops.topk_transform(
+            score=logits_chunk.contiguous(),
+            lengths=lengths_chunk.contiguous(),
+            src_page_table=page_table_1[b0 : b1 + 1].contiguous(),
+            dst_page_table=dst_page_table,
+            topk=indexer.index_topk,
+            cu_seqlens_q=chunk_q_xpu.to(device=device, dtype=torch.int32).contiguous(),
+        )
+        topk_result[start:end] = dst_page_table
         del logits_chunk
-        topk_result[start:end] = raw_topk_chunk
     del ks, q_fp8, k_fp8, k_scale
-    del q_interval_cpu, q_interval_xpu, k_interval_cpu, k_interval_xpu
+    del q_interval_cpu, q_interval_xpu
     return topk_result
 
 def _get_topk_ragged_with_cp(
@@ -785,7 +791,8 @@ def _forward_cuda_k_only(
     assert forward_batch.forward_mode.is_extend_without_speculative()
 
     # Fast path: only compute and store k cache, skip all q and weights ops
-    key = indexer._get_k_bf16(x, positions, enable_dual_stream)
+    # 0.5.19 dropped the ``enable_dual_stream`` parameter from ``_get_k_bf16``.
+    key = indexer._get_k_bf16(x, positions)
     key_shape = key.shape
     key = key.view(-1, indexer.block_size)
     k_fp8 = torch.empty(
