@@ -38,77 +38,76 @@ def _create_backend_kunlun(
     backend_type = _resolve_backend_type(self, backend_name)
     is_decode_multistep = backend_name == "decode_attention_backend"
 
-    factory = None
-    if backend_type == "kunlun_compressed":
+    def _make_compressed_backend():
+        """Build the Kunlun DeepSeek-V4 (compressed) draft backend."""
+        from sglang_kunlun.hooks.layers.attention.kunlun_deepseek_v4_backend import (
+            KunlunDeepseekV4AttnBackend,
+            KunlunDeepseekV4MultiStepBackend,
+        )
 
-        def factory():
-            """factory functio"""
-            from sglang_kunlun.hooks.layers.attention.kunlun_deepseek_v4_backend import (
-                KunlunDeepseekV4AttnBackend,
-                KunlunDeepseekV4MultiStepBackend,
-            )
-
-            if is_decode_multistep:
-                return (
-                    backend_type,
-                    KunlunDeepseekV4MultiStepBackend(
-                        self.draft_model_runner, self.topk, self.speculative_num_steps
-                    ),
-                )
+        if is_decode_multistep:
             return (
                 backend_type,
-                KunlunDeepseekV4AttnBackend(self.draft_model_runner, skip_prefill=False),
+                KunlunDeepseekV4MultiStepBackend(
+                    self.draft_model_runner, self.topk, self.speculative_num_steps
+                ),
             )
+        return (
+            backend_type,
+            KunlunDeepseekV4AttnBackend(self.draft_model_runner, skip_prefill=False),
+        )
 
-    elif backend_type in ("dsa", "nsa"):
+    def _make_dsa_backend():
+        """Build the Kunlun DeepSeek sparse attention (DSA/NSA) draft backend."""
+        from sglang_kunlun.hooks.layers.attention.kunlun_nsa_backend import (
+            KunlunDSAAttnBackend,
+            KunlunDSAMultiStepBackend,
+        )
 
-        def factory():
-            """factory functio"""
-            from sglang_kunlun.hooks.layers.attention.kunlun_nsa_backend import (
-                KunlunDSAAttnBackend,
-                KunlunDSAMultiStepBackend,
-            )
-
-            seed = getattr(self, "seed_dsa_topk_from_draft_extend", False)
-            if is_decode_multistep:
-                return (
-                    "dsa",
-                    KunlunDSAMultiStepBackend(
-                        self.draft_model_runner,
-                        self.topk,
-                        self.speculative_num_steps,
-                        seed_dsa_topk_from_draft_extend=seed,
-                    ),
-                )
+        seed = getattr(self, "seed_dsa_topk_from_draft_extend", False)
+        if is_decode_multistep:
             return (
                 "dsa",
-                KunlunDSAAttnBackend(
+                KunlunDSAMultiStepBackend(
                     self.draft_model_runner,
-                    skip_prefill=False,
+                    self.topk,
+                    self.speculative_num_steps,
                     seed_dsa_topk_from_draft_extend=seed,
                 ),
             )
+        return (
+            "dsa",
+            KunlunDSAAttnBackend(
+                self.draft_model_runner,
+                skip_prefill=False,
+                seed_dsa_topk_from_draft_extend=seed,
+            ),
+        )
 
-    elif backend_type == "kunlun":
+    def _make_platform_backend():
+        """Build the generic Kunlun draft backend through the platform."""
+        from sglang.srt.platforms import current_platform
 
-        def factory():
-            """factory functio"""
-            from sglang.srt.platforms import current_platform
-
-            if is_decode_multistep and (
-                self.server_args.speculative_attention_mode != "decode"
-            ):
-                cls = current_platform.get_draft_decode_attention_backend_cls()
-                return (
-                    backend_type,
-                    cls(self.draft_model_runner, self.topk, self.speculative_num_steps),
-                )
-            cls = current_platform.get_draft_prefill_attention_backend_cls()
+        if is_decode_multistep and (
+            self.server_args.speculative_attention_mode != "decode"
+        ):
+            cls = current_platform.get_draft_decode_attention_backend_cls()
             return (
                 backend_type,
-                cls(self.draft_model_runner, skip_prefill=False),
+                cls(self.draft_model_runner, self.topk, self.speculative_num_steps),
             )
+        cls = current_platform.get_draft_prefill_attention_backend_cls()
+        return (
+            backend_type,
+            cls(self.draft_model_runner, skip_prefill=False),
+        )
 
+    factory = {
+        "kunlun_compressed": _make_compressed_backend,
+        "dsa": _make_dsa_backend,
+        "nsa": _make_dsa_backend,
+        "kunlun": _make_platform_backend,
+    }.get(backend_type)
     if factory is not None:
         backend_map = dict(backend_map)
         backend_map[backend_type] = factory
