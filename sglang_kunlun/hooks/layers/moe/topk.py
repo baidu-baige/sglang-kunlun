@@ -58,6 +58,73 @@ class StandardTopKOutput(NamedTuple):
 # imported, so the upstream nvcc-JIT kernel would not get patched.
 
 
+def _kunlun_biased_grouped_topk(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: int,
+    topk_group: int,
+    num_fused_shared_experts: int,
+    routed_scaling_factor: Optional[float],
+    apply_routed_scaling_factor_on_output: Optional[bool],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused sigmoid + biased grouped top-k + renorm on Kunlun.
+
+    0.5.19's ``biased_grouped_topk_gpu`` routes CUDA (which Kunlun masquerades as)
+    either into flashinfer's ``fused_topk_deepseek`` -- which rejects the reported
+    compute capability -- or into the nvcc-JIT ``moe_fused_gate``, whose Kunlun
+    replacement only implements single-group routing. DeepSeek V3.x routes over 8
+    groups, so neither is usable and the whole gate runs through
+    ``kunlun_ops.moe_sigmoid_group_topk_norm`` instead.
+
+    Contract matches ``biased_grouped_topk_impl``: sigmoid scores, bias added for
+    ranking only, group top-2-sum group selection, renormalized weights, and the
+    routed scaling factor applied only when the caller asks for it on the output.
+    """
+    if num_fused_shared_experts:
+        raise NotImplementedError(
+            "Kunlun biased grouped top-k does not implement fused shared experts; "
+            "launch with --disable-shared-experts-fusion"
+        )
+    if not renormalize:
+        raise NotImplementedError(
+            "kunlun_ops.moe_sigmoid_group_topk_norm always renormalizes; "
+            "renormalize=False is not supported"
+        )
+
+    scale = 1.0
+    if routed_scaling_factor is not None and apply_routed_scaling_factor_on_output:
+        scale = float(routed_scaling_factor)
+
+    num_tokens, num_experts = gating_output.shape
+    topk_weights = torch.empty(
+        num_tokens, topk, dtype=torch.float32, device=gating_output.device
+    )
+    topk_ids = torch.empty(
+        num_tokens, topk, dtype=torch.int32, device=gating_output.device
+    )
+    if num_tokens == 0:
+        return topk_weights, topk_ids
+
+    # The kernel also emits a per-block routing statistic; the MoE method
+    # regenerates it on demand, so it is discarded here.
+    block_statistic = torch.empty(
+        12, num_experts + 1, dtype=torch.int32, device=gating_output.device
+    )
+    kunlun_ops.moe_sigmoid_group_topk_norm(
+        x=gating_output,
+        topk_index=topk_ids,
+        norm_score=topk_weights,
+        block_statistic=block_statistic,
+        bias=correction_bias.float(),
+        scale=scale,
+        n_group=num_expert_group,
+        topk_group=topk_group,
+    )
+    return topk_weights, topk_ids
+
+
 @plugin_hook(
     "sglang.srt.layers.moe.topk.select_experts",
     type=HookType.REPLACE,
@@ -116,8 +183,7 @@ def select_experts_kunlun(
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
         else:
-            topk_weights, topk_ids = biased_grouped_topk(
-                hidden_states=hidden_states,
+            topk_weights, topk_ids = _kunlun_biased_grouped_topk(
                 gating_output=router_logits,
                 correction_bias=correction_bias,
                 topk=num_routed_topk if _use_aiter else top_k,

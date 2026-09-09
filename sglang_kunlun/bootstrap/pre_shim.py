@@ -111,6 +111,52 @@ def _patch_optional_tilelang_import() -> None:
     builtins.__import__ = optional_tilelang_import
 
 
+def _patch_transformers_optional_modules() -> None:
+    """Stub transformers modules that only newer releases provide.
+
+    ``sglang.srt.configs.__init__`` unconditionally imports
+    ``muse_glimmer_processing``, which does a top-level
+    ``from transformers.image_processing_backends import TorchvisionBackend``.
+    That module only exists in transformers >= 4.58, so on an older install the
+    *entire* ``sglang.srt.configs`` package fails to import and the server cannot
+    start at all -- even though the Kunlun deployment never serves MuseGlimmer.
+    A stub module keeps the import working; touching the symbol would fail, which
+    is the correct outcome for an unsupported model.
+    """
+    import sys
+    import types
+
+    try:
+        import transformers  # noqa: F401
+    except Exception:
+        return
+
+    if "transformers.image_processing_backends" in sys.modules:
+        return
+    try:
+        import transformers.image_processing_backends  # noqa: F401
+
+        return
+    except ImportError:
+        pass
+
+    module = types.ModuleType("transformers.image_processing_backends")
+
+    class TorchvisionBackend:  # pragma: no cover - unreachable on Kunlun
+        """Placeholder for the transformers >= 4.58 image-processing backend."""
+
+        def __init__(self, *_args, **_kwargs):
+            raise NotImplementedError(
+                "transformers.image_processing_backends.TorchvisionBackend "
+                "requires transformers >= 4.58; the Kunlun deployment stubs it "
+                "so that sglang.srt.configs stays importable."
+            )
+
+    module.TorchvisionBackend = TorchvisionBackend
+    sys.modules["transformers.image_processing_backends"] = module
+    setattr(transformers, "image_processing_backends", module)
+
+
 def _patch_flashinfer_optional_symbols() -> None:
     """Inject stubs for optional flashinfer symbols imported at sglang import time.
 
@@ -172,6 +218,11 @@ def _kunlun_pre_shim() -> None:
 
     try:
         _patch_flashinfer_optional_symbols()
+    except Exception:
+        pass
+
+    try:
+        _patch_transformers_optional_modules()
     except Exception:
         pass
 
