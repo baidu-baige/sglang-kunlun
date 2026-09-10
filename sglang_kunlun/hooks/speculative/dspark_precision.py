@@ -37,7 +37,7 @@ _DSPARK_EXTRA_QUANT_IGNORE = (
 )
 
 
-def _clear_unaccepted_c4_states(self, rejected_locs: torch.Tensor) -> None:
+def _clear_unaccepted_c4_states(self, rejected_locs: torch.Tensor, mask: torch.Tensor | None = None) -> None:
     """把被拒草稿 token 对应的 ratio-4 compress-state 行置为无效。
 
     c4 不像 c128 那样按 request 寻址，行号来自 token 的 SWA slot。置无效的方式是
@@ -47,6 +47,13 @@ def _clear_unaccepted_c4_states(self, rejected_locs: torch.Tensor) -> None:
     ``swa_page * ring_size + swa_loc % ring_size``，**不除** ``compress_ratio``。
     那个 ``/ compress_ratio`` 只属于 ``plan_c.read_page``（压缩页索引），不属于
     raw state ring。多除一次会把 4 个 slot 折叠到同一行、且只覆盖 buffer 前 1/4。
+
+    ``mask`` 让调用方传完整的 ``[bs, num_draft]`` loc 加一个布尔掩码，而不是先在
+    host 上做布尔选择——布尔选择的输出形状依赖数据，会强制一次 D2H 同步。
+    行号只取决于 ``(ring_size, kv_score.shape[0])``，而 43 层的 c4 pool 这两个值
+    是一样的，所以按这个 key 缓存：原实现在每个 pool 里重算一遍 rows，还各带一次
+    ``rows[keep]`` 布尔选择和一次 ``torch.unique``（两者都同步），~80 个 pool 就是
+    ~160 次同步、~1400 个 kernel。
     """
     if rejected_locs is None or rejected_locs.numel() == 0:
         return
@@ -60,15 +67,24 @@ def _clear_unaccepted_c4_states(self, rejected_locs: torch.Tensor) -> None:
         return
     swa_loc = self.translate_loc_from_full_to_swa(rejected_locs).to(torch.int64)
     swa_loc = swa_loc.reshape(-1)
+    base_keep = swa_loc >= 0
+    if mask is not None:
+        base_keep = base_keep & mask.reshape(-1).to(swa_loc.device)
+    row_cache: dict[tuple[int, int], torch.Tensor] = {}
     for pool in pools:
         kv_score = getattr(getattr(pool, "kv_score_buffer", None), "kv_score", None)
         if kv_score is None:
             continue
         ring_size = pool.ring_size
-        rows = swa_loc // self.swa_page_size * ring_size + swa_loc % ring_size
-        # 未映射的 slot（swa_loc < 0）折到 row 0 会破坏合法状态，直接丢掉。
-        keep = (swa_loc >= 0) & (rows >= 0) & (rows < kv_score.shape[0])
-        rows = torch.unique(rows[keep])
+        num_rows = kv_score.shape[0]
+        cache_key = (int(ring_size), int(num_rows))
+        rows = row_cache.get(cache_key)
+        if rows is None:
+            rows = swa_loc // self.swa_page_size * ring_size + swa_loc % ring_size
+            # 未映射的 slot（swa_loc < 0）折到 row 0 会破坏合法状态，直接丢掉。
+            keep = base_keep & (rows >= 0) & (rows < num_rows)
+            rows = rows[keep]
+            row_cache[cache_key] = rows
         if rows.numel() == 0:
             continue
         half = kv_score.shape[-1] // 2
@@ -153,7 +169,8 @@ def clear_unaccepted_compress_states_kunlun(result, self, *args, **kwargs):
     if clear_c4 is not None and loc_2d is not None:
         keep = commit_lens.to(loc_2d.device).reshape(-1, 1)
         offsets = torch.arange(num_draft, device=loc_2d.device).reshape(1, num_draft)
-        clear_c4(loc_2d[offsets >= keep])
+        rejected = offsets >= keep
+        clear_c4(loc_2d, mask=rejected)
     return result
 
 

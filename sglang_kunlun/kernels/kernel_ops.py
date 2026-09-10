@@ -4151,60 +4151,84 @@ def chain_speculative_sampling_triton(
 ) -> None:
     """Torch replacement for chain speculative rejection sampling on Kunlun."""
 
+    """Batched, sync-free chain rejection sampling.
+
+    Semantically identical to the row-by-row reference below, but every decision
+    stays on device. The reference walked ``bs`` rows in Python and called
+    ``.item()`` about ten times per row (candidate id, coin comparison, retrieve
+    index, ``norm_sum <= 0``, ``any()``, ``argmax``), so a batch of 32 issued
+    ~330 blocking D2H copies per step and 32 separate 1-D ``cumsum`` launches
+    over the whole vocab. Here the same work is 1 batched cumsum and 0 syncs.
+
+    Chain (not tree) topology is what the DSPARK buffers describe:
+    ``retrive_next_token`` is ``[1, 2, ..., -1]`` and ``retrive_next_sibling`` is
+    all ``-1``, so acceptance is a prefix property and the probability row used
+    at step ``s`` is always ``s - 1``.
+    """
     batch_size, num_slots = candidates.shape
     vocab_size = target_probs.shape[-1]
-    for bid in range(batch_size):
-        root_global_idx = int(retrive_index[bid, 0].item())
-        accept_index[bid, 0] = root_global_idx
-        last_accepted_global_idx = root_global_idx
-        num_accept = 0
-        cur_prob_row = 0
-        continue_verifying = True
+    device = candidates.device
+    num_steps = num_slots - 1
+    rows = torch.arange(batch_size, device=device)
+    slot_index = retrive_index[:, :num_slots].to(torch.int64)
 
-        step = 1
-        while step < num_slots and continue_verifying:
-            draft_token = int(candidates[bid, step].item())
-            p = target_probs[bid, cur_prob_row, draft_token]
-            q = draft_probs[bid, cur_prob_row, draft_token]
-            coin = uniform_samples[bid, step - 1]
-            if bool((coin * q < p).item()):
-                num_accept += 1
-                cur_prob_row = step
-                predicts[last_accepted_global_idx] = draft_token
-                curr_global_idx = int(retrive_index[bid, step].item())
-                accept_index[bid, num_accept] = curr_global_idx
-                last_accepted_global_idx = curr_global_idx
-                step += 1
-            else:
-                continue_verifying = False
+    if num_steps > 0:
+        token = candidates[:, 1:num_slots].to(torch.int64).unsqueeze(-1)
+        p = target_probs[:, :num_steps, :].gather(2, token).squeeze(-1)
+        q = draft_probs[:, :num_steps, :].gather(2, token).squeeze(-1)
+        coin = uniform_samples[:, :num_steps].to(p.dtype)
+        accept = coin * q < p
+        step_ids = torch.arange(1, num_slots, device=device).expand(batch_size, num_steps)
+        # first rejected step id, or num_slots when the whole chain is accepted
+        first_reject = torch.where(
+            accept, step_ids.new_full((), num_slots), step_ids
+        ).amin(dim=1)
+        num_accept = first_reject - 1
+    else:
+        num_accept = torch.zeros(batch_size, dtype=torch.int64, device=device)
 
-        accept_token_num[bid] = num_accept
+    all_accept = num_accept >= num_steps
+    target_row = target_probs[rows, num_accept]
+    draft_row = draft_probs[rows, num_accept.clamp(max=draft_probs.shape[1] - 1)]
+    # A degenerate draft row can carry NaN; the reference treats NaN q as 0 so the
+    # residual falls back to p instead of poisoning norm_sum.
+    draft_row = torch.where(torch.isnan(draft_row), draft_row.new_zeros(()), draft_row)
+    residual = torch.where(
+        all_accept.unsqueeze(1), target_row, torch.clamp(target_row - draft_row, min=0)
+    )
 
-        target_row = target_probs[bid, cur_prob_row]
-        if continue_verifying:
-            residual = target_row
-        else:
-            draft_row = draft_probs[bid, cur_prob_row]
-            # A degenerate draft row can carry NaN. clamp() propagates NaN, which
-            # would make norm_sum NaN, every cumsum comparison False, and the
-            # fallback emit vocab_size - 1 (a reserved id) instead of a token
-            # drawn from the target. Upstream's kernel treats NaN q as 0 so the
-            # residual falls back to p; match that.
-            # 对应triton算子的q_val = tl.where(q_val == q_val, q_val, 0.0)
-            draft_row = torch.where(torch.isnan(draft_row), 0.0, draft_row)
-            residual = torch.clamp(target_row - draft_row, min=0)
+    norm_sum = residual.sum(dim=1)
+    threshold = uniform_samples_for_final_sampling.to(norm_sum.dtype) * norm_sum
+    above = residual.cumsum(dim=1) > threshold.unsqueeze(1)
+    first_above = above.to(torch.int32).argmax(dim=1).to(torch.int64)
+    valid = (norm_sum > 0) & above.any(dim=1)
+    final_token = torch.where(
+        valid, first_above, torch.full_like(first_above, vocab_size - 1)
+    )
 
-        norm_sum = residual.sum()
-        if bool((norm_sum <= 0).item()):
-            final_token = vocab_size - 1
-        else:
-            threshold = uniform_samples_for_final_sampling[bid] * norm_sum
-            above = torch.cumsum(residual, dim=0) > threshold
-            if bool(above.any().item()):
-                final_token = int(torch.argmax(above.to(torch.int32)).item())
-            else:
-                final_token = vocab_size - 1
-        predicts[last_accepted_global_idx] = final_token
+    accept_token_num.copy_(num_accept.to(accept_token_num.dtype))
+    # Only columns <= num_accept are ever read (``accept_index[row, correct_len]``);
+    # writing the full row is well-defined there and leaves nothing uninitialised.
+    accept_index.copy_(slot_index.to(accept_index.dtype))
+
+    slot_ids = torch.arange(num_slots, device=device).unsqueeze(0)
+    flat_index = slot_index.reshape(-1)
+    current = predicts[flat_index].reshape(batch_size, num_slots)
+    if num_steps > 0:
+        next_token = torch.cat([candidates[:, 1:num_slots], candidates[:, -1:]], dim=1)
+    else:
+        next_token = candidates
+    limit = num_accept.unsqueeze(1)
+    value = torch.where(
+        slot_ids < limit,
+        next_token.to(current.dtype),
+        torch.where(
+            slot_ids == limit,
+            final_token.unsqueeze(1).to(current.dtype),
+            current,
+        ),
+    )
+    predicts[flat_index] = value.reshape(-1)
 
 
 @register_triton_op(
