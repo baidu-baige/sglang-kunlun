@@ -5182,3 +5182,38 @@ def fused_dsa_draft_extend_metadata(
         max_cols=max_seqlen_k,
         real_page_size=real_page_size,
     )
+
+
+@register_triton_op(
+    "sglang.kernels.ops.attention.dsa.cp_split",
+    "dsa_cp_round_robin_split_q_seqs_kernel",
+)
+def dsa_cp_round_robin_split_q_seqs_kernel(
+    in_seqs: torch.Tensor,
+    out_seqs: torch.Tensor,
+    bs_idx: torch.Tensor,
+    tokens: int,
+    cp_size: int,
+    cp_rank: int,
+    **kwargs,
+) -> None:
+    """Round-robin CP q-sequence split, without the sequential Triton loop."""
+    if out_seqs.numel() == 0:
+        return
+
+    lengths = in_seqs[:tokens].to(torch.int64)
+    total = torch.cumsum(lengths, dim=0)
+    taken = torch.div(total, cp_size, rounding_mode="floor") + (
+        total % cp_size > cp_rank
+    ).to(total.dtype)
+    per_seq = taken - torch.cat([taken.new_zeros(1), taken[:-1]])
+
+    selected = torch.nonzero(per_seq > 0, as_tuple=False).flatten()
+    if selected.numel() != out_seqs.numel():
+        raise RuntimeError(
+            "dsa_cp_round_robin_split_q_seqs: selected rows do not match the "
+            f"preallocated output ({selected.numel()} vs {out_seqs.numel()}; "
+            f"tokens={tokens}, cp_size={cp_size}, cp_rank={cp_rank})"
+        )
+    out_seqs.copy_(per_seq.index_select(0, selected).to(out_seqs.dtype))
+    bs_idx.copy_(selected.to(bs_idx.dtype))

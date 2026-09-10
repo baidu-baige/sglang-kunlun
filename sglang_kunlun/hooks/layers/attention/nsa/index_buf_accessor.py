@@ -59,6 +59,16 @@ def set_k_and_s_triton(cls, pool, buf, loc, index_k, index_k_scale) -> None:
     """Set NSA K and S index buffers with Kunlun kernels."""
     import kunlun_ops
 
+    # The kernel only reports "k_num != loc_num" without the counts; surface them,
+    # since a mismatch here means the caller mixed a CP-sharded K with full-batch
+    # cache locations (or vice versa).
+    if index_k.shape[0] != loc.shape[0]:
+        raise RuntimeError(
+            "kunlun set_k_and_s_triton: row mismatch "
+            f"index_k={tuple(index_k.shape)} index_k_scale={tuple(index_k_scale.shape)} "
+            f"loc={tuple(loc.shape)} page_size={pool.page_size}"
+        )
+
     kunlun_ops.set_k_and_s_triton(
         buf=buf.contiguous(),
         loc=loc.to(torch.int64).contiguous(),

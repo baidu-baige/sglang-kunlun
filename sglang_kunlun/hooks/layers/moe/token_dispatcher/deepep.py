@@ -398,7 +398,12 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         """dispatch_a"""
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        
+        self._normal_orig_num_tokens = hidden_states.shape[0]
+        if self._normal_orig_num_tokens == 0:
+            hidden_states = hidden_states.new_zeros((1, hidden_states.shape[1]))
+            topk_ids = topk_ids.new_zeros((1, topk_ids.shape[1]))
+            topk_weights = topk_weights.new_zeros((1, topk_weights.shape[1]))
+
         import kunlun_ops
         topk_ids = topk_ids.to(torch.int32)
         num_tokens, hidden_size = hidden_states.shape
@@ -520,6 +525,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         event.current_stream_wait() if self.async_finish else ()
         self.handle = None
         self.src2dst = None
+        if getattr(self, "_normal_orig_num_tokens", None) == 0:
+            hidden_states = hidden_states[:0]
         return hidden_states
 
     def _combine_core(self, x: torch.Tensor, previous_event):
