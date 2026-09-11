@@ -332,11 +332,27 @@ def cdiv(a: int, b: int) -> int:
     return -(a // -b)
 
 
+# Fully-masked attention blocks produce LSE = -inf. The Kunlun merge kernel then
+# evaluates (-inf) - (-inf) = nan, where the Triton reference special-cases it;
+# the symptom is a request whose output degenerates into a run of "!" tokens.
+# Both a long prompt (a chunk boundary can leave one side of the cascade with no
+# valid keys) and concurrent short requests hit this, so clamp the exponent floor
+# to a finite value before the op. Semantically equivalent: exp(-1e30) == 0.
+_LSE_FLOOR = -1e30
+
+
+def _sanitize_lse(lse: torch.Tensor) -> torch.Tensor:
+    """Replace -inf in a log-sum-exp tensor with a finite floor, in place."""
+    floor = max(_LSE_FLOOR, torch.finfo(lse.dtype).min)
+    return lse.clamp_(min=floor)
+
+
 # TODO(hebiao064): remove this once we have a better way to handle the merge_state_v2 torch.compile issue
 @torch._dynamo.disable()
 def merge_state_v2_wrapper(o, s_a, o_exp, s_b):
-    """merge_state_v2_wrapper"""
-    return merge_state_v2(o, s_a, o_exp, s_b)
+    """Merge two attention partials, guarding the LSE inputs against -inf."""
+    return merge_state_v2(o, _sanitize_lse(s_a), o_exp, _sanitize_lse(s_b))
+
 
 
 class KunlunAttentionBackend(AttentionBackend):
@@ -1718,7 +1734,7 @@ class KunlunAttentionBackend(AttentionBackend):
                             **kwargs,
                         )
                     )
-                    o, _ = merge_state_v2(
+                    o, _ = merge_state_v2_wrapper(
                         o,
                         softmax_lse.T.contiguous(),
                         o_expand,
@@ -1793,7 +1809,7 @@ class KunlunAttentionBackend(AttentionBackend):
                     return_softmax_lse=True,
                     num_splits=self.num_splits,
                 )
-                o, _ = merge_state_v2(
+                o, _ = merge_state_v2_wrapper(
                     o,
                     softmax_lse.T.contiguous(),
                     o_expand,

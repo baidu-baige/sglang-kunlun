@@ -1,35 +1,30 @@
-"""Hooks for DeepseekV4 NextN / MTP INT4 checkpoint mapping."""
+"""Kunlun method hook for the upstream DeepSeek V4 NextN model."""
 
 from __future__ import annotations
 
-from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
-from sglang.srt.models.deepseek_v4_nextn import DeepseekV4ForCausalLMNextN
-from sglang.srt.models.utils import WeightsMapper
+import torch
+import torch.nn.functional as F
+from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
-# Install the base mapper first so NextN can reuse its substr/suffix maps.
-from . import deepseek_v4 as _deepseek_v4  # noqa: F401
 
-_base_mapper = DeepseekV4ForCausalLM.hf_to_sglang_mapper
-
-# The checkpoint names the MTP weights `mtp.<i>.*`, but this module tree is
-# `model.{e_proj,h_proj,enorm,hnorm,...}` for the layer-external weights and
-# `model.decoder.*` for the decoder layer. The compressed-tensors
-# targets/ignore lists use the checkpoint names, so they need to be
-# rewritten on top of the base DeepseekV4 remapping.
-DeepseekV4ForCausalLMNextN.hf_to_sglang_mapper = WeightsMapper(
-    orig_to_new_substr={
-        **_base_mapper.orig_to_new_substr,
-        r"mtp\.\d+\.attn_norm": r"decoder\.input_layernorm",
-        r"mtp\.\d+\.ffn_norm": r"decoder\.post_attention_layernorm",
-        r"mtp\.\d+\.attn\.": r"decoder\.self_attn\.",
-        r"mtp\.\d+\.ffn\.": r"decoder\.mlp\.",
-        r"mtp\.\d+\.": r"model\.",
-    },
-    orig_to_new_prefix=_base_mapper.orig_to_new_prefix,
-    orig_to_new_suffix=_base_mapper.orig_to_new_suffix,
+@plugin_hook(
+    "sglang.srt.models.deepseek_v4_nextn.DeepseekV4ModelNextN.hc_head",
+    type=HookType.REPLACE,
 )
-
-DeepseekV4ForCausalLMNextN.packed_modules_mapping = {
-    "wqkv_a": ["wq_a", "wkv"],
-    "gate_up_proj": ["gate_proj", "up_proj"],
-}
+def hc_head_kunlun(
+    self,
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+):
+    """Match the Golden explicit FP32 MHC-head sequence."""
+    if x.numel() == 0:
+        return x.new_empty((0, x.shape[-1]))
+    shape, dtype = x.size(), x.dtype
+    x = x.flatten(1).float()
+    rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.rms_norm_eps)
+    mixes = F.linear(x, hc_fn) * rsqrt
+    pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
+    y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
+    return y.to(dtype)

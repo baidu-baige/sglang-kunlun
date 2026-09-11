@@ -216,3 +216,21 @@ def compress_state_alloc_kv_score_buffer_kunlun(
                 )
             )
     self.kv_score_buffer.clear()
+
+
+@plugin_hook(
+    "sglang.srt.mem_cache.memory_pool.MambaPool._should_fuse_slot_ops",
+    type=HookType.AROUND,
+)
+def disable_fused_mamba_slot_ops(original_fn, self) -> bool:
+    """Disable fused slot operations only on the Kunlun platform.
+
+    Returns:
+        ``False`` on Kunlun so the upstream Torch clear/copy fallback runs;
+        ``True`` elsewhere so native fused operations remain unchanged.
+    """
+    from sglang.srt.platforms import current_platform
+
+    if getattr(current_platform, "device_name", None) == "kunlun":
+        return False
+    return original_fn(self)

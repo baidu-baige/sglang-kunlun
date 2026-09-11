@@ -8,3 +8,5 @@ Importing the submodules registers their ``@plugin_hook`` targets in
 
 from . import unquant  # noqa: F401
 from . import w8a8_int8  # noqa: F401
+
+from . import compressed_tensors  # noqa: F401

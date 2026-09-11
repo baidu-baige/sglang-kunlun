@@ -2,6 +2,85 @@
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def _install_import_stub(names: tuple[str, ...]) -> None:
+    """Replace ``names`` with empty stub modules in ``sys.modules``."""
+    import sys
+    import types
+
+    for name in list(sys.modules):
+        for root in names:
+            if name == root or name.startswith(root + "."):
+                del sys.modules[name]
+                break
+
+    for name in names:
+        stub = types.ModuleType(name)
+        stub.__path__ = []  # namespace-like so submodule imports fail cleanly
+        stub._kunlun_stub = True
+        sys.modules[name] = stub
+
+
+def _stub_module_if_unloadable(probe: str, names: tuple[str, ...]) -> None:
+    """Stub ``names`` when importing ``probe`` fails with a non-ImportError.
+
+    CUDA-only extensions such as CuTeDSL (``cutlass``) and ``deep_gemm`` are
+    installed in the Kunlun image but cannot initialize there: they load a CUDA
+    toolkit / ``libcudart`` flavour that the XPU driver shim does not provide, and
+    they signal that with ``RuntimeError`` rather than ``ImportError``.
+
+    Upstream sglang guards these imports with ``except ImportError`` only, so the
+    ``RuntimeError`` escapes and breaks every Kimi-K3 module that transitively
+    imports them. Installing an empty stub converts any later
+    ``import <name>.<sub>`` into ``ModuleNotFoundError`` (an ``ImportError``),
+    which upstream does handle, so those code paths report as unavailable.
+
+    A genuine ``ImportError`` is left alone: upstream already handles it.
+    """
+    import importlib
+    import sys
+
+    if getattr(sys.modules.get(names[0]), "_kunlun_stub", False):
+        return
+
+    try:
+        importlib.import_module(probe)
+        return
+    except ImportError:
+        return
+    except Exception as exc:
+        logger.info(
+            "Kunlun: %r cannot initialize on this host (%s: %s); installing an "
+            "import stub so CUDA-only paths report as unavailable.",
+            probe,
+            type(exc).__name__,
+            str(exc)[:120],
+        )
+
+    _install_import_stub(names)
+
+
+def _disable_flashinfer_version_check() -> None:
+    """Stop flashinfer's cubin/python version check from aborting the import.
+
+    ``sglang.srt.layers.quantization.fp4_utils`` does a top-level
+    ``from flashinfer import fp4_quantize`` guarded only by ``except ImportError``.
+    On Kunlun hosts the installed ``flashinfer-cubin`` and ``flashinfer-python``
+    versions do not match, and flashinfer raises ``RuntimeError`` at import time,
+    which escapes that guard and breaks every Kimi-K3 module that transitively
+    imports the quantization package.
+
+    The FP4/cubin kernels themselves are never used on XPU, so skipping the
+    version check is safe and only affects the import path.
+    """
+    import os
+
+    os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
+
 
 def _patch_fla_utils_if_loaded() -> None:
     import sys
@@ -210,6 +289,21 @@ def _kunlun_pre_shim() -> None:
         _patch_optional_tilelang_import()
     except Exception:
         pass
+
+    # Kimi-K3 pulls the quantization package (and therefore flashinfer +
+    # CuTeDSL) in at import time; both shims must run before that happens.
+    _disable_flashinfer_version_check()
+
+    for probe, names in (
+        ("cutlass", ("cutlass", "nvidia_cutlass_dsl")),
+        ("deep_gemm", ("deep_gemm",)),
+    ):
+        try:
+            _stub_module_if_unloadable(probe, names)
+        except Exception:
+            logger.warning(
+                "Kunlun: import stub installation for %r failed", probe, exc_info=True
+            )
 
     try:
         _patch_torch_cuda_symm_mem_apis()

@@ -299,17 +299,21 @@ def moe_post(
     sorted_tokens_idx: torch.Tensor,
     topk_weights: torch.Tensor,
     output_shape: torch.Size,
+    output_dtype
 ) -> torch.Tensor:
     """Combine sorted expert outputs with router weights."""
     import kunlun_ops
+    out_dtype = down.dtype if output_dtype is None else output_dtype
 
     output = torch.empty(output_shape, dtype=down.dtype, device=down.device)
     dequant_scale = torch.ones_like(topk_weights, dtype=torch.float32)
     kunlun_ops.moe_post(
         x=down.reshape(-1, down.shape[-1]),
         moe_index=sorted_tokens_idx.view_as(topk_weights),
-        normed_scale=topk_weights,
+        normed_scale=topk_weights.to(torch.float32),
         dequant_scale=dequant_scale,
         y=output,
     )
+    if output.dtype is not out_dtype:
+        output = output.to(out_dtype)
     return output

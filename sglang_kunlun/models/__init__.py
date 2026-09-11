@@ -6,9 +6,13 @@ import logging
 
 from sglang.srt.environ import envs
 
-from . import deepseek_v4  # noqa: F401
-from . import deepseek_v4_nextn  # noqa: F401
-from . import deepseek_v4_precision  # noqa: F401
+# Kimi-K3 W4A16 weight-loading hooks. SGLang imports the external model package
+# from its model registry, which runs before any weight iterator, so
+# registering them here keeps the packed-name protection and the shard trimming
+# active independently of when the plugin's own hook bundle is installed.
+from sglang_kunlun.hooks.models import (  # noqa: F401
+    kimi_k3_w4a16_loader as _kimi_k3_w4a16_loader,
+)
 
 logger = logging.getLogger(__name__)
 

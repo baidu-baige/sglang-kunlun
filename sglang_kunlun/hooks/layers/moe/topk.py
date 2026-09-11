@@ -35,6 +35,7 @@ from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 import kunlun_ops
+from sglang_kunlun.kernels.moe_router import route_k3_torch
 
 
 class StandardTopKOutput(NamedTuple):
@@ -155,7 +156,21 @@ def select_experts_kunlun(
     # remove num_fused_shared_experts from grouped_topk/biased_grouped_topk
     num_routed_topk = top_k - num_fused_shared_experts
     block_statistic = None
-    if use_grouped_topk:
+    use_k3_router = (
+        use_grouped_topk
+        and custom_routing_function is None
+        and correction_bias is not None
+        and num_fused_shared_experts == 0
+        and num_expert_group == 1
+        and topk_group == 1
+        and top_k == 16
+        and router_logits.shape[-1] == 896
+    )
+    if use_k3_router:
+        topk_weights, topk_ids = route_k3_torch(
+            router_logits, correction_bias, top_k
+        )
+    elif use_grouped_topk:
         assert topk_group is not None
         assert num_expert_group is not None
         if correction_bias is None:
