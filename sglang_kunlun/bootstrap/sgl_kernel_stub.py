@@ -157,6 +157,13 @@ def install() -> None:
     sys.modules["sgl_kernel.version"].__version__ = "0.0.0+kunlun-stub"  # type: ignore[attr-defined]
     sys.modules["sgl_kernel.utils"].is_arch_support_pdl = lambda: False  # type: ignore[attr-defined]
 
+    from sglang_kunlun.kernels.sgl_kernel_kunlun.attention import (
+        merge_state_v2 as _merge_state_v2,
+    )
+
+    for module in (root, sys.modules["sgl_kernel.attention"]):
+        module.merge_state_v2 = _merge_state_v2  # type: ignore[attr-defined]
+
     # Bind real Kunlun implementations for sgl_kernel top-k APIs.
     # fast_topk: pure-Python fallback (no XPU kernel needed), identical to
     #   the mimo-branch reference in sgl-kernel/python/sgl_kernel/top_k.py.
@@ -184,6 +191,8 @@ def install() -> None:
     for module in (root, sys.modules["sgl_kernel.sampling"]):
         module.top_k_renorm_prob = _top_k_renorm_prob  # type: ignore[attr-defined]
         module.top_p_renorm_prob = _top_p_renorm_prob  # type: ignore[attr-defined]
+        module.top_k_renorm_probs = _top_k_renorm_prob  # type: ignore[attr-defined]
+        module.top_p_renorm_probs = _top_p_renorm_prob  # type: ignore[attr-defined]
         module.tree_speculative_sampling_target_only = _tree_spec_sampling  # type: ignore[attr-defined]
 
     from sglang_kunlun.kernels.sgl_kernel_kunlun.speculative import (

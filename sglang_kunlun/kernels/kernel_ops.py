@@ -345,10 +345,10 @@ def dsv4_create_paged_compress_data_kunlun(
 
 def _dsv4_topk_torch_fallback(*args, **kwargs) -> None:
     from sglang.srt.layers.attention.dsv4.indexer import (
-        topk_transform_512_pytorch_vectorized,
+        topk_transform_pytorch_vectorized,
     )
 
-    topk_transform_512_pytorch_vectorized(*args, **kwargs)
+    topk_transform_pytorch_vectorized(*args, **kwargs)
 
 
 _C4_LOGITS_CHUNK_BYTES_ENV = "SGLANG_KUNLUN_C4_LOGITS_CHUNK_BYTES"
@@ -613,7 +613,7 @@ def _dsv4_topk_transform_graph_safe(
     out_page_indices.copy_(page_indices.to(torch.int32))
 
 
-@register_jit_op("sglang.kernels.ops.attention.dsv4.topk", "topk_transform_512")
+@register_jit_op("sglang.kernels.ops.attention.dsv4.topk", "topk_transform_paged")
 def dsv4_topk_transform_512_kunlun(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -688,7 +688,7 @@ def dsv4_topk_transform_512_kunlun(
     )
 
 
-@register_jit_op("sglang.kernels.ops.attention.dsv4.topk", "topk_transform_512_v2")
+@register_jit_op("sglang.kernels.ops.attention.dsv4.topk", "topk_transform_paged_v2")
 def dsv4_topk_transform_512_v2_kunlun(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -730,13 +730,88 @@ def dsv4_init_compression_metadata_kunlun(
     page_size: int = 0,
     compute_page_indices: bool = True,
 ):
-    return torch.ops.xspeedgate_ops.init_compressed_attn_metadata_v2(
-        seq_lens,
-        positions,
+    # Prefill CP pads the metadata row count (seq_lens/positions) to a multiple
+    # of cp_size while raw_out_loc lists only the real tokens. The padding rows
+    # carry seq_len 1 / position 0, so the kernel does NOT skip them -- feeding
+    # them a padded raw_out_loc would write their compressed KV into a real
+    # cache slot. Upstream sizes the write buffers (*_out_loc) unpadded and masks
+    # rows >= num_write_tokens. Emulate that: run the Kunlun op over the real
+    # rows only, then restore the length/position/page outputs to the padded
+    # size with the padded rows' own seq_lens/positions.
+    bs = seq_lens.shape[0]
+    n = raw_out_loc.shape[0]
+    if n > bs:
+        raise RuntimeError(
+            "dsv4 init_compression_metadata: raw_out_loc longer than seq_lens "
+            f"({tuple(raw_out_loc.shape)} vs {tuple(seq_lens.shape)})"
+        )
+    if n == bs:
+        return torch.ops.xspeedgate_ops.init_compressed_attn_metadata_v2(
+            seq_lens,
+            positions,
+            raw_out_loc,
+            page_table,
+            page_size,
+            compute_page_indices,
+        )
+
+    page_table_r = (
+        page_table[:n] if page_table is not None and page_table.shape[0] > n else page_table
+    )
+    (
+        c4_out,
+        c4_pos,
+        c4_raw,
+        c4_clamp,
+        c128_out,
+        c128_pos,
+        c128_raw,
+        c128_clamp,
+        c128_pages,
+    ) = torch.ops.xspeedgate_ops.init_compressed_attn_metadata_v2(
+        seq_lens[:n],
+        positions[:n],
         raw_out_loc,
-        page_table,
+        page_table_r,
         page_size,
         compute_page_indices,
+    )
+    pad_rows = bs - n
+    seq_lens_tail = seq_lens[n:].to(torch.int32)
+    positions_tail = positions[n:].to(torch.int32)
+    ones_tail = seq_lens_tail.clamp_min(1)
+
+    def _pad(x, tail):
+        return torch.cat([x, tail.to(x.dtype, copy=False)])
+
+    c4_pos = _pad(c4_pos, positions_tail)
+    c4_raw = _pad(c4_raw, seq_lens_tail)
+    c4_clamp = _pad(c4_clamp, ones_tail)
+    c128_pos = _pad(c128_pos, positions_tail)
+    c128_raw = _pad(c128_raw, seq_lens_tail)
+    c128_clamp = _pad(c128_clamp, ones_tail)
+    if c128_pages is not None:
+        c128_pages = torch.cat(
+            [
+                c128_pages,
+                torch.full(
+                    (pad_rows, c128_pages.shape[1]),
+                    -1,
+                    dtype=c128_pages.dtype,
+                    device=c128_pages.device,
+                ),
+            ]
+        )
+    return (
+        c4_out,
+        c4_pos,
+        c4_raw,
+        c4_clamp,
+        c128_out,
+        c128_pos,
+        c128_raw,
+        c128_clamp,
+        c128_pages,
     )
     
 
@@ -1373,6 +1448,11 @@ def dsv4_compress_norm_rope_store_v2_kunlun(
     page_size: int,
     use_fp4: bool = False,
     bf16_store: bool = False,
+    # 4.1 added these three for the HIP FP4 writer; the XPU branch of upstream
+    # `compress_norm_rope_store` does not consume them either.
+    kvcache_scale: Optional[torch.Tensor] = None,
+    rope_cache=None,
+    fp4_k_write_metadata=None,
 ) -> None:
     """Apply v2 post-compression transforms and store into Kunlun cache pages."""
 
@@ -3123,12 +3203,16 @@ def set_mla_kv_buffer_kernel(
 
     from kunlun_ops import set_mla_kv_buffer_triton as impl
 
-    impl(
+    status = impl(
         kv_buffer,
         loc,
         cache_k_nope.contiguous().view(cache_k_nope.shape[0], cache_k_nope.shape[-1]),
         cache_k_rope.contiguous().view(cache_k_rope.shape[0], cache_k_rope.shape[-1]),
     )
+    if status != 0:
+        raise RuntimeError(
+            f"Kunlun MLA cache set returned non-zero status {status}"
+        )
 
 
 @register_triton_op("sglang.srt.mem_cache.utils", "get_mla_kv_buffer_kernel")
@@ -5217,3 +5301,37 @@ def dsa_cp_round_robin_split_q_seqs_kernel(
         )
     out_seqs.copy_(per_seq.index_select(0, selected).to(out_seqs.dtype))
     bs_idx.copy_(selected.to(bs_idx.dtype))
+
+
+@register_jit_op(
+    "sglang.kernels.ops.mamba.mamba_state_indices_triton",
+    "fused_replay_state_indices",
+)
+def fused_replay_state_indices(
+    *,
+    req_pool_indices: torch.Tensor,
+    mamba_index_mapping: torch.Tensor,
+    out_state_indices: torch.Tensor,
+    valid_bs: int,
+    total_bs: int,
+) -> torch.Tensor:
+    """Torch form of the mamba replay state-indices fusion."""
+    valid = max(0, min(int(valid_bs), int(total_bs)))
+    total = int(total_bs)
+
+    # Gather first: the Triton kernel masks its load to the valid rows, so the
+    # padding zero-fill below cannot influence the gathered values. Doing it in
+    # this order keeps that true no matter how the buffers alias.
+    if valid > 0:
+        req = req_pool_indices[:valid].to(torch.long)
+        out_state_indices[:valid] = mamba_index_mapping[req].to(
+            out_state_indices.dtype
+        )
+    if total > valid:
+        # -1 is the sentinel mamba kernels test with `state_idx < 0`.
+        out_state_indices[valid:total] = -1
+        # Side effect the reference chain relies on: padded rows of the static
+        # req_pool_indices buffer are zeroed so captured kernels that gather
+        # with them stay in bounds.
+        req_pool_indices[valid:total] = 0
+    return out_state_indices[:total]

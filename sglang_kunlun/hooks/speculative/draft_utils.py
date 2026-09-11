@@ -21,20 +21,9 @@ def _create_backend_kunlun(
     backend_map,
     error_template,
     stamps_children: bool = False,
+    **kwargs,
 ):
-    """Swap the Kunlun factories into ``backend_map`` and let upstream drive.
-
-    ``backend_name`` is the slot consulted for the backend type:
-    ``"decode_attention_backend"`` for the multi-step decode backend and
-    ``"prefill_attention_backend"`` (or decode, per speculative_attention_mode)
-    for the draft-extend backend.
-
-    0.5.19 moved the stamping (``prefill/decode_attention_backend_str``) and the
-    draft-decode sidecar wrapper *into* ``_create_backend``, and its map entries
-    now return ``(stamp, backend)``. Rather than reimplementing that, we only
-    replace the map entry for the resolved backend type and delegate, so every
-    upstream post-step still runs.
-    """
+    """Swap the Kunlun factories into ``backend_map`` and let upstream drive."""
     backend_type = _resolve_backend_type(self, backend_name)
     is_decode_multistep = backend_name == "decode_attention_backend"
 
@@ -118,6 +107,7 @@ def _create_backend_kunlun(
         backend_map,
         error_template,
         stamps_children=stamps_children,
+        **kwargs,
     )
 
 

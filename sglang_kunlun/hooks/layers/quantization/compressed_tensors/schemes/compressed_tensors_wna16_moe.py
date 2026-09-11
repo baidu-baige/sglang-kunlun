@@ -308,7 +308,11 @@ class KunlunCompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             packed_int4=True,
         )
 
-        output = moe_post(down, sorted_tokens_idx, topk_weights, x.shape)
+        # int8 grouped 路径下 down 是 bf16，这里要落回模型 dtype，
+        # 否则下面的 fp16 clamp 判断会被跳过、且会把 bf16 传给后续 fp16 的层。
+        output = moe_post(
+            down, sorted_tokens_idx, topk_weights, x.shape, output_dtype=x.dtype
+        )
 
         routed_scaling_factor = getattr(
             self.moe_runner_config, "routed_scaling_factor", None

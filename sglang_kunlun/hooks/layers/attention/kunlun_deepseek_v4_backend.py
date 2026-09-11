@@ -221,13 +221,16 @@ class KunlunDSV4AttnMetadata(DSV4AttnMetadata):
 
     def init_flashmla_related(self, is_prefill: bool = False) -> None:
         """Initialize Kunlun sparse metadata without FlashMLA schedulers."""
-        if self.c4_sparse_topk not in (512, 1024):
-            raise ValueError(f"unsupported Kunlun C4 top-k: {self.c4_sparse_topk}")
+        # 4.1 renamed the DSV4 metadata field (and the backend attribute) from
+        # c4_sparse_topk/c4_topk to index_topk; the value is the same
+        # `hf_text_config.index_topk` fallback to C4_TOPK.
+        if self.index_topk not in (512, 1024):
+            raise ValueError(f"unsupported Kunlun C4 top-k: {self.index_topk}")
         self.c4_sparse_topk_lengths = torch.clamp(
-            self.c4_topk_lengths_clamp1, max=self.c4_sparse_topk
+            self.c4_topk_lengths_clamp1, max=self.index_topk
         )
         self.c4_sparse_page_indices = torch.full(
-            (self.c4_topk_lengths_clamp1.size(0), self.c4_sparse_topk),
+            (self.c4_topk_lengths_clamp1.size(0), self.index_topk),
             -1,
             dtype=torch.int32,
             device=self.c4_topk_lengths_clamp1.device,
@@ -239,6 +242,7 @@ class KunlunDSV4AttnMetadata(DSV4AttnMetadata):
         # Keep this unset to match the patched xspeedgate top-k path; a raw
         # buffer would force the 0.5.14 JIT wrapper into its PyTorch fallback.
         self.c4_sparse_raw_indices = None
+        self.c0_flashmla_metadata = None
         self.c1_flashmla_metadata = None
         self.c4_flashmla_metadata = None
         self.c128_flashmla_metadata = None
@@ -509,19 +513,31 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         self._attention_graph_extend_aux = {}
         self._c4_decode_aux = {}
 
-    def get_swa_page_indices(self, seq_lens_casual, req_pool_indices_repeated):
-        """Translate request token offsets into Kunlun SWA page indices."""
+    def get_swa_page_indices(
+        self, seq_lens_casual, req_pool_indices_repeated, swa_replay_start=None
+    ):
+        """Translate request token offsets into Kunlun SWA page indices.
+
+        ``swa_replay_start`` (4.1) is the per-row window floor used by decoder
+        SWA bounded replay: offsets below it are never written at the tail
+        layers, so the window is clamped at the floor instead of at 0.
+        """
         # Match the contract: invalid history offsets are clamped to the
         # first physical row and remain valid indices; the length tensor masks
         # those rows. Upstream 0.5.14 writes -1 here, which changes graph replay
         # inputs and is not accepted by the Kunlun compressed-attention path.
         pos_causal = seq_lens_casual - 1
+        lower = (
+            torch.zeros_like(pos_causal).unsqueeze(1)
+            if swa_replay_start is None
+            else swa_replay_start.reshape(-1, 1).to(pos_causal.dtype)
+        )
         offsets = torch.clamp(
             pos_causal.unsqueeze(1)
             - torch.arange(
                 upstream.SWA_WINDOW, **self.cuda_int32_kwargs
             ).unsqueeze(0),
-            min=0,
+            min=lower,
         )
         raw_indices = self.req_to_token[
             req_pool_indices_repeated[:, None].clamp(
@@ -712,7 +728,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             raw_indices = core_metadata.c4_sparse_raw_indices
 
         if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
-            upstream_indexer.topk_transform_512_pytorch_vectorized(
+            upstream_indexer.topk_transform_pytorch_vectorized(
                 logits,
                 c4_seq_lens,
                 page_table,
@@ -721,7 +737,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 raw_indices,
             )
         elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
-            upstream_indexer.topk_transform_512_v2(
+            upstream_indexer.topk_transform_paged_v2(
                 logits,
                 c4_seq_lens,
                 page_table,
@@ -730,7 +746,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 indexer_metadata.topk_metadata,
             )
         else:
-            upstream_indexer.topk_transform_512(
+            upstream_indexer.topk_transform_paged(
                 logits,
                 c4_seq_lens,
                 page_table,
@@ -799,6 +815,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             metadata.core_attn_metadata, upstream.DSV4AttnMetadata
         ):
             core = metadata.core_attn_metadata
+            core.c0_flashmla_metadata = None
             core.c1_flashmla_metadata = None
             core.c4_flashmla_metadata = None
             core.c128_flashmla_metadata = None
@@ -818,6 +835,13 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         is_prefill: bool = False,
         dspark_block_size: Optional[int] = None,
         num_tokens: Optional[int] = None,
+        # 4.1 additions: `swa_replay_start` is the per-row window floor used by
+        # decoder SWA bounded replay, `num_groups` only feeds the request-window
+        # layout and `dspark_swa_buffers` lets the caller pass precomputed draft
+        # window indices.
+        swa_replay_start: Optional[torch.Tensor] = None,
+        num_groups: Optional[int] = None,
+        dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> KunlunDSV4AttnMetadata:
         """Build Kunlun core attention metadata for the current request."""
         if dspark_block_size is not None:
@@ -828,12 +852,22 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 max_seq_len=max_seq_len,
                 out_loc=out_loc,
                 dspark_block_size=dspark_block_size,
+                dspark_swa_buffers=dspark_swa_buffers,
             )
+        # 4.1 can build the SWA window through `window_layout()` when the encoder
+        # bounded-replay feature is on. That path also needs `swa_out_cache_loc`
+        # and write-loc plumbing the Kunlun op does not have, so fail loudly
+        # instead of silently approximating it.
+        assert self.token_to_kv_pool.request_window is None, (
+            "4.1 request-window (encoder SWA bounded replay) is not supported by "
+            "the Kunlun DSV4 backend"
+        )
         assert self.swa_page_size == upstream.SWA_WINDOW
         seq_lens_casual = seq_lens_casual.to(torch.int32)
         swa_page_indices = self.get_swa_page_indices(
             seq_lens_casual=seq_lens_casual,
             req_pool_indices_repeated=req_pool_indices_repeated,
+            swa_replay_start=swa_replay_start,
         )
         # Match the PyTorch metadata contract: mapping==0 denotes an
         # invalid/tombstoned SWA slot, and valid entries must be a leading
@@ -852,6 +886,15 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             torch.clamp(seq_lens_casual, max=upstream.SWA_WINDOW),
             effective_swa_len,
         )
+        if swa_replay_start is not None:
+            # Slots below the floor are unreachable: upstream shrinks the valid
+            # count to match the floored window start.
+            floored = (seq_lens_casual - 1) - swa_replay_start.to(
+                seq_lens_casual.dtype
+            ) + 1
+            swa_topk_lengths = torch.minimum(
+                swa_topk_lengths, floored.clamp_min(0).to(swa_topk_lengths.dtype)
+            )
         page_table = req_to_token[
             req_pool_indices_repeated,
             : _dsv4_page_table_span(max_seq_len, seq_lens_casual) : self.page_size,
@@ -865,7 +908,9 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             page_table=(page_table // self.page_size).to(torch.int32),
             swa_page_indices=swa_page_indices,
             swa_topk_lengths=torch.clamp(seq_lens_casual, max=upstream.SWA_WINDOW),
-            c4_sparse_topk=self.c4_topk,
+            index_topk=self.index_topk,
+            present_ratios=self.present_ratios,
+            low_ratios=self.low_ratios,
         )
         # Apply the effective-length contract after construction as well;
         # this keeps the value correct if upstream metadata initialization resets it.
@@ -877,6 +922,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             metadata.c4_sparse_topk_lengths = None
             metadata.c4_sparse_page_indices = None
             metadata.c4_sparse_raw_indices = None
+            metadata.c0_flashmla_metadata = None
             metadata.c1_flashmla_metadata = None
             metadata.c4_flashmla_metadata = None
             metadata.c128_flashmla_metadata = None
@@ -907,6 +953,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         max_seq_len: int,
         out_loc: torch.Tensor,
         dspark_block_size: int,
+        dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> KunlunDSV4AttnMetadata:
         """DSpark draft block 前向的 core metadata（只有窗口，没有压缩分支）。
 
@@ -918,12 +965,15 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         """
         assert self.swa_page_size == upstream.SWA_WINDOW
         seq_lens_casual = seq_lens_casual.to(torch.int32)
-        swa_page_indices, swa_topk_lengths = self.get_dspark_swa_page_indices(
-            seq_lens_casual=seq_lens_casual,
-            req_pool_indices_repeated=req_pool_indices_repeated,
-            out_loc=out_loc,
-            block_size=dspark_block_size,
-        )
+        if dspark_swa_buffers is not None:
+            swa_page_indices, swa_topk_lengths = dspark_swa_buffers
+        else:
+            swa_page_indices, swa_topk_lengths = self.get_dspark_swa_page_indices(
+                seq_lens_casual=seq_lens_casual,
+                req_pool_indices_repeated=req_pool_indices_repeated,
+                out_loc=out_loc,
+                block_size=dspark_block_size,
+            )
         page_table = req_to_token[
             req_pool_indices_repeated,
             : _dsv4_page_table_span(max_seq_len, seq_lens_casual) : self.page_size,
@@ -937,12 +987,15 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             page_table=(page_table // self.page_size).to(torch.int32),
             swa_page_indices=swa_page_indices,
             swa_topk_lengths=swa_topk_lengths,
-            c4_sparse_topk=self.c4_topk,
+            index_topk=self.index_topk,
+            present_ratios=self.present_ratios,
+            low_ratios=self.low_ratios,
         )
         metadata.swa_topk_lengths = swa_topk_lengths
         metadata.c4_sparse_topk_lengths = None
         metadata.c4_sparse_page_indices = None
         metadata.c4_sparse_raw_indices = None
+        metadata.c0_flashmla_metadata = None
         metadata.c1_flashmla_metadata = None
         metadata.c4_flashmla_metadata = None
         metadata.c128_flashmla_metadata = None

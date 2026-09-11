@@ -25,7 +25,7 @@ from .device import KunlunDeviceMixin
 
 
 class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
-    supported_quantization = ["int8"]
+    supported_quantization = ["int8", "w8a8_int8", "compressed-tensors"]
 
     def __init__(self) -> None:
         super().__init__()
@@ -38,6 +38,14 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
     def init_backend(self):
         """Initialize Kunlun backend registrations."""
         super().init_backend()
+        # Must happen here, not in __init__: this is the point upstream reserves
+        # for it (``model_runner.py:248`` calls init_backend, and the
+        # chunked-prefix gate runs later in the same function at ``:394``).
+        # __init__ is too early -- it fires while sglang.srt.server_args is
+        # still executing, before CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
+        # exists -- and launch.py is too narrow, because the scheduler
+        # subprocesses are spawned fresh and never run it.
+        self._extend_attention_backend_choices()
 
     @staticmethod
     def _extend_attention_backend_choices() -> None:
@@ -50,6 +58,27 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
                 for backend in ("kunlun", "kunlun_compressed"):
                     if backend not in choices:
                         choices.append(backend)
+
+            # Declare that the Kunlun MLA path reads the chunked prefix-cache
+            # layout. Without this, `maybe_disable_chunked_prefix_cache`
+            # (``model_runner_components/misc_utils.py:40``) silently forces
+            # ``disable_chunked_prefix_cache=True`` because "kunlun" is not in
+            # the whitelist, ``ForwardBatch.attn_attend_prefix_cache`` stays
+            # None, and any prompt longer than --chunked-prefill-size dies in
+            # ``KunlunK3MLAAttnBackend._forward_extend_mla`` with "query LOD
+            # total != KV LOD total outside the chunked-prefix path".
+            # ``add_chunked_prefix_cache_attention_backend`` (``server_args.py:231``)
+            # is the extension point upstream documents for OOT platforms.
+            add_backend = getattr(
+                server_args, "add_chunked_prefix_cache_attention_backend", None
+            )
+            supported = getattr(
+                server_args, "CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS", None
+            )
+            if add_backend is not None and supported is not None:
+                for backend in ("kunlun", "kunlun_compressed"):
+                    if backend not in supported:
+                        add_backend(backend)
         except Exception:
             pass
 
@@ -96,6 +125,16 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
 
     def get_default_attention_backend(self) -> str:
         return "kunlun"
+
+    def get_quantization_config(self, quantization: str):
+        """Route ``compressed-tensors`` to the Kunlun config subclass."""
+        if quantization == "compressed-tensors":
+            from sglang_kunlun.hooks.layers.quantization.compressed_tensors import (
+                KunlunCompressedTensorsConfig,
+            )
+
+            return KunlunCompressedTensorsConfig
+        return None
 
     def get_draft_prefill_attention_backend_cls(self) -> type | None:
         """Return the Kunlun draft prefill attention backend class."""
