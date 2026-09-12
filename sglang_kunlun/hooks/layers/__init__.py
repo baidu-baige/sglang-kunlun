@@ -17,6 +17,7 @@ def _disable_cuda_triton_vocab_embedding(self, input_):
 
 
 from . import linear  # noqa: F401,E402
+from . import logits_processor  # noqa: F401,E402
 from . import mhc  # noqa: F401
 from . import quantization  # noqa: F401
 from . import moe  # noqa: F401

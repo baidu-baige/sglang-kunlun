@@ -299,7 +299,6 @@ def moe_post(
     sorted_tokens_idx: torch.Tensor,
     topk_weights: torch.Tensor,
     output_shape: torch.Size,
-    output_dtype
 ) -> torch.Tensor:
     """Combine sorted expert outputs with router weights."""
     import kunlun_ops

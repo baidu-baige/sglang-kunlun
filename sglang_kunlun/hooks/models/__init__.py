@@ -3,6 +3,8 @@
 from . import deepseek_v4  # noqa: F401
 from . import deepseek_v4_precision  # noqa: F401
 from . import deepseek_v4_nextn  # noqa: F401
+from . import dsv41_engram_int8  # noqa: F401
+from . import dsv41_dspark_weights  # noqa: F401
 
 # Kimi-K3 model hook registrations.
 from . import kimi_k3_gemm  # noqa: F401

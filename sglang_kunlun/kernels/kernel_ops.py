@@ -3085,7 +3085,7 @@ def mask_topk_ids(topk_ids: torch.Tensor, num_token_non_padded: torch.Tensor) ->
 
 @register_jit_op("sglang.kernels.ops.moe.moe_fused_gate", "moe_fused_gate")
 def moe_fused_gate_dsv4_kunlun(
-    input: torch.Tensor,
+    scores: torch.Tensor,
     bias: torch.Tensor,
     topk: int,
     scoring_func: str = "sigmoid",
@@ -3096,34 +3096,74 @@ def moe_fused_gate_dsv4_kunlun(
     moe_softcapping: float = 0.0,
     num_expert_group: int = 1,
     topk_group: int = 1,
+    *,
+    bias_alt: Optional[torch.Tensor] = None,
+    input_ids: Optional[torch.Tensor] = None,
+    bias_alt_token_id: Optional[int] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    renormalize_epsilon: float = 0.0,
+    packed_out: Optional[torch.Tensor] = None,
 ):
-    """Match the monkey-patched DeepSeek-V4 fused MoE gate."""
+    """Match the monkey-patched DeepSeek-V4 fused MoE gate.
+
+    4.1 added the V4.1 vision-language routing contract: ``bias_alt`` replaces
+    ``bias`` on rows whose ``input_ids == bias_alt_token_id``, rows at or past
+    the device scalar ``num_token_non_padded`` become zero weight / id -1, and
+    ``renormalize_epsilon`` selects ``sum + eps`` over the zero-sum guard. The
+    Kunlun op takes one bias vector, so a per-row alternative bias is handled by
+    running the gate once per bias and selecting per row -- only the VL routing
+    path (``vl_routing.vision_topk``) passes ``bias_alt``, so text-only routing
+    pays nothing.
+    """
     import kunlun_ops
 
     if num_expert_group != 1 or topk_group != 1:
         raise ValueError("grouped routing is not supported by the DSV4 fused gate")
     if moe_softcapping != 0.0:
         raise ValueError("MoE softcapping is not supported by the DSV4 fused gate")
+    if packed_out is not None:
+        raise NotImplementedError(
+            "packed_out (FlashInfer routed-MoE form) is not supported by the "
+            "Kunlun fused gate"
+        )
 
-    num_rows = input.shape[0]
-    topk_weights = torch.empty(
-        num_rows, topk, dtype=torch.float32, device=input.device
+    num_rows = scores.shape[0]
+
+    def run(inp: torch.Tensor, bias_vec: torch.Tensor):
+        weights = torch.empty(num_rows, topk, dtype=torch.float32, device=inp.device)
+        indices = torch.empty(num_rows, topk, dtype=torch.int32, device=inp.device)
+        kunlun_ops.moe_fused_gate_dsv4(
+            inp.to(torch.float32),
+            bias_vec,
+            weights,
+            indices,
+            topk,
+            scoring_func,
+            num_fused_shared_experts,
+            renormalize,
+            routed_scaling_factor,
+            apply_routed_scaling_factor_on_output,
+        )
+        return weights, indices
+
+    use_alt = (
+        bias_alt is not None and input_ids is not None and bias_alt_token_id is not None
     )
-    topk_indices = torch.empty(
-        num_rows, topk, dtype=torch.int32, device=input.device
-    )
-    kunlun_ops.moe_fused_gate_dsv4(
-        input.to(torch.float32),
-        bias,
-        topk_weights,
-        topk_indices,
-        topk,
-        scoring_func,
-        num_fused_shared_experts,
-        renormalize,
-        routed_scaling_factor,
-        apply_routed_scaling_factor_on_output,
-    )
+    if use_alt:
+        alt = (input_ids.to(torch.int64) == int(bias_alt_token_id)).unsqueeze(-1)
+        w_main, i_main = run(scores, bias)
+        w_alt, i_alt = run(scores, bias_alt)
+        topk_weights = torch.where(alt, w_alt, w_main)
+        topk_indices = torch.where(alt, i_alt, i_main)
+    else:
+        topk_weights, topk_indices = run(scores, bias)
+
+    if num_token_non_padded is not None:
+        # Device scalar; keep this tensor-only so it stays graph-capturable.
+        limit = num_token_non_padded.to(device=scores.device).reshape(())
+        padded = (torch.arange(num_rows, device=scores.device) >= limit).unsqueeze(-1)
+        topk_weights = topk_weights.masked_fill(padded, 0.0)
+        topk_indices = topk_indices.masked_fill(padded, -1)
     return topk_weights, topk_indices
 
 

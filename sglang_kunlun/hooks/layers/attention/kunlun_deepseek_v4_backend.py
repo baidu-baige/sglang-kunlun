@@ -220,30 +220,71 @@ class KunlunDSV4AttnMetadata(DSV4AttnMetadata):
     """DSV4 metadata without CUDA FlashMLA scheduler objects."""
 
     def init_flashmla_related(self, is_prefill: bool = False) -> None:
-        """Initialize Kunlun sparse metadata without FlashMLA schedulers."""
+        """Initialize Kunlun sparse metadata without FlashMLA schedulers.
+
+        Mirrors the upstream ratio split. V4-Flash stages carry ratio 4 (and
+        possibly 128); the V4.1 checkpoint carries only ratios 0/1/2, so the c4
+        buffers must stay unset there and the c1/c2 buffers must be allocated --
+        otherwise the low-ratio path silently degrades to window-only attention
+        (and an absent c4 pool crashes this method outright).
+        """
         # 4.1 renamed the DSV4 metadata field (and the backend attribute) from
         # c4_sparse_topk/c4_topk to index_topk; the value is the same
         # `hf_text_config.index_topk` fallback to C4_TOPK.
         if self.index_topk not in (512, 1024):
-            raise ValueError(f"unsupported Kunlun C4 top-k: {self.index_topk}")
-        self.c4_sparse_topk_lengths = torch.clamp(
-            self.c4_topk_lengths_clamp1, max=self.index_topk
-        )
-        self.c4_sparse_page_indices = torch.full(
-            (self.c4_topk_lengths_clamp1.size(0), self.index_topk),
-            -1,
-            dtype=torch.int32,
-            device=self.c4_topk_lengths_clamp1.device,
-        )
-        self.c4_sparse_page_indices = upstream._pad_last_dim(
-            self.c4_sparse_page_indices
-        )
+            raise ValueError(f"unsupported Kunlun top-k: {self.index_topk}")
+        if 4 in self.present_ratios:
+            self.c4_sparse_topk_lengths = torch.clamp(
+                self.c4_topk_lengths_clamp1, max=self.index_topk
+            )
+            self.c4_sparse_page_indices = torch.full(
+                (self.c4_topk_lengths_clamp1.size(0), self.index_topk),
+                -1,
+                dtype=torch.int32,
+                device=self.c4_topk_lengths_clamp1.device,
+            )
+            self.c4_sparse_page_indices = upstream._pad_last_dim(
+                self.c4_sparse_page_indices
+            )
+        else:
+            self.c4_sparse_topk_lengths = None
+            self.c4_sparse_page_indices = None
         # Kunlun's custom prefill attention consumes physical page indices only.
         # Keep this unset to match the patched xspeedgate top-k path; a raw
         # buffer would force the 0.5.14 JIT wrapper into its PyTorch fallback.
         self.c4_sparse_raw_indices = None
+        # V4.1 low-ratio (1/2) sparse top-k buffers. The indexer fills them in
+        # place; the attention op reads them as (slot, -1-padded) extra indices.
+        for ratio, lengths in (
+            (1, self.c1_topk_lengths_clamp1),
+            (2, self.c2_topk_lengths_clamp1),
+        ):
+            if ratio not in self.low_ratios:
+                continue
+            assert lengths is not None, (
+                f"present low ratio {ratio} without its topk lengths"
+            )
+            setattr(
+                self,
+                f"c{ratio}_sparse_topk_lengths",
+                torch.clamp(lengths, max=self.index_topk),
+            )
+            setattr(
+                self,
+                f"c{ratio}_sparse_page_indices",
+                upstream._pad_last_dim(
+                    torch.full(
+                        (lengths.size(0), self.index_topk),
+                        -1,
+                        dtype=torch.int32,
+                        device=lengths.device,
+                    )
+                ),
+            )
+            setattr(self, f"c{ratio}_sparse_raw_indices", None)
         self.c0_flashmla_metadata = None
         self.c1_flashmla_metadata = None
+        self.c2_flashmla_metadata = None
         self.c4_flashmla_metadata = None
         self.c128_flashmla_metadata = None
 
@@ -512,6 +553,140 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         self._attention_decode_aux = {}
         self._attention_graph_extend_aux = {}
         self._c4_decode_aux = {}
+
+    _WINDOW_WARNED = False
+
+    def _low_ratio_index_topk_sm90_decode(self, layer, x, q_lora, req, pos) -> None:
+        """Capture-safe low-ratio decode/verify indexer top-k.
+
+        Upstream routes non-Blackwell decode through the SM90 `fp4_index_logits_decode`
+        Triton kernel (absent on XPU) and keeps `_low_ratio_index_topk_torch` as the
+        eager oracle. That oracle cannot run under CUDA graph capture: it derives
+        output shapes from data (`torch.unique_consecutive(req).tolist()`) and reads
+        scalars back to the host (`lens.max().item()`), both illegal during capture --
+        observed as `RuntimeError: Trying to create tensor with negative dimension
+        -72340172838076673` at the first capture call.
+
+        This is a row-wise reformulation with static shapes:
+
+        * every row is scored against a fixed window of compressed positions
+          `j in [0, window)` and masked by that row's own visible length, which is
+          the reference's per-request `lc = max(lens)` set expressed per row (rows
+          of a request share `req`, hence share the candidate slots for a given j);
+        * `window` is static -- `DSV4_LOW_RATIO_INDEX_WINDOW` (default 32768) capped
+          by the capture's max sequence length -- so no shape depends on data. For a
+          compressed length that fits the window this is identical to the reference;
+          beyond it the window is a documented approximation.
+        * the window is chunked and a running top-k is kept across chunks, so the
+          transient tensors stay bounded while the result is still the exact top-k
+          over the whole window.
+
+        Candidate publish/consume is row-indexed: within one forward the rows are
+        the same for every layer, so a `[rows, window]` mask carries exactly the
+        request-keyed masks the reference built.
+        """
+        ratio = layer.compress_ratio
+        indexer = layer.indexer
+        core = self.forward_metadata.core_attn_metadata
+        pool = self.token_to_kv_pool
+        rows = x.shape[0]
+        if rows == 0:
+            return
+        topk = indexer.index_topk
+        cap = int(os.environ.get("DSV4_LOW_RATIO_INDEX_WINDOW", "32768"))
+        window = min(self.MAX_SEQ_LEN_FOR_CAPTURE // ratio + 1, cap)
+        k = min(topk, window)
+
+        page_indices = core.sparse_page_indices(ratio)
+        page_indices.fill_(-1)
+
+        q = indexer.queries(q_lora, layer.freqs_cis[pos])  # [R, H, index_head_dim]
+        head_w = indexer.head_weights(x)  # [R, H]
+        visible = ((pos + 1) // ratio).to(torch.int64)  # compressed length per row
+        req_i = req.to(torch.int64).reshape(-1)
+        device = x.device
+        neg = torch.finfo(torch.float32).min
+        req_width = self.req_to_token.shape[1] - 1
+
+        publish = bool(getattr(indexer, "is_candidate_source", False))
+        consume = None
+        if getattr(indexer, "uses_candidates", False) and isinstance(
+            self.candidate_masks, dict
+        ):
+            consume = self.candidate_masks.get("rows")
+        published = (
+            torch.zeros((rows, window), dtype=torch.bool, device=device)
+            if publish
+            else None
+        )
+
+        if not KunlunDeepseekV4AttnBackend._WINDOW_WARNED and bool(
+            (visible > window).any()
+        ):
+            KunlunDeepseekV4AttnBackend._WINDOW_WARNED = True
+            logger.warning(
+                "low-ratio indexer: visible compressed length exceeds the static "
+                "window %d; candidates beyond it are not scored. Raise "
+                "DSV4_LOW_RATIO_INDEX_WINDOW for exact results.",
+                window,
+            )
+
+        best_val = torch.full((rows, k), neg, dtype=torch.float32, device=device)
+        # Unfilled slots sort last: the attention op reads a *leading* prefix of
+        # `sparse_topk_lengths` entries, so the valid positions must come first
+        # (the reference sorts too). A `window` sentinel is greater than every real
+        # position and is filtered by the `reach` mask below.
+        best_j = torch.full((rows, k), window, dtype=torch.int64, device=device)
+
+        from sglang.srt.layers.attention.dsv4.indexer import select_candidate_blocks
+
+        jc = int(os.environ.get("DSV4_LOW_RATIO_INDEX_CHUNK", "2048"))
+        rc = int(os.environ.get("DSV4_LOW_RATIO_INDEX_ROWS", "64"))
+        for j0 in range(0, window, jc):
+            j = torch.arange(j0, j0 + jc, device=device)  # static width
+            tok_pos = (j * ratio).clamp_max(req_width)
+            valid = j.unsqueeze(0) < visible.unsqueeze(1)
+            for r0 in range(0, rows, rc):
+                r1 = min(r0 + rc, rows)
+                slots = self.req_to_token[req_i[r0:r1, None], tok_pos[None, :]] // ratio
+                v = valid[r0:r1]
+                index_k = pool.get_low_ratio_index_k_dequant(
+                    layer.layer_id, slots.reshape(-1)
+                ).reshape(r1 - r0, jc, -1)
+                # `DeepseekV41Indexer.scores` with a per-row K: bf16 up to the
+                # reduction, then relu, head-weight and head sum in fp32.
+                dots = (q[r0:r1].unsqueeze(2) * index_k.unsqueeze(1)).sum(dim=-1)
+                s = (dots.relu() * head_w[r0:r1].unsqueeze(-1)).sum(dim=1).float()
+                s = s.masked_fill(~v, neg)
+                if consume is not None:
+                    s = s.masked_fill(~consume[r0:r1, j0 : j0 + jc], neg)
+                if published is not None:
+                    published[r0:r1, j0 : j0 + jc] = select_candidate_blocks(
+                        s,
+                        visible[r0:r1, None],
+                        topk_blocks=indexer.candidate_topk_blocks,
+                        block_size=indexer.candidate_block_size,
+                    )
+                cand_val, cand_j = s.topk(k, dim=-1, sorted=False)
+                merged_val = torch.cat([best_val[r0:r1], cand_val], dim=1)
+                merged_j = torch.cat([best_j[r0:r1], j0 + cand_j], dim=1)
+                top = merged_val.topk(k, dim=-1, sorted=False)
+                best_val[r0:r1] = top.values
+                best_j[r0:r1] = merged_j.gather(1, top.indices)
+
+        # Sort the (value, position) pairs by position so valid entries form the
+        # leading prefix the attention op expects; `best_val` must follow.
+        order = best_j.argsort(dim=-1)
+        best_j = best_j.gather(1, order)
+        best_val = best_val.gather(1, order)
+        reach = (best_j < visible.unsqueeze(1)) & (best_val > neg)
+        sel_pos = (best_j * ratio).clamp_max(req_width)
+        sel_slots = self.req_to_token[req_i[:, None], sel_pos] // ratio
+        page_indices[:, :k] = torch.where(
+            reach, sel_slots, torch.full_like(sel_slots, -1)
+        ).to(torch.int32)
+        if published is not None:
+            self.candidate_masks = {"rows": published}
 
     def get_swa_page_indices(
         self, seq_lens_casual, req_pool_indices_repeated, swa_replay_start=None
@@ -1188,7 +1363,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         v: torch.Tensor,
         layer,
         forward_batch,
-        compress_ratio: Literal[0, 4, 128],
+        compress_ratio: Literal[0, 1, 2, 4, 128],
         save_kv_cache: bool = True,
         attn_sink: Optional[torch.Tensor] = None,
         **_,
@@ -1231,7 +1406,15 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         extra_cache = None
         extra_indices = None
         extra_lengths = None
-        if compress_ratio == 4:
+        if compress_ratio in (1, 2):
+            # DeepSeek V4.1 low ratios: the compressed latent pool is the extra
+            # cache and the indexer published the top-k slots into it. The
+            # `page_width = page_size // ratio` split below matches the
+            # `page_size // ratio` the compressed pool was built with.
+            extra_cache = pool.get_extra_key_buffer(layer.layer_id)
+            extra_indices = core.sparse_page_indices(compress_ratio)
+            extra_lengths = core.sparse_topk_lengths(compress_ratio)
+        elif compress_ratio == 4:
             extra_cache = pool.get_extra_key_buffer(layer.layer_id)
             extra_indices = core.c4_sparse_page_indices
             extra_lengths = core.c4_sparse_topk_lengths

@@ -59,6 +59,11 @@ def register_all() -> None:
     from sglang_kunlun.kernels import k3_conv_registry as _k3_conv_registry  # noqa: F401
     from sglang_kunlun.kernels import kernel_ops, kernel_registry
 
+    # V4.1 low-ratio (compress_ratio 1/2) kernel replacements. Must be imported
+    # before kernel_ops.install(), which snapshots the registration tables.
+    from sglang_kunlun.kernels import dsv41_low_ratio as _dsv41_low_ratio  # noqa: F401
+    from sglang_kunlun.kernels import dsv41_mhc as _dsv41_mhc  # noqa: F401
+
     # Must precede kernel_ops.install(): ``sglang.kernels.selector`` caches
     # resolved callables (``lru_cache`` on ``_resolve``), so the override has to
     # be in place before any op is resolved for the first time.
