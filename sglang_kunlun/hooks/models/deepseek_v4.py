@@ -134,20 +134,36 @@ def mqa_forward_prepare_kunlun(
     )
     _store_kv_to_swa_cache_direct(self, kv, forward_batch, attn_backend)
 
-    if self.indexer is not None:
-        self.indexer(
-            x=x,
-            q_lora=q_lora,
-            forward_batch=forward_batch,
-            attn_backend=attn_backend,
-        )
-    if self.compressor is not None:
-        attn_backend.forward_core_compressor(
-            x,
-            forward_batch,
-            self.layer_id,
-            self.compressor,
-        )
+    # V4.1 low ratios own a different source pipeline: `DeepseekV41Compressor` /
+    # `DeepseekV41Indexer` are not per-layer indexer modules -- they expose
+    # project()/queries()/scores() and have no forward, so `self.indexer(...)`
+    # and the c4 `forward_core_compressor` are both invalid. Upstream routes both
+    # through the backend's `forward_low_ratio_sources`. V4 (ratio 4/128) keeps
+    # the c4 calls below.
+    if getattr(self, "compress_ratio", 0) in (1, 2):
+        if self.compressor is not None or self.indexer is not None:
+            attn_backend.forward_low_ratio_sources(
+                layer=self,
+                x=x,
+                q_lora=q_lora,
+                positions=positions,
+                forward_batch=forward_batch,
+            )
+    else:
+        if self.indexer is not None:
+            self.indexer(
+                x=x,
+                q_lora=q_lora,
+                forward_batch=forward_batch,
+                attn_backend=attn_backend,
+            )
+        if self.compressor is not None:
+            attn_backend.forward_core_compressor(
+                x,
+                forward_batch,
+                self.layer_id,
+                self.compressor,
+            )
 
     if q_out is not None:
         q_out.copy_(q)
@@ -412,3 +428,84 @@ def fuse_wqkv_a_weight_scale_kunlun(original_fn, self, weights, *args, **kwargs)
     if not _environ.envs.SGLANG_OPT_FUSE_WQA_WKV.get():
         return original_fn(self, weights, *args, **kwargs)
     return original_fn(self, _fuse_wqkv_a_weight_scales(weights), *args, **kwargs)
+
+def _dequant_int8_per_channel(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """W8A8-INT8 checkpoint layout -> bf16: ``weight[O, I] * scale[O, 1]``."""
+    assert weight.dtype == torch.int8, f"expected int8, got {weight.dtype}"
+    return (weight.to(torch.float32) * scale.to(torch.float32)).to(torch.bfloat16)
+
+
+@plugin_hook(
+    "sglang.srt.models.deepseek_v4._prepare_deepseek_v4_weights",
+    type=HookType.REPLACE,
+)
+def _prepare_deepseek_v4_weights_kunlun(weights, quant_config):
+    """Streaming weight transform that also understands the W8A8-INT8 wo_a layout.
+
+    The 4.1 tree's transform only matches the FP8 wo_a layout
+    (``.wo_a.weight`` fp8 + ``.wo_a.scale`` block scales). The W8A8-INT8 release
+    stores ``.wo_a.weight`` I8 [O, I] with a per-output-channel
+    ``.wo_a.weight_scale`` BF16 [O, 1]. The model builds ``wo_a`` as bf16
+    (``wo_a_quant_config`` is None when the quant config is not FP8), so without
+    this branch the scale is an unknown parameter -- dropped with a
+    "not found in params_dict" warning -- and wo_a would be used unscaled.
+
+    Everything that is not wo_a passes through untouched; the FP8 branch keeps
+    the upstream ``_dequant_fp8`` so this hook is format-agnostic.
+    """
+    from sglang.srt.models.deepseek_v4 import _dequant_fp8
+
+    pending: dict[str, dict[str, torch.Tensor]] = {}
+
+    def _emit(prefix: str, bucket: dict) -> Optional[tuple]:
+        """Emit only when the companion scale has arrived; otherwise keep waiting.
+
+        Emitting the raw weight as soon as it appears would leave the scale to be
+        flushed separately -- the model then has no parameter for it and wo_a is
+        used unscaled. That is exactly the failure this hook exists to fix.
+        """
+        weight = bucket.get("weight")
+        if weight is None:
+            return None
+        if "scale" in bucket:
+            return prefix + ".weight", _dequant_fp8(weight, bucket["scale"])
+        if "weight_scale" in bucket:
+            return prefix + ".weight", _dequant_int8_per_channel(
+                weight, bucket["weight_scale"]
+            )
+        return None
+
+    for name, tensor in weights:
+        if name.endswith(".wo_a.weight"):
+            prefix = name[: -len(".weight")]
+            bucket = pending.setdefault(prefix, {})
+            bucket["weight"] = tensor
+            emitted = _emit(prefix, bucket)
+            if emitted is not None:
+                pending.pop(prefix, None)
+                yield emitted
+            continue
+        if name.endswith(".wo_a.scale") or name.endswith(".wo_a.weight_scale"):
+            # Strip only the tensor suffix: `.wo_a` is part of the module prefix.
+            if name.endswith(".wo_a.weight_scale"):
+                suffix, key = ".weight_scale", "weight_scale"
+            else:
+                suffix, key = ".scale", "scale"
+            prefix = name[: -len(suffix)]
+            bucket = pending.setdefault(prefix, {})
+            bucket[key] = tensor
+            emitted = _emit(prefix, bucket)
+            if emitted is not None:
+                pending.pop(prefix, None)
+                yield emitted
+            continue
+        yield name, tensor
+
+    for prefix, bucket in pending.items():
+        # A weight whose companion scale never appeared (checkpoint without wo_a
+        # scales) passes through unchanged; a stray scale is forwarded as upstream.
+        if bucket.get("weight") is not None:
+            yield prefix + ".weight", bucket["weight"]
+        for key, suffix in (("scale", ".scale"), ("weight_scale", ".weight_scale")):
+            if key in bucket:
+                yield prefix + suffix, bucket[key]
