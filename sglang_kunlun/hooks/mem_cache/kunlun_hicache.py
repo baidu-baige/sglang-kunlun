@@ -3,7 +3,9 @@
 The Kunlun runtime currently exposes only the layer-first, full-page MLA
 transfer operators.  Keep the upstream pool allocation and orchestration, but
 replace the V4 transfer boundary so that it cannot fall back to the CUDA
-token-granular ``transfer_cache_dsv4_mla`` implementation.
+token-granular ``transfer_cache_dsv4_mla`` implementation.  The transfer
+kernels themselves live in ``sglang_kunlun.kernels.sgl_kernel_kunlun``; only
+the pool-shape adaptation and hook wiring stay here.
 """
 
 from __future__ import annotations
@@ -12,8 +14,10 @@ import torch
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
-# Importing the extension registers the ``torch.ops.xspeedgate_ops`` namespace.
-import xspeedgate_ops  # noqa: F401
+from sglang_kunlun.kernels.sgl_kernel_kunlun.dsv4_hicache import (
+    transfer_kv_all_layer_mla,
+    transfer_kv_per_layer_mla,
+)
 
 
 def _require_full_page_transfer(pool, host_indices, device_indices) -> None:
@@ -63,15 +67,13 @@ def _transfer_all_layer(pool, host_indices, device_indices, io_backend: str) -> 
         return
     _require_supported_layout(pool, io_backend)
     page_size = _pool_page_size(pool)
-    torch.ops.xspeedgate_ops.transfer_kv_all_layer_mla(
+    transfer_kv_all_layer_mla(
         src_layers=pool.device_ptrs,
         dst_layers=pool.data_ptrs,
         src_indices=_page_rows(device_indices, page_size),
         dst_indices=_page_rows(host_indices, page_size),
         item_size=_pool_item_bytes(pool),
         num_layers=pool.layer_num,
-        block_quota=2,
-        num_warps_per_block=32,
     )
 
 
@@ -83,7 +85,7 @@ def _transfer_per_layer(
         return
     _require_supported_layout(pool, io_backend)
     page_size = _pool_page_size(pool)
-    torch.ops.xspeedgate_ops.transfer_kv_per_layer_mla(
+    transfer_kv_per_layer_mla(
         src=pool.data_refs[layer_id],
         dst=pool.device_buffers[layer_id]
         if hasattr(pool, "device_buffers")
@@ -91,8 +93,6 @@ def _transfer_per_layer(
         src_indices=_page_rows(host_indices, page_size),
         dst_indices=_page_rows(device_indices, page_size),
         item_size=_pool_item_bytes(pool),
-        block_quota=2,
-        num_warps_per_block=32,
     )
 
 

@@ -1,5 +1,9 @@
 """Kunlun-backed implementations of sgl_kernel APIs."""
 
+from .dsv4_hicache import (
+    transfer_kv_all_layer_mla,
+    transfer_kv_per_layer_mla,
+)
 from .layernorm import fused_add_rmsnorm, rmsnorm
 from .sampling import (
     top_k_renorm_prob,
@@ -17,6 +21,8 @@ __all__ = [
     "rmsnorm",
     "top_k_renorm_prob",
     "top_p_renorm_prob",
+    "transfer_kv_all_layer_mla",
+    "transfer_kv_per_layer_mla",
     "tree_speculative_sampling_target_only",
     "verify_tree_greedy",
 ]
