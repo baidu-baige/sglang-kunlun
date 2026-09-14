@@ -84,12 +84,22 @@ ALLOC_MEMORY_FUNCS.default_factory = lambda: alloc_with_shared_host_kv
 
 
 @plugin_hook(
-    "sglang.srt.mem_cache.memory_pool_host.HostPoolGroup."
+    "sglang.srt.mem_cache.memory_pool_host.DeepSeekV4PagedHostPool."
+    "backup_from_device_all_layer",
+    type=HookType.AROUND,
+)
+@plugin_hook(
+    "sglang.srt.mem_cache.memory_pool_host.DeepSeekV4StateHostPool."
     "backup_from_device_all_layer",
     type=HookType.AROUND,
 )
 def dsv4_shared_backup(original_fn, self, *args, **kwargs):
-    """Skip host writes on non-leader TP ranks sharing the same host KV."""
+    """Skip host writes on non-leader TP ranks sharing the same host KV.
+
+    0.5.19 moved the host-pool backup entry point from ``HostPoolGroup`` (a
+    0.5.17-only class) onto the per-pool classes, so this hook follows the
+    pool backup methods instead.
+    """
     if shared_host_kv.skip_write():
         return None
     return original_fn(self, *args, **kwargs)
@@ -109,7 +119,7 @@ def verify_shared_indices(original_fn, self, *args, **kwargs):
 
 
 @plugin_hook(
-    "sglang.srt.mem_cache.memory_pool_host.HostPoolGroup.destroy",
+    "sglang.srt.mem_cache.pool_host.group.HostPoolGroup.destroy",
     type=HookType.AROUND,
 )
 def shutdown_shared_host_kv(original_fn, self, *args, **kwargs):
