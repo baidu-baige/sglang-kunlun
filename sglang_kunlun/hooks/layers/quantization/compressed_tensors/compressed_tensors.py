@@ -135,6 +135,25 @@ class KunlunCompressedTensorsConfig(CompressedTensorsConfig):
         if "FusedMoE" in self.target_scheme_map and "DeepEPMoE" not in self.target_scheme_map:
             self.target_scheme_map["DeepEPMoE"] = self.target_scheme_map["FusedMoE"]
 
+    def get_scheme_dict(
+        self,
+        layer: torch.nn.Module,
+        layer_name: Optional[str] = None,
+        matched_target: Optional[str] = None,
+    ):
+        """Resolve a layer's scheme, translating the NextN decoder prefix.
+
+        The EAGLE/NextN draft model builds its MTP layer under a
+        ``model.decoder.`` prefix, while compressed-tensors targets/ignore
+        lists use ``model.layers.<idx>.`` names. Normalize the draft prefix to
+        a plain layer path so ``find_matched_target`` / ``should_ignore_layer``
+        resolve it with the same config groups as the base model; the returned
+        scheme is independent of the module path.
+        """
+        if layer_name and layer_name.startswith("model.decoder."):
+            layer_name = "model.layers.0." + layer_name[len("model.decoder.") :]
+        return super().get_scheme_dict(layer, layer_name, matched_target)
+
     def get_linear_scheme(
         self, layer: torch.nn.Module, layer_name: Optional[str] = None
     ):
