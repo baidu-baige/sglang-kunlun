@@ -103,18 +103,40 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
             original = deepseek_v4_hook.apply_deepseek_v4_defaults
             if not getattr(original, "_kunlun_compressed", False):
                 def apply_deepseek_v4_defaults(args, model_arch):
+                    # 新解析管线禁止在这里写 server_args 字段，决策要声明进 stash，
+                    # 同一字段以最后一次声明为准。
+                    from sglang.srt.arg_groups.overrides import (
+                        declare_resolution,
+                        resolving_view,
+                    )
+
                     requested = args.attention_backend
                     requested_kv_dtype = args.kv_cache_dtype
-                    if requested == "kunlun_compressed" and requested_kv_dtype == "fp16":
-                        args.kv_cache_dtype = "bfloat16"
+                    if requested != "kunlun_compressed":
+                        original(args, model_arch)
+                        return
+
+                    if requested_kv_dtype == "fp16":
+                        # `_deepseek_v4_kv_cache_dtype` 只接受 fp8_e4m3/bfloat16，
+                        # 先把 fp16 藏起来，跑完再声明回去。
+                        declare_resolution(
+                            args,
+                            "kunlun_compressed",
+                            kv_cache_dtype="bfloat16",
+                        )
+
                     original(args, model_arch)
-                    if requested == "kunlun_compressed":
-                        args.attention_backend = requested
-                        args.kv_cache_dtype = requested_kv_dtype
-                        if args.prefill_attention_backend in (None, "dsv4"):
-                            args.prefill_attention_backend = requested
-                        if args.decode_attention_backend in (None, "dsv4"):
-                            args.decode_attention_backend = requested
+
+                    cfg = resolving_view(args)
+                    declared = {
+                        "attention_backend": requested,
+                        "kv_cache_dtype": requested_kv_dtype,
+                    }
+                    if cfg.prefill_attention_backend in (None, "dsv4"):
+                        declared["prefill_attention_backend"] = requested
+                    if cfg.decode_attention_backend in (None, "dsv4"):
+                        declared["decode_attention_backend"] = requested
+                    declare_resolution(args, "kunlun_compressed", **declared)
 
                 apply_deepseek_v4_defaults._kunlun_compressed = True
                 deepseek_v4_hook.apply_deepseek_v4_defaults = apply_deepseek_v4_defaults

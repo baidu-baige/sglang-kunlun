@@ -107,21 +107,26 @@ def mqa_forward_prepare_kunlun(
     q_lora = self.q_norm(q_lora)
     q, _ = self.wq_b(q_lora)
     q = q.view(-1, self.n_local_heads, self.head_dim)
-    import kunlun_ops
+    # Q 的 per-head 无权重 RMSNorm 是 V4 专属。上游用 `config.q_head_norm` 控制
+    # （`_compute_q_b` 的 `fused_q_norm_rope` 分支），V4 是 True、**V4.1 是 False**；
+    # checkpoint 自带的参考实现也只归一化低秩 q_lora，从不碰 per-head Q。无条件做会让
+    # 每层 Q 被多归一化一次（layer 0 实测 |Q|max 31.4 → 11.1），输出全错但量级看着正常。
+    if getattr(self, "q_head_norm", True):
+        import kunlun_ops
 
-    q_normalized = torch.empty_like(q)
-    kunlun_ops.rmsnorm(
-        q,
-        None,
-        q_normalized,
-        self.eps,
-        False,
-        True,
-        None,
-        None,
-        None,
-    )
-    q = q_normalized
+        q_normalized = torch.empty_like(q)
+        kunlun_ops.rmsnorm(
+            q,
+            None,
+            q_normalized,
+            self.eps,
+            False,
+            True,
+            None,
+            None,
+            None,
+        )
+        q = q_normalized
     kv = self.kv_norm(kv)
 
     from sglang.srt.models.deepseek_v4 import fused_rope_inplace
@@ -181,14 +186,18 @@ def moe_gate_forward_kunlun(
     gemm_output_zero_allocator=None,
     forward_batch=None,
 ):
-    """Match the Kunlun DSV4 router GEMM contract."""
+    """Match the Kunlun DSV4 router GEMM contract.
+
+    logits 走 **fp32**，与上游所有 CUDA 路径（`tiny_gemm_bf16(out_dtype=fp32)` /
+    `linear_bf16_fp32`）和参考实现（`Gate.forward`: `linear(x.float(), weight.float())`）
+    一致。V4.1 是 384 个 expert + top-6，fp16 只有约 3 位十进制有效数字，`sqrtsoftplus`
+    分数接近时会选错 expert。
+    """
 
     del gemm_output_zero_allocator, forward_batch
-    if hidden_states.dtype not in (torch.bfloat16, torch.float16):
+    if hidden_states.dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise TypeError(f"unsupported Kunlun MoE gate input dtype: {hidden_states.dtype}")
-    if self.weight.dtype != hidden_states.dtype:
-        hidden_states = hidden_states.to(dtype=self.weight.dtype)
-    return hidden_states @ self.weight.T
+    return hidden_states.float() @ self.weight.float().T
 
 
 @plugin_hook(

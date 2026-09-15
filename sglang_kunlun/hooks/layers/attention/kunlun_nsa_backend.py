@@ -44,9 +44,17 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_prefill,
 )
 from sglang.srt.layers.attention.dsa.utils import (
-    is_dsa_prefill_cp_in_seq_split,
     is_dsa_prefill_cp_round_robin_split,
 )
+
+try:
+    from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
+except ImportError:  # dsv4.1 删掉了 DSA prefill-CP 的 in-seq-split 模式
+
+    def is_dsa_prefill_cp_in_seq_split() -> bool:
+        """0.5.14 prefill-CP no longer supports in-seq-split."""
+        return False
+
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
     DeepseekSparseAttnMultiStepBackend,

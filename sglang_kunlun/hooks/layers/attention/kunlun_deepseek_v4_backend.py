@@ -385,11 +385,19 @@ def _dsa_cp_prefill_ranks(forward_batch) -> Optional[tuple]:
     the layers run, so every per-token metadata field the Kunlun boundary consumes
     is already CP-local while ``forward_batch.extend_seq_lens_cpu`` stays global.
     """
-    from sglang.srt.layers.attention.dsa.utils import (
-        can_dsa_prefill_cp_round_robin_split,
-    )
+    # CP-V1 废弃把 round-robin 改名成 interleave
+    # （`can_dsa_prefill_cp_round_robin_split` → `can_dsa_prefill_cp_interleave`），
+    # 判据和 token→rank 映射都没变。
+    try:
+        from sglang.srt.layers.attention.dsa.utils import (
+            can_dsa_prefill_cp_interleave as _can_cp_split,
+        )
+    except ImportError:
+        from sglang.srt.layers.attention.dsa.utils import (
+            can_dsa_prefill_cp_round_robin_split as _can_cp_split,
+        )
 
-    if not can_dsa_prefill_cp_round_robin_split(forward_batch):
+    if not _can_cp_split(forward_batch):
         return None
 
     from sglang.srt.runtime_context import get_parallel
@@ -1378,7 +1386,9 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         core = self.forward_metadata.core_attn_metadata
         pool = self.token_to_kv_pool
         cache_dim = pool.swa_kv_pool.kv_cache_total_dim
-        swa_size = pool.swa_window_size
+        # `swa_window_size` 在新版 `DeepSeekV4TokenToKVPool` 里被删了，它一直只是
+        # `swa_page_size`（SWA ring 的每请求宽度）的别名。
+        swa_size = pool.swa_page_size
         win_cache = pool.get_swa_key_buffer_radix(layer.layer_id)
         win_cache = win_cache.reshape(-1, cache_dim)
 

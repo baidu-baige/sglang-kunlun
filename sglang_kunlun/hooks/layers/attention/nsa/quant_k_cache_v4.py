@@ -11,15 +11,15 @@ def _resolve_kv_cache_dtype(kv_cache_dtype: torch.dtype | None) -> torch.dtype:
     if kv_cache_dtype is not None:
         return kv_cache_dtype
 
-    from sglang.srt.server_args import get_global_server_args
+    from sglang_kunlun.compat import server_arg
 
-    value = get_global_server_args().kv_cache_dtype
+    value = server_arg("kv_cache_dtype")
     if value in ("fp16", "float16", "half"):
         return torch.float16
     if value in ("bf16", "bfloat16"):
         return torch.bfloat16
     if value is None or value == "auto":
-        return get_global_server_args().dtype
+        return server_arg("dtype")
     raise NotImplementedError(f"Unsupported DSV4 KV-cache dtype: {value}")
 
 

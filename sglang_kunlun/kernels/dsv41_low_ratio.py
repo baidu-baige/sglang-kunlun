@@ -13,12 +13,15 @@ Registered symbols:
   * sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4.rope_tail_fake_quant_fp4
   * sglang.kernels.ops.embeddings.engram_gate.fused_engram_gate
   * sglang.kernels.ops.embeddings.engram_gather.engram_gather
+  * sglang.kernels.ops.embeddings.engram_hash.engram_hash_ids
+  * sglang.kernels.ops.embeddings.engram_hash.engram_hash_ids_and_commit
+  * sglang.kernels.ops.embeddings.engram_hash.engram_commit_history
 """
 
 from __future__ import annotations
 
 import ctypes
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -326,6 +329,63 @@ def engram_hash_ids_kunlun(
 
 
 @register_jit_op(
+    "sglang.kernels.ops.embeddings.engram_hash", "engram_hash_ids_and_commit"
+)
+def engram_hash_ids_and_commit_kunlun(
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    history: torch.Tensor,
+    req_slots: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    token_map: torch.Tensor,
+    multipliers: torch.Tensor,
+    primes: torch.Tensor,
+    offsets: torch.Tensor,
+    pad_id: int,
+    image_token_id: "int | None" = None,
+    mm_pad_shift: int = 0,
+    block_t: int = 32,
+) -> torch.Tensor:
+    """Decode 期的 hash id + 原地推进 history，torch 版。
+
+    上游把 commit 融进了 `_engram_hash_kernel`（`write_tokens=False` 且给
+    `out_cache_loc`），`EngramHasher.forward` 在这条路上提前 return，所以只覆盖
+    `engram_hash_ids` 不够：不注册这个符号，每个 decode step 都会走进 triton，
+    报 `AssertionError: libcuda.so cannot found!`。
+
+    commit 的表达式与 hasher 自己的 torch 分支一致：新行 = 该 token 及其 `width-1` 个
+    最近前驱，oldest-first。`out_cache_loc == 0` 的行是 graph padding，不能落表。
+    """
+    out, tokens = engram_hash_ids_kunlun(
+        input_ids,
+        positions,
+        mode=0,  # MODE_DECODE
+        history=history,
+        token_map=token_map,
+        multipliers=multipliers,
+        primes=primes,
+        offsets=offsets,
+        pad_id=pad_id,
+        num_real=None,
+        req_slots=req_slots,
+        block=1,
+        row=None,
+        starts=None,
+        image_token_id=image_token_id,
+        mm_pad_shift=mm_pad_shift,
+        block_t=block_t,
+    )
+    width = history.shape[1]
+    if width and req_slots.numel():
+        live = out_cache_loc != 0
+        rows = req_slots.to(torch.int64)[live]
+        if rows.numel():
+            history[rows] = tokens[live][:, :width].flip(-1).to(history.dtype)
+    return out
+
+
+@register_jit_op(
     "sglang.kernels.ops.embeddings.engram_hash", "engram_commit_history"
 )
 def engram_commit_history_kunlun(
@@ -555,6 +615,8 @@ def fused_store_cache_kunlun(
     *,
     page_size: int,
     type: str,
+    layout=None,
+    freqs_cis: Optional[torch.Tensor] = None,
 ) -> None:
     """Fused FP8 quantize + paged scatter for the DeepSeek-V4 caches.
 
@@ -575,6 +637,39 @@ def fused_store_cache_kunlun(
         )
     n = input.shape[0]
     if n == 0:
+        return
+    if freqs_cis is not None:
+        # V4.1 的 CUDA kernel 把 64 维 RoPE 尾部的旋转折进了 store，让 fp4/fp8 只 round
+        # 一次。昆仑池是 plain fp16，没有可融合的量化——但此时上游传进来的是**未旋转**的
+        # latent，静默存下去就是错值路径。
+        raise NotImplementedError(
+            "fused_store_cache(freqs_cis=...) reaches the Kunlun half-cache path; "
+            "the caller must pass the already-rotated latent (freqs_cis=None)"
+        )
+    if cache.dtype in (torch.float16, torch.bfloat16):
+        # 昆仑半 cache 布局。`DeepSeekV4SingleKVPool` 在本平台被 hook 过
+        # （`hooks/mem_cache/common.py::dsv4_create_buffer_kunlun` /
+        # `dsv4_get_bytes_per_token_kunlun`）：一页是
+        # `page_size * (qk_nope_head_dim + qk_rope_head_dim)` 个 `store_dtype` **元素**，
+        # 即 plain fp16/bf16 latent，不是 N 卡 FlashMLA 的 584 B/token 打包
+        # （448 fp8 nope + 7 ue8m0 scale + 1 pad + 128 B bf16 rope）。XSpeedGate 两侧
+        # （写 `set_k_and_s_v4_with_mapping`、读 `compressed_attention`）也是这个布局。
+        #
+        # 把 FlashMLA 字节打包写进这个 buffer，就是当初每个 CSA2（ratio 1/2）层 attention
+        # 输出 NaN 的原因：压缩 KV 池只有 `set_extra_key_buffer_fused` →
+        # `set_key_buffer_fused` → 这里一条写入路径，布局不匹配的表现是池子里的行接近
+        # fp16 上限（≈65000）且带 NaN，然后是最终 hidden state 全 0、logits 完全均匀。
+        dim = input.shape[-1]
+        num_pages = cache.shape[0]
+        assert cache.numel() == num_pages * page_size * dim, (
+            f"half-cache page mismatch: cache{tuple(cache.shape)} vs "
+            f"page_size={page_size} dim={dim}"
+        )
+        loc = indices.to(torch.int64).reshape(-1)
+        page = loc // page_size
+        slot = loc - page * page_size
+        view = cache.view(num_pages, page_size, dim)
+        view[page, slot] = input.to(cache.dtype)
         return
     u8 = cache.view(torch.uint8)
     flat = u8.reshape(-1)
