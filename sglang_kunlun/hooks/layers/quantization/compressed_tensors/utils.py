@@ -299,17 +299,29 @@ def moe_post(
     sorted_tokens_idx: torch.Tensor,
     topk_weights: torch.Tensor,
     output_shape: torch.Size,
+    output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    """Combine sorted expert outputs with router weights."""
+    """Combine sorted expert outputs with router weights.
+
+    两个 dtype 约束来自 kunlun_ops.moe_post：normed_scale 必须"同 x 或 fp32"，
+    y 必须同 x。而走 int8 grouped 路径时 moe_fc 固定用 bf16 产出 down（见上面的
+    kernel_dtype），此时若模型是 fp16、topk_weights 就是 fp16，bf16 + fp16 这个组合
+    算子不接受，会报 "moe_post not support x/normed_scale dtype"。
+    所以 normed_scale 统一升到 fp32（实测对 bf16/fp16 的 x 都合法），
+    输出再按 output_dtype 落回模型 dtype。
+    """
     import kunlun_ops
 
+    out_dtype = down.dtype if output_dtype is None else output_dtype
     output = torch.empty(output_shape, dtype=down.dtype, device=down.device)
     dequant_scale = torch.ones_like(topk_weights, dtype=torch.float32)
     kunlun_ops.moe_post(
         x=down.reshape(-1, down.shape[-1]),
         moe_index=sorted_tokens_idx.view_as(topk_weights),
-        normed_scale=topk_weights,
+        normed_scale=topk_weights.to(torch.float32),
         dequant_scale=dequant_scale,
         y=output,
     )
+    if output.dtype is not out_dtype:
+        output = output.to(out_dtype)
     return output

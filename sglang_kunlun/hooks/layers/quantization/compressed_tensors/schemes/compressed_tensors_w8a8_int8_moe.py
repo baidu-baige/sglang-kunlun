@@ -207,7 +207,10 @@ class KunlunCompressedTensorsW8A8Int8MoE(CompressedTensorsMoEScheme):
             quantize_input=True,
         )
 
-        output = moe_post(down, sorted_tokens_idx, topk_weights, x.shape)
+        # 同 wna16 那条路径：int8 grouped 下 down 是 bf16，要落回模型 dtype。
+        output = moe_post(
+            down, sorted_tokens_idx, topk_weights, x.shape, output_dtype=x.dtype
+        )
 
         routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
         if routed_scaling_factor not in (None, 1.0):
