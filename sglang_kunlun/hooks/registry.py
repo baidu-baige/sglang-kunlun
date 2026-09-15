@@ -51,6 +51,13 @@ def register_all() -> None:
     from sglang_kunlun.kernels import flashinfer_hook as _flashinfer_hook  # noqa: F401
     from sglang_kunlun.kernels import kernel_ops
 
+    # MiniMax-M3 lives in one self-contained package: importing it applies the
+    # Triton compatibility patches the upstream sparse modules need at import
+    # time and registers the model's JIT replacements. Must run before
+    # kernel_ops.install() (which resolves every registered kernel target) and
+    # before the generic hook modules pull upstream MiniMax code in.
+    importlib.import_module("sglang_kunlun.hooks.models.minimax")
+
     legacy_jit_specs = [
         key
         for key, spec in kernel_ops._JIT_OPS.items()
