@@ -155,6 +155,72 @@ def _alloc_2m_aligned(total_bytes: int, dtype: torch.dtype, device: str):
 
 
 @plugin_hook(
+    "sglang.srt.model_executor.pool_configurator.DSV4PoolConfigurator.__init__",
+    type=HookType.AFTER,
+)
+def dsv4_pool_configurator_kv_bytes_kunlun(result, self, kvc):
+    """按昆仑半 cache 的槽位大小定 DSV4 各池子的容量。
+
+    `DSV4PoolConfigurator` 自己算 `kv_bytes = qk_nope + qk_rope*2 + 8`（448+128+8=584 B，
+    N 卡 FlashMLA 的 fp8 nope + bf16 rope + ue8m0 scale 打包），**从不问 pool 的
+    `get_bytes_per_token()`**，所以上面那个 `dsv4_get_bytes_per_token_kunlun` 影响不到容量。
+    昆仑一个槽位是 `(qk_nope + qk_rope)` 个 fp16 元素 = 1024 B，比它大 1.75 倍，于是
+    configurator 发的 token 额度是实际能装下的 1.72 倍（`bytes_per_full_token` 口径
+    3966 → 应为 6826，full_token 5804544 → 3372544）。表现是 `--mem-fraction-static 0.75`
+    在建池阶段 OOM（0.6 只是踩着卡的物理上限侥幸过关），以及 `full token usage` 恒为 0.00。
+
+    上游自己的 bf16 latent 池就是 `attn_head_dim * 2`（`self._unified` 分支），这里取同一个值。
+
+    只改 `kv_bytes` 不够：`bytes_per_full_token` 在 `__init__` 内就算完了，所以要连带重算
+    依赖它的四个缓存值。不依赖 `kv_bytes` 的 `swa_cap_tokens` / `swa_prefix_tails` 不用动，
+    而 `_get_swa_fixed_bytes()` 是调用时才读 `kv_bytes` 的方法，会自动跟上。
+    """
+    if self.kv_cache_dtype_str not in ("fp16", "float16", "bf16", "bfloat16"):
+        return result
+    if getattr(self, "_unified", False):
+        return result  # unified KV 本来就按 bf16 latent 定容量
+
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+        get_dsv4_indexer_bytes_per_token,
+    )
+
+    old_kv_bytes = self.kv_bytes
+    self.kv_bytes = self.attn_head_dim * 2  # fp16/bf16 各 2 字节
+
+    if self.encoder_replay:
+        # `request_window_bytes` 也按 kv_bytes 算，但只在 encoder bounded replay 下非零。
+        raise NotImplementedError(
+            "encoder SWA bounded replay 的 request_window_bytes 未按昆仑半 cache 重算"
+        )
+
+    cfg = kvc.model_config
+    low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
+        self.indexer_head_dim, use_fp4_indexer=True
+    )
+    self.low_ratio_bytes_per_full_token = sum(
+        (self.kv_bytes + low_ratio_index_bytes) / cfg.compress_ratios[l]
+        for l in cfg.hf_config.kv_source_layer_ids
+        if kvc.layer_info.start_layer <= l < kvc.layer_info.end_layer
+        and cfg.compress_ratios[l] in (1, 2)
+    )
+    self.bytes_per_swa_token = self._get_bytes_per_swa_token()
+    self.bytes_per_full_token = self._get_bytes_per_full_token()
+    if self.is_speculative:
+        self.bytes_per_full_token *= self._spec_infl
+        self.bytes_per_swa_token *= self._spec_infl
+
+    logger.info(
+        "Kunlun half-cache DSV4 pool sizing: kv_bytes %d -> %d, "
+        "bytes_per_full_token %.2f, bytes_per_swa_token %.2f",
+        old_kv_bytes,
+        self.kv_bytes,
+        self.bytes_per_full_token,
+        self.bytes_per_swa_token,
+    )
+    return result
+
+
+@plugin_hook(
     "sglang.srt.mem_cache.deepseek_v4_memory_pool.DeepSeekV4IndexerPool._create_buffer",
     type=HookType.AROUND,
 )

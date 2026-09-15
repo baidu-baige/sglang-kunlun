@@ -377,11 +377,20 @@ def engram_hash_ids_and_commit_kunlun(
         block_t=block_t,
     )
     width = history.shape[1]
-    if width and req_slots.numel():
-        live = out_cache_loc != 0
-        rows = req_slots.to(torch.int64)[live]
-        if rows.numel():
-            history[rows] = tokens[live][:, :width].flip(-1).to(history.dtype)
+    if width:
+        # 无条件逐元素，不做 host 同步、不产生数据相关形状，可以进 CUDA graph。
+        # `out_cache_loc == 0` 的行是 graph padding，重定向到 history 末尾那行保留槽位
+        # （`init_history` 按 `num_req_slots + 1` 分配，注释写的就是 "a spare row for
+        # graph padding"，`pad_row = num_req_slots = history.shape[0] - 1`）。
+        # 这和上游自己的 torch 分支同一套写法（`engram.py:371`:
+        # `commit_rows = torch.where(out_loc == 0, self.pad_row, commit_rows)`）。
+        #
+        # 先前用布尔掩码选行（`req_slots[out_cache_loc != 0]`）+ `rows.numel()` 判空，
+        # 在 capture 期是数据相关形状 + host 读：实测 decode graph 捕获时在这一行
+        # 申请 10.14 GiB 直接 OOM。
+        pad_row = history.shape[0] - 1
+        rows = torch.where(out_cache_loc == 0, pad_row, req_slots.to(torch.int64))
+        history[rows] = tokens[:, :width].flip(-1).to(history.dtype)
     return out
 
 
