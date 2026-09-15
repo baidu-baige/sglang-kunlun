@@ -223,6 +223,35 @@ def select_experts_kunlun(
                 topk=num_routed_topk if _use_aiter else top_k,
                 renormalize=renormalize,
             )
+        elif scoring_func == "sigmoid":
+            # MiniMax-M3: upstream routes the sigmoid gate through the JIT fused
+            # gate, which also carries apply_routed_scaling_factor_on_output and
+            # the fused shared experts. The plugin replaces that kernel
+            # (moe_fused_gate_dsv4_kunlun handles scoring_func="sigmoid" too),
+            # so call it instead of fused_topk.
+            from sglang.kernels.ops.moe.moe_fused_gate import (
+                moe_fused_gate as _jit_moe_fused_gate,
+            )
+
+            bias_fp32 = (
+                correction_bias.to(torch.float32)
+                if correction_bias is not None
+                else torch.zeros(
+                    router_logits.shape[1],
+                    dtype=torch.float32,
+                    device=router_logits.device,
+                )
+            )
+            topk_weights, topk_ids = _jit_moe_fused_gate(
+                router_logits,
+                bias_fp32,
+                num_routed_topk if _use_aiter else top_k,
+                scoring_func="sigmoid",
+                num_fused_shared_experts=num_fused_shared_experts,
+                renormalize=renormalize,
+                routed_scaling_factor=routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            )
         else:
             assert not apply_routed_scaling_factor_on_output, "Not implemented"
             # Qwen3MOE uses fused_topk

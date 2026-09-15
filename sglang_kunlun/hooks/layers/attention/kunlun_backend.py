@@ -976,6 +976,97 @@ class KunlunAttentionBackend(AttentionBackend):
 
         self.forward_metadata = metadata
 
+    def _paged_kv_view(self, key_cache, value_cache, page_table):
+        """Zero-copy paged HND view over the NHD slot pool (decode path).
+
+        ``speculative_attention`` reads ``data_ptr`` + scalar ``block_size`` /
+        ``kv_head_num`` and ignores tensor strides, so the physical NHD pool is
+        consumed directly through a strided ``[num_pages, head, page, dim]`` view
+        with no copy. ``page_table`` is returned unchanged. Zero-copy and
+        static-shape, so it stays safe on the CUDA-graph captured decode path
+        (same idea as ``minimax_sparse._paged_view``).
+
+        Returns ``(key, value, page_table)``.
+        """
+        if key_cache.dim() == 4 or self.page_size <= 1:
+            return key_cache, value_cache, page_table
+        num_slots, head_num, k_dim = key_cache.shape
+        v_dim = value_cache.shape[2]
+        num_pages = num_slots // self.page_size
+        key_view = key_cache.view(
+            num_pages, self.page_size, head_num, k_dim
+        ).permute(0, 2, 1, 3)
+        value_view = value_cache.view(
+            num_pages, self.page_size, head_num, v_dim
+        ).permute(0, 2, 1, 3)
+        return key_view, value_view, page_table
+
+    def _paged_kv_gather(self, key_cache, value_cache, page_table):
+        """Gather referenced pages into a contiguous paged HND buffer (prefill path).
+
+        ``prefill_attention`` builds its op tensors from ``data_ptr`` + *shape* and
+        DROPS strides (``tensor_block_util.h::create_xops_tensor``), so it needs a
+        truly contiguous HND buffer. Gather only the pages referenced by
+        ``page_table`` (padding entries are negative), materialize them as a
+        compact contiguous ``[n_pages, head, page, dim]`` buffer, and remap
+        ``page_table`` onto it so the copy stays bounded to the working set instead
+        of the whole pool.
+
+        Returns ``(key, value, page_table)``.
+        """
+        if key_cache.dim() == 4 or self.page_size <= 1:
+            return key_cache, value_cache, page_table
+        if key_cache.dim() != 3 or value_cache.dim() != 3:
+            raise RuntimeError(
+                f"Unexpected Kunlun KV cache rank: K={key_cache.dim()}, "
+                f"V={value_cache.dim()}"
+            )
+        if page_table is None or page_table.dim() != 2:
+            raise RuntimeError("Contiguous paged KV conversion requires a 2D page table")
+        num_slots, head_num, k_dim = key_cache.shape
+        v_dim = value_cache.shape[2]
+        if num_slots % self.page_size != 0:
+            raise RuntimeError(
+                f"NHD KV cache slots {num_slots} are not divisible by page_size "
+                f"{self.page_size}"
+            )
+        num_pages = num_slots // self.page_size
+
+        # Gather only the referenced pages (padding entries are negative).
+        page_ids = page_table[page_table >= 0].unique().to(torch.long)
+        if page_ids.numel() == 0:
+            raise RuntimeError("Paged KV conversion received an empty page table")
+        if page_ids[-1] >= num_pages:
+            raise RuntimeError(
+                f"Page table contains page {page_ids[-1].item()}, but KV cache has "
+                f"only {num_pages} pages"
+            )
+        slot_offsets = torch.arange(
+            self.page_size, device=key_cache.device, dtype=torch.long
+        )
+        slot_ids = (
+            page_ids[:, None] * self.page_size + slot_offsets[None, :]
+        ).reshape(-1)
+        key_paged = key_cache.index_select(0, slot_ids).view(
+            page_ids.numel(), self.page_size, head_num, k_dim
+        ).permute(0, 2, 1, 3).contiguous()
+        value_paged = value_cache.index_select(0, slot_ids).view(
+            page_ids.numel(), self.page_size, head_num, v_dim
+        ).permute(0, 2, 1, 3).contiguous()
+
+        # Remap global page ids to their compact index; keep padding (-1) so the
+        # op still ignores those slots.
+        remap = torch.full(
+            (num_pages,), -1, dtype=page_table.dtype, device=page_table.device
+        )
+        remap[page_ids.to(page_table.device)] = torch.arange(
+            page_ids.numel(), dtype=page_table.dtype, device=page_table.device
+        )
+        page_remap = torch.full_like(page_table, -1)
+        valid_pages = page_table >= 0
+        page_remap[valid_pages] = remap[page_table[valid_pages].long()]
+        return key_paged, value_paged, page_remap
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1174,11 +1265,16 @@ class KunlunAttentionBackend(AttentionBackend):
                     context_lens_cpu = context_lens_xpu.cpu().to(torch.int32)
 
                 if is_draft_extend:
+                    (
+                        paged_key_cache,
+                        paged_value_cache,
+                        paged_page_table,
+                    ) = self._paged_kv_view(key_cache, value_cache, page_table)
                     kunlun_ops.speculative_attention(
                         out=o_select,
                         q=q,
-                        k_cache=key_cache,
-                        v_cache=value_cache,
+                        k_cache=paged_key_cache,
+                        v_cache=paged_value_cache,
                         context_lens_cpu=context_lens_cpu,
                         context_lens_xpu=context_lens_xpu,
                         batch_num=batch_size,
@@ -1191,20 +1287,25 @@ class KunlunAttentionBackend(AttentionBackend):
                         block_size=self.page_size,
                         max_num_blocks_per_seq=page_table.shape[1],
                         max_window_size=layer.sliding_window_size if layer.sliding_window_size is not None else -1,
-                        block_tables=page_table,
+                        block_tables=paged_page_table,
                         sink=sinks.to(torch.float32) if sinks is not None else None
                         # vo_head_dim=v_dim,
                     )
                     result = o_select.contiguous()
                 else: # target verify
+                    (
+                        paged_key_cache,
+                        paged_value_cache,
+                        paged_page_table,
+                    ) = self._paged_kv_view(key_cache, value_cache, page_table)
                     kunlun_ops.speculative_attention(
                         out=o_select,
                         q=q.view(
                             -1, self.speculative_num_draft_tokens,
                             layer.tp_q_head_num, layer.head_dim
                         ),
-                        k_cache=key_cache,
-                        v_cache=value_cache,
+                        k_cache=paged_key_cache,
+                        v_cache=paged_value_cache,
                         context_lens_cpu=context_lens_cpu,
                         context_lens_xpu=context_lens_xpu,
                         batch_num=batch_size,
@@ -1220,7 +1321,7 @@ class KunlunAttentionBackend(AttentionBackend):
                             layer.sliding_window_size
                             if layer.sliding_window_size is not None else -1
                         ),
-                        block_tables=page_table,
+                        block_tables=paged_page_table,
                         sink=(
                             sinks.to(torch.float32)
                             if sinks is not None else None
@@ -1270,14 +1371,19 @@ class KunlunAttentionBackend(AttentionBackend):
                 context_kvlen_lod_cpu = orig_kv_lod_cpu
                 context_kvlen_lod_xpu = metadata.extra_attn_metadata.kv_lod_xpu
                 _q_view = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                (
+                    paged_key_cache,
+                    paged_value_cache,
+                    paged_page_table,
+                ) = self._paged_kv_gather(key_cache, value_cache, page_table)
                 kunlun_ops.prefill_attention(
                     q=_q_view,
-                    k=key_cache,
-                    v=value_cache,
+                    k=paged_key_cache,
+                    v=paged_value_cache,
                     out=o_,
                     is_causal=False,
                     is_prefix_cache=True,
-                    block_table=page_table.to(torch.int32).contiguous(),
+                    block_table=paged_page_table.to(torch.int32).contiguous(),
                     context_qlen_lod_cpu=context_seq_lod_cpu,
                     context_qlen_lod_xpu=context_seq_lod_xpu,
                     context_kvlen_lod_cpu=context_kvlen_lod_cpu,
@@ -1669,11 +1775,16 @@ class KunlunAttentionBackend(AttentionBackend):
                     context_lens_xpu = metadata.cache_seqlens_int32.to(torch.int32).contiguous()
                     context_lens_cpu = context_lens_xpu.cpu().to(torch.int32)
 
+                (
+                    paged_key_cache,
+                    paged_value_cache,
+                    paged_page_table,
+                ) = self._paged_kv_view(key_cache, value_cache, page_table)
                 kunlun_ops.speculative_attention(
                     out=o_select,
                     q=q,
-                    k_cache=key_cache,
-                    v_cache=value_cache,
+                    k_cache=paged_key_cache,
+                    v_cache=paged_value_cache,
                     context_lens_cpu=context_lens_cpu,
                     context_lens_xpu=context_lens_xpu,
                     batch_num=batch_size,
@@ -1686,7 +1797,7 @@ class KunlunAttentionBackend(AttentionBackend):
                     block_size=self.page_size,
                     max_num_blocks_per_seq=page_table.shape[1],
                     max_window_size=layer.sliding_window_size if layer.sliding_window_size is not None else -1,
-                    block_tables=page_table,
+                    block_tables=paged_page_table,
                     sink=sinks.to(torch.float32) if sinks is not None else None,
                     qlod_cpu=cu_seqlens_q_cpu,
                     qlod_xpu=cu_seqlens_q,

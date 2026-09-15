@@ -195,6 +195,19 @@ def install() -> None:
         module.build_tree_kernel_efficient = _build_tree_kernel_efficient  # type: ignore[attr-defined]
         module.verify_tree_greedy = _verify_tree_greedy  # type: ignore[attr-defined]
 
+    # Gemma-family norms (MiniMax-M3 uses GemmaRMSNorm for its q/k norms; the
+    # 0.5.13 line had these bindings and the model path calls them directly).
+    from sglang_kunlun.kernels.sgl_kernel_kunlun.layernorm import (
+        gemma_fused_add_rmsnorm as _gemma_fused_add_rmsnorm,
+        gemma_rmsnorm as _gemma_rmsnorm,
+    )
+
+    for module in (root, sys.modules.get("sgl_kernel.layernorm")):
+        if module is None:
+            continue
+        module.gemma_fused_add_rmsnorm = _gemma_fused_add_rmsnorm  # type: ignore[attr-defined]
+        module.gemma_rmsnorm = _gemma_rmsnorm  # type: ignore[attr-defined]
+
     from sglang_kunlun.kernels.sgl_kernel_kunlun.elementwise import (
         silu_and_mul as _silu_and_mul,
     )
