@@ -5241,3 +5241,39 @@ def dsa_cp_round_robin_split_q_seqs_kernel(
         )
     out_seqs.copy_(per_seq.index_select(0, selected).to(out_seqs.dtype))
     bs_idx.copy_(selected.to(bs_idx.dtype))
+
+
+@register_jit_op(
+    "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe",
+    "swiglu_no_interleaved_with_alpha_and_limit",
+)
+def swiglu_no_interleaved_with_alpha_and_limit_kunlun(
+    x: torch.Tensor,
+    gemm1_alpha: float,
+    gemm1_limit: float,
+) -> torch.Tensor:
+    """Apply the Kunlun fused non-interleaved SwiGLU-OAI replacement.
+
+    MiniMax-M3 configures gemm1_alpha / gemm1_clamp_limit (SwiGLU-OAI), which
+    upstream routes through this helper; the W8A8 MoE hook below bypasses the
+    MoeRunner, so the helper is replaced here and called explicitly.
+    """
+    input_2d = x.contiguous().view(-1, x.shape[-1])
+    output = torch.empty(
+        (input_2d.shape[0], input_2d.shape[1] // 2),
+        dtype=x.dtype,
+        device=x.device,
+    )
+
+    import kunlun_ops
+
+    kunlun_ops.swiglu_bias(
+        input_2d,
+        output,
+        None,
+        float(gemm1_alpha),
+        1.0,
+        float(gemm1_limit),
+        True,
+    )
+    return output.view(x.shape[:-1] + (x.shape[-1] // 2,))

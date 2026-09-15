@@ -368,23 +368,47 @@ def moe_apply_kunlun(
         act=None,
     )
     dump_selected_moe_rows(layer, "fc1.gate_up_raw", gate_up, num_tokens, top_k)
+    # SwiGLU-OAI (MiniMax-M3 sets gemm1_alpha + gemm1_clamp_limit with
+    # interleaved=False) goes through the upstream helper, which kernel_ops
+    # replaces with an XSpeedGate launch; the DSV4-style swiglu_limit clamp +
+    # kunlun swiglu stays for the models that use it.
+    gemm1_alpha = getattr(self.moe_runner_config, "gemm1_alpha", None)
+    gemm1_limit = getattr(self.moe_runner_config, "gemm1_clamp_limit", None)
+    interleaved = getattr(self.moe_runner_config, "interleaved", False)
     swiglu_limit = self.moe_runner_config.swiglu_limit
-    if swiglu_limit is not None:
-        half = gate_up.shape[-1] // 2
-        gate_up[..., :half].clamp_(max=float(swiglu_limit))
-        gate_up[..., half:].clamp_(
-            min=-float(swiglu_limit), max=float(swiglu_limit)
+    if gemm1_alpha is not None:
+        if gemm1_limit is None:
+            raise AssertionError("gemm1_limit is required when gemm1_alpha is set")
+        if interleaved:
+            raise NotImplementedError(
+                "Kunlun W8A8 MoE SwiGLU-OAI only supports non-interleaved layout"
+            )
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+            swiglu_no_interleaved_with_alpha_and_limit,
         )
-    dump_selected_moe_rows(
-        layer, "fc1.gate_up_clamped", gate_up, num_tokens, top_k
-    )
-    activated = torch.empty(
-        *gate_up.shape[:-1],
-        gate_up.shape[-1] // 2,
-        dtype=gate_up.dtype,
-        device=device,
-    )
-    kunlun_ops.swiglu(gate_up, activated)
+
+        activated = swiglu_no_interleaved_with_alpha_and_limit(
+            gate_up,
+            gemm1_alpha,
+            gemm1_limit,
+        )
+    else:
+        if swiglu_limit is not None:
+            half = gate_up.shape[-1] // 2
+            gate_up[..., :half].clamp_(max=float(swiglu_limit))
+            gate_up[..., half:].clamp_(
+                min=-float(swiglu_limit), max=float(swiglu_limit)
+            )
+        dump_selected_moe_rows(
+            layer, "fc1.gate_up_clamped", gate_up, num_tokens, top_k
+        )
+        activated = torch.empty(
+            *gate_up.shape[:-1],
+            gate_up.shape[-1] // 2,
+            dtype=gate_up.dtype,
+            device=device,
+        )
+        kunlun_ops.swiglu(gate_up, activated)
     dump_selected_moe_rows(layer, "swiglu.output", activated, num_tokens, top_k)
     activated = activated.reshape(num_tokens * top_k, -1)
     activated_q = torch.empty_like(activated, dtype=torch.int8)

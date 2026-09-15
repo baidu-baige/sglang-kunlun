@@ -4,7 +4,12 @@ from .dsv4_hicache import (
     transfer_kv_all_layer_mla,
     transfer_kv_per_layer_mla,
 )
-from .layernorm import fused_add_rmsnorm, rmsnorm
+from .layernorm import (
+    fused_add_rmsnorm,
+    gemma_fused_add_rmsnorm,
+    gemma_rmsnorm,
+    rmsnorm,
+)
 from .sampling import (
     top_k_renorm_prob,
     top_p_renorm_prob,
@@ -17,6 +22,8 @@ __all__ = [
     "build_tree_kernel_efficient",
     "fast_topk",
     "fused_add_rmsnorm",
+    "gemma_fused_add_rmsnorm",
+    "gemma_rmsnorm",
     "moe_fused_gate",
     "rmsnorm",
     "top_k_renorm_prob",

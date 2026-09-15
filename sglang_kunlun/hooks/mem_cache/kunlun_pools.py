@@ -81,15 +81,37 @@ class KunlunMHATokenToKVPool(MHATokenToKVPool):
     def set_kv_buffer(
         self,
         layer: RadixAttention,
-        loc: torch.Tensor,
+        loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
-        """Set KV cache buffer using the kunlun_ops reshape_and_cache kernel."""
-        from kunlun_ops import reshape_and_cache
+        """Set KV cache buffer using the Kunlun-specific cache writer.
+
+        Layout-dependent store (mirrors ``_create_buffers``):
+
+        * ``head_dim != v_head_dim`` (padded 4D / MIMO): ``kunlun_ops.reshape_and_cache``;
+        * HND 4D paged: page/offset scatter;
+        * NHD 3D slot-row: plain slot scatter. The slot-row buffer is
+          page-aligned and ``loc`` is a physical slot id, and the XPU
+          ``reshape_and_cache`` only accepts the 4D paged layout, so a kernel
+          launch here would fail (and the upstream writer may dispatch
+          unsupported CUDA/XPU kernels).
+        """
+        # 0.5.19 wraps the write target in KVWriteLoc (swa/full sub-pool pair)
+        # at the backend boundary; only the generic loc applies to this pool.
+        from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
+
+        loc, _, _ = unwrap_write_loc(loc_info)
+        if dcp_kv_mask is not None:
+            # Kunlun does not run decode-context-parallel; a masked write here
+            # would silently drop tokens, so fail loudly if it ever appears.
+            raise NotImplementedError(
+                "KunlunMHATokenToKVPool.set_kv_buffer does not support dcp_kv_mask"
+            )
 
         if self.head_dim != self.v_head_dim:
             cache_v = F.pad(cache_v, pad=(0, 64), mode="constant", value=0)
@@ -121,9 +143,34 @@ class KunlunMHATokenToKVPool(MHATokenToKVPool):
                 f"Unexpected K/V shape {tuple(cache_k.shape)} vs loc {tuple(loc.shape)}"
             )
 
-        k4 = self.k_buffer[layer_id - self.start_layer]
-        v4 = self.v_buffer[layer_id - self.start_layer]
-        reshape_and_cache(k_bhd, v_bhd, k4, v4, loc.to(torch.int32), None, None, 0)
+        k_buf = self.k_buffer[layer_id - self.start_layer]
+        v_buf = self.v_buffer[layer_id - self.start_layer]
+        if self.head_dim != self.v_head_dim:
+            # MIMO uses Kunlun's padded 4D cache writer.
+            from kunlun_ops import reshape_and_cache
+
+            reshape_and_cache(
+                k_bhd,
+                v_bhd,
+                k_buf,
+                v_buf,
+                loc.to(torch.int32),
+                None,
+                None,
+                0,
+            )
+            return
+
+        if self.use_hnd:
+            # Match the upstream HND layout: [page, head, offset, dim].
+            pages = loc // self.page_size
+            offs = loc % self.page_size
+            k_buf[pages, :, offs, :] = k_bhd
+            v_buf[pages, :, offs, :] = v_bhd
+            return
+
+        k_buf[loc] = k_bhd
+        v_buf[loc] = v_bhd
 
     def get_contiguous_buf_infos(self):
         """Return contiguous buffer pointers, byte lengths, and item sizes."""
