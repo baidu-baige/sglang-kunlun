@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 import torch
 
@@ -36,7 +37,7 @@ _DSPARK_EXTRA_QUANT_IGNORE = (
 )
 
 
-def _clear_unaccepted_c4_states(self, rejected_locs: torch.Tensor) -> None:
+def _clear_unaccepted_c4_states(self, rejected_locs: torch.Tensor, mask: torch.Tensor | None = None) -> None:
     """把被拒草稿 token 对应的 ratio-4 compress-state 行置为无效。
 
     c4 不像 c128 那样按 request 寻址，行号来自 token 的 SWA slot。置无效的方式是
@@ -46,6 +47,13 @@ def _clear_unaccepted_c4_states(self, rejected_locs: torch.Tensor) -> None:
     ``swa_page * ring_size + swa_loc % ring_size``，**不除** ``compress_ratio``。
     那个 ``/ compress_ratio`` 只属于 ``plan_c.read_page``（压缩页索引），不属于
     raw state ring。多除一次会把 4 个 slot 折叠到同一行、且只覆盖 buffer 前 1/4。
+
+    ``mask`` 让调用方传完整的 ``[bs, num_draft]`` loc 加一个布尔掩码，而不是先在
+    host 上做布尔选择——布尔选择的输出形状依赖数据，会强制一次 D2H 同步。
+    行号只取决于 ``(ring_size, kv_score.shape[0])``，而 43 层的 c4 pool 这两个值
+    是一样的，所以按这个 key 缓存：原实现在每个 pool 里重算一遍 rows，还各带一次
+    ``rows[keep]`` 布尔选择和一次 ``torch.unique``（两者都同步），~80 个 pool 就是
+    ~160 次同步、~1400 个 kernel。
     """
     if rejected_locs is None or rejected_locs.numel() == 0:
         return
@@ -57,17 +65,31 @@ def _clear_unaccepted_c4_states(self, rejected_locs: torch.Tensor) -> None:
     ]
     if not pools:
         return
-    swa_loc = self.translate_loc_from_full_to_swa(rejected_locs).to(torch.int64)
+    # out_cache_loc 在 batch>1 时可能含越界占位值；先 clamp+mask 再索引，
+    # 避免 translate_loc_from_full_to_swa 的 advanced indexing 越界崩溃。
+    mapping = self.full_to_swa_index_mapping
+    valid_loc = (rejected_locs >= 0) & (rejected_locs < mapping.shape[0])
+    safe_locs = rejected_locs.clamp(0, mapping.shape[0] - 1)
+    swa_loc = torch.where(valid_loc, mapping[safe_locs], -1).to(torch.int64)
     swa_loc = swa_loc.reshape(-1)
+    base_keep = swa_loc >= 0
+    if mask is not None:
+        base_keep = base_keep & mask.reshape(-1).to(swa_loc.device)
+    row_cache: dict[tuple[int, int], torch.Tensor] = {}
     for pool in pools:
         kv_score = getattr(getattr(pool, "kv_score_buffer", None), "kv_score", None)
         if kv_score is None:
             continue
         ring_size = pool.ring_size
-        rows = swa_loc // self.swa_page_size * ring_size + swa_loc % ring_size
-        # 未映射的 slot（swa_loc < 0）折到 row 0 会破坏合法状态，直接丢掉。
-        keep = (swa_loc >= 0) & (rows >= 0) & (rows < kv_score.shape[0])
-        rows = torch.unique(rows[keep])
+        num_rows = kv_score.shape[0]
+        cache_key = (int(ring_size), int(num_rows))
+        rows = row_cache.get(cache_key)
+        if rows is None:
+            rows = swa_loc // self.swa_page_size * ring_size + swa_loc % ring_size
+            # 未映射的 slot（swa_loc < 0）折到 row 0 会破坏合法状态，直接丢掉。
+            keep = base_keep & (rows >= 0) & (rows < num_rows)
+            rows = rows[keep]
+            row_cache[cache_key] = rows
         if rows.numel() == 0:
             continue
         half = kv_score.shape[-1] // 2
@@ -152,8 +174,33 @@ def clear_unaccepted_compress_states_kunlun(result, self, *args, **kwargs):
     if clear_c4 is not None and loc_2d is not None:
         keep = commit_lens.to(loc_2d.device).reshape(-1, 1)
         offsets = torch.arange(num_draft, device=loc_2d.device).reshape(1, num_draft)
-        clear_c4(loc_2d[offsets >= keep])
+        rejected = offsets >= keep
+        clear_c4(loc_2d, mask=rejected)
     return result
+
+
+def _quant_config_targets_draft_attn(quant_config) -> bool:
+    """checkpoint 是否真的量化了 draft 的 wq_a/wkv。
+
+    W8A8 那份 checkpoint 里 ``mtp.N.attn.wq_a`` 只有 ``.weight``、没有
+    ``weight_scale``，必须补进 ignore 才不会被截断成 0（就是下面那个 hook 的由来）。
+    但 W4A8 那份是真的按 int8 量化了这两层、带 weight_scale，此时补 ignore 会反过来
+    把它们当未量化权重加载。所以先看 target_scheme_map 里有没有命中它们。
+    """
+    targets = getattr(quant_config, "target_scheme_map", None)
+    if not targets:
+        return False
+    probes = ("model.mtp.0.self_attn.wq_a", "model.mtp.0.self_attn.wkv")
+    for target in targets:
+        if not isinstance(target, str) or not target.startswith("re:"):
+            continue
+        try:
+            pattern = re.compile(target[3:])
+        except re.error:
+            continue
+        if any(pattern.fullmatch(name) for name in probes):
+            return True
+    return False
 
 
 @plugin_hook(
@@ -170,10 +217,16 @@ def align_dspark_quant_ignore_kunlun(original_fn, self, *args, **kwargs):
                 break
     ignore = getattr(quant_config, "ignore", None)
     if isinstance(ignore, list):
-        for pattern in _DSPARK_EXTRA_QUANT_IGNORE:
-            if pattern not in ignore:
-                ignore.append(pattern)
+        if _quant_config_targets_draft_attn(quant_config):
+            logger.info(
+                "[DSPARK_QUANT_IGNORE] checkpoint 已量化 draft 的 wq_a/wkv，跳过补 ignore"
+            )
+        else:
+            for pattern in _DSPARK_EXTRA_QUANT_IGNORE:
+                if pattern not in ignore:
+                    ignore.append(pattern)
     return original_fn(self, *args, **kwargs)
+
 
 
 @plugin_hook(
@@ -186,3 +239,155 @@ def align_dspark_stage_prefix_kunlun(original_fn, self, *args, **kwargs):
     if isinstance(prefix, str) and "stages." in prefix:
         kwargs["prefix"] = prefix.replace("stages.", "mtp.")
     return original_fn(self, *args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# R1（QuaRot）旋转补偿
+#
+# 量化时对权重做了旋转，旋转后 draft 私有的 RMSNorm gamma 和折进共享（target）权重里的
+# 旋转对不上，checkpoint 里因此额外带了 4 个补偿矩阵：
+#   mtp.{0,1,2}.context_correction.blocks   [4, 1024, 1024] bf16
+#   mtp.2.final_correction.blocks           [4, 1024, 1024] bf16
+# 内容是 C = Q @ diag(g) @ Q.T 的块对角残差（hc_mult=4、hidden=4096 => 4 块 1024×1024）。
+# 上游 sglang 0.5.17 没有这两个模块，权重被 load_weights 里的
+# "DSpark V4 draft: unexpected weight" 直接丢弃 => draft 质量偏低、accept rate 偏低。
+# 实测补上后 300 条评测里 accept len 3.06 -> 3.63、accept rate 0.412 -> 0.527，三个
+# 测试集分数基本持平。
+#
+# 参考实现来自 vLLM 侧的同一改动（scripts/vllm-dsv4-w4a8-changes.patch）。
+# 非旋转 checkpoint（如 fp16 那份 W8A8）不带这些张量，所有 hook 自动退化成 identity。
+# ---------------------------------------------------------------------------
+_CORRECTION_RE = re.compile(r"^mtp\.(\d+)\.(context_correction|final_correction)\.blocks$")
+
+
+def apply_block_correction(x: torch.Tensor, blocks: torch.Tensor) -> torch.Tensor:
+    """``x @ block_diag(blocks)``，按块右乘。
+
+    ``blocks`` 是 ``[n_blocks, b, b]``，要求 ``x`` 最后一维 == n_blocks * b。
+    用 fp32 运算再 cast 回 ``x`` 的 dtype（gamma 解析上会相消，量级 ~O(1)）。
+    """
+    n_blocks, b, _ = blocks.shape
+    orig_dtype = x.dtype
+    lead = x.shape[:-1]
+    xr = x.reshape(-1, n_blocks, b).to(torch.float32)
+    out = torch.einsum("tnb,nbc->tnc", xr, blocks.to(torch.float32))
+    return out.reshape(*lead, n_blocks * b).to(orig_dtype)
+
+
+class _BlockCorrection(torch.nn.Module):
+    """只用来持有一份 ``blocks`` 缓冲，按需挂到 stage 上。"""
+
+    def __init__(self, weight: torch.Tensor) -> None:
+        super().__init__()
+        self.register_buffer("blocks", weight.detach().clone(), persistent=False)
+
+
+class _NormWithBlockCorrection(torch.nn.Module):
+    """``norm`` 之后紧接一次块对角补偿。
+
+    final_correction 的作用点是 ``_logits_from_x_post_hc`` 里
+    ``x = last.norm(x_post_hc)`` 之后、乘 lm_head 之前。``last.norm`` 全文件只有那一处
+    调用点，所以把 norm 包一层等价于在中间插一步，比 REPLACE 整个 logits 函数更稳
+    （不用把 fp32 lm_head / markov TP 分片那些分支抄一遍、跟着上游漂移）。
+    注意不能把补偿折进 lm_head 权重：lm_head 是和 target 共享的。
+    """
+
+    def __init__(self, norm: torch.nn.Module, weight: torch.Tensor) -> None:
+        super().__init__()
+        self.norm = norm
+        self.register_buffer("blocks", weight.detach().clone(), persistent=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """forward"""
+        return apply_block_correction(self.norm(x), self.blocks)
+
+
+def _attach_correction(model, stage_id: int, kind: str, weight: torch.Tensor) -> None:
+    """把补偿矩阵挂到对应位置。找不到目标就直接抛，不静默跳过。"""
+    stage = model.stages[stage_id]
+    # 只有最后一个 stage 有 norm，所以设备要从任意一个已存在的参数上取，
+    # 否则前面的 stage 会留在 CPU 上，einsum 时报 "mat2 is on cpu"。
+    device = next(stage.parameters()).device
+    weight = weight.to(device)
+    if kind == "context_correction":
+        stage.context_correction = _BlockCorrection(weight)
+    else:
+        norm = stage.norm
+        if isinstance(norm, _NormWithBlockCorrection):
+            raise RuntimeError("final_correction 被加载了两次")
+        stage.norm = _NormWithBlockCorrection(norm, weight)
+
+
+def _strip_correction_blocks(model, weights):
+    """从权重流里摘出补偿矩阵并就地挂上，其余原样透传。"""
+    found = []
+    for name, tensor in weights:
+        m = _CORRECTION_RE.match(name)
+        if m is None:
+            yield name, tensor
+            continue
+        _attach_correction(model, int(m.group(1)), m.group(2), tensor)
+        found.append(name)
+    if found:
+        logger.info(
+            "[DSPARK_R1] 已挂上 %d 个旋转补偿矩阵: %s", len(found), ", ".join(sorted(found))
+        )
+
+
+@plugin_hook(
+    "sglang.srt.models.deepseek_v4_dspark.DeepseekV4ForCausalLMDSpark.load_weights",
+    type=HookType.AROUND,
+)
+def load_dspark_correction_blocks_kunlun(original_fn, self, weights, *args, **kwargs):
+    """补偿矩阵不是注册参数，先从权重流里摘出来挂好，剩下的交给上游 loader。"""
+    return original_fn(self, _strip_correction_blocks(self, weights), *args, **kwargs)
+
+
+@plugin_hook(
+    "sglang.srt.models.deepseek_v4_dspark.DeepseekV4ForCausalLMDSpark."
+    "write_target_hidden_kv",
+    type=HookType.REPLACE,
+)
+def write_target_hidden_kv_with_correction_kunlun(
+    self, *, main_hidden, swa_loc, positions, pool
+):
+    """写 target hidden 的 KV 时按 stage 施加 context_correction。
+
+    这条路径的输入是 main_x（走 main_proj + main_norm，**没有 attn_norm**），所以要撤掉
+    折进旋转后 wkv 的 attn_norm gamma、重新施加 main_norm gamma，即
+    C_k = Q @ diag(gamma_main_norm / gamma_attn_norm_k) @ Q.T。每个 stage 的 C_k 不同，
+    而上游 ``CommitKvProj.execute`` 是三个 stage 共享一个 main_x 的融合实现，用不了；
+    有补偿时退回逐 stage 投影（复用已有的 ``kv_proj_only``），没有补偿时保持融合路径。
+    """
+    from sglang.kernels.ops.speculative.dspark.dspark_draft_model import CommitKvProj
+
+    main_x = self.project_target_hidden(main_hidden)
+    swa_loc = swa_loc.to(torch.int32)
+    corrections = [getattr(stage, "context_correction", None) for stage in self.stages]
+    if any(corr is not None for corr in corrections):
+        kvs = [
+            stage.self_attn.kv_proj_only(
+                main_x
+                if corr is None
+                else apply_block_correction(main_x, corr.blocks)
+            )
+            for stage, corr in zip(self.stages, corrections)
+        ]
+    else:
+        kvs = CommitKvProj.execute(
+            main_x=main_x,
+            wkv_linears=[stage.self_attn.wkv for stage in self.stages],
+        )
+    for stage, kv in zip(self.stages, kvs):
+        attn = stage.self_attn
+        pool.set_swa_key_buffer_radix_fused_norm_rope(
+            layer_id=attn.layer_id,
+            swa_loc=swa_loc,
+            kv=kv,
+            kv_weight=attn.kv_norm.weight.data,
+            eps=attn.eps,
+            freqs_cis=attn.freqs_cis,
+            positions=positions,
+        )
+
+

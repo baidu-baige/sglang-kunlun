@@ -9,7 +9,7 @@ function usage()
 	echo -e "bash $0 [args]"
 	echo -e ""
     echo -e "Optional Arguments:"
-    echo -e "--engine_type=<engine_type>                  engine type, e.g., sglang_kunlun"
+    echo -e "--engine_type=<engine_type>                  engine type, e.g., aiak_sglang"
     echo -e "--XPYTORCH_VERSION=<XPYTORCH_VERSION>        XPYTORCH_VERSION"
     echo -e "--XPYTORCH_DOWNLOAD_ADDR=<XPYTORCH_DOWNLOAD_ADDR>  XPYTORCH_DOWNLOAD_ADDR"
     echo -e "--XFLASH_MLA_VERSION=<XFLASH_MLA_VERSION>    XFLASH_MLA_VERSION"
@@ -104,9 +104,18 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+xpu_requirements_dir="/workspace/aiak_sglang/dockerfile/xpu_requirements.env"
+if [[ -f "$xpu_requirements_dir" ]]; then
+    set -a
+    source "$xpu_requirements_dir"
+    set +a
+else
+    echo "Warning: $xpu_requirements_dir not found, skipping..."
+fi
 ############################################################# 基础环境开始 ###########################################################
 
-sglang_kunlun_dir="/workspace/sglang_kunlun"
+aiak_sglang_dir="/workspace/aiak_sglang"
+sglang_kunlun_dir="/workspace/sglang-kunlun"
 
 function install_base_env() {
     rm -rf /etc/apt/sources.list && cp ${sglang_kunlun_dir}/dockerfile/sources.list /etc/apt/sources.list
@@ -117,6 +126,10 @@ function install_base_env() {
     apt-get install libarchive-dev zlib1g-dev -y
     apt-get install bc tree pwgen nodejs -y
     apt-get install libgoogle-glog-dev -y
+
+    # 安装 cmake
+    # wget -qO /cmake-3.28.6-linux-x86_64.sh https://cce-ai-datasets.bj.bcebos.com/hac-aiacc/aiak2.0/cmake-3.28.6-linux-x86_64.sh
+    # bash /cmake-3.28.6-linux-x86_64.sh --prefix=/usr/local --exclude-subdir && rm -rf /cmake-3.28.6-linux-x86_64.sh
     
     rm -rf /opt/conda/pip.conf /root/.config/pip/pip.conf /root/.pip/pip.conf /etc/pip.conf /etc/xdg/pip/pip.conf /usr/pip.conf
     cp ${sglang_kunlun_dir}/dockerfile/pip.conf /etc/pip.conf
@@ -144,15 +157,7 @@ function install_dep() {
     project="$1"
 
     # 允许的项目名列表
-    allow_projects="xpytorch kunlun_ops xspeedgate_ops xmooncake runtime lib_tmp xtriton xsgl_kernel"
-
-    # 公共下载前缀
-    # BASE_URL="https://su.bcebos.com/v1/klx-sdk-release-public/DS_PD/${project}/${version}"
-    # BASE_URL2="https://baidu-kunlun-public.su.bcebos.com/baidu-kunlun-share/${version}"
-    # if [[ -z "$project" || -z "$version" ]]; then
-    #     echo "Usage: install_dep <project> <version>"
-    #     return 1
-    # fi
+    allow_projects="xpytorch flash_mla deepep kunlun_ops xmooncake xsgl_kernel xtriton runtime lib_tmp attentionstore"
 
     # 检查 project 是否在允许范围
     found=0
@@ -170,7 +175,7 @@ function install_dep() {
     if [[ "$project" == "xpytorch" ]]; then
         url="${XPYTORCH_DOWNLOAD_ADDR}"
         if [[ -z "$url" || "$url" == "NA" ]]; then
-            url="https://klx-sdk-release-public.su.bcebos.com/kunlun2aiak_output/20260707/xpytorch-cp310-torch290-ubuntu2004-x64.run"
+            url="https://klx-sdk-release-public.su.bcebos.com/xpytorch/release/3.6.2.1/xpytorch-cp310-torch290-ubuntu2004-x64.run"
         fi
         run_file="${url##*/}"
         echo "Downloading $url"
@@ -180,6 +185,7 @@ function install_dep() {
         rm -rf "$run_file"
         echo "${project}_addr=${url}" >> /versions
     elif [[ "$project" == "kunlun_ops" ]]; then
+        # kunlun_ops
         url="${KUNLUN_OPS_DOWNLOAD_ADDR}"
         if [[ -z "$url" || "$url" == "NA" ]]; then
             url="https://klx-sdk-release-public.su.bcebos.com/kunlun2aiak_output/20260707/kunlun_ops-0.1.205%2B223cef9e-cp310-cp310-linux_x86_64.whl"
@@ -191,8 +197,8 @@ function install_dep() {
         pip3 install "$whl_file" --force-reinstall
         rm "$whl_file"
         echo "${project}_addr=${url}" >> /versions
-    elif [[ "$project" == "xspeedgate_ops" ]]; then
-        # download xspeedgate_ops
+        
+        # xspeedgate_ops
         url="${XSPEEDGATE_OPS_DOWNLOAD_ADDR}"
         if [[ -z "$url" || "$url" == "NA" ]]; then
             url="http://aihc-private-hcd.bj.bcebos.com/xspeedgate_release/torch29/20260626_144331/xspeedgate_ops-1.2.0+680bed9.torch29-cp310-cp310-linux_x86_64.whl"
@@ -204,29 +210,31 @@ function install_dep() {
         rm "$whl_file"
         echo "xspeedgate_ops_addr=${url}" >> /versions
 
-        # download cocopod
-        wget -O cocopod-1.3.0+224a318-cp310-cp310-linux_x86_64.whl https://vllm-ai-models.bj.bcebos.com/aiak_share/20260609/torch29/cocopod-1.3.0%2B224a318-cp310-cp310-linux_x86_64.whl
-        pip3 install cocopod-1.3.0+224a318-cp310-cp310-linux_x86_64.whl --force-reinstall
-        rm cocopod-1.3.0+224a318-cp310-cp310-linux_x86_64.whl
+        # # cocopod ops
+        # wget -O cocopod-1.3.0+224a318-cp310-cp310-linux_x86_64.whl https://vllm-ai-models.bj.bcebos.com/aiak_share/20260609/torch29/cocopod-1.3.0%2B224a318-cp310-cp310-linux_x86_64.whl
+        # pip3 install cocopod-1.3.0+224a318-cp310-cp310-linux_x86_64.whl --force-reinstall
+        # rm cocopod-1.3.0+224a318-cp310-cp310-linux_x86_64.whl
 
     elif [[ "$project" == "runtime" ]]; then
         # 下载.43版本xre
-        # url="https://klx-sdk-release-public.su.bcebos.com/xre/kl3-release/5.0.21.43.6/peermem/xre-Linux-x86_64-5.0.21.43.6.tar.gz"
+        url="https://klx-sdk-release-public.su.bcebos.com/xre/kl3-release/5.0.21.43.6/peermem/xre-Linux-x86_64-5.0.21.43.6.tar.gz"
         # 下载 5.19版本xre
-        url="https://klx-sdk-release-public.su.bcebos.com/xre/kl3-release/5.19.0.0/peermem/xre-Linux-x86_64-5.19.0.0.tar.gz"
+        # url="https://klx-sdk-release-public.su.bcebos.com/xre/kl3-release/5.19.0.0/peermem/xre-Linux-x86_64-5.19.0.0.tar.gz"
         echo "Downloading $url"
         curl -O "$url" || wget "$url"
-        # tar -xzvf xre-Linux-x86_64-5.0.21.43.6.tar.gz
-        # mv xre-Linux-x86_64-5.0.21.43.6 /usr/local/xre
-        tar -xzvf xre-Linux-x86_64-5.19.0.0.tar.gz
-        mv xre-Linux-x86_64-5.19.0.0 /usr/local/xre
+        tar -xzvf xre-Linux-x86_64-5.0.21.43.6.tar.gz
+        mv xre-Linux-x86_64-5.0.21.43.6 /usr/local/xre
+        # tar -xzvf xre-Linux-x86_64-5.19.0.0.tar.gz
+        # mv xre-Linux-x86_64-5.19.0.0 /usr/local/xre
         # 增加软连接
         cd /usr/local/xre/so && ln -s libxpucuda.so libcuda.so && ln -s libxpucuda.so libcuda.so.1 && cd -
-        # rm -rf xre-Linux-x86_64-5.0.21.43.6*
-        rm -rf xre-Linux-x86_64-5.19.0.0*
+        rm -rf xre-Linux-x86_64-5.0.21.43.6*
+        # rm -rf xre-Linux-x86_64-5.19.0.0*
         echo "${project}_addr=${url}" >> /versions
+
     elif [[ "$project" == "lib_tmp" ]]; then
         echo "Add yourself dependencies here"
+
         # download bkcl
         url="https://su.bcebos.com/v1/klx-sdk-release-public/xccl/release/3.1.8.1/xccl_Linux_x86_64_cuda12.tar.gz"
         echo "Downloading $url"
@@ -253,7 +261,21 @@ function install_dep() {
         rm -rf deep_ep-cp310-cp310-linux_x86_64*
         echo "${project}_addr=${url}" >> /versions
 
-    elif [[ "$project" == "xmooncake" ]]; then
+        # download xdeepgemm
+        url="https://su.bcebos.com/v1/klx-sdk-release-public/DS_PD/xdeep_gemm/20250818/xdpgm_ubuntu2004_x86_64.tar.gz"
+        echo "Downloading $url"
+        #curl -O "$url" || wget "$url"
+        #tar -xzvf xdpgm_ubuntu2004_x86_64.tar.gz
+        #whl_file=$(find xdpgm_ubuntu2004_x86_64 -name "*.whl" | head -n 1)
+        #if [[ -z "$whl_file" ]]; then
+        #    echo "No .whl file found in output directory"
+        #    return 3
+        #fi
+        #pip3 install "$whl_file" --force-reinstall
+        #rm -rf xdpgm_ubuntu2004_x86_64*
+        #echo "${project}_addr=${url}" >> /versions
+
+     elif [[ "$project" == "xmooncake" ]]; then
         url="https://su.bcebos.com/v1/klx-sdk-release-public/DS_PD/xmooncake/20250912_9/output.tar.gz"
         echo "Downloading $url"
         curl -O "$url" || wget "$url"
@@ -267,9 +289,22 @@ function install_dep() {
         rm -rf output*
         echo "${project}_addr=${url}" >> /versions
     
-    #依赖
     elif [[ "$project" == "xtriton" ]]; then
         url="https://su.bcebos.com/v1/klx-sdk-release-public/DS_PD/xtriton/20250624/output.tar.gz"
+        echo "Downloading $url"
+        curl -O "$url" || wget "$url"
+        tar -xzvf output.tar.gz
+        whl_file=$(find output -name "*.whl" | head -n 1)
+        if [[ -z "$whl_file" ]]; then
+            echo "No .whl file found in output directory"
+            return 3
+        fi
+        pip3 install "$whl_file" --force-reinstall
+        rm -rf output*
+        echo "${project}_addr=${url}" >> /versions
+    
+    elif [[ "$project" == "flash_mla" ]]; then
+        url="https://su.bcebos.com/v1/klx-sdk-release-public/DS_PD/flash_mla/20250529/output.tar.gz"
         echo "Downloading $url"
         curl -O "$url" || wget "$url"
         tar -xzvf output.tar.gz
@@ -296,14 +331,26 @@ function install_dep() {
     fi
 }
 
-function install_sglang_kunlun() {
-    cd ${sglang_kunlun_dir}
+
+function install_aiak_sglang() {
+    cd ${aiak_sglang_dir}
 
     # 安装sglang
-    pip3 install -r ${sglang_kunlun_dir}/requirements.txt
-    pip3 install -e ${sglang_kunlun_dir} --no-deps
+    pip3 install -r ${aiak_sglang_dir}/requirements.txt
     pip3 install --no-cache-dir compressed_tensors tilelang \
     -i https://pip.baidu-int.com/simple/ --no-deps --trusted-host pip.baidu.com
+    cd ${aiak_sglang_dir}/python
+    python3 -m build --wheel
+    export http_proxy=http://10.63.229.53:8891 && export https_proxy=http://10.63.229.53:8891
+    pip3 install dist/*
+    unset http_proxy https_proxy
+
+    # rm -rf ${aiak_sglang_dir}
+    # 拷贝common_ops依赖 
+    cp /workspace/aiak_sglang/common_ops.cpython-310-x86_64-linux-gnu.so /workspace/aiak_sglang/sgl-kernel/python/sgl_kernel/common_ops.cpython-310-x86_64-linux-gnu.so
+    rm /workspace/aiak_sglang/common_ops.cpython-310-x86_64-linux-gnu.so
+    #/workspace/aiak_sglang/sgl-kernel/python/sgl_kernel/
+    # 因上面的目录已经删除，所以后续执行目录需要再存在的目录下执行，不然会遇到莫名其妙的报错
     cd /workspace
 }
 
@@ -337,6 +384,18 @@ function file_soft_chain() {
     ln -s /lib/x86_64-linux-gnu/libffi.so.7.1.0 /root/miniconda/envs/python310_torch29_cuda/lib/libffi.so
 }
 
+function install_sglang_kunlun() {
+    cd ${sglang_kunlun_dir}
+
+    # 安装sglang kunlun plugin
+    pip3 install -r ${sglang_kunlun_dir}/requirements.txt
+    pip3 install -e ${sglang_kunlun_dir} --no-deps
+    #pip3 install --no-cache-dir compressed_tensors tilelang \
+    #-i https://pip.baidu-int.com/simple/ --no-deps --trusted-host pip.baidu.com
+    echo "sglang_kunlun_plugin=${sglang_kunlun_dir}" >> /versions
+    cd /workspace
+}
+
 
 # 切换到 python310_torch29_cuda conda环境
 . /root/miniconda/etc/profile.d/conda.sh
@@ -345,23 +404,17 @@ conda activate python310_torch29_cuda
 
 install_base_env
 install_sight
-#install_performance_tool ${performance_tool_download_addr}
-#install_aiak_sglang
-install_dep xpytorch
-#install_dep flash_mla ${XFLASH_MLA_VERSION}
-install_dep kunlun_ops
-install_dep xspeedgate_ops
 install_dep runtime
 install_dep lib_tmp
+install_dep xpytorch
+install_dep flash_mla
+install_dep kunlun_ops
 install_dep xmooncake
-# import依赖
 install_dep xtriton
-#install_dep attentionstore ${ATTENTION_STORE_VERSION}
 file_soft_chain
-
-####框架相关的
+ # 框架
 install_dep xsgl_kernel
-# install_sglang
-# install_sglang_kunlun
+install_aiak_sglang
+install_sglang_kunlun
 
 ############################################################# 基础环境结束 ###########################################################

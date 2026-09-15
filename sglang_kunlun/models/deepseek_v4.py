@@ -291,3 +291,126 @@ def hc_post_kunlun(
     )
     return out
 
+
+# ---------------------------------------------------------------------------
+# compressed-tensors 量化配置的命名对齐
+#
+# W4A8 那份 checkpoint 的 quantization_config 是按 **checkpoint 原始命名** 导出的
+# （``layers.N.attn.*`` / ``layers.N.ffn.*``、wq_a 与 wkv 未融合），而 sglang 的模块
+# 路径是 ``layers.N.self_attn.*`` / ``layers.N.mlp.*``、且默认把 wq_a+wkv 融合成
+# wqkv_a。两者对不上时 find_matched_target 会直接抛
+# "Unable to find matching target for model.layers.0.self_attn.wqkv_a"。
+#
+# sglang 本来就有这个对齐通道：loader.py 里
+# ``hf_to_sglang_mapper = getattr(model_class, "hf_to_sglang_mapper", None)``，
+# 拿到后调 ``quant_config.apply_weight_name_mapper()``。但 DSV4 的模型类没有定义这个
+# 属性，于是通道是空的。这里把它补上。
+#
+# 规则写成正则模式串上的子串替换（WeightsMapper 按 key 长度倒序匹配、命中一条即停），
+# 所以更长的 wq_a/wkv→wqkv_a 规则会先于通用的 attn→self_attn 规则生效。
+# 对已经用 sglang 命名导出的 W8A8 checkpoint 这些规则全部不命中，是无害的空操作
+# （``layers\.\d+\.self_attn\.`` 里不含 ``layers\.\d+\.attn\.``）。
+# ---------------------------------------------------------------------------
+_DSV4_QUANT_NAME_MAP_BASE = {
+    # DSpark draft 用 fuse_wqa_wkv=False，mtp 侧本来就不融合。
+    r"mtp\.\d+\.attn\.": r"mtp\.\d+\.self_attn\.",
+    r"layers\.\d+\.attn\.": r"layers\.\d+\.self_attn\.",
+    r"layers\.\d+\.ffn\.": r"layers\.\d+\.mlp\.",
+    r"mtp\.\d+\.ffn\.": r"mtp\.\d+\.mlp\.",
+}
+
+# 开融合时才把 wq_a/wkv 折到 wqkv_a 上（两者 scheme 相同，映射后合并成一个 key）。
+# 关融合时必须不折，否则模型里是分开的 wq_a / wkv 两个模块、反而匹配不上。
+_DSV4_QUANT_NAME_MAP_FUSED = {
+    r"layers\.\d+\.attn\.wq_a$": r"layers\.\d+\.self_attn\.wqkv_a$",
+    r"layers\.\d+\.attn\.wkv$": r"layers\.\d+\.self_attn\.wqkv_a$",
+}
+
+
+def _build_dsv4_quant_name_map(fuse_wqa_wkv: bool) -> dict:
+    mapping = dict(_DSV4_QUANT_NAME_MAP_BASE)
+    if fuse_wqa_wkv:
+        mapping.update(_DSV4_QUANT_NAME_MAP_FUSED)
+    return mapping
+
+
+def _install_dsv4_quant_name_mapper() -> None:
+    from sglang.srt import environ as _environ
+    from sglang.srt.models.utils import WeightsMapper
+
+    fuse = bool(_environ.envs.SGLANG_OPT_FUSE_WQA_WKV.get())
+    mapper = WeightsMapper(orig_to_new_substr=_build_dsv4_quant_name_map(fuse))
+    targets = []
+    from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+    targets.append(DeepseekV4ForCausalLM)
+    try:
+        from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
+
+        targets.append(DeepseekV4ForCausalLMDSpark)
+    except ImportError:
+        pass
+    for cls in targets:
+        # 已经自带 mapper 的话不覆盖（上游若后续补上，以上游为准）。
+        if getattr(cls, "hf_to_sglang_mapper", None) is None:
+            cls.hf_to_sglang_mapper = mapper
+
+
+_install_dsv4_quant_name_mapper()
+
+
+# 融合后的 wqkv_a 拿不到 per-channel weight_scale 的问题。
+#
+# 上游的 wq_a+wkv 融合分支（sglang/srt/models/deepseek_v4.py 的 `elif fuse_wqa_wkv and (...)`）
+# 只认 ``.weight`` 和 ``.weight_scale_inv``（fp8 块量化命名），不认 compressed-tensors 的
+# per-channel ``.weight_scale``。于是这两份 scale 掉进通用分支、被改名成
+# ``self_attn.wq_a.weight_scale``，而模型里只有融合后的 ``wqkv_a.weight_scale``，
+# 日志报 "not found in params_dict"、融合模块的 scale 保持初值 => int8 反量化出垃圾
+# => logits 变垃圾 => 解码出空串。注意 ``.weight`` 本身是被正确 cat 融合的，只有 scale 缺失，
+# 加载阶段不报错，很难发现。
+#
+# 这里不改上游，而是在进 load_weights 之前把权重流里的两份 scale 先合并、直接以融合后的名字
+# ``...wqkv_a.weight_scale`` 交出去，上游的通用分支就能在 params_dict 里找到它、正常加载。
+# 合并方式和 ``.weight`` 完全一致：per-channel scale 是 per-output-channel，
+# 融合就是把输出通道按 q、kv 顺序接起来，所以同样是 ``torch.cat([q, kv], dim=0)``。
+_WQKV_A_SCALE_SHARDS = {".wq_a.weight_scale": "q", ".wkv.weight_scale": "kv"}
+
+
+def _fuse_wqkv_a_weight_scales(weights):
+    """把 wq_a / wkv 的 weight_scale 合并成融合后 wqkv_a 的那一份。"""
+    pending: dict = {}
+    for name, tensor in weights:
+        shard = next(
+            (s for suffix, s in _WQKV_A_SCALE_SHARDS.items() if name.endswith(suffix)),
+            None,
+        )
+        if shard is None:
+            yield name, tensor
+            continue
+        fused = name.replace(".wq_a.", ".wqkv_a.").replace(".wkv.", ".wqkv_a.")
+        bucket = pending.setdefault(fused, {})
+        assert shard not in bucket, f"duplicate shard {shard} for {fused}"
+        bucket[shard] = tensor
+        if len(bucket) == 2:
+            yield fused, torch.cat([bucket["q"], bucket["kv"]], dim=0)
+            del pending[fused]
+    # 只凑到一半的按原名交回去，让上游按原逻辑报 not found，不要静默吞掉。
+    for fused, bucket in pending.items():
+        for shard, tensor in bucket.items():
+            back = ".wq_a." if shard == "q" else ".wkv."
+            yield fused.replace(".wqkv_a.", back), tensor
+
+
+@plugin_hook(
+    "sglang.srt.models.deepseek_v4.DeepseekV4ForCausalLM.load_weights",
+    type=HookType.AROUND,
+)
+def fuse_wqkv_a_weight_scale_kunlun(original_fn, self, weights, *args, **kwargs):
+    """开融合时，先把 wq_a/wkv 的 weight_scale 合并再交给上游 loader。"""
+    from sglang.srt import environ as _environ
+
+    if not _environ.envs.SGLANG_OPT_FUSE_WQA_WKV.get():
+        return original_fn(self, weights, *args, **kwargs)
+    return original_fn(self, _fuse_wqkv_a_weight_scales(weights), *args, **kwargs)
+
+
