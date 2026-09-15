@@ -236,6 +236,71 @@ def _patch_transformers_optional_modules() -> None:
     setattr(transformers, "image_processing_backends", module)
 
 
+def _patch_transformers_optional_model_modules() -> None:
+    """Stub 只有更新版 transformers 才有的 `transformers.models.*` 包。
+
+    失败形态和 `_patch_transformers_optional_modules` 一样，只是深一层：
+    `sglang.srt.configs.glm5_next` 在顶层 `from
+    transformers.models.glm_ocr.configuration_glm_ocr import GlmOcrVisionConfig`，
+    而 `glm_ocr` 在本机的 transformers 4.57.1 上不存在。不 stub 的话整个
+    `sglang.srt.configs` 包不可导入，进而所有经它导入的昆仑 hook 模块全部注册失败——
+    哪怕本部署只服务 DeepSeek。stub 类继承 `PretrainedConfig` 以保证导入期可被子类化，
+    但实例化时抛错：对本平台不支持的模型来说这是正确行为。
+    """
+    import sys
+    import types
+
+    try:
+        import transformers  # noqa: F401
+        from transformers.configuration_utils import PretrainedConfig
+    except Exception:
+        return
+
+    # (package, submodule, symbol names)
+    specs = (("glm_ocr", "configuration_glm_ocr", ("GlmOcrVisionConfig",)),)
+
+    for pkg_name, sub_name, symbols in specs:
+        full_pkg = f"transformers.models.{pkg_name}"
+        full_sub = f"{full_pkg}.{sub_name}"
+        if full_sub in sys.modules:
+            continue
+        try:
+            __import__(full_sub)
+            continue
+        except ImportError:
+            pass
+
+        pkg = sys.modules.get(full_pkg) or types.ModuleType(full_pkg)
+        pkg.__path__ = []  # mark as package so submodule imports resolve
+        sub = types.ModuleType(full_sub)
+
+        for symbol in symbols:
+
+            def _make(symbol_name: str, missing: str = full_pkg):
+                class _MissingConfig(PretrainedConfig):
+                    """Placeholder for a config class from a newer transformers."""
+
+                    def __init__(self, *_args, **_kwargs):
+                        raise NotImplementedError(
+                            f"{missing}.{symbol_name} requires a newer "
+                            "transformers release; sglang-kunlun stubs it so "
+                            "that sglang.srt.configs stays importable."
+                        )
+
+                _MissingConfig.__name__ = symbol_name
+                _MissingConfig.__qualname__ = symbol_name
+                return _MissingConfig
+
+            cls = _make(symbol)
+            setattr(sub, symbol, cls)
+            setattr(pkg, symbol, cls)
+
+        setattr(pkg, sub_name, sub)
+        sys.modules[full_pkg] = pkg
+        sys.modules[full_sub] = sub
+        setattr(transformers.models, pkg_name, pkg)
+
+
 def _patch_flashinfer_optional_symbols() -> None:
     """Inject stubs for optional flashinfer symbols imported at sglang import time.
 
@@ -317,6 +382,11 @@ def _kunlun_pre_shim() -> None:
 
     try:
         _patch_transformers_optional_modules()
+    except Exception:
+        pass
+
+    try:
+        _patch_transformers_optional_model_modules()
     except Exception:
         pass
 

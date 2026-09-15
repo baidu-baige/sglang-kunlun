@@ -128,9 +128,10 @@ def moe_gate_forward_half_precision_kunlun(
 
 def _restore_requested_fp16_parameter_dtype(*linears):
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-    from sglang.srt.server_args import get_global_server_args
 
-    if get_global_server_args().dtype not in _FP16_DTYPE_NAMES:
+    from sglang_kunlun.compat import server_arg
+
+    if server_arg("dtype") not in _FP16_DTYPE_NAMES:
         return
 
     for linear in linears:

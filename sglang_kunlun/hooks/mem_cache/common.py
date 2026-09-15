@@ -16,6 +16,26 @@ logger = logging.getLogger(__name__)
 
 
 @plugin_hook(
+    "sglang.srt.mem_cache.kv_cache_dtype.configure_kv_cache_dtype",
+    type=HookType.AROUND,
+)
+def configure_kv_cache_dtype_kunlun(original_fn, **kwargs):
+    """把 `--kv-cache-dtype fp16` 解析成 `torch.float16`。
+
+    昆仑的 DSV4 池子是 fp16/bf16 的"半 cache"（见下面 `dsv4_create_buffer_kunlun`），
+    所以本平台跑 fp16 KV cache。上游的解析表没有 fp16 分支，会落到
+    `raise ValueError(f"Unsupported kv_cache_dtype: ...")`，因此在这里拦掉。字符串槽返回
+    None —— 上游用 None 表示未量化池（auto 分支就不设这个标记，backend 靠它判断是否 descale）。
+
+    配套改动：`sitecustomize.py` 把 fp16 加回 argparse choices；`platform/srt.py` 在上游
+    DeepSeek-V4 hook 断言这个值时先换成 bfloat16、跑完再声明回来。
+    """
+    if kwargs.get("server_args_kv_cache_dtype") == "fp16":
+        return None, torch.float16
+    return original_fn(**kwargs)
+
+
+@plugin_hook(
     "sglang.srt.mem_cache.allocator.paged.PagedTokenToKVPoolAllocator.alloc_decode",
     type=HookType.REPLACE,
 )

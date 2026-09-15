@@ -238,6 +238,32 @@ def _dsv4_plan_payload(plan):
     return plan.compress_plan, plan.write_plan, 0
 
 
+def _assert_v4_kv_layout(layout, where: str) -> None:
+    """拒绝 V4.1 的打包 KV 布局。
+
+    DSV4.1 给每个 paged KV 写入路径都带上 `KVLayout`（V4=584B fp8+bf16、V41=528B、
+    V41_FP4=288B）。昆仑池存的是 plain fp16/bf16 latent，对应上游的 V4 slot；其余打包
+    格式没有 XSpeedGate 写入实现，所以必须显式报错，不能静默写成 reader 解析不了的布局
+    —— 这类不匹配的表现是 attention 输出 NaN，而不是报错。
+    """
+    if layout is None:
+        return
+    name = getattr(layout, "value", layout)
+    if name not in ("v4", "V4"):
+        raise NotImplementedError(
+            f"{where}: KV layout {name!r} has no Kunlun implementation; "
+            "the half-cache pool only speaks the V4 layout"
+        )
+    if layout is None:
+        return
+    name = getattr(layout, "value", layout)
+    if name not in ("v4", "V4"):
+        raise NotImplementedError(
+            f"{where}: KV layout {name!r} has no Kunlun implementation; "
+            "the half-cache pool only speaks the V4 layout"
+        )
+
+
 @register_jit_op("sglang.kernels.ops.attention.dsv4.compress_old", "compress_forward")
 def dsv4_compress_forward_kunlun(
     kv_score_buffer: torch.Tensor,
@@ -325,11 +351,16 @@ def dsv4_create_paged_compress_data_kunlun(
     extend_seq_lens: torch.Tensor,
     req_to_token: torch.Tensor,
     full_to_swa_index_mapping: torch.Tensor,
+    use_req_ring: bool = False,
     block: int = 128,
 ):
     """Create compressor-v1 paged indices using the Kunlun fused op."""
 
     del block
+    if use_req_ring:
+        raise NotImplementedError(
+            "use_req_ring is not supported by the Kunlun compress plan builder"
+        )
     return torch.ops.xspeedgate_ops.create_paged_compress_data(
         req_pool_indices=req_pool_indices.to(torch.int64),
         seq_lens=seq_lens.to(torch.int32).contiguous(),
@@ -963,11 +994,18 @@ def dsv4_compressor_decode_plan_kunlun(
     seq_lens: torch.Tensor,
     swa_page_size: int,
     ring_size: int,
+    use_req_ring: bool = False,
 ):
     """dsv4_compressor_decode_plan_kunlun"""
     from sglang.kernels.ops.attention.dsv4.compress import CompressorDecodePlan
     if compress_ratio not in (4, 128):
         raise ValueError(f"unsupported compression ratio: {compress_ratio}")
+    # 与上游自己的 XPU 分支一致：request-ring 的 plan 布局（unified KV、ratio 4）没有
+    # XSpeedGate 实现。昆仑池不是 `_unified_kv`，所以调用方传的恒为 False。
+    if use_req_ring:
+        raise NotImplementedError(
+            "use_req_ring is not supported by the Kunlun compress plan builder"
+        )
     plan_d = torch.ops.xspeedgate_ops.dsv4_compressor_decode_plan(
         req_pool_indices,
         req_to_token,
@@ -1040,9 +1078,9 @@ def _dsv4_num_draft_tokens() -> int | None:
     """投机的 draft token 数；拿不到就返回 None（不阻塞启动）。"""
 
     try:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang_kunlun.compat import server_arg
 
-        return get_global_server_args().speculative_num_draft_tokens
+        return server_arg("speculative_num_draft_tokens")
     except Exception:  # pragma: no cover - 仅用于日志与断言
         return None
 
@@ -1137,11 +1175,16 @@ def dsv4_compressor_prefill_plan_kunlun(
     ring_size: int,
     num_q_tokens: int,
     use_cuda_graph: bool = False,
+    use_req_ring: bool = False,
 ):
     """dsv4_compressor_prefill_plan_kunlun"""
     from sglang.kernels.ops.attention.dsv4.compress import CompressorPrefillPlan
     if compress_ratio not in (4, 128):
         raise ValueError(f"unsupported compression ratio: {compress_ratio}")
+    if use_req_ring:
+        raise NotImplementedError(
+            "use_req_ring is not supported by the Kunlun compress plan builder"
+        )
     if num_q_tokens < req_pool_indices.shape[0]:
         raise ValueError("num_q_tokens must be at least the batch size")
     pin_buffer = torch.empty(
@@ -1453,11 +1496,15 @@ def dsv4_compress_norm_rope_store_v2_kunlun(
     kvcache_scale: Optional[torch.Tensor] = None,
     rope_cache=None,
     fp4_k_write_metadata=None,
+    # 4.1 给每个 paged KV 写入都带上布局标记；昆仑池是 plain fp16/bf16 半 cache，
+    # 对应上游的 V4 布局。
+    layout=None,
 ) -> None:
     """Apply v2 post-compression transforms and store into Kunlun cache pages."""
 
     if use_fp4:
         raise NotImplementedError("FP4 indexer is not enabled for the Torch reference")
+    _assert_v4_kv_layout(layout, "compress_norm_rope_store")
     plan_raw = plan[1].contiguous()
     if plan_raw.shape[0] == 0:
         return
@@ -4701,9 +4748,11 @@ def dsv4_fused_k_norm_rope_flashmla_kunlun(
     out_loc: torch.Tensor,
     kvcache: torch.Tensor,
     page_size: int,
+    layout=None,
 ) -> None:
     """Use the normalize/rotate/store sequence for the 0.5.14 K path."""
 
+    _assert_v4_kv_layout(layout, "fused_k_norm_rope_flashmla")
     if kv.shape[0] == 0:
         return
 
