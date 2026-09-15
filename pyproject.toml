@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sglang-kunlun"
+version = "0.1.0"
+description = "SGLang OOT platform plugin for Kunlun (XPU) chips."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Baidu, Inc." }]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+# We do NOT depend on torch_xmlir here — the Kunlun runtime is provided by
+# the host environment and importing it conditionally is the activate()
+# contract (returns None on non-Kunlun machines).
+dependencies = []
+
+[project.entry-points."sglang.srt.platforms"]
+kunlun = "sglang_kunlun.platform:activate"
+
+[project.entry-points."sglang.srt.plugins"]
+kunlun_hooks = "sglang_kunlun.hooks.registry:register_all"
+
+[project.scripts]
+sglang-kunlun-launch = "sglang_kunlun.launch:main"
+
+[tool.setuptools]
+py-modules = ["sitecustomize"]
+
+[tool.setuptools.packages.find]
+include = ["sglang_kunlun*"]
