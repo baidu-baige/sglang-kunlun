@@ -55,6 +55,24 @@ def _enable_transformers_compatibility() -> None:
     compatible_strict._sglang_kunlun_compatible = True
     hub_dataclasses.strict = compatible_strict
 
+    # Newer transformers ship configs whose names this sglang tree registers
+    # itself (e.g. ``qwen3_asr``), and AutoConfig.register refuses duplicates.
+    # Keep upstream's registration and drop the duplicate instead of failing.
+    from transformers.models.auto.configuration_auto import AutoConfig
+
+    original_register = AutoConfig.register
+    if getattr(original_register, "_sglang_kunlun_compatible", False):
+        return
+
+    def compatible_register(model_type, config, exist_ok=False):
+        try:
+            return original_register(model_type, config, exist_ok=exist_ok)
+        except ValueError:
+            return config
+
+    compatible_register._sglang_kunlun_compatible = True
+    AutoConfig.register = compatible_register
+
 
 class _ServerArgsLoader(importlib.abc.Loader):
     def __init__(self, wrapped):
