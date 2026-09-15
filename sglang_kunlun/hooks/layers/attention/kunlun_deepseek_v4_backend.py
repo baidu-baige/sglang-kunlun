@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+from sglang_kunlun.kernels import dsv4_mixed_kv
 from sglang_kunlun.kernels.kernel_ops import (
     dsv4_c4_paged_mqa_logits_torch,
     dsv4_compressed_attention_torch,
@@ -497,6 +498,58 @@ def _dsv4_page_table_span(max_seq_len: int, seq_lens_casual: torch.Tensor) -> in
             needed,
         )
     return needed
+
+
+_MIXED_CACHE_L3_BYTES = 90 * 1024 * 1024
+_MIXED_CACHE_L3_BUFFERS = {}
+_MIXED_CACHE_L3_REVIEW_FLAGS = (
+    "enable_two_batch_overlap",
+    "enable_single_batch_overlap",
+)
+
+
+def _warn_if_overlap_flags_enabled() -> None:
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        args = get_global_server_args()
+    except Exception:
+        return
+    enabled = [
+        name for name in _MIXED_CACHE_L3_REVIEW_FLAGS if getattr(args, name, False)
+    ]
+    if enabled:
+        logger.warning(
+            "dsv4 mixed-cache L3 scratch is shared per (device, stream) while %s is "
+            "enabled. Sharing stays valid only while the two ubatches' ops are "
+            "serialized on one stream; re-check that before changing the overlap "
+            "implementation, or allocate per instance.",
+            ", ".join(enabled),
+        )
+
+
+def _mixed_cache_l3_buffer(device, stream):
+    """Return the L3 scratch for ``device`` + ``stream``, allocating once per key."""
+    key = (device, stream.cuda_stream)
+    buf = _MIXED_CACHE_L3_BUFFERS.get(key)
+    if buf is None:
+        _warn_if_overlap_flags_enabled()
+        from torch_xmlir.xpu.memory import use_l3
+
+        with use_l3():
+            buf = torch.empty(_MIXED_CACHE_L3_BYTES, dtype=torch.uint8, device=device)
+        _MIXED_CACHE_L3_BUFFERS[key] = buf
+        device_keys = [k for k in _MIXED_CACHE_L3_BUFFERS if k[0] == device]
+        logger.info(
+            "dsv4 mixed-cache L3 scratch: +%.0f MB for %s stream=%s "
+            "(device total: %.0f MB in %d buffer(s))",
+            _MIXED_CACHE_L3_BYTES / (1 << 20),
+            device,
+            hex(stream.cuda_stream),
+            len(device_keys) * _MIXED_CACHE_L3_BYTES / (1 << 20),
+            len(device_keys),
+        )
+    return buf
 
 
 class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
@@ -1149,6 +1202,11 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         core = self.forward_metadata.core_attn_metadata
         pool = self.token_to_kv_pool
         cache_dim = pool.swa_kv_pool.kv_cache_total_dim
+        is_mixed_int8_cache = cache_dim == dsv4_mixed_kv.mixed_int8_bytes_per_token(
+            pool.swa_kv_pool.qk_nope_head_dim,
+            pool.swa_kv_pool.qk_rope_head_dim,
+            pool.swa_kv_pool.quantize_block_size,
+        )
         swa_size = pool.swa_window_size
         win_cache = pool.get_swa_key_buffer_radix(layer.layer_id)
         win_cache = win_cache.reshape(-1, cache_dim)
@@ -1173,6 +1231,11 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 valid = int(win_lengths.max().item())
                 valid = max(1, min(valid, win_indices.shape[1]))
                 win_indices = win_indices[:, :valid].contiguous()
+        # -1 的兜底 mask 不能只挂在 draft 分支上：``hybrid_attention_with_mixed_cache``
+        # 没有 window-length 参数，负的页索引会被它当成真实地址偏移，直接非法访存；
+        # 而 TARGET_VERIFY 下 ``core.swa_page_indices`` 可能由非 draft 的 backend
+        # 实例刷新，把 -1 留了下来。fp16/bf16 走 compressed_attention，行为不变。
+        if self.is_dspark_draft or is_mixed_int8_cache:
             win_indices.masked_fill_(win_indices < 0, 0)
         extra_cache = None
         extra_indices = None
@@ -1203,6 +1266,10 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 extra_cache = extra_cache[:, : page_width * cache_dim].reshape(
                     -1, cache_dim
                 )
+            if is_mixed_int8_cache:
+                win_cache = dsv4_mixed_kv.unpack_mixed_int8(win_cache)
+                if extra_cache is not None:
+                    extra_cache = dsv4_mixed_kv.unpack_mixed_int8(extra_cache)
             for name, value in (
                 ("compressed_attention.input.q", q_3d),
                 ("compressed_attention.input.win_cache", win_cache),
@@ -1229,7 +1296,10 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             )
             return reference_out
 
-        if q_3d.dtype != win_cache.dtype:
+        if is_mixed_int8_cache:
+            if q_3d.dtype != torch.bfloat16:
+                q_3d = torch.nan_to_num(q_3d).to(torch.bfloat16)
+        elif q_3d.dtype != win_cache.dtype:
             q_3d = q_3d.to(win_cache.dtype)
         q_lod_cpu, q_lod, kv_lens_cpu, kv_lens = self._make_lod(
             forward_batch, q_3d.shape[0], q_3d.device
@@ -1409,32 +1479,94 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 ).reshape(extra_indices_op.shape).to(
                     extra_indices_op.dtype
                 ).contiguous()
-        torch.ops.xspeedgate_ops.compressed_attention(
-            q_op,
-            win_cache_op,
-            win_indices_op,
-            extra_cache_op,
-            extra_indices_op,
-            out_op,
-            max_logits_op,
-            lse_op,
-            q_lod_cpu_op,
-            q_lod_op,
-            kv_lens_cpu_op,
-            kv_lens_op,
-            self.softmax_scale,
-            # CP round-robin batches one local token per item; the per-token KV
-            # lengths already encode the causal prefix, so kernel-side causal
-            # masking would truncate valid context.
-            not cp_prefill,
-            win_indices_op.shape[1],
-            effective_ratio,
-            compressed_topk,
-            attn_sink_op,
-            # # Keep the C4 producer on the caller stream so PyTorch owns the
-            # # lifetime of the contiguous temporary inputs.
-            # side_stream=torch.cuda.current_stream().cuda_stream,
-        )
+        if is_mixed_int8_cache:
+            win_cache_op = win_cache_op.view(torch.int8)
+            if extra_cache_op.numel():
+                extra_cache_op = extra_cache_op.view(torch.int8)
+            else:
+                extra_cache_op = torch.empty(
+                    (0, win_cache_op.shape[1]),
+                    dtype=torch.int8,
+                    device=win_cache_op.device,
+                )
+                extra_indices_op = torch.empty(
+                    (q_op.shape[0], 0),
+                    dtype=torch.int32,
+                    device=q_op.device,
+                )
+            import kunlun_ops
+
+            if not hasattr(self, "_mixed_cache_side_stream"):
+                self._mixed_cache_side_stream = torch.cuda.Stream(device=q_op.device)
+            current_stream = torch.cuda.current_stream(device=q_op.device)
+            l3_buf = _mixed_cache_l3_buffer(q_op.device, current_stream)
+            self._mixed_cache_side_stream.wait_stream(current_stream)
+            for tensor in (
+                q_op,
+                win_cache_op,
+                win_indices_op,
+                extra_cache_op,
+                extra_indices_op,
+                out_op,
+                max_logits_op,
+                lse_op,
+                q_lod_op,
+                kv_lens_op,
+                attn_sink_op,
+            ):
+                if tensor is not None:
+                    tensor.record_stream(self._mixed_cache_side_stream)
+            kunlun_ops.hybrid_attention_with_mixed_cache(
+                q_op,
+                win_cache_op,
+                win_indices_op,
+                extra_cache_op,
+                extra_indices_op,
+                out_op,
+                max_logits_op,
+                lse_op,
+                q_lod_cpu_op,
+                q_lod_op,
+                kv_lens_cpu_op,
+                kv_lens_op,
+                self.softmax_scale,
+                not cp_prefill,
+                win_indices_op.shape[1],
+                effective_ratio,
+                compressed_topk,
+                attn_sink_op,
+                self._mixed_cache_side_stream.cuda_stream,
+                l3_buf=l3_buf.data_ptr(),
+                l3_buf_size=l3_buf.numel(),
+            )
+            current_stream.wait_stream(self._mixed_cache_side_stream)
+        else:
+            torch.ops.xspeedgate_ops.compressed_attention(
+                q_op,
+                win_cache_op,
+                win_indices_op,
+                extra_cache_op,
+                extra_indices_op,
+                out_op,
+                max_logits_op,
+                lse_op,
+                q_lod_cpu_op,
+                q_lod_op,
+                kv_lens_cpu_op,
+                kv_lens_op,
+                self.softmax_scale,
+                # CP round-robin batches one local token per item; the per-token KV
+                # lengths already encode the causal prefix, so kernel-side causal
+                # masking would truncate valid context.
+                not cp_prefill,
+                win_indices_op.shape[1],
+                effective_ratio,
+                compressed_topk,
+                attn_sink_op,
+                # # Keep the C4 producer on the caller stream so PyTorch owns the
+                # # lifetime of the contiguous temporary inputs.
+                # side_stream=torch.cuda.current_stream().cuda_stream,
+            )
         for name, value in () if not _dsv4_dump_enabled() else (
             ("compressed_attention.output.out_pre_rope", out_op[:, :local_q_heads]),
             (

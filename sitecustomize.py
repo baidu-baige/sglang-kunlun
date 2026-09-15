@@ -18,10 +18,26 @@ def _enable_kunlun_attention_choice(module) -> None:
     try:
         annotations = module.ServerArgs.__annotations__
         raw_annotation = annotations["kv_cache_dtype"]
-        if isinstance(raw_annotation, str) and "'fp16'" not in raw_annotation:
-            annotations["kv_cache_dtype"] = raw_annotation.replace(
-                "'fp4_e2m1']", "'fp4_e2m1', 'fp16']"
-            )
+        if isinstance(raw_annotation, str):
+            missing = [
+                dtype
+                for dtype in ("fp16", "int8")
+                if f"'{dtype}'" not in raw_annotation
+            ]
+            if missing:
+                extras = ", ".join(f"'{dtype}'" for dtype in missing)
+                if "'fp4_e2m1']" in raw_annotation:
+                    anchor = "'fp4_e2m1']"
+                    replacement = f"'fp4_e2m1', {extras}]"
+                elif "'], resolvable=True" in raw_annotation:
+                    anchor = "'], resolvable=True"
+                    replacement = f"', {extras}], resolvable=True"
+                else:
+                    anchor = None
+                if anchor is not None:
+                    annotations["kv_cache_dtype"] = raw_annotation.replace(
+                        anchor, replacement, 1
+                    )
     except Exception:
         pass
 

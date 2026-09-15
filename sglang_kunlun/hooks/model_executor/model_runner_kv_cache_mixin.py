@@ -27,6 +27,12 @@ def _configure_fp16_kv_cache(original_fn, self):
         self.kv_cache_dtype = torch.float16
         self.kv_cache_dtype_str = "fp16"
         return None
+    if self.server_args.kv_cache_dtype == "int8":
+        import torch
+
+        self.kv_cache_dtype = torch.int8
+        self.kv_cache_dtype_str = "int8"
+        return None
     return original_fn(self)
 
 

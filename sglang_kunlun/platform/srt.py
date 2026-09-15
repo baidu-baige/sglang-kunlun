@@ -92,7 +92,7 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
                 def apply_deepseek_v4_defaults(args, model_arch):
                     requested = args.attention_backend
                     requested_kv_dtype = args.kv_cache_dtype
-                    if requested == "kunlun_compressed" and requested_kv_dtype == "fp16":
+                    if requested == "kunlun_compressed" and requested_kv_dtype in ("fp16", "int8"):
                         args.kv_cache_dtype = "bfloat16"
                     original(args, model_arch)
                     if requested == "kunlun_compressed":

@@ -10,9 +10,40 @@ import torch
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 from sglang.srt.utils import get_num_new_pages, next_power_of_2
+from sglang_kunlun.kernels.dsv4_mixed_kv import mixed_int8_bytes_per_token
 
 
 logger = logging.getLogger(__name__)
+
+
+@plugin_hook(
+    "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+    type=HookType.AROUND,
+)
+def calculate_mla_kv_cache_dim_kunlun(
+    original_fn, *, model_config, kv_cache_dtype, server_args
+):
+    """Report the int8 mixed layout's per-token width to the pool sizer.
+
+    Upstream only special-cases fp8; int8 falls through to
+    ``kv_lora_rank + qk_rope_head_dim`` (512), which is 92 bytes short of what
+    the int8 write path actually consumes. That under-sized cell makes the
+    sizer hand out more tokens than the buffers can hold, so the pool
+    over-commits and blows the memory budget. Return the same width the
+    write path uses (``dsv4_get_bytes_per_token_kunlun`` /
+    ``index_buf_accessor_v4.py``), keyed off ``qk_nope_head_dim`` rather than
+    the semantically different ``kv_lora_rank``.
+    """
+    if kv_cache_dtype == torch.int8:
+        return mixed_int8_bytes_per_token(
+            model_config.qk_nope_head_dim,
+            model_config.qk_rope_head_dim,
+        )
+    return original_fn(
+        model_config=model_config,
+        kv_cache_dtype=kv_cache_dtype,
+        server_args=server_args,
+    )
 
 
 @plugin_hook(
@@ -67,6 +98,12 @@ def paged_alloc_decode_kunlun(self, seq_lens, seq_lens_cpu, last_loc):
 )
 def dsv4_get_bytes_per_token_kunlun(original_fn, self):
     """Return the Kunlun half-cache byte footprint for one token."""
+    if self.store_dtype == torch.int8:
+        return mixed_int8_bytes_per_token(
+            self.qk_nope_head_dim,
+            self.qk_rope_head_dim,
+            self.quantize_block_size,
+        )
     if self.store_dtype in (torch.bfloat16, torch.float16):
         return (self.qk_nope_head_dim + self.qk_rope_head_dim) * self.store_dtype.itemsize
     return original_fn(self)
@@ -78,6 +115,19 @@ def dsv4_get_bytes_per_token_kunlun(original_fn, self):
 )
 def dsv4_create_buffer_kunlun(original_fn, self, *, num_pages: int):
     """Allocate the Kunlun half-precision KV cache buffer."""
+    if self.store_dtype == torch.int8:
+        bytes_per_token = mixed_int8_bytes_per_token(
+            self.qk_nope_head_dim,
+            self.qk_rope_head_dim,
+            self.quantize_block_size,
+        )
+        self.kv_cache_total_dim = bytes_per_token
+        bytes_per_page = self.page_size * bytes_per_token
+        self.bytes_per_page_padded = bytes_per_page
+        return _alloc_2m_aligned(
+            num_pages * bytes_per_page, torch.int8, self.device
+        ).reshape(num_pages, bytes_per_page)
+
     if self.store_dtype not in (torch.bfloat16, torch.float16):
         return original_fn(self, num_pages=num_pages)
 

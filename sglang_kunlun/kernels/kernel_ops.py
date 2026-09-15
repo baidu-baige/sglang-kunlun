@@ -13,6 +13,7 @@ from typing import Callable, Dict, List, Mapping, Optional, Tuple
 import torch
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+from sglang_kunlun.kernels import dsv4_mixed_kv
 
 logger = logging.getLogger(__name__)
 _ENABLE_DSV4_ACCURACY_DUMPS = False
@@ -1381,6 +1382,136 @@ def dsv4_compress_norm_rope_store_v2_kunlun(
     plan_raw = plan[1].contiguous()
     if plan_raw.shape[0] == 0:
         return
+
+    # The caller byte-views the pool buffer before calling
+    # (``compressor_v2.forward_unified`` passes ``kv_cache.view(dtype=torch.uint8)``),
+    # so the dtype cannot identify the layout: bf16/fp16 (1024 B/token), fp8 (584)
+    # and int8 (604) all arrive as uint8. The stride is what identifies the int8
+    # layout -- ``kv.shape[-1] == 512`` (448 nope + 64 rope) also holds for fp16/bf16.
+    int8_mixed_cache = kvcache.shape[1] == page_size * dsv4_mixed_kv.STRIDE
+
+    if int8_mixed_cache and kv.shape[-1] != (
+        dsv4_mixed_kv.NOPE_DIM + dsv4_mixed_kv.ROPE_DIM
+    ):
+        # Falling through would hand an int8 buffer to the fp8 op below, which
+        # writes [nope fp8 | rope bf16 | ue8m0 scale] (584 B/token). Those bytes
+        # dequantise to garbage instead of failing, so refuse instead.
+        raise ValueError(
+            f"int8 mixed KV cache ({dsv4_mixed_kv.STRIDE} B/token) but the "
+            f"compressor produced {kv.shape[-1]} columns, expected "
+            f"{dsv4_mixed_kv.NOPE_DIM + dsv4_mixed_kv.ROPE_DIM}"
+        )
+
+    if int8_mixed_cache:
+        import kunlun_ops
+
+        normalized = kv.to(torch.bfloat16).contiguous().clone()
+        plan_i32 = plan_raw.view(torch.int32)
+        seq_lens = plan_i32[:, 0]
+        num_rows = plan_i32.shape[0]
+
+        # Mirror ``fused_norm_rope_v2`` -- the op the fp16/bf16 path runs -- row
+        # for row: nothing is stored for a row the compressor did not produce, and
+        # the RoPE position is ``seq_len - compress_ratio``.
+        if plan.is_decode:
+            # v2 DecodePlan = {seq_len, write_loc, read_page_0, read_page_1}.
+            # mode=1 wants ``int32[n] = seq_len`` and derives both the row
+            # (``work_id``) and the rotation position (``seq_len - ratio``) itself,
+            # exactly like ``fused_norm_rope_v2``, so the first word is already the
+            # handle we owe the kernel.  The destination is ``out_loc[work_id]``,
+            # which ``_init_compressed_attn_metadata_kernel`` leaves at 0 whenever
+            # ``seq_len % compress_ratio != 0``.
+            storable = seq_lens.remainder(plan.compress_ratio) == 0
+            loc = out_loc.to(torch.int64)[:num_rows]
+            handle = seq_lens.contiguous()
+        else:
+            # v2 CompressPlan = {seq_len, ragged_id | buffer_len, read_page_0,
+            # read_page_1}, whereas mode=0 wants the v1 PrefillPlan = {ragged_id,
+            # batch_id, position, window_len}.  Both are 16 bytes, so handing
+            # ``plan[1]`` over made the kernel read ``seq_len`` as a row index
+            # (writing out of bounds) and ``read_page_0`` as a RoPE position.  The
+            # three fields it really needs:
+            #   dst      = ``out_loc[ragged_id]``; ``is_invalid()`` is seq_len == -1
+            #   row      = the work id (a negative row is the kernel's "skip me")
+            #   position = ``seq_len - 1``, because the kernel rotates by
+            #              ``position + 1 - ratio`` (``fused_norm_rope.cuh``) and
+            #              v1 defines ``position = seq_len - 1`` (``c4.cuh``).
+            #              Feeding the v2 ``seq_len`` -- or ``seq_len - ratio`` --
+            #              rotates ``ratio - 1`` too far.
+            storable = seq_lens != -1
+            loc = out_loc.to(torch.int64).index_select(
+                0,
+                plan_i32[:, 1]
+                .bitwise_and(0xFFFF)
+                .to(torch.int64)
+                .clamp(min=0, max=max(out_loc.shape[0] - 1, 0)),
+            )
+            handle = torch.zeros(
+                (num_rows, 4), dtype=torch.int32, device=plan_i32.device
+            )
+            handle[:, 0] = torch.where(
+                storable,
+                torch.arange(num_rows, dtype=torch.int32, device=plan_i32.device),
+                torch.full((), -1, dtype=torch.int32, device=plan_i32.device),
+            )
+            handle[:, 2] = torch.where(
+                storable, seq_lens - 1, torch.zeros_like(seq_lens)
+            )
+
+        kunlun_ops.dpsk_v4_norm_rope_gptj(
+            normalized,
+            norm_weight.to(normalized.dtype).contiguous(),
+            handle,
+            freq_cis,
+            1 if plan.is_decode else 0,
+            plan.compress_ratio,
+            norm_eps,
+        )
+
+        # A row that must not be stored is zeroed and sent to slot 0, which the
+        # paged allocator reserves for dummy writes (``allocator/paged.py::clear``
+        # starts free pages at 1).  The quantiser still leaves one denormal scale
+        # per group there, but the row dequantises to zero.  Keep this fixed-shape
+        # and sync-free for the same reason
+        # ``dsv4_fused_k_norm_rope_flashmla_kunlun`` does: a host sync or a
+        # data-dependent shape inside a graph capture freezes a stale row count.
+        normalized = torch.where(
+            storable.unsqueeze(-1),
+            normalized,
+            torch.zeros((), dtype=normalized.dtype, device=normalized.device),
+        )
+        loc = torch.where(
+            storable, loc, torch.zeros((), dtype=loc.dtype, device=loc.device)
+        )
+
+        flat = kvcache.view(torch.int8).reshape(-1, dsv4_mixed_kv.STRIDE)
+        loc_i32 = (
+            loc.clamp(min=0, max=flat.shape[0] - 1).to(torch.int32).contiguous()
+        )
+        kunlun_ops.quantize_mla_kv_cache_split(
+            normalized,
+            loc_i32,
+            flat,
+            dsv4_mixed_kv.NOPE_DIM,
+            dsv4_mixed_kv.ROPE_DIM,
+            dsv4_mixed_kv.GROUP_SIZE,
+        )
+        # ``quantize_mla_kv_cache_split`` emits [nope | scale | rope]; roll the
+        # tail into the [nope | rope | scale] order every reader derives from
+        # ``dsv4_mixed_kv``.
+        dsv4_mixed_kv.move_scale_to_tail(flat, loc_i32)
+        return
+
+    if kvcache.dtype == torch.int8:
+        # An int8 pool whose stride the check above did not recognise (wrong
+        # ``page_size``, or a caller that does not byte-view its buffer). The fp8
+        # op below would write a different bytes-per-token format into it.
+        raise ValueError(
+            f"int8 KV cache buffer of stride {kvcache.shape[1]} with "
+            f"page_size={page_size}, expected {page_size * dsv4_mixed_kv.STRIDE} "
+            f"({dsv4_mixed_kv.STRIDE} B/token)"
+        )
+
     freq_real = (
         torch.view_as_real(freq_cis).flatten(-2)
         if freq_cis.is_complex()
@@ -4542,6 +4673,42 @@ def dsv4_fused_k_norm_rope_flashmla_kunlun(
         and not getattr(dsv4_fused_k_norm_rope_flashmla_kunlun, "_dumped", False)
     )
     rotated_rows = rotated.reshape(rotated.shape[0], -1)
+    if kvcache.dtype == torch.int8 and kvcache.shape[1] == page_size * dsv4_mixed_kv.STRIDE:
+        committed_rotated = (
+            torch.where(
+                committed,
+                rotated_rows,
+                torch.zeros(
+                    (), dtype=rotated_rows.dtype, device=rotated_rows.device
+                ),
+            )
+            .to(torch.bfloat16)
+            .contiguous()
+        )
+        flat = kvcache.view(torch.int8).reshape(-1, dsv4_mixed_kv.STRIDE)
+        loc_i32 = loc.to(torch.int32).contiguous()
+        kunlun_ops.quantize_mla_kv_cache_split(
+            committed_rotated,
+            loc_i32,
+            flat,
+            dsv4_mixed_kv.NOPE_DIM,
+            dsv4_mixed_kv.ROPE_DIM,
+            dsv4_mixed_kv.GROUP_SIZE,
+        )
+        dsv4_mixed_kv.move_scale_to_tail(flat, loc_i32)
+        return
+
+    if kvcache.dtype == torch.int8:
+        # Same silent-corruption path as ``dsv4_compress_norm_rope_store_v2_kunlun``:
+        # an int8 buffer whose stride the check above did not recognise would take the
+        # bf16 branch below, which casts the rows to int8 and scatters them raw -- no
+        # quantisation and no scales.
+        raise ValueError(
+            f"int8 KV cache buffer of stride {kvcache.shape[1]} with "
+            f"page_size={page_size}, expected {page_size * dsv4_mixed_kv.STRIDE} "
+            f"({dsv4_mixed_kv.STRIDE} B/token)"
+        )
+
     if rotated_rows.dtype != kvcache.dtype:
         # ``set_k_and_s_v4_with_mapping`` copies 2-byte elements without
         # converting, so handing it bf16 rows for an fp16 cache

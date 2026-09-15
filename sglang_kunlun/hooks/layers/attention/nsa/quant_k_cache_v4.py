@@ -18,6 +18,8 @@ def _resolve_kv_cache_dtype(kv_cache_dtype: torch.dtype | None) -> torch.dtype:
         return torch.float16
     if value in ("bf16", "bfloat16"):
         return torch.bfloat16
+    if value in ("int8", "torch.int8"):
+        return torch.int8
     if value is None or value == "auto":
         return get_global_server_args().dtype
     raise NotImplementedError(f"Unsupported DSV4 KV-cache dtype: {value}")
@@ -39,6 +41,13 @@ def quant_to_nope_fp8_rope_bf16_pack_triton(
     assert hidden_dim == 512
 
     resolved_dtype = _resolve_kv_cache_dtype(kv_cache_dtype)
+    if resolved_dtype == torch.int8:
+        return NopeFp8RopeBf16Pack(
+            k_nope_fp8=k_bf16.to(torch.bfloat16).contiguous(),
+            k_rope_bf16=None,
+            scale_k_nope_ue8m0=None,
+            kv_cache_dtype=torch.int8,
+        )
     if resolved_dtype in (torch.bfloat16, torch.float16):
         return NopeFp8RopeBf16Pack(
             k_nope_fp8=k_bf16.to(resolved_dtype),
@@ -46,4 +55,4 @@ def quant_to_nope_fp8_rope_bf16_pack_triton(
             scale_k_nope_ue8m0=None,
             kv_cache_dtype=resolved_dtype,
         )
-    raise NotImplementedError("Only support bf16/fp16 by now.")
+    raise NotImplementedError(f"Unsupported DSV4 KV cache dtype: {kv_cache_dtype}")
