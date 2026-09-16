@@ -990,6 +990,11 @@ class KunlunAttentionBackend(AttentionBackend):
         """
         if key_cache.dim() == 4 or self.page_size <= 1:
             return key_cache, value_cache, page_table
+        # Gate: this conversion exists for the MiniMax sparse sub-pools only.
+        # Every other pool keeps the previous behaviour (cache passed through
+        # untouched), so no other model can be affected by it.
+        if not getattr(self.token_to_kv_pool, "is_minimax_sparse_pool", False):
+            return key_cache, value_cache, page_table
         num_slots, head_num, k_dim = key_cache.shape
         v_dim = value_cache.shape[2]
         num_pages = num_slots // self.page_size
@@ -1015,6 +1020,10 @@ class KunlunAttentionBackend(AttentionBackend):
         Returns ``(key, value, page_table)``.
         """
         if key_cache.dim() == 4 or self.page_size <= 1:
+            return key_cache, value_cache, page_table
+        # Gate: gathering exists for the MiniMax sparse sub-pools only; every
+        # other pool keeps the previous behaviour.
+        if not getattr(self.token_to_kv_pool, "is_minimax_sparse_pool", False):
             return key_cache, value_cache, page_table
         if key_cache.dim() != 3 or value_cache.dim() != 3:
             raise RuntimeError(

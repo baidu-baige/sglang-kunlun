@@ -65,14 +65,90 @@ class KunlunMHATokenToKOnlyPool(MHATokenToKOnlyPool):
         current_platform.synchronize()
 
 
+class KunlunMiniMaxMHATokenToKVPool(KunlunMHATokenToKVPool):
+    """MHA sub-pool for the MiniMax sparse KV path (main K/V + index K/V).
+
+    Only this subclass knows how the MiniMax sparse path stores KV; the shared
+    ``KunlunMHATokenToKVPool`` keeps its previous behaviour so no other model can
+    be affected. The two differences:
+
+    * the MiniMax sparse sub-pools are 3D NHD slot-row buffers at page_size > 1
+      and the XPU ``reshape_and_cache`` only accepts the 4D paged layout, so the
+      NHD store is a plain slot scatter instead of a kernel launch;
+    * the write target can arrive as ``KVWriteLoc`` (0.5.19 backend contract),
+      which the shared writer now unwraps too; unwrapped here so the layout
+      branch below sees the plain tensor.
+
+    Every other layout (padded 4D / HND) falls back to the shared writer.
+    """
+
+    #: Marker for the dense backend's paged-KV view gate (duck-typed, so the
+    #: shared backend does not import this package).
+    is_minimax_sparse_pool = True
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc_info,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
+    ):
+        """Store K/V, scattering NHD slot-row buffers instead of using the kernel."""
+        from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
+
+        loc, _, _ = unwrap_write_loc(loc_info)
+        if self.head_dim == self.v_head_dim and not self.use_hnd:
+            # NHD slot-row (MiniMax sparse sub-pools). dtype/scale handling is
+            # identical to the shared writer; only the final store differs.
+            if cache_k.dtype != self.dtype:
+                if k_scale is not None:
+                    cache_k.div_(k_scale)
+                if v_scale is not None:
+                    cache_v.div_(v_scale)
+                if not self.enable_int8_kv_cache:
+                    cache_k = cache_k.to(self.dtype)
+                    cache_v = cache_v.to(self.dtype)
+            if self.store_dtype != self.dtype:
+                cache_k = cache_k.view(self.store_dtype)
+                cache_v = cache_v.view(self.store_dtype)
+
+            if cache_k.dim() == 3 and cache_k.shape[0] == loc.numel():
+                k_bhd = cache_k.contiguous()
+                v_bhd = cache_v.contiguous()
+            elif cache_k.dim() == 3 and cache_k.shape[1] == loc.numel():
+                k_bhd = cache_k.permute(1, 0, 2).contiguous()
+                v_bhd = cache_v.permute(1, 0, 2).contiguous()
+            else:
+                raise RuntimeError(
+                    f"Unexpected K/V shape {tuple(cache_k.shape)} vs loc "
+                    f"{tuple(loc.shape)}"
+                )
+
+            if layer_id_override is not None:
+                layer_id = layer_id_override
+            else:
+                layer_id = layer.layer_id
+            self.k_buffer[layer_id - self.start_layer][loc] = k_bhd
+            self.v_buffer[layer_id - self.start_layer][loc] = v_bhd
+            return
+
+        return super().set_kv_buffer(
+            layer, loc, cache_k, cache_v, k_scale, v_scale, layer_id_override
+        )
+
+
 class KunlunMiniMaxSparseKVPool(MiniMaxSparseKVPool):
     """MiniMax sparse KV pool using Kunlun paged MHA sub-pools."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(
             *args,
-            main_pool_cls=KunlunMHATokenToKVPool,
-            index_kv_pool_cls=KunlunMHATokenToKVPool,
+            main_pool_cls=KunlunMiniMaxMHATokenToKVPool,
+            index_kv_pool_cls=KunlunMiniMaxMHATokenToKVPool,
             index_k_pool_cls=KunlunMHATokenToKOnlyPool,
             **kwargs,
         )

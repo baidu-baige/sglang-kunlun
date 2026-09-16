@@ -3018,12 +3018,30 @@ def moe_fused_gate_dsv4_kunlun(
     topk_group: int = 1,
 ):
     """Match the monkey-patched DeepSeek-V4 fused MoE gate."""
-    import kunlun_ops
-
     if num_expert_group != 1 or topk_group != 1:
         raise ValueError("grouped routing is not supported by the DSV4 fused gate")
     if moe_softcapping != 0.0:
         raise ValueError("MoE softcapping is not supported by the DSV4 fused gate")
+
+    if scoring_func == "sigmoid" and apply_routed_scaling_factor_on_output:
+        # MiniMax-M3 contract (its only caller is the MiniMax sigmoid branch in
+        # hooks/layers/moe/topk.py); DSV4 keeps the dsv4 op below. The MiniMax
+        # implementation lives in the MiniMax package on purpose.
+        from sglang_kunlun.hooks.models.minimax.kernels import (
+            moe_fused_gate_minimax,
+        )
+
+        return moe_fused_gate_minimax(
+            input,
+            bias,
+            topk,
+            num_fused_shared_experts=num_fused_shared_experts,
+            renormalize=renormalize,
+            routed_scaling_factor=routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        )
+
+    import kunlun_ops
 
     num_rows = input.shape[0]
     topk_weights = torch.empty(
