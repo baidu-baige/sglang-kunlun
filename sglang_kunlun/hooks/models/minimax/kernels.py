@@ -6,8 +6,9 @@ Two groups, both registered at import time (``register_jit_op`` records a spec;
 
 * ``minimax_store_kv_index`` / ``minimax_qknorm_rope`` — upstream
   ``sglang.kernels.ops.*`` helpers replaced by XSpeedGate launches;
-* ``moe_fused_gate`` is NOT registered here: the main plugin already covers
-  ``sglang.kernels.ops.moe.moe_fused_gate`` for the same upstream contract.
+* ``moe_fused_gate`` is NOT registered here either: the main plugin owns the
+  single registration and dispatches the MiniMax contract (sigmoid + output
+  scaling) into :func:`moe_fused_gate_minimax` below.
 """
 
 from __future__ import annotations
@@ -128,3 +129,79 @@ def minimax_qknorm_rope(
 # ``scoring_func="sigmoid"`` with ``num_fused_shared_experts`` from the config.
 # Registering it again here raises "jit op already registered" (kernel_ops
 # rejects duplicate keys), so the MiniMax package deliberately leaves it alone.
+
+
+def moe_fused_gate_minimax(
+    scores: torch.Tensor,
+    bias: torch.Tensor,
+    topk: int,
+    num_fused_shared_experts: int = 0,
+    renormalize: bool = True,
+    routed_scaling_factor: float = 1.0,
+    apply_routed_scaling_factor_on_output: bool = False,
+):
+    """MiniMax-M3 fused gate (sigmoid + optional fused shared experts).
+
+    Called by the plugin's ``moe_fused_gate`` replacement only for the MiniMax
+    contract (``scoring_func="sigmoid"`` with the routed scaling applied on the
+    output); the DSV4 ``sqrtsoftplus`` contract keeps using
+    ``kunlun_ops.moe_fused_gate_dsv4``.
+    """
+    if not renormalize:
+        raise NotImplementedError(
+            "Kunlun MiniMax moe_fused_gate requires renormalize=True"
+        )
+    if routed_scaling_factor is None:
+        routed_scaling_factor = 1.0
+
+    import kunlun_ops
+
+    num_tokens, num_experts = scores.shape
+    weights = torch.empty((num_tokens, topk), dtype=torch.float32, device=scores.device)
+    indices = torch.empty((num_tokens, topk), dtype=torch.int32, device=scores.device)
+
+    if num_fused_shared_experts:
+        import xspeedgate_ops  # noqa: F401 - 注册 xspeedgate_ops schema
+
+        if hasattr(torch.ops.xspeedgate_ops, "minimax_m3_moe_fused_gate"):
+            return torch.ops.xspeedgate_ops.minimax_m3_moe_fused_gate(
+                scores,
+                bias,
+                1,
+                1,
+                topk,
+                num_fused_shared_experts,
+                routed_scaling_factor,
+                apply_routed_scaling_factor_on_output,
+            )
+        # Older xspeedgate_ops (e.g. 1.2.0) has no M3 gate; the kunlun gate
+        # implements the same contract including the fused shared experts.
+        kunlun_ops.moe_fused_gate(
+            scores,
+            bias,
+            1,
+            1,
+            topk,
+            num_fused_shared_experts,
+            routed_scaling_factor,
+            weights,
+            indices,
+            torch.empty((12, num_experts), dtype=torch.int32, device=scores.device),
+        )
+    else:
+        kunlun_ops.moe_fused_gate(
+            scores,
+            bias,
+            1,
+            1,
+            topk,
+            0,
+            routed_scaling_factor,
+            weights,
+            indices,
+            torch.empty((12, num_experts), dtype=torch.int32, device=scores.device),
+        )
+
+    if apply_routed_scaling_factor_on_output:
+        weights *= routed_scaling_factor
+    return weights, indices

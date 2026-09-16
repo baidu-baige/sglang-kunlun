@@ -223,12 +223,15 @@ def select_experts_kunlun(
                 topk=num_routed_topk if _use_aiter else top_k,
                 renormalize=renormalize,
             )
-        elif scoring_func == "sigmoid":
-            # MiniMax-M3: upstream routes the sigmoid gate through the JIT fused
-            # gate, which also carries apply_routed_scaling_factor_on_output and
-            # the fused shared experts. The plugin replaces that kernel
-            # (moe_fused_gate_dsv4_kunlun handles scoring_func="sigmoid" too),
-            # so call it instead of fused_topk.
+        elif scoring_func == "sigmoid" and apply_routed_scaling_factor_on_output:
+            # MiniMax-M3 contract only: sigmoid scoring plus the routed scaling
+            # applied on the output weights. This exact combination used to hit
+            # the ``assert not apply_routed_scaling_factor_on_output`` below, so
+            # nothing that worked before reaches this branch — every other
+            # sigmoid caller (flag False) keeps the previous fused_topk path.
+            # Upstream routes it through the JIT fused gate (which carries both
+            # the scaling flag and the fused shared experts); the plugin
+            # replaces that kernel with the MiniMax implementation.
             from sglang.kernels.ops.moe.moe_fused_gate import (
                 moe_fused_gate as _jit_moe_fused_gate,
             )
