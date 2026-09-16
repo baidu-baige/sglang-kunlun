@@ -144,6 +144,14 @@ class KunlunMiniMaxMHATokenToKVPool(KunlunMHATokenToKVPool):
 class KunlunMiniMaxSparseKVPool(MiniMaxSparseKVPool):
     """MiniMax sparse KV pool using Kunlun paged MHA sub-pools."""
 
+    #: The dense backend holds *this wrapper* (the sparse backend holds the
+    #: sub-pools directly), and it gates the NHD -> paged conversions of its
+    #: paged-KV helpers on this marker. Without it here, a chunked prefill
+    #: (chunk 2+) handed ``kunlun_ops.prefill_attention`` the raw 3D NHD pool in
+    #: ``is_prefix_cache=True`` mode, which the XPU kernel rejects
+    #: (``prefill_attention_block.cc`` xops_block_ERROR).
+    is_minimax_sparse_pool = True
+
     def __init__(self, *args, **kwargs):
         super().__init__(
             *args,
