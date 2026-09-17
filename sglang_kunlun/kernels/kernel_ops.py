@@ -4823,6 +4823,56 @@ def _set_k_and_s_triton_kernel(
 
 
 @register_triton_op(
+    "sglang.kernels.ops.attention.dsa.cp_split",
+    "dsa_cp_round_robin_split_q_seqs_kernel",
+)
+def dsa_cp_round_robin_split_q_seqs_kernel(
+    in_seqs: torch.Tensor,
+    out_seqs: torch.Tensor,
+    bs_idx: torch.Tensor,
+    tokens: int,
+    cp_size: int,
+    cp_rank: int,
+) -> None:
+    """Torch port of the DSA CP round-robin q-sequence split kernel.
+
+    Both upstream call sites use Triton launch syntax
+    (``dsa_cp_round_robin_split_q_seqs_kernel[(1,)](...)`` in
+    ``InterleaveCPStrategy.shard_per_request`` and ``kernel[grid](...)`` in
+    ``dsa.utils``), which ``KernelLauncher`` already bridges; Triton itself has
+    no Kunlun backend ("0 compatible backends for target (cuda)"), so the scan
+    is reimplemented here.
+
+    Writes the compacted per-rank query lengths (``out_seqs``) and the batch
+    indices that own them (``bs_idx``) exactly like the kernel: a running
+    remainder carries across requests, and only requests with a non-zero share
+    are emitted.
+    """
+
+    total = int(out_seqs.numel())
+    cp_size = max(int(cp_size), 1)
+    cp_rank = int(cp_rank)
+    extra = 0
+    written = 0
+    for index in range(int(tokens)):
+        cur_len = int(in_seqs[index].item()) + extra
+        cur_seq = cur_len // cp_size + (1 if cur_len % cp_size > cp_rank else 0)
+        extra = cur_len - cur_seq * cp_size
+        if cur_seq <= 0:
+            continue
+        if written >= total:
+            # Should not happen: the caller sizes the buffers from its own CPU
+            # copy of this scan. Fail loudly rather than truncating silently.
+            raise RuntimeError(
+                "dsa cp split produced more non-empty requests than the "
+                f"caller allocated ({written + 1} > {total})"
+            )
+        bs_idx[written] = index
+        out_seqs[written] = cur_seq
+        written += 1
+
+
+@register_triton_op(
     "sglang.kernels.ops.attention.dsa.triton_kernel",
     "_act_quant_kernel",
 )

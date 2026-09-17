@@ -1,4 +1,4 @@
-"""kunlun_nsa attention backend for sglang (DeepSeek sparse attention)."""
+"""kunlun_nsa attention backend"""
 
 from __future__ import annotations
 

@@ -3,11 +3,26 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 
 import torch
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
+from sglang_kunlun.models.mtp_input_correction import (
+    BLOCKS_SUFFIX,
+    MODEL_ATTR,
+    attach_correction,
+    corrected_hidden,
+    load_blocks_from_checkpoint,
+    mtp_input_correction_enabled,
+)
+
+logger = logging.getLogger(__name__)
+
+# One-shot state for the MTP input-correction diagnostics.
+_MTP_CORRECTION_LOGGED = False
+_MTP_CORRECTION_LOADED = False
 
 def draft_forward_context(draft_model_runner):
     """Bind the ambient ForwardContext to the *draft* runner's attention backend.
@@ -347,11 +362,69 @@ def publish_verify_stride_kunlun(result, self, batch, grammar_barrier=None):
     return result
 
 
-# NOTE: 0.5.19 上游 ``_resolve_spec_v2_tokens`` 已经等价于原先昆仑替换的实现
-# （按 stride 定宽切行 + accept_lens 截断），并且额外维护
-# ``result.num_block_accept_tokens`` / ``num_cap_tokens``（``process_batch_result_decode``
-# 会无条件读取）以及 ``req.kv.kv_committed_len``（0.5.17 是 ``req.kv_committed_len``）。
-# 继续替换只会丢掉这些新账本，所以这里不再挂 hook，直接用上游实现。
+def _ensure_draft_input_correction(worker, model) -> None:
+    """Attach the checkpoint's MTP input correction to the draft model once.
+
+    The loader hook in ``models/deepseek_v4.py`` is the proper path, but which
+    model module actually runs depends on the deployment; reading the tensor
+    straight from the draft checkpoint here keeps the fix working regardless.
+    """
+    global _MTP_CORRECTION_LOADED
+    if _MTP_CORRECTION_LOADED:
+        return
+    _MTP_CORRECTION_LOADED = True
+    runner = getattr(worker, "draft_runner", None)
+    model_path = getattr(getattr(runner, "model_config", None), "model_path", None)
+    if not model_path:
+        model_path = getattr(worker.server_args, "speculative_draft_model_path", None) or getattr(
+            worker.server_args, "model_path", None
+        )
+    blocks = load_blocks_from_checkpoint(model_path)
+    if blocks is None:
+        logger.info(
+            "sglang-kunlun: no %s in %s; MTP input correction stays off",
+            BLOCKS_SUFFIX,
+            model_path,
+        )
+        return
+    attach_correction(model, blocks)
+    logger.info(
+        "sglang-kunlun: loaded MTP input correction %s from %s",
+        tuple(blocks.shape),
+        model_path,
+    )
+
+
+def correct_draft_input_hidden(worker, batch_result):
+    """Apply the draft's MTP input correction to the target hidden, if any.
+
+    Returns the corrected tensor (or ``None`` when there is nothing to do, so
+    the caller leaves the batch result untouched).
+    """
+    if not mtp_input_correction_enabled():
+        return None
+    runner = getattr(worker, "draft_runner", None)
+    model = getattr(runner, "model", None)
+    if model is None:
+        return None
+    if getattr(model, MODEL_ATTR, None) is None:
+        _ensure_draft_input_correction(worker, model)
+    if getattr(model, MODEL_ATTR, None) is None:
+        return None
+    hidden = batch_result.logits_output.hidden_states
+    corrected = corrected_hidden(model, hidden)
+    if corrected is hidden:
+        return None
+    global _MTP_CORRECTION_LOGGED
+    if not _MTP_CORRECTION_LOGGED:
+        _MTP_CORRECTION_LOGGED = True
+        logger.info(
+            "sglang-kunlun: MTP input correction applied to the draft hidden "
+            "(%s %s)",
+            tuple(corrected.shape),
+            corrected.dtype,
+        )
+    return corrected
 
 
 @plugin_hook(
@@ -361,6 +434,15 @@ def publish_verify_stride_kunlun(result, self, batch, grammar_barrier=None):
 def draft_extend_for_decode_kunlun(self, batch, batch_result):
     """Compact accepted request prefixes for synchronous DSV4 draft extend."""
     import sglang.srt.speculative.eagle_worker_v2 as upstream
+
+    # GLM-5.3's MTP input correction (QuaRot/R1 compensation for the draft's
+    # input hidden, ``model.norm.mtp_input_correction.blocks``) is attached to
+    # the draft model at load time by ``models/mtp_input_correction.py``. The
+    # draft consumes the *target* hidden here (and in the prefill extend), so
+    # correct it once per batch before it is compacted / indexed.
+    corrected = correct_draft_input_hidden(self, batch_result)
+    if corrected is not None:
+        batch_result.logits_output.hidden_states = corrected
 
     if self.server_args.disable_overlap_schedule:
         accepted = accepted_prefix_indices(
@@ -418,6 +500,15 @@ def draft_extend_for_decode_kunlun(self, batch, batch_result):
         can_graph = can_run_draft_extend_graph(
             self.cuda_graph_runner_for_draft_extend, forward_batch
         )
+    # GLM-5.2 MTP IndexShare: publish this extend's indexer top-k so the next
+    # draft loop can seed its sparse selection instead of re-running the decode
+    # indexer. The graph path is already wired by the runner (it hands the
+    # captured buffer to spec_info during capture); the eager path owns it here.
+    seed_enabled = bool(getattr(self, "seed_dsa_topk_from_draft_extend", False))
+    if seed_enabled and not can_graph:
+        forward_batch.spec_info.dsa_seed_topk_capture = (
+            self._get_dsa_extend_topk_buf(forward_batch.input_ids.shape[0])
+        )
     manager = self.draft_runner.canary_manager
     canary_context = (
         upstream.context_tuple(
@@ -471,5 +562,16 @@ def draft_extend_for_decode_kunlun(self, batch, batch_result):
     next_draft_input.topk_p = topk_p
     next_draft_input.topk_index = topk_index
     next_draft_input.hidden_states = output.hidden_states
+    if seed_enabled:
+        # One index row per request, taken from the last accepted position
+        # (``select_index``), which is the position whose context the next draft
+        # loop's first query continues from.
+        seed_capture = (
+            self.cuda_graph_runner_for_draft_extend.buffers.dsa_seed_topk_capture
+            if can_graph
+            else forward_batch.spec_info.dsa_seed_topk_capture
+        )
+        if seed_capture is not None:
+            next_draft_input.dsa_topk_indices = seed_capture[select_index]
     if self.server_args.speculative_use_rejection_sampling:
         next_draft_input.draft_probs = draft_probs
