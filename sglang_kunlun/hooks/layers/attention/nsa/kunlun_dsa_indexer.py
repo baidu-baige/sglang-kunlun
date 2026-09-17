@@ -33,6 +33,7 @@ from einops import rearrange
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
+from sglang.srt.layers.cp.utils import get_cp_strategy, is_cp_v2_active
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.layers.attention.dsa.dsa_indexer import (
     _broadcast_indexer_topk_from_rank0,
@@ -766,7 +767,17 @@ def _get_q_k_bf16(
         key = rotate_activation(key)
 
     # allgather+rerrange
-    if forward_batch.attn_cp_metadata is not None and indexer.dsa_enable_prefill_cp:
+    if is_cp_v2_active(forward_batch):
+        # CP-v2 (``--cp-strategy interleave``): the strategy owns the gather, so
+        # it restores the original token order and drops the per-rank padding.
+        # ``cp_all_gather_rerange_output`` cannot do that here: for round-robin
+        # it returns ``local_rows * cp_size`` rows, and the local rows are padded
+        # to ``max_rank_len`` whenever ``total_tokens % cp_size != 0``. The K
+        # store pairs one key row with one ``forward_batch.out_cache_loc`` entry,
+        # so the extra padded rows make the Kunlun store abort with
+        # "set_k_and_s_triton: k_num != loc_num".
+        key = get_cp_strategy().materialize_full_indexer_k_cache(key, forward_batch)
+    elif forward_batch.attn_cp_metadata is not None and indexer.dsa_enable_prefill_cp:
         key = cp_all_gather_rerange_output(
             key.contiguous(),
             indexer.cp_size,
@@ -918,11 +929,14 @@ def forward_cuda(
     query, key = _get_q_k_bf16(indexer,
             q_lora, x, positions, False, forward_batch=forward_batch
         )
+    # ``_get_q_k_bf16`` already gathered the key to the full sequence (CP) and
+    # restored the token order, so it pairs row-for-row with the (also full)
+    # ``forward_batch.out_cache_loc``.
+    key_shape = key.shape
+    key = key.view(-1, indexer.block_size)
     # TODO: try to remove this to act_quant
     query_shape = query.shape
-    key_shape = key.shape
     query = query.view(-1, indexer.block_size)
-    key = key.view(-1, indexer.block_size)
     q_fp8 = torch.empty(
         query.shape,
         device=query.device,
