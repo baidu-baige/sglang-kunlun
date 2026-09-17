@@ -17,7 +17,8 @@ logger = logging.getLogger(__name__)
 
 try:
     import torch
-    import sglang.srt.layers.attention.fla.utils as _fla_utils
+    # 0.5.19 把 fla 从 srt/layers/attention 移到了 kernels/ops/attention。
+    import sglang.kernels.ops.attention.fla.utils as _fla_utils
 
     def _get_available_device() -> str:
         return "cuda"
@@ -30,4 +31,4 @@ try:
     _fla_utils.is_intel = False
     logger.info("Kunlun: fla.utils.get_available_device -> 'cuda'")
 except Exception as e:  # pragma: no cover
-    logger.warning("fla utils kunlun patch failed: %s", e)
+    logger.warning("fla utils kunlun patch failed: %s", e, exc_info=True)

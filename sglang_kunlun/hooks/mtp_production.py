@@ -9,7 +9,7 @@ import torch
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
-from sglang_kunlun.models.mtp_input_correction import (
+from sglang_kunlun.hooks.models.mtp_input_correction import (
     BLOCKS_SUFFIX,
     MODEL_ATTR,
     attach_correction,

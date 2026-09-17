@@ -1,4 +1,9 @@
-"""Kunlun model hooks and out-of-tree model registration."""
+"""Kunlun model hooks and out-of-tree model registration.
+
+hook 实现已全部迁移到 ``sglang_kunlun.hooks.models``；本包只保留 out-of-tree
+model package 的设置（上游 ModelRegistry 据此解析外部模型模块）。为让 int4
+name mapper 等注册在模型解析前就绪，这里从 hooks 包提前 import 一次。
+"""
 
 from __future__ import annotations
 
@@ -6,10 +11,9 @@ import logging
 
 from sglang.srt.environ import envs
 
-from . import deepseek_v2  # noqa: F401
-from . import deepseek_v4  # noqa: F401
-from . import deepseek_v4_nextn  # noqa: F401
-from . import deepseek_v4_precision  # noqa: F401
+# 提前 import：int4/量化 name mapper 的安装挂在 deepseek_v4 hook 模块的 import
+# 副作用上，必须早于上游读取 ``hf_to_sglang_mapper``（模型加载）。
+from sglang_kunlun.hooks.models import deepseek_v4 as _deepseek_v4  # noqa: F401
 
 logger = logging.getLogger(__name__)
 

@@ -21,4 +21,5 @@ _kunlun_pre_shim()
 from . import attention_registry  # noqa: E402,F401
 from . import kunlun_deepseek_v4_backend  # noqa: E402,F401
 from . import nsa  # noqa: E402,F401
+from . import dsv4  # noqa: E402,F401
 from . import fla  # noqa: E402,F401
