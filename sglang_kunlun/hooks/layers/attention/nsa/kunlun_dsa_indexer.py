@@ -186,6 +186,61 @@ def _get_logits_head_gate(indexer, x: torch.Tensor, q_scale: torch.Tensor):
     return weights
 
 
+def _live_row_index(
+    extend_lens: List[int], rows: int, device: torch.device
+) -> Optional[torch.Tensor]:
+    """Rows of a padded per-request metadata layout that carry real q tokens."""
+    q_offset = sum(extend_lens)
+    bs = len(extend_lens)
+    if rows == q_offset or bs == 0 or rows % bs != 0:
+        return None
+    stride = rows // bs
+    if any(length > stride for length in extend_lens):
+        return None
+    return torch.cat(
+        [
+            torch.arange(i * stride, i * stride + length, device=device)
+            for i, length in enumerate(extend_lens)
+            if length > 0
+        ]
+    )
+
+
+def _metadata_shapes(attn_metadata) -> str:
+    """One-line dump of the DSA metadata row shapes, for alignment failures."""
+    fields = (
+        "cache_seqlens_int32",
+        "dsa_cache_seqlens_int32",
+        "dsa_seqlens_expanded",
+        "page_table_1",
+        "real_page_table",
+        "cu_seqlens_q",
+        "cu_seqlens_k",
+    )
+    parts = []
+    for name in fields:
+        value = getattr(attn_metadata, name, None)
+        parts.append(f"{name}={None if value is None else tuple(value.shape)}")
+    parts.append(f"max_seq_len_q={getattr(attn_metadata, 'max_seq_len_q', None)}")
+    parts.append(f"max_seq_len_k={getattr(attn_metadata, 'max_seq_len_k', None)}")
+    parts.append(
+        f"dsa_extend_seq_lens_list={getattr(attn_metadata, 'dsa_extend_seq_lens_list', None)}"
+    )
+    return "md(" + ", ".join(parts) + ")"
+
+
+def _align_rows_to_q(tensor, extend_lens: List[int], q_offset: int):
+    """Reduce a per-request-padded metadata tensor to the live q rows."""
+    if tensor is None or tensor.shape[0] == q_offset:
+        return tensor
+    index = _live_row_index(extend_lens, tensor.shape[0], tensor.device)
+    if index is not None:
+        return tensor[index]
+    if tensor.shape[0] > q_offset:
+        return tensor[:q_offset]
+    return tensor
+
+
 def _get_topk_paged(
     indexer,
     forward_batch: ForwardBatch,
@@ -226,21 +281,44 @@ def _get_topk_paged(
         seqlens_32 = metadata.get_seqlens_int32()
         seqlens_32_cpu = metadata.get_seqlens_int32_cpu()
 
-    # DRAFT_EXTEND_V2 pads the page table to ``bs * speculative_num_draft_tokens``
-    # rows while only the accepted prefix is live, and the Kunlun ops require
-    # exactly one page-table row per context length.
-    if block_tables.shape[0] > seqlens_32.shape[0]:
-        block_tables = block_tables[: seqlens_32.shape[0]]
-
     assert len(q_fp8.shape) == 3, f"q_fp8.shape: {q_fp8.shape}"
     q_fp8 = q_fp8.unsqueeze(1)
 
     if len(weights.shape) == 2:
         weights = weights.unsqueeze(1)
-    
+
     # When attn_tp_size > 1 or in the MAX_LEN padding mode, padding may exist in the hidden states,
     # and it is necessary to extract the actual q length.
-    q_offset = sum(metadata.get_dsa_extend_len_cpu())
+    extend_lens = list(metadata.get_dsa_extend_len_cpu())
+    q_offset = sum(extend_lens)
+
+    # ``dsa_paged_mqa_logits`` takes its batch from ``q.size(0)`` (== q_offset
+    # below) and requires the gathered scale, the page table and the context
+    # lengths to have exactly that many rows. Draft-extend metadata pads the page
+    # table to ``max_extend_len`` rows per request, so pick the live rows per
+    # request instead of a prefix -- a prefix would misalign every request that
+    # follows a partially-accepted one.
+    seqlens_32 = _align_rows_to_q(seqlens_32, extend_lens, q_offset)
+    seqlens_32_cpu = _align_rows_to_q(seqlens_32_cpu, extend_lens, q_offset)
+    block_tables = _align_rows_to_q(block_tables, extend_lens, q_offset)
+    if seqlens_32.shape[0] != q_offset or block_tables.shape[0] != q_offset:
+        backend = get_attn_backend()
+        raise RuntimeError(
+            "kunlun DSA paged top-k: cannot align metadata rows with the q rows. "
+            "The metadata does not describe this batch -- usually it was built for "
+            "a different (earlier/smaller) batch. "
+            f"mode={forward_batch.forward_mode}, q_offset={q_offset}, "
+            f"q_rows={q_fp8.shape[0]}, extend_lens={extend_lens}, "
+            f"context_lens={seqlens_32.shape[0]}, page_table={block_tables.shape[0]}, "
+            f"fb.batch_size={getattr(forward_batch, 'batch_size', None)}, "
+            f"fb.extend_seq_lens_cpu={getattr(forward_batch, 'extend_seq_lens_cpu', None)}, "
+            f"fb.seq_lens_cpu={getattr(forward_batch, 'seq_lens_cpu', None)}, "
+            f"fb.seq_lens_rows={forward_batch.seq_lens.numel()}, "
+            f"{_metadata_shapes(metadata.attn_metadata)}, "
+            f"active_backend=({id(backend)}, {type(backend).__name__}), "
+            f"fb_id={id(forward_batch)}, "
+            f"provenance={getattr(forward_batch, '_kunlun_draft_meta_provenance', None)}"
+        )
         
     head_dim = get_token_to_kv_pool().index_head_dim
     k_fp8 = kv_cache_fp8[:, :page_size * head_dim].view(
@@ -282,8 +360,30 @@ def _get_topk_paged(
     )
     
     logits = logits.reshape(-1, max_seq_len)
-    
-    topk_result = metadata.topk_transform(logits, indexer.index_topk)
+
+    # ``topk_transform`` maps the selected positions through
+    # ``attn_metadata.page_table_1``, which is padded per request just like the
+    # page-64 table. ``batch_idx_list`` is the upstream seam for selecting its
+    # rows, so reuse it rather than letting the gather blow up on mismatched rows.
+    page_table_1 = metadata.get_page_table_1()
+    page_table_index = None
+    if page_table_1 is not None and page_table_1.shape[0] != q_offset:
+        page_table_index = _live_row_index(
+            extend_lens, page_table_1.shape[0], logits.device
+        )
+        if page_table_index is None or page_table_index.numel() != q_offset:
+            raise RuntimeError(
+                "kunlun DSA paged top-k: page_table_1 rows cannot be aligned with "
+                f"the q rows (q_offset={q_offset}, extend_lens={extend_lens}, "
+                f"page_table_1={tuple(page_table_1.shape)}, "
+                f"mode={forward_batch.forward_mode}, "
+                f"{_metadata_shapes(metadata.attn_metadata)}, "
+                f"provenance={getattr(forward_batch, '_kunlun_draft_meta_provenance', None)})"
+            )
+
+    topk_result = metadata.topk_transform(
+        logits, indexer.index_topk, batch_idx_list=page_table_index
+    )
     # Restore possible padding exist in the hidden states.
     if q_offset < q_fp8.shape[0]:
         pad_len = q_fp8.shape[0] - q_offset
@@ -965,7 +1065,23 @@ def forward_cuda(
     kunlun_ops.quant2d(key, k_fp8, k_scale, force_sdnn=True)
     k_fp8 = k_fp8.view(key_shape)
     k_scale = k_scale.view(key_shape[0], -1)
-    
+
+    # Under prefill CP the gathered K covers the CP-padded token count (the round-robin
+    # split requires a multiple of cp_size) while out_cache_loc only lists the real
+    # tokens. The rerange restores token order, so the padding is the tail.
+    store_k_fp8, store_k_scale = k_fp8, k_scale
+    loc_rows = forward_batch.out_cache_loc.shape[0]
+    if store_k_fp8.shape[0] != loc_rows:
+        if store_k_fp8.shape[0] < loc_rows:
+            raise RuntimeError(
+                "kunlun DSA indexer: fewer K rows than cache locations "
+                f"(key={tuple(store_k_fp8.shape)}, loc={loc_rows}, "
+                f"cp_size={getattr(indexer, 'cp_size', None)}, "
+                f"cp_meta={forward_batch.attn_cp_metadata is not None})"
+            )
+        store_k_fp8 = store_k_fp8[:loc_rows]
+        store_k_scale = store_k_scale[:loc_rows]
+
     # `_get_logits_head_gate` expects a Tensor. For tuple activations, dequantize
     # to a float tensor here (callsite), keeping `_get_logits_head_gate` backend-agnostic.
     if isinstance(x, tuple):
@@ -1007,8 +1123,8 @@ def forward_cuda(
     get_token_to_kv_pool().set_index_k_scale_buffer(
         layer_id=layer_id,
         loc=forward_batch.out_cache_loc,
-        index_k=k_fp8,
-        index_k_scale=k_scale,
+        index_k=store_k_fp8,
+        index_k_scale=store_k_scale,
     )
     seq_len = forward_batch.seq_lens_cpu[0].item()
     

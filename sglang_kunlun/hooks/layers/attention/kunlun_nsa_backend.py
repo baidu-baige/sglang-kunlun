@@ -359,14 +359,7 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
         self._rewrap_graph_metadata(bs, forward_mode)
 
     def _rewrap_graph_metadata(self, bs: int, forward_mode: ForwardMode) -> None:
-        """Install the Kunlun metadata wrapper for this batch size.
-
-        The wrapper is created once per bs and then reused: the cuda graph is
-        recorded against its host mirrors, so their storage must stay stable
-        across replays (see ``KunlunDSAMetadata.refresh_host_mirrors``). It is
-        also written back into ``decode_cuda_graph_metadata`` so that upstream's
-        replay-prep updates the very object the forward path reads.
-        """
+        """Install the Kunlun metadata wrapper for this batch size, optionally updating the tensors."""
         cache = self.decode_cuda_graph_metadata
         metadata = self.forward_metadata
 

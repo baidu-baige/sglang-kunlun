@@ -69,19 +69,7 @@ def _kunlun_biased_grouped_topk(
     routed_scaling_factor: Optional[float],
     apply_routed_scaling_factor_on_output: Optional[bool],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Fused sigmoid + biased grouped top-k + renorm on Kunlun.
-
-    0.5.19's ``biased_grouped_topk_gpu`` routes CUDA (which Kunlun masquerades as)
-    either into flashinfer's ``fused_topk_deepseek`` -- which rejects the reported
-    compute capability -- or into the nvcc-JIT ``moe_fused_gate``, whose Kunlun
-    replacement only implements single-group routing. DeepSeek V3.x routes over 8
-    groups, so neither is usable and the whole gate runs through
-    ``kunlun_ops.moe_sigmoid_group_topk_norm`` instead.
-
-    Contract matches ``biased_grouped_topk_impl``: sigmoid scores, bias added for
-    ranking only, group top-2-sum group selection, renormalized weights, and the
-    routed scaling factor applied only when the caller asks for it on the output.
-    """
+    """Fused sigmoid + biased grouped top-k + renorm on Kunlun"""
     if num_fused_shared_experts:
         raise NotImplementedError(
             "Kunlun biased grouped top-k does not implement fused shared experts; "

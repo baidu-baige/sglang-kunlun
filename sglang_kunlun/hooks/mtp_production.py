@@ -24,8 +24,32 @@ logger = logging.getLogger(__name__)
 _MTP_CORRECTION_LOGGED = False
 _MTP_CORRECTION_LOADED = False
 
+def draft_forward_context(draft_model_runner):
+    """Bind the ambient ForwardContext to the *draft* runner's attention backend.
+
+    ``ModelRunner._forward_raw`` only publishes a ForwardContext when none is
+    active (``if has_forward_context(): ctx_mgr = nullcontext()``). The
+    draft-extend-for-decode call runs inside the target worker's forward, so the
+    draft model would otherwise resolve ``get_attn_backend()`` -- and through it
+    ``get_token_to_kv_pool()`` / the DSA indexer metadata -- to the *target*
+    backend, whose ``forward_metadata`` describes a different batch. Overriding
+    the single-field context is the documented pattern for exactly this case.
+    """
+    from sglang.srt.model_executor.forward_context import (
+        ForwardContext,
+        forward_context,
+    )
+
+    return forward_context(ForwardContext(attn_backend=draft_model_runner.attn_backend))
+
+
 def accepted_prefix_indices(accept_lens, tokens_per_request):
     """Flatten accepted prefixes from fixed-width per-request speculative rows."""
+    if accept_lens.numel() == 0:
+        # An empty local batch (a DP rank with nothing to decode this step) would
+        # build a ``{0, 1}`` comparison, which the XMLIR ``lt`` kernel rejects
+        # outright ([INVALID-SHAPE]{0, 1}). Return the empty index directly.
+        return accept_lens.new_empty((0,), dtype=torch.int64)
     columns = torch.arange(
         tokens_per_request, device=accept_lens.device, dtype=accept_lens.dtype
     )
@@ -75,6 +99,18 @@ def prepare_for_draft_extend_kunlun(
     accepted_only = accept_lens is not None and (
         predict.shape[0] != batch_size * num_draft_tokens
     )
+    if accept_lens is not None and accept_lens.numel() != batch_size:
+        # ``extend_seq_lens_cpu`` is taken from accept_lens while seq_lens /
+        # req_pool_indices come from the batch, so a length mismatch silently
+        # builds self-inconsistent DSA metadata (N extend lengths, batch_size
+        # page-table rows) that only explodes later inside the indexer.
+        raise RuntimeError(
+            "kunlun draft-extend: accept_lens does not match the local batch "
+            f"(accept_lens={accept_lens.detach().to('cpu').tolist()}, "
+            f"batch_size={batch_size}, predict_rows={predict.shape[0]}, "
+            f"num_draft_tokens={num_draft_tokens}, "
+            f"forward_mode={batch.forward_mode})"
+        )
     batch.spec_info = draft_extend_input
     batch.input_ids = predict
     maybe_detect_oob(
@@ -175,9 +211,70 @@ def prepare_for_draft_extend_kunlun(
     can_graph = can_run_draft_extend_graph(cuda_graph_runner, forward_batch)
     forward_batch._kunlun_can_run_draft_extend_graph = can_graph
     if not batch.forward_mode.is_idle() and not can_graph:
-        draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+        # The DSA backend derives its per-request rows from ``seq_lens`` /
+        # ``req_pool_indices`` but its per-token rows from ``extend_seq_lens``, so
+        # any disagreement here produces metadata that does not describe this
+        # batch and only fails much later inside the indexer.
+        rows = {
+            "seq_lens": forward_batch.seq_lens.numel(),
+            "seq_lens_cpu": (
+                None
+                if forward_batch.seq_lens_cpu is None
+                else forward_batch.seq_lens_cpu.numel()
+            ),
+            "req_pool_indices": forward_batch.req_pool_indices.numel(),
+            "extend_seq_lens": (
+                None
+                if forward_batch.extend_seq_lens is None
+                else forward_batch.extend_seq_lens.numel()
+            ),
+            "extend_seq_lens_cpu": (
+                None
+                if forward_batch.extend_seq_lens_cpu is None
+                else len(forward_batch.extend_seq_lens_cpu)
+            ),
+            "batch_size": forward_batch.batch_size,
+        }
+        if len({v for v in rows.values() if v is not None}) != 1:
+            raise RuntimeError(
+                "kunlun draft-extend: inconsistent row counts before building DSA "
+                f"metadata: {rows}, batch_seq_lens={len(batch.seq_lens)}, "
+                f"accept_lens={accept_lens.detach().to('cpu').tolist()}, "
+                f"predict_rows={predict.shape[0]}, accepted_only={accepted_only}, "
+                f"num_draft_tokens={num_draft_tokens}, "
+                f"seq_lens_cpu_values={forward_batch.seq_lens_cpu}"
+            )
+        # Build the metadata under the draft backend's own context: the DSA
+        # backend resolves the KV pool through ``get_token_to_kv_pool()``, which
+        # reads the ambient ForwardContext (still the target worker's here).
+        backend = draft_model_runner.attn_backend
+        with draft_forward_context(draft_model_runner):
+            backend.init_forward_metadata(forward_batch)
+        # Provenance for the indexer's alignment check: which backend object was
+        # initialized, with which row counts, for which ForwardBatch.
+        built = getattr(backend, "forward_metadata", None)
+        forward_batch._kunlun_draft_meta_provenance = {
+            "backend_id": id(backend),
+            "backend_cls": type(backend).__name__,
+            "fb_id": id(forward_batch),
+            "rows": rows,
+            "md_cache_seqlens": (
+                None if built is None else built.cache_seqlens_int32.numel()
+            ),
+            "md_dsa_seqlens_expanded": (
+                None if built is None else built.dsa_seqlens_expanded.numel()
+            ),
+        }
         if not is_npu() or can_graph:
-            forward_batch.mark_forward_metadata_ready()
+            # ``replan_equivalent=True`` is required, not cosmetic: with DP
+            # attention ``prepare_mlp_sync_batch`` pads this batch *after* we
+            # pre-plan here (1 real request -> 4 rows of [5,1,1,1] in PD decode),
+            # and ``needs_forward_metadata_init()`` only re-plans a marked batch
+            # when the mark site declared the re-plan safe. Without the flag the
+            # forward runs the padded batch against pre-padding metadata. This
+            # site qualifies: it plans with the same backend object the forward
+            # path uses and adds no view context.
+            forward_batch.mark_forward_metadata_ready(replan_equivalent=True)
     return forward_batch
 
 
@@ -424,7 +521,7 @@ def draft_extend_for_decode_kunlun(self, batch, batch_result):
         if manager is not None
         else contextlib.nullcontext()
     )
-    with canary_context:
+    with draft_forward_context(self.draft_runner), canary_context:
         output = (
             self.cuda_graph_runner_for_draft_extend.execute(forward_batch)
             if can_graph
