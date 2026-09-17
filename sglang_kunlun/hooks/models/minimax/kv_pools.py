@@ -13,6 +13,11 @@ retraction offloads/reloads every sub-pool uniformly through the wrapper.
 
 from __future__ import annotations
 
+from typing import Optional
+
+import torch
+
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
     MiniMaxSparseKVPool,
