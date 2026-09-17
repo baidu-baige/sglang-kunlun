@@ -5,10 +5,6 @@ from __future__ import annotations
 import torch
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
-from sglang.srt.mem_cache.pool_host.common import (
-    ALLOC_MEMORY_FUNCS,
-    alloc_with_host_register,
-)
 
 from . import shared_host_kv
 
@@ -60,49 +56,37 @@ def configure_dsv4_hiradix(original_fn, self, *args, **kwargs):
     return original_fn(self, *args, **kwargs)
 
 
-_ORIGINAL_ALLOC_WITH_HOST_REGISTER = alloc_with_host_register
+@plugin_hook(
+    "sglang.srt.mem_cache.pool_host.common.alloc_with_host_register",
+    type=HookType.AROUND,
+)
+def alloc_with_shared_host_kv(
+    original_fn,
+    dims,
+    dtype,
+    device,
+    pin_memory,
+    allocator,
+    registration_granularity_bytes=None,
+):
+    """共享 host KV 生效时从共享区分配，否则走原注册分配。
 
-
-def alloc_with_shared_host_kv(dims, *, dtype, device, pin_memory, allocator):
-    """Allocate from shared host KV when active, else fall back to the original."""
+    各 host pool 通过 ``ALLOC_MEMORY_FUNCS[device]`` 取值，其默认 factory 是
+    ``lambda: alloc_with_host_register``——lambda 在**调用时**做全局名查找，
+    而插件 apply 早于任何 host pool 构造（cuda 键的首次取值），所以包装本函数
+    即可覆盖全部分配点；不再需要改上游 defaultdict 的 default_factory。
+    """
     shared = shared_host_kv.maybe_shared_alloc(dims, dtype, device)
     if shared is not None:
         return shared
-    return _ORIGINAL_ALLOC_WITH_HOST_REGISTER(
+    return original_fn(
         dims,
         dtype=dtype,
         device=device,
         pin_memory=pin_memory,
         allocator=allocator,
+        registration_granularity_bytes=registration_granularity_bytes,
     )
-
-
-# Host pool modules use the defaultdict's factory rather than looking up the
-# function by name at call time.  Replacing the function symbol alone would
-# therefore leave the already-imported allocator path unchanged.
-ALLOC_MEMORY_FUNCS.default_factory = lambda: alloc_with_shared_host_kv
-
-
-@plugin_hook(
-    "sglang.srt.mem_cache.memory_pool_host.DeepSeekV4PagedHostPool."
-    "backup_from_device_all_layer",
-    type=HookType.AROUND,
-)
-@plugin_hook(
-    "sglang.srt.mem_cache.memory_pool_host.DeepSeekV4StateHostPool."
-    "backup_from_device_all_layer",
-    type=HookType.AROUND,
-)
-def dsv4_shared_backup(original_fn, self, *args, **kwargs):
-    """Skip host writes on non-leader TP ranks sharing the same host KV.
-
-    0.5.19 moved the host-pool backup entry point from ``HostPoolGroup`` (a
-    0.5.17-only class) onto the per-pool classes, so this hook follows the
-    pool backup methods instead.
-    """
-    if shared_host_kv.skip_write():
-        return None
-    return original_fn(self, *args, **kwargs)
 
 
 @plugin_hook(

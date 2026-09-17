@@ -19,6 +19,8 @@ from sglang_kunlun.kernels.sgl_kernel_kunlun.dsv4_hicache import (
     transfer_kv_per_layer_mla,
 )
 
+from . import shared_host_kv
+
 
 def _require_full_page_transfer(pool, host_indices, device_indices) -> None:
     if host_indices is None or device_indices is None:
@@ -104,7 +106,14 @@ def _transfer_per_layer(
 def dsv4_paged_backup_kunlun(
     original_fn, self, device_pool, host_indices, device_indices, io_backend
 ):
-    """Back up all layers of the DSV4 paged host pool with the Kunlun kernel."""
+    """Back up all layers of the DSV4 paged host pool with the Kunlun kernel.
+
+    共享 host KV 开启时只有 leader rank 写 host（原实现在
+    ``shared_host_kv_hooks`` 里以第二个 AROUND 短路表达；两个 hook 同 target
+    会触发 "Multiple AROUND hooks" 提示且顺序敏感，这里合并为单一 hook）。
+    """
+    if shared_host_kv.skip_write():
+        return None
     _transfer_all_layer(self, host_indices, device_indices, io_backend)
 
 
@@ -128,7 +137,12 @@ def dsv4_paged_load_kunlun(
 def dsv4_state_backup_kunlun(
     original_fn, self, device_pool, host_indices, device_indices, io_backend
 ):
-    """Back up all layers of the DSV4 state host pool with the Kunlun kernel."""
+    """Back up all layers of the DSV4 state host pool with the Kunlun kernel.
+
+    同 paged 版：合并了共享 host KV 的 leader-rank 短路判断。
+    """
+    if shared_host_kv.skip_write():
+        return None
     _transfer_all_layer(self, host_indices, device_indices, io_backend)
 
 

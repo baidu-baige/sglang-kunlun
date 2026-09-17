@@ -7,7 +7,7 @@ def _patch_fla_utils_if_loaded() -> None:
     import sys
     import torch
 
-    module = sys.modules.get("sglang.srt.layers.attention.fla.utils")
+    module = sys.modules.get("sglang.kernels.ops.attention.fla.utils")
     if module is None:
         return
 

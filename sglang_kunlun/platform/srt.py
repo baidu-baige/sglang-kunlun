@@ -45,7 +45,7 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
 
     def __init__(self) -> None:
         super().__init__()
-        # Must run before any sglang.srt.layers.attention.fla import.
+        # Must run before any sglang.kernels.ops.attention.fla import.
         from sglang_kunlun.bootstrap import _kunlun_pre_shim
 
         _kunlun_pre_shim()

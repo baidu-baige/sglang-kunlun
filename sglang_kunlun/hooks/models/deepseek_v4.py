@@ -1,72 +1,316 @@
-"""Hooks for DeepseekV4DecoderLayer methods (hc_post, hc_pre)."""
+"""Method hooks for the upstream DeepSeek V4 model; no model classes are copied."""
+
 from __future__ import annotations
 
-from typing import Literal
+from typing import Optional
 
 import torch
+import torch.nn.functional as F
+from torch import nn
 
-from sglang.srt.environ import envs
-from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
-from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+from sglang_kunlun.kernels.kernel_ops import dsv4_mqa_wo_a_einsum_kunlun
 
-# --------------------------- INT4 checkpoint support ---------------------
-# The compressed-tensors targets/ignore lists in the INT4 checkpoint use the
-# original HF module names (`attn`/`ffn`/`w1..w3`), while the weights
-# themselves are remapped by `remap_weight_name_to_dpsk_hf_format`. The mapper
-# is picked up by the model loader to remap the quantization config. The keys
-# look like regexes because the checkpoint targets are regex strings; 0.5.14
-# WeightsMapper still matches them as plain substrings.
-DeepseekV4ForCausalLM.packed_modules_mapping = {
-    "wqkv_a": ["wq_a", "wkv"],
-    "gate_up_proj": ["gate_proj", "up_proj"],
-}
-
-DeepseekV4ForCausalLM.hf_to_sglang_mapper = WeightsMapper(
-    orig_to_new_substr={
-        r"\.attn\.": r"\.self_attn\.",
-        r"\.ffn\.": r"\.mlp\.",
-        r"\.attn_norm": r"\.input_layernorm",
-        r"\.ffn_norm": r"\.post_attention_layernorm",
-    },
-    orig_to_new_suffix={
-        r"\.w1$": r"\.gate_proj$",
-        r"\.w2$": r"\.down_proj$",
-        r"\.w3$": r"\.up_proj$",
-    },
-)
+from .mtp_input_correction import strip_correction_blocks
 
 
-def _fuse_wqkv_a_weight_scale(weights):
-    """Concat the ``wq_a``/``wkv`` per-channel scales for the fused ``wqkv_a``.
-
-    Upstream `load_weights` already fuses ``.weight`` and ``.weight_scale_inv``;
-    the int4 checkpoint instead carries ``.weight_scale``, which is fused here
-    so the generic loader path picks it up as a plain ``wqkv_a.weight_scale``.
-    """
-    pending = {}
-    for name, tensor in weights:
-        is_q = name.endswith(".wq_a.weight_scale")
-        if not is_q and not name.endswith(".wkv.weight_scale"):
-            yield name, tensor
-            continue
-        fused_name = name.replace(".wq_a." if is_q else ".wkv.", ".wqkv_a.")
-        bucket = pending.setdefault(fused_name, {})
-        shard: Literal["q", "kv"] = "q" if is_q else "kv"
-        assert shard not in bucket, f"duplicate shard {shard} for {fused_name}"
-        bucket[shard] = tensor
-        if len(bucket) == 2:
-            yield fused_name, torch.cat([bucket["q"], bucket["kv"]], dim=0)
-            pending.pop(fused_name)
-    assert not pending, f"unpaired wqkv_a weight scales: {sorted(pending)}"
+def _store_kv_to_swa_cache_direct(self, kv, forward_batch, attn_backend) -> None:
+    """Store normalized KV through the active DSV4 cache-pack contract."""
+    attn_backend.store_cache(
+        layer_id=self.layer_id,
+        swa_k=kv,
+        forward_batch=forward_batch,
+    )
 
 
 @plugin_hook(
-    target="sglang.srt.models.deepseek_v4.DeepseekV4ForCausalLM.load_weights",
+    "sglang.srt.models.deepseek_v4.MQALayer._compute_kv_to_cache",
+    type=HookType.REPLACE,
+)
+def compute_kv_to_cache_kunlun(
+    self,
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    attn_backend,
+    qkv_a: Optional[torch.Tensor] = None,
+) -> None:
+    """Normalize and rotate KV, then use the dirty 0.5.14 direct writer."""
+    if qkv_a is not None:
+        kv = qkv_a[..., self.q_lora_rank :]
+    else:
+        kv, _ = self.wkv(x)
+    kv = self.kv_norm(kv)
+
+    from sglang.srt.models.deepseek_v4 import fused_rope_inplace
+
+    fused_rope_inplace(
+        kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
+        None,
+        self.freqs_cis,
+        positions,
+    )
+    _store_kv_to_swa_cache_direct(self, kv, forward_batch, attn_backend)
+
+
+@plugin_hook(
+    "sglang.srt.models.deepseek_v4.MQALayer._forward_prepare",
     type=HookType.AROUND,
 )
-def load_weights_kunlun(original_fn, self, weights, is_nextn=False):
-    """Pre-process the int4/int8 weight stream, then defer to upstream."""
-    if envs.SGLANG_OPT_FUSE_WQA_WKV.get():
-        weights = _fuse_wqkv_a_weight_scale(weights)
-    return original_fn(self, weights, is_nextn)
+def mqa_forward_prepare_kunlun(
+    original_fn,
+    self,
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    attn_backend,
+    q_out: Optional[torch.Tensor] = None,
+    x_quant=None,
+):
+    """Use the single-call Q/KV RoPE order for prefill and decode."""
+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        is_unified_kv_triton,
+    )
+
+    use_cp = False
+    if self.dsa_enable_prefill_cp:
+        from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+
+        use_cp = dsa_use_prefill_cp(forward_batch)
+
+    if (
+        not (
+            forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_decode_or_idle()
+        )
+        or is_unified_kv_triton()
+        or use_cp
+    ):
+        return original_fn(
+            self,
+            x,
+            positions,
+            forward_batch,
+            attn_backend,
+            q_out,
+            x_quant=x_quant,
+        )
+
+    x_linear = x_quant if x_quant is not None else x
+    if self.fuse_wqa_wkv:
+        qkv_a, _ = self.wqkv_a(x_linear)
+        q_lora = qkv_a[..., : self.q_lora_rank]
+        kv = qkv_a[..., self.q_lora_rank :]
+    else:
+        q_lora, _ = self.wq_a(x_linear)
+        kv, _ = self.wkv(x_linear)
+
+    q_lora = self.q_norm(q_lora)
+    q, _ = self.wq_b(q_lora)
+    q = q.view(-1, self.n_local_heads, self.head_dim)
+    import kunlun_ops
+
+    q_normalized = torch.empty_like(q)
+    kunlun_ops.rmsnorm(
+        q,
+        None,
+        q_normalized,
+        self.eps,
+        False,
+        True,
+        None,
+        None,
+        None,
+    )
+    q = q_normalized
+    kv = self.kv_norm(kv)
+
+    from sglang.srt.models.deepseek_v4 import fused_rope_inplace
+
+    fused_rope_inplace(
+        q[..., -self.qk_rope_head_dim :],
+        kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
+        self.freqs_cis,
+        positions,
+    )
+    _store_kv_to_swa_cache_direct(self, kv, forward_batch, attn_backend)
+
+    if self.indexer is not None:
+        self.indexer(
+            x=x,
+            q_lora=q_lora,
+            forward_batch=forward_batch,
+            attn_backend=attn_backend,
+        )
+    if self.compressor is not None:
+        attn_backend.forward_core_compressor(
+            x,
+            forward_batch,
+            self.layer_id,
+            self.compressor,
+        )
+
+    if q_out is not None:
+        q_out.copy_(q)
+        q = q_out
+    return q, None
+
+
+@plugin_hook(
+    "sglang.srt.models.deepseek_v2.MoEGate.forward",
+    type=HookType.REPLACE,
+)
+def moe_gate_forward_kunlun(
+    self,
+    hidden_states: torch.Tensor,
+    gemm_output_zero_allocator=None,
+    forward_batch=None,
+):
+    """Match the Kunlun DSV4 router GEMM contract."""
+
+    del gemm_output_zero_allocator, forward_batch
+    if hidden_states.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError(f"unsupported Kunlun MoE gate input dtype: {hidden_states.dtype}")
+    if self.weight.dtype != hidden_states.dtype:
+        hidden_states = hidden_states.to(dtype=self.weight.dtype)
+    return hidden_states @ self.weight.T
+
+
+@plugin_hook(
+    "sglang.srt.models.deepseek_v4.DeepseekV4Model.hc_head",
+    type=HookType.REPLACE,
+)
+def hc_head_kunlun(
+    self,
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+):
+    """Match the graph-captured base-model MHC head exactly."""
+    shape, dtype = x.size(), x.dtype
+    x = x.flatten(1).float()
+    rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
+    mixes = F.linear(x, hc_fn) * rsqrt
+    pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
+    y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
+    return y.to(dtype)
+
+
+# Golden keeps this hook disabled so the upstream Torch hc_pre runs and the
+# mHC post/comb stay fp32; the Kunlun fused hc_pre returns fp16.
+# @plugin_hook(
+#     "sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayer.hc_pre",
+#     type=HookType.REPLACE,
+# )
+def hc_pre_kunlun(
+    self,
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm: Optional[nn.Module] = None,
+    forward_batch: Optional[ForwardBatch] = None,
+):
+    """Kunlun MHC pre with the 0.5.14 four-value return contract."""
+    del norm, forward_batch
+    shape, dtype = x.shape, x.dtype
+    if x.shape[0] == 0:
+        y = torch.empty((0, shape[-1]), dtype=dtype, device=x.device)
+        post = torch.empty((0, self.hc_mult), dtype=torch.float32, device=x.device)
+        comb = torch.empty(
+            (0, self.hc_mult, self.hc_mult), dtype=torch.float32, device=x.device
+        )
+        return y, post, comb, False
+
+    if self.hc_mult != 4:
+        raise ValueError("Kunlun hc_pre supports hc_mult=4 only")
+    x_flat = x.reshape(x.shape[0], -1).float()
+    x_view = x_flat.view(x.shape[0], self.hc_mult, -1)
+    rms = torch.rsqrt(
+        x_flat.square().mean(dim=-1, keepdim=True) + self.rms_norm_eps
+    )
+    mixes = F.linear(x_flat, hc_fn.float()) * rms
+    pre = torch.sigmoid(mixes[:, : self.hc_mult] * hc_scale[:1] + hc_base[: self.hc_mult])
+    pre = pre + self.hc_eps
+    post = 2.0 * torch.sigmoid(
+        mixes[:, self.hc_mult : 2 * self.hc_mult] * hc_scale[1:2]
+        + hc_base[self.hc_mult : 2 * self.hc_mult]
+    )
+    comb = (
+        mixes[:, 2 * self.hc_mult :] * hc_scale[2]
+        + hc_base[2 * self.hc_mult :]
+    ).view(x.shape[0], self.hc_mult, self.hc_mult)
+
+    # Sinkhorn normalization matches the reference's stabilized row/column order.
+    comb = comb - comb.amax(dim=-1, keepdim=True)
+    comb = torch.exp(comb)
+    comb = comb / comb.sum(dim=-1, keepdim=True) + self.hc_eps
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
+    for _ in range(max(self.hc_sinkhorn_iters - 1, 0)):
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
+    y = (pre.unsqueeze(-1) * x_view).sum(dim=1).to(dtype)
+    return y, post, comb, False
+
+
+# 融合后的 wqkv_a 拿不到 per-channel weight_scale 的问题。
+#
+# 上游的 wq_a+wkv 融合分支（sglang/srt/models/deepseek_v4.py 的 `elif fuse_wqa_wkv and (...)`）
+# 只认 ``.weight`` 和 ``.weight_scale_inv``（fp8 块量化命名），不认 compressed-tensors 的
+# per-channel ``.weight_scale``。于是这两份 scale 掉进通用分支、被改名成
+# ``self_attn.wq_a.weight_scale``，而模型里只有融合后的 ``wqkv_a.weight_scale``，
+# 日志报 "not found in params_dict"、融合模块的 scale 保持初值 => int8 反量化出垃圾
+# => logits 变垃圾 => 解码出空串。注意 ``.weight`` 本身是被正确 cat 融合的，只有 scale 缺失，
+# 加载阶段不报错，很难发现。
+#
+# 这里不改上游，而是在进 load_weights 之前把权重流里的两份 scale 先合并、直接以融合后的名字
+# ``...wqkv_a.weight_scale`` 交出去，上游的通用分支就能在 params_dict 里找到它、正常加载。
+# 合并方式和 ``.weight`` 完全一致：per-channel scale 是 per-output-channel，
+# 融合就是把输出通道按 q、kv 顺序接起来，所以同样是 ``torch.cat([q, kv], dim=0)``。
+_WQKV_A_SCALE_SHARDS = {".wq_a.weight_scale": "q", ".wkv.weight_scale": "kv"}
+
+
+def _fuse_wqkv_a_weight_scales(weights):
+    """把 wq_a / wkv 的 weight_scale 合并成融合后 wqkv_a 的那一份。"""
+    pending: dict = {}
+    for name, tensor in weights:
+        shard = next(
+            (s for suffix, s in _WQKV_A_SCALE_SHARDS.items() if name.endswith(suffix)),
+            None,
+        )
+        if shard is None:
+            yield name, tensor
+            continue
+        fused = name.replace(".wq_a.", ".wqkv_a.").replace(".wkv.", ".wqkv_a.")
+        bucket = pending.setdefault(fused, {})
+        assert shard not in bucket, f"duplicate shard {shard} for {fused}"
+        bucket[shard] = tensor
+        if len(bucket) == 2:
+            yield fused, torch.cat([bucket["q"], bucket["kv"]], dim=0)
+            del pending[fused]
+    # 只凑到一半的按原名交回去，让上游按原逻辑报 not found，不要静默吞掉。
+    for fused, bucket in pending.items():
+        for shard, tensor in bucket.items():
+            back = ".wq_a." if shard == "q" else ".wkv."
+            yield fused.replace(".wqkv_a.", back), tensor
+
+
+@plugin_hook(
+    "sglang.srt.models.deepseek_v4.DeepseekV4ForCausalLM.load_weights",
+    type=HookType.AROUND,
+)
+def fuse_wqkv_a_weight_scale_kunlun(original_fn, self, weights, *args, **kwargs):
+    """开融合时，先把 wq_a/wkv 的 weight_scale 合并再交给上游 loader。"""
+    from sglang.srt import environ as _environ
+
+    # 有些 checkpoint 自带 MTP 输入补偿（QuaRot/R1 旋转补偿，作用点是 draft 收到的
+    # target hidden）。上游不认识这个模块，会以
+    # "model.norm.mtp_input_correction.blocks not found in params_dict." 丢掉它。
+    # 这条 hook 只覆盖走 DeepseekV4 loader 的模型：把补偿块从权重流里摘出来挂到模型上，
+    # 再由 mtp_production 在 draft-extend 边界施加（或由 NextN 自带的 rot_weight 槽位施加）。
+    weights = strip_correction_blocks(self, weights)
+    if not _environ.envs.SGLANG_OPT_FUSE_WQA_WKV.get():
+        return original_fn(self, weights, *args, **kwargs)
+    return original_fn(self, _fuse_wqkv_a_weight_scales(weights), *args, **kwargs)
