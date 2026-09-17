@@ -109,7 +109,7 @@ def verify_tree_greedy(
             base = retrive_index[batch_idx, 0].item()
             span = slice(base, base + candidates.shape[1])
             logger.warning(
-                "[DSV4_MTP_VERIFY] row=%s accepted=%s candidates=%s "
+                "[SPECDMP-VERIFY] row=%s accepted=%s candidates=%s "
                 "target_argmax=%s bonus=%s",
                 batch_idx,
                 num_accepted,
