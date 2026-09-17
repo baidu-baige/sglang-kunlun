@@ -49,6 +49,7 @@ def _dump_dir() -> Optional[str]:
 
 
 def msa_dump_enabled() -> bool:
+    """是否开启 msa dump：只由 ``SGLANG_MSA_DUMP_DIR`` 决定，其余开关都是可选。"""
     return _dump_dir() is not None
 
 
