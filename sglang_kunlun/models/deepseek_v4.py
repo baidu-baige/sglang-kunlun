@@ -10,6 +10,7 @@ from torch import nn
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+from sglang_kunlun.models.mtp_input_correction import strip_correction_blocks
 from sglang_kunlun.kernels.kernel_ops import dsv4_mqa_wo_a_einsum_kunlun
 
 
@@ -409,8 +410,12 @@ def fuse_wqkv_a_weight_scale_kunlun(original_fn, self, weights, *args, **kwargs)
     """开融合时，先把 wq_a/wkv 的 weight_scale 合并再交给上游 loader。"""
     from sglang.srt import environ as _environ
 
+    # 有些 checkpoint 自带 MTP 输入补偿（QuaRot/R1 旋转补偿，作用点是 draft 收到的
+    # target hidden）。上游不认识这个模块，会以
+    # "model.norm.mtp_input_correction.blocks not found in params_dict." 丢掉它。
+    # 这条 hook 只覆盖走 DeepseekV4 loader 的模型：把补偿块从权重流里摘出来挂到模型上，
+    # 再由 mtp_production 在 draft-extend 边界施加（或由 NextN 自带的 rot_weight 槽位施加）。
+    weights = strip_correction_blocks(self, weights)
     if not _environ.envs.SGLANG_OPT_FUSE_WQA_WKV.get():
         return original_fn(self, weights, *args, **kwargs)
     return original_fn(self, _fuse_wqkv_a_weight_scales(weights), *args, **kwargs)
-
-

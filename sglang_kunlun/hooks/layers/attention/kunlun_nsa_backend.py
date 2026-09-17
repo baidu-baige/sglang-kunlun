@@ -1,27 +1,4 @@
-"""kunlun_nsa attention backend for sglang 0.5.14 (DeepSeek sparse attention).
-
-Ported from the 0.5.8 subclass
-``sgl_kernel/patch/layers/attention/kunlun_nsa_backend.py``. Same design: subclass
-upstream and override only what really differs on Kunlun.
-
-0.5.14 deltas that this port had to honour (see
-``/home/zx/doc/ds_v32/kunlun_dsa_0514_migration_delta.md``):
-
-* ``NativeSparseAttnBackend`` -> ``DeepseekSparseAttnBackend``, ``NSAMetadata`` ->
-  ``DSAMetadata``, ``NSAIndexerMetadata`` -> ``DSAIndexerMetadata``, all ``nsa_*``
-  metadata fields -> ``dsa_*``; ``TopkTransformMethod`` moved to
-  ``dsa/dsa_topk_backend.py``.
-* the cuda-graph seams changed: there is no
-  ``init_forward_metadata_capture_cuda_graph`` / ``..._replay_cuda_graph`` any more,
-  so ``cum_q_lod`` is injected in ``_build_forward_metadata_cuda_graph`` and
-  ``_apply_cuda_graph_metadata`` instead.
-* ``DSAIndexerMetadata`` gained ``topk_backend`` / ``paged_mqa_ctx_lens_2d`` /
-  ``force_unfused_topk`` and its ``topk_transform`` now delegates to
-  ``DSATopKBackend``. ``DSATopKBackend`` is a closed Enum, so a plugin cannot add a
-  member - the Kunlun fused topk stays an override of ``topk_transform``.
-* ``DeepseekSparseAttnMultiStepBackend`` builds ``speculative_num_steps - 1``
-  backends (0.5.8 built all of them).
-"""
+"""kunlun_nsa attention backend"""
 
 from __future__ import annotations
 

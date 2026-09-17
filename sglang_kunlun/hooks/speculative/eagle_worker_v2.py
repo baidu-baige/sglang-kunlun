@@ -10,8 +10,24 @@ Patch only the eager metadata-init behavior added in the patch version:
 """
 
 from __future__ import annotations
-
+import os
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+
+
+@plugin_hook(
+    "sglang.srt.speculative.eagle_worker_v2.EagleDraftWorker.__init__",
+    type=HookType.AFTER,
+)
+def disable_mtp_index_share_kunlun(result, self, *args, **kwargs):
+    """Diagnostic: force the multi-step draft to compute its own DSA top-k.
+    """
+    if os.environ.get("SGLANG_KUNLUN_DISABLE_MTP_INDEX_SHARE") != "1":
+        return result
+    if hasattr(self, "index_share_for_mtp_iteration"):
+        self.index_share_for_mtp_iteration = False
+    if hasattr(self, "seed_dsa_topk_from_draft_extend"):
+        self.seed_dsa_topk_from_draft_extend = False
+    return result
 
 
 @plugin_hook(
