@@ -65,7 +65,12 @@ def _clear_unaccepted_c4_states(self, rejected_locs: torch.Tensor, mask: torch.T
     ]
     if not pools:
         return
-    swa_loc = self.translate_loc_from_full_to_swa(rejected_locs).to(torch.int64)
+    # out_cache_loc 在 batch>1 时可能含越界占位值；先 clamp+mask 再索引，
+    # 避免 translate_loc_from_full_to_swa 的 advanced indexing 越界崩溃。
+    mapping = self.full_to_swa_index_mapping
+    valid_loc = (rejected_locs >= 0) & (rejected_locs < mapping.shape[0])
+    safe_locs = rejected_locs.clamp(0, mapping.shape[0] - 1)
+    swa_loc = torch.where(valid_loc, mapping[safe_locs], -1).to(torch.int64)
     swa_loc = swa_loc.reshape(-1)
     base_keep = swa_loc >= 0
     if mask is not None:

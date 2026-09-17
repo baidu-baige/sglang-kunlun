@@ -16,11 +16,14 @@ import torch.nn.functional as F
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
 )
+
+from .common import _alloc_2m_aligned
 
 
 class KunlunMHATokenToKVPool(MHATokenToKVPool):
@@ -250,6 +253,67 @@ class KunlunMLATokenToKVPool(MLATokenToKVPool):
         return cache_k_nope, cache_k_rope
 
 
+class KunlunIndexKeyCache(IndexKeyCache):
+    """``IndexKeyCache`` whose per-layer buffers start on a 2MiB boundary.
+
+    Upstream allocates each layer's index-K(+scale) buffer with a plain
+    ``torch.zeros``, so the base addresses are only 2MiB-aligned by accident
+    (measured on DS V3.2 @ tp8: alternating 0 / +532992 across layers). The
+    Kunlun peermem/XDR path maps device memory at 2MiB granularity, so an
+    unaligned base makes ``ibv_reg_mr`` fail with EINVAL(22) once the buffer is
+    registered for PD KV transfer -- and the disaggregation hook only rounds the
+    registered *lengths* up, not the pointers.
+    """
+
+    def __init__(self, pool, index_buf_size: int):
+        self.pool = pool
+        num_pages = (index_buf_size + pool.page_size + 1) // pool.page_size
+        dtype = pool.index_k_with_scale_buffer_dtype
+        itemsize = torch.tensor([], dtype=dtype).element_size()
+        with (
+            torch.cuda.use_mem_pool(pool.custom_mem_pool)
+            if pool.custom_mem_pool
+            else nullcontext()
+        ):
+            self.buffer = []
+            for layer_idx in range(pool.layer_num):
+                shape = self._buffer_shape(self._layer_num_pages(layer_idx, num_pages))
+                total_bytes = shape[0] * shape[1] * itemsize
+                if total_bytes == 0:
+                    # Layers that reuse the previous layer's top-k keep upstream's
+                    # 0-row placeholder.
+                    self.buffer.append(
+                        torch.zeros(shape, dtype=dtype, device=pool.device)
+                    )
+                    continue
+                self.buffer.append(
+                    _alloc_2m_aligned(total_bytes, dtype, pool.device).reshape(shape)
+                )
+
+
 class KunlunNSATokenToKVPool(DSATokenToKVPool):
-    """Kunlun DSA/NSA KV pool with int8 index buffer dtype."""
+    """Kunlun DSA/NSA KV pool: int8 index buffer dtype, 2MiB-aligned buffers."""
+
     index_k_with_scale_buffer_dtype = torch.int8
+
+    def _create_buffers(self):
+        """Allocate the MLA KV cache 2MiB-aligned (see KunlunIndexKeyCache)."""
+        shape = (self.size + self.page_size, 1, self.kv_cache_dim)
+        itemsize = torch.tensor([], dtype=self.store_dtype).element_size()
+        total_bytes = shape[0] * shape[1] * shape[2] * itemsize
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                # Slot 0 stays the dummy sink for padded tokens, as upstream.
+                self.kv_buffer = [
+                    _alloc_2m_aligned(
+                        total_bytes, self.store_dtype, self.device
+                    ).reshape(shape)
+                    for _ in range(self.layer_num)
+                ]
+
+    def _create_index_key_cache(self) -> IndexKeyCache:
+        return KunlunIndexKeyCache(self, self.index_buf_size)
