@@ -1,6 +1,6 @@
 """Kunlun MoE top-k hooks.
 
-Two functional differences vs upstream:
+One functional difference vs upstream:
   * The fused sigmoid+grouped-topk+norm JIT kernel
     (``sglang.jit_kernel.grouped_topk.grouped_topk``) is replaced with
     ``kunlun_ops.moe_sigmoid_group_topk_norm`` — the upstream JIT path nvcc-
@@ -9,9 +9,17 @@ Two functional differences vs upstream:
     exactly like upstream; the per-block routing statistic that Kunlun's MoE
     needs is regenerated on demand in ``unquant.py`` via
     ``kunlun_ops.gen_block_statistic`` (so dropping it here is fine).
-  * ``select_experts`` returns a Kunlun-specific ``StandardTopKOutput``
-    that carries the extra ``block_statistic`` field alongside the
-    standard ``topk_weights`` / ``topk_ids`` / ``router_logits``.
+
+``select_experts`` MUST return the upstream
+``sglang.srt.layers.moe.topk.StandardTopKOutput``. Defining a same-named
+NamedTuple here (e.g. to carry an extra ``block_statistic`` field) silently
+breaks ``TopKOutputChecker.format_is_standard``, which is an ``isinstance``
+check against the upstream class: the EP local-expert-id remapping in
+``StandardDispatcher.dispatch`` is then skipped with no error at all, the
+Kunlun MoE kernels receive GLOBAL expert ids where they expect local ones,
+index their per-expert buffers out of bounds and fault the device (which in
+turn wedges the C2C fabric). Consumers that want the per-block routing
+statistic regenerate it on demand via ``kunlun_ops.gen_block_statistic``.
 """
 from __future__ import annotations
 
@@ -19,8 +27,8 @@ import torch
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
     TopKConfig,
-    TopKOutputFormat,
     biased_grouped_topk,
     biased_topk_impl,
     _use_aiter,
@@ -30,26 +38,12 @@ from sglang.srt.layers.moe.topk import (
     fused_topk,
     fused_topk_softmax_torch_raw_logits
 )
-from typing import Optional, NamedTuple, Tuple
+from typing import Optional, Tuple
 from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 import kunlun_ops
 from sglang_kunlun.kernels.moe_router import route_k3_torch
-
-
-class StandardTopKOutput(NamedTuple):
-    """Standard top-k output format."""
-
-    topk_weights: torch.Tensor
-    topk_ids: torch.Tensor
-    router_logits: torch.Tensor
-    block_statistic: torch.Tensor
-
-    @property
-    def format(self) -> TopKOutputFormat:
-        """TopKOutputFormat"""
-        return TopKOutputFormat.STANDARD
 
 
 # NOTE: the JIT replacement for ``sglang.jit_kernel.grouped_topk.grouped_topk``
@@ -155,7 +149,6 @@ def select_experts_kunlun(
     # DeepSeek V2/V3/R1 series models use grouped_top_k
     # remove num_fused_shared_experts from grouped_topk/biased_grouped_topk
     num_routed_topk = top_k - num_fused_shared_experts
-    block_statistic = None
     use_k3_router = (
         use_grouped_topk
         and custom_routing_function is None
@@ -274,4 +267,4 @@ def select_experts_kunlun(
 
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
 
-    return StandardTopKOutput(topk_weights, topk_ids, router_logits, block_statistic)
+    return StandardTopKOutput(topk_weights, topk_ids, router_logits)
