@@ -10,8 +10,9 @@ mathematically equivalent torch expressions.
 Registered symbols:
   * sglang.kernels.ops.layernorm.rmsnorm_fp32.rmsnorm_fp32
   * sglang.kernels.ops.attention.dsv4.c2_decode_pool.c2_decode_pool
-  * sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant.rope_tail_fake_quant_fp4
+  * sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant._rope_tail_fake_quant_fp4_kernel
   * sglang.kernels.ops.embeddings.engram_gate.fused_engram_gate
+    (XSpeedGate `fused_engram_gate_v2`, torch fallback for the inputs it rejects)
   * sglang.kernels.ops.embeddings.engram_gather.engram_gather
   * sglang.kernels.ops.embeddings.engram_hash.engram_hash_ids
   * sglang.kernels.ops.embeddings.engram_hash.engram_hash_ids_and_commit
@@ -26,7 +27,7 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 
-from sglang_kunlun.kernels.kernel_ops import register_jit_op
+from sglang_kunlun.kernels.kernel_ops import register_jit_op, register_triton_op
 
 
 @register_jit_op("sglang.kernels.ops.layernorm.rmsnorm_fp32", "rmsnorm_fp32")
@@ -178,32 +179,89 @@ def fake_quant_compressed_kv_kunlun(x: torch.Tensor) -> torch.Tensor:
     return _fake_quant_compressed_kv_torch(x)
 
 
-@register_jit_op(
+@register_triton_op(
     "sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant",
-    "rope_tail_fake_quant_fp4",
+    "_rope_tail_fake_quant_fp4_kernel",
 )
-def rope_tail_fake_quant_fp4_kunlun(
-    x: torch.Tensor,
-    freqs: torch.Tensor,
-    rope_dim: int,
-    inverse: bool = False,
-    block_size: int = 32,
+def _rope_tail_fake_quant_fp4_kernel(
+    x_ptr: torch.Tensor,
+    f_ptr: torch.Tensor,
+    out_ptr: torch.Tensor,
+    x_stride_r: int,
+    out_stride_r: int,
+    f_stride_t: int,
+    rows_per_token: int,
     *,
-    compressed_kv: bool = False,
-) -> torch.Tensor:
-    """Rotate the last `rope_dim` features, then FP4 round-trip.
+    D: int,
+    RD: int,
+    BLK: int,
+    AMAX_FLOOR: float,
+    INVERSE: bool,
+    COMPRESSED_KV: bool,
+    grid: "tuple[int, ...] | None" = None,
+    **kwargs,
+) -> None:
+    """Fused RoPE tail and FP4 round-trip, on the XSpeedGate kernel.
 
-    Delegates to the repo's torch oracle for the RoPE and the per-32 UE8M0 FP4
-    step; the compressed-KV (per-16 E4M3) step uses the XPU-safe E4M3 rounding
-    above because the oracle's fp8 dtype cast is unimplemented on P800.
+    Replaces the Triton kernel rather than its launcher, so upstream's launcher
+    keeps doing the setup the wrapper refuses to redo (`x.contiguous`, freqs
+    `view_as_real`, `out=empty_like`, `block_size=16` for compressed KV, the
+    `reshape(-1, D)` views and the `rows == 0` early return). `grid` carries the
+    Triton launch bound, which the op needs as a plain argument because XTDK has
+    no `program_id` introspection.
+
+    The op's own bounds: bf16 `x`/`out`, fp32 `f_ptr` as the `[T, RD/2, 2]`
+    real view, `D` in {128, 512}, `RD == 64`, and `BLK` 16 for compressed KV
+    else 32 -- which is what `_rope_fq4` (`dsv41_sparse.py:26`) admits, since it
+    only reaches this kernel for bf16 CUDA-shaped tensors.
     """
-    from sglang.kernels.ops.attention.dsv4.torch_quant import fake_quant_fp4
-    from sglang.srt.layers.attention.dsv4.dsv41_sparse import rope_tail
+    rows = int(grid[0]) if grid is not None else x_ptr.shape[0]
+    torch.ops.xspeedgate_ops.rope_tail_fake_quant_fp4_kernel(
+        x_ptr,
+        f_ptr,
+        out_ptr,
+        x_stride_r,
+        out_stride_r,
+        f_stride_t,
+        rows_per_token,
+        D,
+        RD,
+        BLK,
+        AMAX_FLOOR,
+        INVERSE,
+        COMPRESSED_KV,
+        rows,
+    )
 
-    rotated = rope_tail(x, freqs, rope_dim, inverse)
-    if compressed_kv:
-        return _fake_quant_compressed_kv_torch(rotated)
-    return fake_quant_fp4(rotated, block_size)
+
+
+_ENGRAM_GATE_V2_DTYPES = (torch.bfloat16, torch.float32)
+
+
+def _engram_gate_v2_usable(
+    x: torch.Tensor,
+    kv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float,
+) -> bool:
+    """Whether `xspeedgate_ops::fused_engram_gate_v2` accepts these inputs.
+
+    Mirrors `check_fused_engram_gate_inputs`
+    (`XSpeedGate/wrapper/src/fusion/fused_engram_gate.cpp:93`): bf16/fp32 io with
+    `x.dtype == kv.dtype`, bf16/fp32 weights sharing one dtype, everything
+    contiguous and on the same device, `eps > 0`. Anything else keeps the torch
+    path instead of tripping a TORCH_CHECK deep inside a forward.
+    """
+    if x.dtype is not kv.dtype or x.dtype not in _ENGRAM_GATE_V2_DTYPES:
+        return False
+    if q_weight.dtype is not k_weight.dtype or q_weight.dtype not in _ENGRAM_GATE_V2_DTYPES:
+        return False
+    if not all(t.is_contiguous() for t in (x, kv, q_weight, k_weight)):
+        return False
+    if any(t.device != x.device for t in (kv, q_weight, k_weight)):
+        return False
+    return eps > 0.0
 
 
 @register_jit_op(
@@ -220,7 +278,29 @@ def fused_engram_gate_kunlun(
     """FP32 RMS(x) * RMS(key), weighted dot, sigmoid gate, value residual.
 
     x [T, HC, D], kv [T, (HC+1)*D] laid out head-major with the value段 last.
+
+    Runs on the XSpeedGate `fused_engram_gate_v2` op when the inputs fit its
+    contract — that is the production path, the shape dispatch (feature-parallel
+    / row / token) lives inside the op. The torch expression below stays as the
+    fallback for the cases the op rejects (fp16, mixed io dtypes, non-contiguous
+    inputs), since `engram_gate`'s own CUDA guard does not cover every caller.
     """
+    if _engram_gate_v2_usable(x, kv, q_weight, k_weight, eps):
+        return torch.ops.xspeedgate_ops.fused_engram_gate_v2(
+            x, kv, q_weight, k_weight, eps, clamp_value
+        )
+    return _fused_engram_gate_torch(x, kv, q_weight, k_weight, eps, clamp_value)
+
+
+def _fused_engram_gate_torch(
+    x: torch.Tensor,
+    kv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float,
+    clamp_value: float,
+) -> torch.Tensor:
+    """Torch transcription of the engram gate, used when the op declines."""
     t, hc, d = x.shape
     xf = x.float()
     kvf = kv.float()
