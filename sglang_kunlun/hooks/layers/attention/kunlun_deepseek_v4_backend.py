@@ -2365,3 +2365,88 @@ def _forward_compress_zeroed_kunlun(
         plan,
     )
     return rotate_activation(kv_compressed) if rotate else kv_compressed
+
+
+# ── CP 预填索引器：dense fp4 logits 仅 deep_gemm 有，改走上游的纯 torch 实现 ──
+#
+# 现象：P 开 CP 后，**真实请求**进来时 8 个 rank 全挂
+#     ImportError: cannot import name 'fp8_fp4_mqa_logits' from 'deep_gemm'
+# 链路：
+#     forward_low_ratio_sources(2832) → _forward_low_ratio_sources_cp(2902)
+#       → _low_ratio_index_topk_dense(3313) → _dense_fp4_mqa_logits(339)
+#         → from deep_gemm import fp8_fp4_mqa_logits
+#
+# 上游本来有分派（`_low_ratio_index_topk`，3200-3233）：
+#     elif self._use_dense_fp4_prefill_indexer(fb) and _is_sm100_or_newer():
+#         self._low_ratio_index_topk_extend(...)   # dense fp4（deep_gemm）
+#     else:
+#         self._low_ratio_index_topk_torch(...)    # 纯 torch 回退
+# 其中 `_use_dense_fp4_prefill_indexer` 读的就是 `SGLANG_DSV41_TORCH_PREFILL_INDEXER`
+# （脚本里设成 1）。**但 CP 分支绕过了这个分派**，直接调 `_low_ratio_index_topk_dense`
+# ⇒ 开关对 CP 不生效，请求期必然撞 deep_gemm。
+#
+# 为什么 1-token 的 warmup 没炸：插件里 `_cp_short_prompt_needs_reference` 把退化批次
+# 送去了 Torch 参考路径；只有真实 prompt 才走到这里。
+#
+# 做法：AROUND 挂 `_low_ratio_index_topk_dense`，当「开关要求 torch」或「deep_gemm
+# 取不到 fp8_fp4_mqa_logits」时，重定向到上游自带的 `_low_ratio_index_topk_torch`。
+# **不复制上游任何方法**，直接复用那份纯 torch 实现 —— 它自带分块
+# （`_TORCH_INDEXER_SCORE_BUDGET_BYTES` 控制 `[rows, heads, lc]` 中间张量，就是为
+# 16k prompt 控显存加的），语义上也已按请求分组处理。
+#
+# `req` 怎么构造：dense 版把 `q_lens`（tensor）与 `q_lens_cpu`（list）作为参数收进来了，
+# 它们是本 rank **每个请求的本地行数**（CP 下每 rank 只算自己的行），
+# 据此 `repeat_interleave` 可精确重建每行的请求下标；torch 版正是按
+# `torch.unique_consecutive(req)` 分请求遍历的，而本 rank 的行天然按请求连续排列。
+#
+# 开关沿用 `SGLANG_DSV41_TORCH_PREFILL_INDEXER`；此外 deep_gemm 不可用时也会自动
+# 走这条路，免得忘记设开关就炸。
+
+
+def _dense_fp4_indexer_usable() -> bool:
+    """dense fp4 索引器是否可用（依赖 deep_gemm 的 fp8_fp4_mqa_logits）。"""
+    if envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get():
+        return False
+    try:
+        from deep_gemm import fp8_fp4_mqa_logits  # noqa: F401
+    except Exception:  # noqa: BLE001 - 任何导入失败都说明不可用
+        return False
+    return True
+
+
+@plugin_hook(
+    "sglang.srt.layers.attention.deepseek_v4_backend.DeepseekV4AttnBackend."
+    "_low_ratio_index_topk_dense",
+    type=HookType.AROUND,
+)
+def low_ratio_index_topk_dense_kunlun(
+    original_fn, self, layer, x, q_lora, pos, forward_batch, q_lens, q_lens_cpu
+):
+    """CP 预填索引器在昆仑上改走上游的纯 torch 实现。"""
+    if _dense_fp4_indexer_usable():
+        return original_fn(self, layer, x, q_lora, pos, forward_batch, q_lens, q_lens_cpu)
+
+    if not getattr(upstream, "_kunlun_dense_indexer_warned", False):
+        upstream._kunlun_dense_indexer_warned = True
+        logging.getLogger(__name__).warning(
+            "低 ratio 预填索引器：dense fp4（deep_gemm fp8_fp4_mqa_logits）不可用，"
+            "改用上游 _low_ratio_index_topk_torch。SGLANG_DSV41_TORCH_PREFILL_INDEXER=%s，"
+            "本次请求 %d 个（本地）请求、%d 行。",
+            envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get(),
+            len(q_lens_cpu),
+            int(x.shape[0]),
+        )
+
+    # `req` 必须是**全局请求池下标**，不能是 batch 内序号 ——
+    # torch 版会拿它去索引 `self.req_to_token[r, j * ratio]` 取该请求的压缩 K 行，
+    # 用 batch 内序号会读错请求 → 稀疏索引全错 → 输出乱码。
+    # 上游 `dsv41_sparse.token_req_indices` 的语义就是
+    # `repeat_interleave(req_pool_indices, 每请求行数)`；CP 下这里要用**本地**
+    # 每请求行数（`q_lens_cpu`，= `interleave_rows_per_request(extend_seq_lens_cpu,
+    # attn_cp_rank, attn_cp_size)`），因为本 rank 只算自己的行、且按请求连续排列。
+    req = torch.repeat_interleave(
+        forward_batch.req_pool_indices.to(torch.int64),
+        torch.as_tensor(q_lens_cpu, device=x.device, dtype=torch.int64),
+        output_size=int(x.shape[0]),
+    )
+    return self._low_ratio_index_topk_torch(layer, x, q_lora, req, pos)
