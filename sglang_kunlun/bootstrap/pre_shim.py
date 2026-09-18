@@ -370,6 +370,19 @@ def _kunlun_pre_shim() -> None:
                 "Kunlun: import stub installation for %r failed", probe, exc_info=True
             )
 
+    # 上面那个 helper 只处理「装了但初始化 RuntimeError」的情况；真的**没装**时
+    # 它走 `except ImportError: return`，不装 stub。但上游有**裸 import**：
+    #     sglang/srt/layers/attention/dsa_backend.py:97
+    #         if is_cuda():
+    #             import deep_gemm
+    # 昆仑的 is_cuda() 为 True ⇒ deep_gemm 只要不可导入就必炸
+    # （实测 D 节点在 tokenizer/HTTP 进程里 `ModuleNotFoundError: No module
+    #  named 'deep_gemm'`，整个服务起不来）。这里补一刀兜底。
+    try:
+        _stub_deep_gemm_if_missing()
+    except Exception:
+        logger.warning("Kunlun: deep_gemm 兜底 stub 安装失败", exc_info=True)
+
     try:
         _patch_torch_cuda_symm_mem_apis()
     except Exception:
@@ -457,3 +470,31 @@ def _kunlun_pre_shim() -> None:
         _patch_fla_utils_if_loaded()
     except Exception:
         pass
+
+
+def _stub_deep_gemm_if_missing() -> None:
+    """deep_gemm 完全没安装时也装一个空 stub。
+
+    与 `_stub_module_if_unloadable` 的区别：那个只在「能 import 但抛非 ImportError」
+    时装 stub；这里覆盖「`find_spec` 就是 None」的场景，因为上游存在
+    `if is_cuda(): import deep_gemm` 这类**没有 try/except 保护**的裸 import，
+    在昆仑（is_cuda() 为 True）上会直接抛 ModuleNotFoundError。
+
+    空 stub 的效果：`import deep_gemm` 成功；`from deep_gemm import x` 变成
+    ImportError（上游的 except ImportError 能兜住）；`deep_gemm.x` 变成
+    AttributeError（响亮失败，不会静默走错路径）。
+    脚本里的 `SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=True` 会让那些 deep_gemm
+    函数本来就不被调用。
+    """
+    import importlib.util
+    import sys
+
+    if getattr(sys.modules.get("deep_gemm"), "_kunlun_stub", False):
+        return
+    if importlib.util.find_spec("deep_gemm") is not None:
+        return
+    logger.info(
+        "Kunlun: deep_gemm 未安装；安装空 stub 以通过上游 "
+        "`if is_cuda(): import deep_gemm` 这类裸 import。"
+    )
+    _install_import_stub(("deep_gemm",))

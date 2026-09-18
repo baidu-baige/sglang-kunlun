@@ -518,3 +518,84 @@ def _prepare_deepseek_v4_weights_kunlun(weights, quant_config):
         for key, suffix in (("scale", ".scale"), ("weight_scale", ".weight_scale")):
             if key in bucket:
                 yield prefix + suffix, bucket[key]
+
+
+# ── 让 V4.1 在开 CP 的同时保留 vision（ViT）──────────────────────────────
+#
+# 上游 `models/deepseek_v4.py:4613-4621` 有一段硬校验：
+#
+#     if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+#         if (get_parallel().attn_cp_size != 1
+#             or get_pp_group().world_size != 1
+#             or not get_moe_a2a_backend().is_none()):
+#             raise ValueError(
+#                 "V4.1 vision currently supports TP/EP/DP without CP, PP or MoE A2A")
+#
+# 这个限制对应的真实缺口是：**"VL 感知的路由"只接在 forward_normal /
+# forward_normal_dual_stream 上**（`deepseek_v2.py:1021` / `:1243` 才查
+# `e_score_correction_bias_vl`）。开 CP 之后 forward 走的是 CP 分支，不再查这个偏置。
+#
+# 而这个偏置**只对 `input_ids == image_token_id` 的 token 生效**
+# （`multimodal/dsv41/vl_routing.py` 里要么 `bias_alt_token_id=image_token_id`，
+# 要么 `torch.where(input_ids == image_token_id, bias_vl, bias)`）——
+# **纯文本请求里没有任何 token 等于 image_token_id**，所以缺这块对文本任务
+# 数值没有影响；图片请求会静默用错路由偏置。因此本 hook 只适用于"纯文本路径"。
+#
+# 做法：只在 `DeepseekV4ForCausalLM.__init__` 期间，把 `deepseek_v4` 模块里的
+# `get_parallel` 换成"attn_cp_size 报 1、其余字段透传"的代理，让校验通过；
+# `__init__` 退出时立刻恢复。选这个点位的依据：
+#   * `ParallelState` 是 `@dataclass(frozen=True, slots=True)`，改不了实例；
+#   * `deepseek_v4.py` 里 `attn_cp_size` 只有两处读取 —— 4617 的校验（在
+#     `__init__` 内）和 4176 的 forward（`__init__` 期间不会执行），
+#     所以代理的作用面只有那一个校验。
+#
+# `SGLANG_KUNLUN_ALLOW_VISION_WITH_CP=0` 可关掉，回到上游行为。
+
+
+class _AttnCpAsOne:
+    """`get_parallel()` 的透传代理：只把 `attn_cp_size` 报成 1，其余原样透传。"""
+
+    __slots__ = ("_state",)
+
+    def __init__(self, state):
+        object.__setattr__(self, "_state", state)
+
+    @property
+    def attn_cp_size(self) -> int:
+        """报 1 表示开 CP；其他字段原样透传。"""
+        return 1
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_state"), name)
+
+
+@plugin_hook(
+    "sglang.srt.models.deepseek_v4.DeepseekV4ForCausalLM.__init__",
+    type=HookType.AROUND,
+)
+def allow_vision_with_cp(original_fn, self, *args, **kwargs):
+    """开 CP 时绕过 "V4.1 vision ... without CP" 校验，ViT 照常构造。"""
+    import logging
+    import os
+
+    import sglang.srt.models.deepseek_v4 as _dsv4
+
+    if os.environ.get("SGLANG_KUNLUN_ALLOW_VISION_WITH_CP", "1") != "1":
+        return original_fn(self, *args, **kwargs)
+
+    if not getattr(_dsv4, "_kunlun_cp_vision_warned", False):
+        _dsv4._kunlun_cp_vision_warned = True
+        logging.getLogger(__name__).warning(
+            "V4.1：已放宽 'vision without CP' 校验（真实 attn_cp_size=%s）。"
+            "ViT 会照常构造并加载权重；但 VL 路由偏置在 CP 路径上不会被查 —— "
+            "纯文本无影响，图片请求会静默算错。"
+            "如需回到上游行为：SGLANG_KUNLUN_ALLOW_VISION_WITH_CP=0",
+            getattr(_dsv4.get_parallel(), "attn_cp_size", "?"),
+        )
+
+    real_get_parallel = _dsv4.get_parallel
+    try:
+        _dsv4.get_parallel = lambda: _AttnCpAsOne(real_get_parallel())
+        return original_fn(self, *args, **kwargs)
+    finally:
+        _dsv4.get_parallel = real_get_parallel

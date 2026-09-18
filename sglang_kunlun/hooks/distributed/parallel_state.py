@@ -94,3 +94,60 @@ def kunlun_init_model_parallel_group(
         rank_offset=rank_offset,
         max_world_size=max_world_size,
     )
+
+
+# ── 补上 pynccl 被关掉之后的集合通信缺口 ─────────────────────────────────
+#
+# 本模块把 `init_model_parallel_group` 的 `use_pynccl` 强制成 False（昆仑不支持
+# pynccl 的 CUDA private API，见 `bootstrap/pre_shim.py`）。但上游有两个集合通信
+# 是 **pynccl-only**：
+#
+#   `parallel_state.py:1213`  `reduce_scatterv`  → "pynccl is required for reduce_scatterv"
+#   `parallel_state.py:1400`  `all_gatherv`      → "pynccl is required for all_gatherv"
+#
+# 而且它们的 `with pynccl_comm.change_state(enable=True)` 写在 assert **之前**，
+# 所以 pynccl 为 None 时抛的是
+#     AttributeError: 'NoneType' object has no attribute 'change_state'
+# 而不是那句可读的 assert 信息 —— 排查时容易误判成别的 None。
+#
+# 谁需要它：**DP attention 的 MoE 同步路径**
+# （`models/deepseek_v4.py:3639` `_run_moe_ffn_dp_sync` 里的
+# `get_tp_group().reduce_scatterv(...)`）。8 卡 DP + MoE 必然走到，
+# 不补这个缺口 D 节点会在 CUDA graph capture 期直接挂。
+#
+# `_deterministic_reduce_scatterv`（`parallel_state.py:1186`）是同一语义的 torch 实现
+# （`all_reduce` + `narrow`，逐位相同的结果），而 `all_reduce` 自身有完整的非 pynccl
+# 回退（hpu/xpu/npu 通信器 → 最终 `torch.distributed.all_reduce`），
+# 所以 pynccl 缺失时直接复用它。
+#
+# `SGLANG_KUNLUN_REDUCE_SCATTERV_FALLBACK=0` 可关掉，回到上游行为（会在 DP 下报错）。
+
+_KUNLUN_RSV_WARNED: set = set()
+
+
+@plugin_hook(
+    "sglang.srt.distributed.parallel_state.GroupCoordinator.reduce_scatterv",
+    type=HookType.AROUND,
+)
+def reduce_scatterv_without_pynccl(original_fn, self, input_, output=None, sizes=None):
+    """pynccl 缺失时用 `_deterministic_reduce_scatterv` 顶掉 pynccl-only 实现。"""
+    import logging
+    import os
+
+    if os.environ.get("SGLANG_KUNLUN_REDUCE_SCATTERV_FALLBACK", "1") != "1":
+        return original_fn(self, input_, output, sizes)
+
+    if getattr(self, "pynccl_comm", None) is not None:
+        return original_fn(self, input_, output, sizes)
+
+    key = getattr(self, "unique_name", id(self))
+    if key not in _KUNLUN_RSV_WARNED:
+        _KUNLUN_RSV_WARNED.add(key)
+        logging.getLogger(__name__).info(
+            "reduce_scatterv: 该组 pynccl_comm 为 None（昆仑关闭 pynccl），"
+            "改用 _deterministic_reduce_scatterv（all_reduce + narrow）。"
+            "group=%s world_size=%s",
+            getattr(self, "unique_name", "?"),
+            getattr(self, "world_size", "?"),
+        )
+    return self._deterministic_reduce_scatterv(input_, output, sizes)
