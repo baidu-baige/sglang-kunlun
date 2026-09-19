@@ -3954,6 +3954,25 @@ def assign_draft_cache_locs_page_size_1(
 # replacement needed.
 
 
+@register_jit_op(
+    "sglang.kernels.ops.speculative.multi_layer_eagle",
+    "fill_draft_extend_prepare_buffers_triton",
+)
+def fill_draft_extend_prepare_buffers_triton(*args, **kwargs):
+    """Route the draft-extend buffer fill to upstream's native torch variant.
+
+    The upstream kernel is a ``@triton.jit`` kernel compiled for the CUDA target and
+    XPU has no backend for it ("0 compatible backends for target (cuda)"). Upstream
+    ships ``fill_draft_extend_prepare_buffers_native`` with an identical signature and
+    uses it on NPU, so reuse that instead of re-deriving the buffer layout here.
+    """
+    from sglang.kernels.ops.speculative.multi_layer_eagle import (
+        fill_draft_extend_prepare_buffers_native,
+    )
+
+    return fill_draft_extend_prepare_buffers_native(*args, **kwargs)
+
+
 @register_triton_op("sglang.kernels.ops.speculative.eagle", "fill_bonus_tokens")
 def fill_bonus_tokens(
     accept_tokens: torch.Tensor,
