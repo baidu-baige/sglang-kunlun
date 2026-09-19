@@ -157,6 +157,15 @@ def install() -> None:
     sys.modules["sgl_kernel.version"].__version__ = "0.0.0+kunlun-stub"  # type: ignore[attr-defined]
     sys.modules["sgl_kernel.utils"].is_arch_support_pdl = lambda: False  # type: ignore[attr-defined]
 
+    # ``sglang.srt.compilation.weak_ref_tensor`` binds ``sgl_kernel.weak_ref_tensor``
+    # on CUDA/HIP/XPU, and the breakable prefill-graph capture calls it for every
+    # captured argument, so the stub has to provide a real implementation.
+    from sglang_kunlun.kernels.sgl_kernel_kunlun.weak_ref import (
+        weak_ref_tensor as _weak_ref_tensor,
+    )
+
+    root.weak_ref_tensor = _weak_ref_tensor  # type: ignore[attr-defined]
+
     # Bind real Kunlun implementations for sgl_kernel top-k APIs.
     # fast_topk: pure-Python fallback (no XPU kernel needed), identical to
     #   the mimo-branch reference in sgl-kernel/python/sgl_kernel/top_k.py.
