@@ -18,6 +18,7 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_compiler_backend
@@ -395,11 +396,14 @@ class KunlunAttentionBackend(AttentionBackend):
             and model_runner.token_to_kv_pool.swa_layer_nums > 0
         )
 
-        self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        # Resolved spec settings live in the runtime spec context, not in the
+        # ServerArgs seed: `model_runner.server_args.speculative_*` is still unset
+        # when the backend is built, which left `target_verify_metadata` empty and
+        # made the target-verify graph capture fail with KeyError 'cache_seqlens'.
+        # Mirrors sglang.srt.layers.attention.xpu_backend.
+        self.topk = get_spec().speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
-        self.speculative_num_draft_tokens = (
-            model_runner.server_args.speculative_num_draft_tokens
-        )
+        self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
 
         self.fa_impl_ver = fa_impl_ver
