@@ -8,9 +8,9 @@ kernel so `kernel_ops.install()` can patch it in place; the bodies are the
 mathematically equivalent torch expressions.
 
 Registered symbols:
-  * sglang.kernels.ops.layernorm.rmsnorm_fp32.rmsnorm_fp32
-  * sglang.kernels.ops.attention.dsv4.c2_decode_pool.c2_decode_pool
-  * sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant.rope_tail_fake_quant_fp4
+  * sglang.kernels.ops.attention.dsv4.rmsnorm_fp32.rmsnorm_fp32
+  * sglang.kernels.ops.attention.dsv4.pair_pool_decode.pair_pool_decode
+  * sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4.rope_tail_fake_quant_fp4
   * sglang.kernels.ops.embeddings.engram_gate.fused_engram_gate
   * sglang.kernels.ops.embeddings.engram_gather.engram_gather
   * sglang.kernels.ops.embeddings.engram_hash.engram_hash_ids
@@ -29,7 +29,9 @@ import torch
 from sglang_kunlun.kernels.kernel_ops import register_jit_op
 
 
-@register_jit_op("sglang.kernels.ops.layernorm.rmsnorm_fp32", "rmsnorm_fp32")
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.rmsnorm_fp32", "rmsnorm_fp32"
+)
 def rmsnorm_fp32_kunlun(
     x: torch.Tensor, weight: torch.Tensor, eps: float
 ) -> torch.Tensor:
@@ -46,9 +48,9 @@ def rmsnorm_fp32_kunlun(
 
 
 @register_jit_op(
-    "sglang.kernels.ops.attention.dsv4.c2_decode_pool", "c2_decode_pool"
+    "sglang.kernels.ops.attention.dsv4.pair_pool_decode", "pair_pool_decode"
 )
-def c2_decode_pool_kunlun(
+def pair_pool_decode_kunlun(
     kv: torch.Tensor,
     score: torch.Tensor,
     pos: torch.Tensor,
@@ -63,7 +65,7 @@ def c2_decode_pool_kunlun(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Ratio-2 decode pair pooling and state update in torch.
 
-    Mirrors `_c2_decode_pool_kernel` step for step. All state reads happen
+    Mirrors `_pair_pool_decode_kernel` step for step. All state reads happen
     before any write (the kernel never has two rows sharing a slot in one
     launch), so plain gather-then-scatter reproduces it without the racy
     per-program ordering. Softmax runs in fp32 with the same pair-axis order as
@@ -160,7 +162,7 @@ def _round_to_e4m3_rne(v: torch.Tensor) -> torch.Tensor:
 
 def _fake_quant_compressed_kv_torch(x: torch.Tensor) -> torch.Tensor:
     """FP4 round-trip with one E4M3 scale per 16 compressed-KV elements."""
-    from sglang.kernels.ops.attention.dsv4.torch_quant import FP4_MAX, round_fp4
+    from sglang.srt.layers.attention.dsv4.torch_quant import FP4_MAX, round_fp4
 
     blocks = x.float().unflatten(-1, (-1, 16))
     amax = blocks.abs().amax(dim=-1, keepdim=True)
@@ -171,7 +173,7 @@ def _fake_quant_compressed_kv_torch(x: torch.Tensor) -> torch.Tensor:
 
 
 @register_jit_op(
-    "sglang.kernels.ops.attention.dsv4.torch_quant", "fake_quant_compressed_kv"
+    "sglang.srt.layers.attention.dsv4.torch_quant", "fake_quant_compressed_kv"
 )
 def fake_quant_compressed_kv_kunlun(x: torch.Tensor) -> torch.Tensor:
     """XPU-safe replacement for the E4M3-scaled FP4 round-trip."""
@@ -179,7 +181,7 @@ def fake_quant_compressed_kv_kunlun(x: torch.Tensor) -> torch.Tensor:
 
 
 @register_jit_op(
-    "sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant",
+    "sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4",
     "rope_tail_fake_quant_fp4",
 )
 def rope_tail_fake_quant_fp4_kunlun(
@@ -197,8 +199,8 @@ def rope_tail_fake_quant_fp4_kunlun(
     step; the compressed-KV (per-16 E4M3) step uses the XPU-safe E4M3 rounding
     above because the oracle's fp8 dtype cast is unimplemented on P800.
     """
-    from sglang.kernels.ops.attention.dsv4.torch_quant import fake_quant_fp4
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import rope_tail
+    from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
 
     rotated = rope_tail(x, freqs, rope_dim, inverse)
     if compressed_kv:

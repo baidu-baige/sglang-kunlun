@@ -36,26 +36,6 @@ def configure_kv_cache_dtype_kunlun(original_fn, **kwargs):
 
 
 @plugin_hook(
-    "sglang.srt.mem_cache.allocator.swa.SWATokenToKVPoolAllocator._free_swa_pages_cuda",
-    type=HookType.REPLACE,
-)
-def free_swa_pages_kunlun(self, full_page_representatives: torch.Tensor):
-    """Free SWA pages through upstream's torch path instead of its Triton one.
-
-    main fused the resolve-and-clear of `full_to_swa_index_mapping` into
-    `get_and_clear_swa_pages_kernel`, picked by `free_index.is_cuda`. XPU
-    tensors answer True there, and the Kunlun triton shim hands back the plain
-    function behind `@triton.jit`, so the launch dies with "'function' object is
-    not subscriptable" the first time a request finishes.
-
-    `_free_swa_pages_none_cuda` is upstream's own non-CUDA branch with the same
-    contract (same mapping clear, same `_SWA_PEER_MAPPED` expectation, same
-    debug assertions) and is what this platform ran before the fusion landed.
-    """
-    return self._free_swa_pages_none_cuda(full_page_representatives)
-
-
-@plugin_hook(
     "sglang.srt.mem_cache.allocator.paged.PagedTokenToKVPoolAllocator.alloc_decode",
     type=HookType.REPLACE,
 )
