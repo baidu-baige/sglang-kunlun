@@ -40,13 +40,15 @@ def _draft_extend_for_decode_kunlun(original_fn, self, batch, batch_result):
     "sglang.srt.speculative.eagle_worker_v2.EAGLEWorkerV2.verify",
     type=HookType.AROUND,
 )
-def verify_kunlun(original_fn, self, batch, grammar_barrier=None):
+def verify_kunlun(original_fn, self, batch, pp_proxy_tensors=None, grammar_barrier=None):
     """Patch verify to conditionally skip attention backend init.
 
     Args:
         original_fn: The original verify function.
         self: The worker instance.
         batch: The batch to verify.
+        pp_proxy_tensors: Pipeline-parallel proxy tensors, forwarded untouched
+            (added upstream in the PP x PD x DSpark work).
 
     Returns:
         The result of the original verify function.
@@ -70,6 +72,11 @@ def verify_kunlun(original_fn, self, batch, grammar_barrier=None):
 
     self.target_worker.forward_batch_generation = patched_forward_batch_generation
     try:
-        return original_fn(self, batch, grammar_barrier=grammar_barrier)
+        return original_fn(
+            self,
+            batch,
+            pp_proxy_tensors=pp_proxy_tensors,
+            grammar_barrier=grammar_barrier,
+        )
     finally:
         self.target_worker.forward_batch_generation = original_forward_batch_generation

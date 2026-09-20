@@ -65,8 +65,19 @@ def mqa_forward_prepare_kunlun(
     attn_backend,
     q_out: Optional[torch.Tensor] = None,
     x_quant=None,
+    q_rope_out: Optional[torch.Tensor] = None,
+    k_nope_out: Optional[torch.Tensor] = None,
+    k_rope_out: Optional[torch.Tensor] = None,
 ):
-    """Use the single-call Q/KV RoPE order for prefill and decode."""
+    """Use the single-call Q/KV RoPE order for prefill and decode.
+
+    `q_rope_out` / `k_nope_out` / `k_rope_out` are upstream's packed fp8
+    two-pool output buffers. The caller only allocates them under
+    `unified_fp8_decode`/`unified_fp8_prefill`, both of which require
+    `is_unified_kv_triton()`, and that gate already sends us down the
+    `original_fn` branch below -- so on the Kunlun fast path they are None.
+    They are still forwarded (and asserted) rather than dropped.
+    """
     from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
         is_unified_kv_triton,
     )
@@ -93,7 +104,15 @@ def mqa_forward_prepare_kunlun(
             attn_backend,
             q_out,
             x_quant=x_quant,
+            q_rope_out=q_rope_out,
+            k_nope_out=k_nope_out,
+            k_rope_out=k_rope_out,
         )
+
+    assert q_rope_out is None and k_nope_out is None and k_rope_out is None, (
+        "packed fp8 two-pool buffers reached the Kunlun prepare path; they are "
+        "only allocated under unified_kv, which is handled above"
+    )
 
     x_linear = x_quant if x_quant is not None else x
     if self.fuse_wqa_wkv:
