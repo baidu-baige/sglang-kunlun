@@ -219,7 +219,9 @@ def _get_paged_mqa_logits_metadata_kunlun(seq_lens, page_size, num_sm):
 class KunlunDSV4AttnMetadata(DSV4AttnMetadata):
     """DSV4 metadata without CUDA FlashMLA scheduler objects."""
 
-    def init_flashmla_related(self, is_prefill: bool = False) -> None:
+    def init_flashmla_related(
+        self, is_prefill: bool = False, low_ratio_buffers=None
+    ) -> None:
         """Initialize Kunlun sparse metadata without FlashMLA schedulers.
 
         Mirrors the upstream ratio split. V4-Flash stages carry ratio 4 (and
@@ -253,6 +255,30 @@ class KunlunDSV4AttnMetadata(DSV4AttnMetadata):
         # Keep this unset to match the patched xspeedgate top-k path; a raw
         # buffer would force the 0.5.14 JIT wrapper into its PyTorch fallback.
         self.c4_sparse_raw_indices = None
+        # Preallocated low-ratio buffers (upstream's `small_metadata` decode
+        # path): adopt them instead of allocating, exactly as upstream does,
+        # so a captured graph keeps pointing at the same storage. The Kunlun
+        # metadata builder never passes them today, but upstream's does and
+        # silently re-allocating here would strand the captured pointers.
+        if low_ratio_buffers is not None:
+            assert not is_prefill and self.low_ratios == (1, 2), (
+                "low_ratio_buffers requires a ratio-1/2 decode batch, got "
+                f"{is_prefill=}, low_ratios={self.low_ratios}"
+            )
+            self.c1_sparse_topk_lengths, self.c1_sparse_page_indices = (
+                low_ratio_buffers[2:4]
+            )
+            self.c2_sparse_topk_lengths, self.c2_sparse_page_indices = (
+                low_ratio_buffers[6:8]
+            )
+            self.c1_sparse_raw_indices = None
+            self.c2_sparse_raw_indices = None
+            self.c0_flashmla_metadata = None
+            self.c1_flashmla_metadata = None
+            self.c2_flashmla_metadata = None
+            self.c4_flashmla_metadata = None
+            self.c128_flashmla_metadata = None
+            return
         # V4.1 low-ratio (1/2) sparse top-k buffers. The indexer fills them in
         # place; the attention op reads them as (slot, -1-padded) extra indices.
         for ratio, lengths in (
@@ -646,7 +672,9 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         # position and is filtered by the `reach` mask below.
         best_j = torch.full((rows, k), window, dtype=torch.int64, device=device)
 
-        from sglang.srt.layers.attention.dsv4.indexer import select_candidate_blocks
+        from sglang.srt.layers.attention.dsv4.candidate_indexer import (
+            select_candidate_blocks,
+        )
 
         jc = int(os.environ.get("DSV4_LOW_RATIO_INDEX_CHUNK", "2048"))
         rc = int(os.environ.get("DSV4_LOW_RATIO_INDEX_ROWS", "64"))
