@@ -30,6 +30,7 @@ from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers import engram as engram_mod
 from sglang.srt.layers.engram import EngramEmbedding
+from sglang_kunlun.kernels.kernel_ops import note_op_path
 
 
 _INT8_CACHE: Optional[bool] = None
@@ -180,13 +181,55 @@ class EngramEmbeddingKunlun(EngramEmbedding):
             return out
         return super().forward(indices, forward_batch, cp_all_tokens=cp_all_tokens)
 
+    def _engram_gather_op_usable(self, ids: torch.Tensor) -> bool:
+        """Whether `xspeedgate_ops::engram_gather` accepts this table and these ids.
+
+        Mirrors `check_engram_gather_args`
+        (`XSpeedGate/wrapper/src/embedding/engram_gather.cpp:35`): int8 [rows, dim]
+        weight and bf16 [rows, 1] scale, both contiguous and on the same XPU as
+        the int32/int64 ids. The table is only off-device in unit tests and on the
+        host-table path (handled above), so a miss just means the torch gather.
+        """
+        weight, scale = self.weight.data, self.weight_scale.data
+        if weight.dtype is not torch.int8 or scale.dtype is not torch.bfloat16:
+            return False
+        if weight.dim() != 2 or weight.size(1) != self.dim:
+            return False
+        if scale.dim() != 2 or scale.size(1) != 1 or scale.size(0) != weight.size(0):
+            return False
+        if not weight.is_cuda or not weight.is_contiguous() or not scale.is_contiguous():
+            return False
+        if scale.device != weight.device or ids.device != weight.device:
+            return False
+        return ids.dtype in (torch.int32, torch.int64)
+
     def _owned_rows(self, indices: torch.Tensor) -> torch.Tensor:
         if not self._int8:
             return super()._owned_rows(indices)
         if self.rows == 0:
             return self._empty(indices).zero_()
         if self.host_table is None:
-            # Device-resident shard: plain tensor gather, no raw pointers.
+            # Device-resident shard: `xspeedgate_ops::engram_gather` reads the int8
+            # payload and the per-row bf16 scale straight out of the table, so no
+            # fp32 [N, dim] temporaries. `block_size == dim` selects the
+            # one-scale-per-row (channel-wise int8) decode, and ids outside
+            # [row_start, row_start + rows) come out as zero rows, which is what
+            # the TP all-reduce sums.
+            ids = indices.reshape(-1)
+            if self._engram_gather_op_usable(ids):
+                note_op_path("engram_gather", "xspeedgate:engram_gather")
+                values = torch.ops.xspeedgate_ops.engram_gather(
+                    self.weight.data,
+                    self.weight_scale.data,
+                    ids.contiguous(),
+                    self.dim,
+                    self.dim,
+                    self.row_start,
+                    self.row_start + self.rows,
+                )
+                return values.view(*indices.shape, self.dim)
+            # Plain tensor gather, for the shapes/dtypes the op declines.
+            note_op_path("engram_gather", "torch:device-table")
             local = (indices - self.row_start).to(torch.int64)
             owned = (local >= 0) & (local < self.rows)
             local = local.masked_fill(~owned, 0)
