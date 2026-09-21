@@ -2990,14 +2990,65 @@ def dsv4_hash_topk_kunlun(
     return topk_weights, topk_ids
 
 
+# kunlun_ops.matmul writes an fp32 result directly for these input dtype pairs.
+_DSV4_MATMUL_FP32_OUT_INPUTS = frozenset(
+    (
+        (torch.bfloat16, torch.bfloat16),
+        (torch.bfloat16, torch.float32),
+        (torch.float32, torch.float32),
+    )
+)
+# fp16 has no fp32-output kernel ("matmul unimplemented"). Its fp16-output
+# kernel still accumulates in fp32, so only the result is rounded, and both
+# input casts are still skipped.
+_DSV4_MATMUL_FP16_OUT_INPUTS = frozenset(((torch.float16, torch.float16),))
+
+
+def _dsv4_kunlun_matmul_out_dtype(
+    x: torch.Tensor, y: torch.Tensor
+) -> Optional[torch.dtype]:
+    """Return the kunlun_ops.matmul output dtype for x @ y.T, or None to fall back."""
+
+    inputs = (x.dtype, y.dtype)
+    if inputs in _DSV4_MATMUL_FP32_OUT_INPUTS:
+        return torch.float32
+    if inputs in _DSV4_MATMUL_FP16_OUT_INPUTS:
+        return torch.float16
+    return None
+
+
 @register_jit_op("sglang.kernels.ops.attention.dsv4.gemm", "linear_bf16_fp32")
 def dsv4_linear_bf16_fp32_kunlun(
     x: torch.Tensor,
     y: torch.Tensor,
 ) -> torch.Tensor:
-    """Preserve the shared DSV4 FP32-output GEMM contract."""
+    """Preserve the shared DSV4 FP32-output GEMM contract.
 
-    return torch.nn.functional.linear(x.float(), y.float())
+    kunlun_ops.matmul consumes the half-precision inputs as they are, so the two
+    .float() copies the torch fallback needs disappear. The weight copy is the
+    expensive one: the fallback re-materialises it on every forward.
+    """
+
+    out_dtype = _dsv4_kunlun_matmul_out_dtype(x, y)
+    if out_dtype is None:
+        result = torch.nn.functional.linear(x.float(), y.float())
+    else:
+        import kunlun_ops
+
+        out = torch.empty(
+            (x.shape[0], y.shape[0]), dtype=out_dtype, device=x.device
+        )
+        kunlun_ops.matmul(x, y, out, False, True)
+        result = out if out_dtype is torch.float32 else out.float()
+    return result
+
+
+def _resolve_silu_and_mul_with_swiglu_limit_out():
+    """Return the ``_out`` variant of the swiglu-limit activation, else None."""
+
+    return getattr(
+        torch.ops.xspeedgate_ops, "silu_and_mul_with_swiglu_limit_out", None
+    )
 
 
 @register_jit_op("sglang.kernels.ops.attention.dsv4.moe", "silu_and_mul_clamp")
@@ -3006,6 +3057,18 @@ def dsv4_silu_and_mul_clamp_kunlun(
     output: torch.Tensor,
     swiglu_limit: float,
 ) -> None:
+    """Apply clamped SiLU-and-mul into ``output``.
+
+    The ``_out`` variant writes the caller's buffer directly, so the allocation
+    of the kernel's own return tensor and the following ``output.copy_`` are
+    gone. Falls back to the allocating variant when unavailable.
+    """
+
+    op = _resolve_silu_and_mul_with_swiglu_limit_out()
+    if op is not None:
+        op(input, output, swiglu_limit)
+        return
+
     output.copy_(
         torch.ops.xspeedgate_ops.silu_and_mul_with_swiglu_limit(input, swiglu_limit)
     )
