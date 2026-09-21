@@ -9,7 +9,20 @@
    XPU 算子（AICapX-1302），入参与上游 wrapper 逐个对齐，可以直接顶替。
    算法是 chain rejection sampling：按 ``u * draft_p < target_p`` 判接受，拒绝处从残差
    分布 ``normalize(relu(target - draft))`` 采 bonus token，输出分布无偏。
-   算子不存在时（旧版 xspeedgate_ops）自动回落到上游 Triton，不影响启动。
+
+   算子不存在时（旧版 xspeedgate_ops）回落到的 ``original_fn`` **不是上游 Triton**，而是
+   ``kernels/kernel_ops.py`` 里用 ``register_jit_op`` 注册的那份纯 torch 实现。两处注册
+   谁都不多余，是一条两级链：
+
+   - ``kernel_ops.install()``（``hooks/registry.py:64``）先把上游 Triton 符号整体换成
+     torch 实现 —— 上游 Triton 在昆仑上根本跑不了，没有这一步就没有可用的兜底。
+   - 之后 ``HookRegistry.apply_hooks()``（``srt/plugins/__init__.py:141``，在所有插件
+     入口函数都执行完之后才调）把这里的 AROUND 包上去，``original_fn`` 取到的自然就是
+     上一步那份 torch 实现。
+
+   这个先后顺序是结构性保证的（install 在 hook 模块 import 之前，apply_hooks 在所有插件
+   之后），不依赖注册顺序的巧合。删掉 ``kernel_ops`` 那一份会让兜底路径退回上游 Triton，
+   等于没有兜底。
 
    注意它有两个调用方，**DSpark 走的是第二个、无条件调用**：
 
@@ -27,12 +40,15 @@
    （表现是请求 hang / 连接被掐断）。
    注意 ``SGLANG_IS_FLASHINFER_AVAILABLE=False`` 挡不住它——那里是模块顶部直接
    ``from flashinfer.sampling import softmax``，绕过了这个开关。
+   这里改成优先调 XSpeedGate 的 ``softmax_temp`` XPU 算子（入参与上游 Triton wrapper
+   逐个对齐），算子不存在时回落到 torch 版本。
 """
 
 
 from __future__ import annotations
 
 import logging
+import os
 
 import torch
 
@@ -86,7 +102,8 @@ def chain_speculative_sampling_kunlun(
         if not _LOGGED:
             _LOGGED = True
             logger.warning(
-                "[KUNLUN_SPEC_SAMPLING] xspeedgate_ops 缺少 %s，回落到上游 Triton 实现",
+                "[KUNLUN_SPEC_SAMPLING] xspeedgate_ops 缺少 %s，回落到 kernel_ops "
+                "注册的 torch 实现",
                 _OP_NAME,
             )
         return original_fn(
@@ -127,6 +144,13 @@ def chain_speculative_sampling_kunlun(
 
 
 _SOFTMAX_LOGGED = False
+_SOFTMAX_OP_NAME = "softmax_temp"
+_SOFTMAX_TEMP_BLOCK_V = 4096
+
+
+def _resolve_softmax_temp_op():
+    """拿到 XPU 的带温度 softmax 算子；不可用时返回 None 走 torch。"""
+    return getattr(torch.ops.xspeedgate_ops, _SOFTMAX_OP_NAME, None)
 
 
 @plugin_hook(
@@ -134,16 +158,48 @@ _SOFTMAX_LOGGED = False
     type=HookType.REPLACE,
 )
 def softmax_temp_execute_kunlun(cls, *args, **kwargs) -> torch.Tensor:
-    """带温度 softmax 走纯 torch 实现。
+    """带温度 softmax 优先走 XSpeedGate 的 XPU 算子。
 
     上游分派顺序是 flashinfer -> triton -> torch，昆仑上前两者都不可用：flashinfer 是
-    预编译的 CUDA kernel（invalid device function），Triton 这套环境也不走。
-    torch 版本就是 ``logits / temp`` 再 softmax，5 行，直接可用。
+    预编译的 CUDA kernel（invalid device function），Triton 这套环境也不走，所以原先
+    钉死在 torch 版本上。torch 版本要 `repeat_interleave` 展一份 per-row 温度、把 logits
+    升到 fp32 存一份、再除、再 softmax —— 在 vocab=129280 上每步多出好几个全量中间张量。
+    `xspeedgate_ops.softmax_temp` 的入参和上游 Triton wrapper 逐个对齐（含
+    `logits_row_stride` / `BLOCK_V`），一个 kernel 直接写进 out。
+    算子不存在时（旧版 xspeedgate_ops）回落到 torch，不影响启动。
     """
     global _SOFTMAX_LOGGED
+    op = _resolve_softmax_temp_op()
+    if op is None:
+        if not _SOFTMAX_LOGGED:
+            _SOFTMAX_LOGGED = True
+            logger.info(
+                "[KUNLUN_SPEC_SAMPLING] SoftmaxTemp 走 torch 实现（绕开 flashinfer）"
+            )
+        return cls.torch(*args, **kwargs)
+
+    logits = kwargs["logits"]
+    temperatures = kwargs["temperatures"]
+    rows_per_request = kwargs["rows_per_request"]
+    num_rows, vocab = logits.shape[0], logits.shape[-1]
+    bs = num_rows // rows_per_request
+    assert (
+        bs * rows_per_request == num_rows
+    ), f"num_rows {num_rows} not divisible by rows_per_request {rows_per_request}"
     if not _SOFTMAX_LOGGED:
         _SOFTMAX_LOGGED = True
         logger.info(
-            "[KUNLUN_SPEC_SAMPLING] SoftmaxTemp 走 torch 实现（绕开 flashinfer）"
+            "[KUNLUN_SPEC_SAMPLING] SoftmaxTemp 使用 xspeedgate_ops.%s",
+            _SOFTMAX_OP_NAME,
         )
-    return cls.torch(*args, **kwargs)
+    out = torch.empty((num_rows, vocab), dtype=torch.float32, device=logits.device)
+    op(
+        logits,
+        temperatures.reshape(bs).to(torch.float32).contiguous(),
+        out,
+        vocab,
+        rows_per_request,
+        logits.stride(0),
+        _SOFTMAX_TEMP_BLOCK_V,
+    )
+    return out

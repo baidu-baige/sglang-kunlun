@@ -258,6 +258,16 @@ def _dsv4_drop_padded_moe_rows(hidden_states, topk_weights):
     return hidden_states * keep, topk_weights * keep
 
 
+def _resolve_clamp_swiglu_dynamic_quant():
+    """Return ``xspeedgate_ops.clamp_swiglu_dynamic_quant``, or None to unfuse.
+
+    The op folds the two ``clamp_`` passes, ``kunlun_ops.swiglu`` and
+    ``kunlun_ops.quant2d`` into one kernel and returns ``[int8 q, fp32 scale]``.
+    """
+
+    return getattr(torch.ops.xspeedgate_ops, "clamp_swiglu_dynamic_quant", None)
+
+
 @plugin_hook(
     "sglang.srt.layers.quantization.w8a8_int8.W8A8Int8MoEMethod.apply",
     type=HookType.REPLACE,
@@ -369,31 +379,43 @@ def moe_apply_kunlun(
     )
     dump_selected_moe_rows(layer, "fc1.gate_up_raw", gate_up, num_tokens, top_k)
     swiglu_limit = self.moe_runner_config.swiglu_limit
-    if swiglu_limit is not None:
-        half = gate_up.shape[-1] // 2
-        gate_up[..., :half].clamp_(max=float(swiglu_limit))
-        gate_up[..., half:].clamp_(
-            min=-float(swiglu_limit), max=float(swiglu_limit)
+    fused_act_quant = (
+        _resolve_clamp_swiglu_dynamic_quant() if swiglu_limit is not None else None
+    )
+    if fused_act_quant is not None:
+        # One kernel for clamp x2 + swiglu + quant2d: the clamped gate_up, the
+        # fp16 activation and its round-trip through memory all disappear. The
+        # two intermediate stage dumps below are only reachable on the unfused
+        # path (set KUNLUN_MOE_CLAMP_SWIGLU_QUANT=0 when they are needed).
+        activated_q, activated_scale = fused_act_quant(
+            gate_up.reshape(num_tokens * top_k, -1), float(swiglu_limit)
         )
-    dump_selected_moe_rows(
-        layer, "fc1.gate_up_clamped", gate_up, num_tokens, top_k
-    )
-    activated = torch.empty(
-        *gate_up.shape[:-1],
-        gate_up.shape[-1] // 2,
-        dtype=gate_up.dtype,
-        device=device,
-    )
-    kunlun_ops.swiglu(gate_up, activated)
-    dump_selected_moe_rows(layer, "swiglu.output", activated, num_tokens, top_k)
-    activated = activated.reshape(num_tokens * top_k, -1)
-    activated_q = torch.empty_like(activated, dtype=torch.int8)
-    activated_scale = torch.empty(
-        (num_tokens * top_k, 1), dtype=torch.float32, device=device
-    )
-    kunlun_ops.quant2d(
-        activated, activated_q, activated_scale, force_sdnn=True
-    )
+    else:
+        if swiglu_limit is not None:
+            half = gate_up.shape[-1] // 2
+            gate_up[..., :half].clamp_(max=float(swiglu_limit))
+            gate_up[..., half:].clamp_(
+                min=-float(swiglu_limit), max=float(swiglu_limit)
+            )
+        dump_selected_moe_rows(
+            layer, "fc1.gate_up_clamped", gate_up, num_tokens, top_k
+        )
+        activated = torch.empty(
+            *gate_up.shape[:-1],
+            gate_up.shape[-1] // 2,
+            dtype=gate_up.dtype,
+            device=device,
+        )
+        kunlun_ops.swiglu(gate_up, activated)
+        dump_selected_moe_rows(layer, "swiglu.output", activated, num_tokens, top_k)
+        activated = activated.reshape(num_tokens * top_k, -1)
+        activated_q = torch.empty_like(activated, dtype=torch.int8)
+        activated_scale = torch.empty(
+            (num_tokens * top_k, 1), dtype=torch.float32, device=device
+        )
+        kunlun_ops.quant2d(
+            activated, activated_q, activated_scale, force_sdnn=True
+        )
     dump_selected_moe_rows(
         layer, "fc2.activated_q", activated_q, num_tokens, top_k
     )
