@@ -5383,9 +5383,9 @@ def fused_dsa_draft_extend_metadata(
 
 @register_triton_op(
     "sglang.kernels.ops.attention.dsa.cp_split",
-    "dsa_cp_round_robin_split_q_seqs_kernel",
+    "dsa_cp_interleave_q_seqs_kernel",
 )
-def dsa_cp_round_robin_split_q_seqs_kernel(
+def dsa_cp_interleave_q_seqs_kernel(
     in_seqs: torch.Tensor,
     out_seqs: torch.Tensor,
     bs_idx: torch.Tensor,
@@ -5408,7 +5408,7 @@ def dsa_cp_round_robin_split_q_seqs_kernel(
     selected = torch.nonzero(per_seq > 0, as_tuple=False).flatten()
     if selected.numel() != out_seqs.numel():
         raise RuntimeError(
-            "dsa_cp_round_robin_split_q_seqs: selected rows do not match the "
+            "dsa_cp_interleave_q_seqs: selected rows do not match the "
             f"preallocated output ({selected.numel()} vs {out_seqs.numel()}; "
             f"tokens={tokens}, cp_size={cp_size}, cp_rank={cp_rank})"
         )
