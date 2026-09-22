@@ -29,6 +29,19 @@ from .common import _alloc_2m_aligned
 class KunlunMHATokenToKVPool(MHATokenToKVPool):
     """Kunlun MHA KV pool with custom buffer creation and reshape-and-cache support."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Upstream's KV-copy kernels are CUDA-target Triton kernels and XPU has no
+        # backend for them ("0 compatible backends for target (cuda)"), so move KV
+        # rows through the pool's torch path. `_init_kv_copy_and_warmup` already ran
+        # inside super().__init__; it only fills `_kv_copy_config`, which the native
+        # branch of `_move_kv_cache_impl` does not read.
+        self.use_native_move_kv_cache = True
+
+    def _init_kv_copy_and_warmup(self):
+        """Skip the tiled-copy warmup -- it JITs the CUDA-only Triton kernel."""
+        self._kv_copy_config = None
+
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
