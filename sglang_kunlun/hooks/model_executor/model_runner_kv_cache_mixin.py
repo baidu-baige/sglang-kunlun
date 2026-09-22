@@ -45,27 +45,54 @@ def _fix_dsv4_swa_allocator(
     req_to_token_pool,
     token_to_kv_pool_allocator,
 ):
-    """Restore the hybrid-SWA allocator contract bypassed by the OOT branch."""
-    from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+    """Restore the hybrid-SWA allocator contract bypassed by the OOT branch.
+
+    The OOT branch hands back the platform's paged allocator for every worker, while the
+    pool it is paired with is only sometimes an ``SWAKVPool``:
+      * the DSV4 main worker and MiMo-V2-Flash's EAGLE/MTP draft worker get a real
+        ``SWAKVPool`` (the draft builds one for the full/swa split), so upstream's
+        ``isinstance(allocator, SWATokenToKVPoolAllocator)`` assert on the draft path
+        fails and ``full_to_swa_index_mapping`` -- asserted at use time -- is never
+        registered;
+      * the MiMo main worker gets a non-SWA pool (`_init_mha_pools` checks
+        ``is_out_of_tree()`` before ``is_hybrid_swa``), where the paged allocator is
+        self-consistent and must be left alone.
+    Rebuild what upstream would have built, mirroring its branch on
+    ``full_max_total_num_tokens == 0``.
+    """
+    from sglang.srt.mem_cache.allocator.swa import (
+        PureSWATokenToKVPoolAllocator,
+        SWATokenToKVPoolAllocator,
+    )
+    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 
     if (
-        self.is_draft_worker
-        or not self.is_hybrid_swa
-        or not is_dsv4_model
+        not self.is_hybrid_swa
+        or not isinstance(token_to_kv_pool, BaseSWAKVPool)
         or isinstance(result, SWATokenToKVPoolAllocator)
     ):
         return result
 
     need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
-    allocator = SWATokenToKVPoolAllocator(
-        sizes.full_max_total_num_tokens,
-        sizes.swa_max_total_num_tokens,
-        page_size=self.page_size,
-        dtype=self.kv_cache_dtype,
-        device=self.device,
-        kvcache=token_to_kv_pool,
-        need_sort=need_sort,
-    )
+    if sizes.full_max_total_num_tokens == 0:
+        allocator = PureSWATokenToKVPoolAllocator(
+            sizes.swa_max_total_num_tokens,
+            page_size=self.page_size,
+            dtype=self.kv_cache_dtype,
+            device=self.device,
+            kvcache=token_to_kv_pool,
+            need_sort=need_sort,
+        )
+    else:
+        allocator = SWATokenToKVPoolAllocator(
+            sizes.full_max_total_num_tokens,
+            sizes.swa_max_total_num_tokens,
+            page_size=self.page_size,
+            dtype=self.kv_cache_dtype,
+            device=self.device,
+            kvcache=token_to_kv_pool,
+            need_sort=need_sort,
+        )
     token_to_kv_pool.register_mapping(allocator.full_to_swa_index_mapping)
     if hasattr(req_to_token_pool, "register_dsv4_allocator"):
         req_to_token_pool.register_dsv4_allocator(allocator)
