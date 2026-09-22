@@ -124,35 +124,25 @@ def mqa_forward_prepare_kunlun(
         kv, _ = self.wkv(x_linear)
 
     q_lora = self.q_norm(q_lora)
-    q, _ = self.wq_b(q_lora)
-    q = q.view(-1, self.n_local_heads, self.head_dim)
-    # Q 的 per-head 无权重 RMSNorm 是 V4 专属。上游用 `config.q_head_norm` 控制
-    # （`_compute_q_b` 的 `fused_q_norm_rope` 分支），V4 是 True、**V4.1 是 False**；
-    # checkpoint 自带的参考实现也只归一化低秩 q_lora，从不碰 per-head Q。无条件做会让
-    # 每层 Q 被多归一化一次（layer 0 实测 |Q|max 31.4 → 11.1），输出全错但量级看着正常。
-    if getattr(self, "q_head_norm", True):
-        import kunlun_ops
-
-        q_normalized = torch.empty_like(q)
-        kunlun_ops.rmsnorm(
-            q,
-            None,
-            q_normalized,
-            self.eps,
-            False,
-            True,
-            None,
-            None,
-            None,
-        )
-        q = q_normalized
+    # Q 的 per-head 无权重 RMSNorm 是 V4 专属：上游用 `config.q_head_norm` 控制
+    # （`_compute_q_b` 里的 `fused_q_norm_rope` 分支），V4 是 True、**V4.1 是 False**；
+    # checkpoint 自带的参考实现也只归一化低秩 q_lora，从不碰 per-head Q。做错会让每层
+    # Q 被多归一化一次（layer 0 实测 |Q|max 31.4 → 11.1），输出全错但量级看着正常。
+    #
+    # 这件事**只有一份实现**：`MQALayer._compute_q_b` 的 REPLACE
+    # （`deepseek_v4_precision.py::compute_q_b_kunlun`）。这里直接调它、传**已经归一化过的**
+    # q_lora（`_compute_q_b` 的入参口径就是上游 `_forward_prepare` 的 `q_for_wqb`），
+    # 而不是就地再抄一遍判据 —— 否则「哪一份生效」会取决于这次 `_forward_prepare` 走没
+    # 走到上游回落分支（CP/unified/多流各自一条），正是待办 #13 记的那类隐患。
+    q = self._compute_q_b(q_lora, positions, q_out)
     kv = self.kv_norm(kv)
 
     from sglang.srt.models.deepseek_v4 import fused_rope_inplace
 
+    # 只 rope kv；q 的 RoPE 已经由 `_compute_q_b` 按上游口径做完了。
     fused_rope_inplace(
-        q[..., -self.qk_rope_head_dim :],
         kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
+        None,
         self.freqs_cis,
         positions,
     )
@@ -189,9 +179,8 @@ def mqa_forward_prepare_kunlun(
                 self.compressor,
             )
 
-    if q_out is not None:
-        q_out.copy_(q)
-        q = q_out
+    # q 写入 q_out 这件事由 `_compute_q_b` 负责（q_out 非空时它返回的就是 q_out），
+    # 这里不再重复 copy。
     return q, None
 
 

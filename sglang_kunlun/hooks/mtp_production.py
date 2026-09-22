@@ -341,8 +341,19 @@ def capture_cuda_graphs_kunlun(self):
     "sglang.srt.speculative.eagle_worker_v2.EAGLEWorkerV2.verify",
     type=HookType.AFTER,
 )
-def publish_verify_stride_kunlun(result, self, batch, grammar_barrier=None):
-    """Carry the verify-time fixed row width to scheduler result processing."""
+def publish_verify_stride_kunlun(
+    result, self, batch, pp_proxy_tensors=None, grammar_barrier=None
+):
+    """Carry the verify-time fixed row width to scheduler result processing.
+
+    ``pp_proxy_tensors`` is declared even though it is unused: the AFTER hook
+    receives the original call's kwargs verbatim, and upstream
+    ``EAGLEWorkerV2.verify(self, batch, pp_proxy_tensors=None, grammar_barrier=None)``
+    is invoked with ``pp_proxy_tensors=`` at every call site. Declaring it
+    explicitly (rather than ``**kwargs``) keeps the hook's parameter list a
+    prefix-match of upstream, so a future upstream signature change is caught by
+    ``scripts/t008_hook_audit.py`` instead of silently swallowing new args.
+    """
     result.speculative_num_draft_tokens = self.speculative_num_draft_tokens
     return result
 
