@@ -1238,3 +1238,182 @@ def _compress_forward_c4_torch(
         out = torch.where(is_bnd, out, torch.zeros_like(out))
 
     return out.to(kv_score_input.dtype)
+
+
+# ===========================================================================
+# Prefill compress-plan generators.
+# Restore symbols that hooks/jit_kernel/dsv4/compress.py::_prefill_plan_generate_torch
+# imports from this module for CompressorPrefillPlan.generate. The decode-plan
+# analogues live in compress.py; these prefill counterparts are host-side plan
+# builders (run at prefill prepare, outside CUDA-graph capture).
+# ===========================================================================
+def _make_prefill_plan_torch(
+    compress_ratio: int,
+    req_pool_indices: torch.Tensor,   # [bs] int64
+    seq_lens: torch.Tensor,           # [bs] int64
+    extend_lens: torch.Tensor,        # [bs] int64
+    req_to_token: torch.Tensor,       # [num_reqs, max_seq] int32
+    full_to_swa: torch.Tensor,        # [num_full_slots] int64
+    swa_page_size: int,
+    ring_size: int,
+    num_q_tokens: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pure-Python reimplementation of plan_compress_prefill.
+
+    Returns (plan_c, plan_w) where:
+      plan_c: [num_c, 16] uint8  (CompressPlan layout)
+      plan_w: [num_w, 8] uint8   (WritePlan layout)
+
+    CompressPlan (16 bytes):
+      uint32  seq_len
+      uint16  ragged_id
+      uint16  buffer_len  (not used here, set 0)
+      int32   read_page_0
+      int32   read_page_1  (not used, set 0 or -1)
+
+    WritePlan (8 bytes):
+      uint32  ragged_id  (packed: batch_id<<16 | ragged_id, but we set just ragged_id)
+      int32   write_loc
+    """
+    device = seq_lens.device
+    cr = compress_ratio
+    bs = int(seq_lens.shape[0])
+
+    compress_entries = []  # list of (seq_len, ragged_id, state_loc)
+    write_entries = []     # list of (ragged_id, state_loc)
+
+    ragged_offset = 0  # running offset across all tokens in all requests
+    for b in range(bs):
+        seq_len = int(seq_lens[b].item())
+        extend_len = int(extend_lens[b].item())
+        prefix_len = seq_len - extend_len
+        rid = int(req_pool_indices[b].item())
+        # See _make_prefill_plan_c4_torch: the state pool is a paged ring, so only
+        # the tail tokens that later steps still read are written (no overlap for
+        # this layout, hence first_w_pos == last compress position).
+        first_w_pos = (seq_len // cr) * cr
+
+        for j in range(extend_len):
+            tok_pos = prefix_len + j  # position within the full sequence
+            ragged_id = ragged_offset + j
+
+            # Compress entry: only at boundary positions
+            pos_in_seq = tok_pos + 1  # 1-indexed position after this token
+            if pos_in_seq % cr == 0 and pos_in_seq > 0:
+                # This token is at the last position of a compress group
+                token_loc_abs = int(req_to_token[rid, tok_pos].item())
+                swa_loc = int(full_to_swa[token_loc_abs].item())
+                swa_page = swa_loc // swa_page_size
+                state_loc = (swa_page * ring_size + (swa_loc % ring_size)) // cr
+                compress_entries.append((pos_in_seq, ragged_id, state_loc))
+                if tok_pos >= first_w_pos:
+                    write_entries.append((ragged_id, state_loc))
+
+        ragged_offset += extend_len
+
+    num_c = len(compress_entries)
+    num_w = len(write_entries)
+    plan_c = torch.zeros(max(num_c, 1), 16, dtype=torch.uint8, device=device)
+    plan_w = torch.zeros(max(num_w, 1), 8, dtype=torch.uint8, device=device)
+
+    if num_c > 0:
+        pc_i32 = plan_c.view(torch.int32)  # [num_c, 4]
+        for i, (sl, rid, sloc) in enumerate(compress_entries):
+            pc_i32[i, 0] = sl     # seq_len
+            pc_i32[i, 1] = rid    # ragged_id (low 16) + buffer_len (high 16) = 0
+            pc_i32[i, 2] = sloc   # read_page_0
+            pc_i32[i, 3] = 0
+
+    if num_w > 0:
+        pw_i32 = plan_w.view(torch.int32)  # [num_w, 2]
+        for i, (rid, sloc) in enumerate(write_entries):
+            pw_i32[i, 0] = rid    # ragged_id
+            pw_i32[i, 1] = sloc   # write_loc
+
+    # Trim to actual sizes
+    plan_c = plan_c[:num_c]
+    plan_w = plan_w[:num_w]
+    return plan_c, plan_w
+
+
+def _make_prefill_plan_c4_torch(
+    compress_ratio,
+    req_pool_indices,
+    seq_lens,
+    extend_lens,
+    req_to_token,
+    full_to_swa,
+    swa_page_size,
+    ring_size,
+    num_q_tokens,
+):
+    """c4 CompressPlan/[num_c,16] + WritePlan/[num_w,8].
+    Writes EVERY extend token to the state pool so overlap pages are populated.
+    """
+    device = seq_lens.device
+    cr = int(compress_ratio)
+    sps = int(swa_page_size)
+    rs = int(ring_size)
+    bs = int(seq_lens.shape[0])
+
+    def cl(x):
+        return (x // sps) * rs + (x % rs)
+
+    comp = []  # (seq_len, ragged_id, read_page_0, read_page_1)
+    wr = []    # (ragged_id, write_loc)
+    ragged_off = 0
+    for b in range(bs):
+        seq_len = int(seq_lens[b].item())
+        ext = int(extend_lens[b].item())
+        pl = seq_len - ext
+        rid = int(req_pool_indices[b].item())
+        # The state pool is a paged ring: only ``ring_size`` slots exist per SWA
+        # page, so writing every extend token (as this used to do) makes the
+        # tokens of one page overwrite each other and leaves the pool holding
+        # whichever token happened to land last. The native plan only writes the
+        # tokens that later steps still need: the tail of the sequence and, for
+        # the overlap (c4) layout, the last ``cr`` tokens of every SWA page.
+        last_c_pos = (seq_len // cr) * cr
+        first_w_pos = last_c_pos - cr
+        for j in range(ext):
+            pos = pl + j
+            ragged_id = ragged_off + j
+            do_write = pos >= first_w_pos or (pos % sps) >= (sps - cr)
+            if do_write:
+                raw = int(req_to_token[rid, pos].item())
+                swa = int(full_to_swa[raw].item())
+                wr.append((ragged_id, cl(swa)))
+            if (pos + 1) % cr == 0:
+                pos1 = pos
+                pos0 = max(pos1 - cr, 0)
+                r1 = int(req_to_token[rid, pos1].item())
+                r0 = int(req_to_token[rid, pos0].item())
+                s1 = int(full_to_swa[r1].item())
+                s0 = int(full_to_swa[r0].item())
+                comp.append((pos + 1, ragged_id, cl(s0) // cr, cl(s1) // cr))
+        ragged_off += ext
+
+    # Long prompts make several extend tokens map onto the same state-pool slot
+    # (the pool is a paged ring) and a scatter with duplicate indices has
+    # undefined behaviour. Keep the sequential last-token-wins semantics of the
+    # native kernel by dropping the earlier writers here on the host: the device
+    # path then needs no index-validating dedup, which is illegal during CUDA
+    # graph capture (the recorded indices are not materialised yet).
+    if wr:
+        wr = list({wl: (rid, wl) for rid, wl in wr}.values())
+
+    num_c = len(comp)
+    num_w = len(wr)
+    plan_c = torch.zeros(max(num_c, 1), 16, dtype=torch.uint8, device=device)
+    plan_w = torch.zeros(max(num_w, 1), 8, dtype=torch.uint8, device=device)
+    pc = plan_c.view(torch.int32)
+    pw = plan_w.view(torch.int32)
+    for i, (sl, rid, rp0, rp1) in enumerate(comp):
+        pc[i, 0] = sl
+        pc[i, 1] = rid
+        pc[i, 2] = rp0
+        pc[i, 3] = rp1
+    for i, (rid, wl) in enumerate(wr):
+        pw[i, 0] = rid
+        pw[i, 1] = wl
+    return plan_c[:num_c], plan_w[:num_w]
