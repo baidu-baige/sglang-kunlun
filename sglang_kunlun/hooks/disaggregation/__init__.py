@@ -45,6 +45,15 @@ def _patch_pool(pool):
         pool.get_contiguous_buf_infos = _wrap_buf_infos(pool.get_contiguous_buf_infos)
     if hasattr(pool, "get_state_buf_infos"):
         pool.get_state_buf_infos = _wrap_buf_infos(pool.get_state_buf_infos)
+    # MiniMax sparse pools ship the block-selector K cache on the state channel
+    # through this third name (``MiniMaxSparseKVPool.get_index_k_state_buf_infos``
+    # -> StateType.MINIMAX_INDEX_K); it never goes through the two methods above,
+    # so without this wrap its lengths stay unaligned and the decode side selects
+    # sparse blocks from a corrupted index-K cache.
+    if hasattr(pool, "get_index_k_state_buf_infos"):
+        pool.get_index_k_state_buf_infos = _wrap_buf_infos(
+            pool.get_index_k_state_buf_infos
+        )
     pool._kunlun_2m_aligned = True
 
 
