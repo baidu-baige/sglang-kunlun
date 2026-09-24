@@ -1094,14 +1094,13 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             if forward_batch.seq_lens_cpu is not None
             else kv_lens.to("cpu", non_blocking=False)
         )
-        # CP alignment pads the token dimension past the scheduler's extend
-        # lengths. Give every padding row its own batch item with a dummy KV
-        # length so the operator contract qlod[-1] == q rows still holds.
-        pad_rows = (
-            num_queries - int(q_lod_cpu[-1].item())
-            if _dsa_prefill_cp_enabled()
-            else 0
-        )
+        # The token dimension can be padded past the scheduler's extend lengths
+        # by two independent sources: CP alignment, and CUDA-graph capture (a
+        # prefill bucket is an aggregate token count and the host-side
+        # ``extend_seq_lens_cpu`` is a placeholder during capture). Either way,
+        # give every padding row its own batch item with a dummy KV length so
+        # the operator contract qlod[-1] == q rows still holds.
+        pad_rows = num_queries - int(q_lod_cpu[-1].item())
         if pad_rows < 0:
             raise ValueError(
                 "Kunlun DSV4 extend lengths exceed the query rows: "

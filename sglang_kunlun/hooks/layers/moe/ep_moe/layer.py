@@ -23,7 +23,7 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
     DeepEPNormalCombineInput,
 )
-from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
+from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
@@ -446,9 +446,17 @@ class DeepEPMoE(FusedMoE):
     ):
         """forward"""
         if is_in_piecewise_cuda_graph():
-            assert TopKOutputChecker.format_is_standard(
-                topk_output
-            ), "Only standard topk output is supported for piecewise cuda graph"
+            # Check the protocol property rather than isinstance against one
+            # concrete class. Kunlun's select_experts returns its *own*
+            # StandardTopKOutput (it carries an extra `block_statistic` field,
+            # see hooks/layers/moe/topk.py), so upstream's isinstance-based
+            # checker rejects a carrier that is standard in every way this
+            # graph op cares about -- it only reads topk_weights/topk_ids/
+            # router_logits below.
+            assert topk_output.format == TopKOutputFormat.STANDARD, (
+                "Only standard topk output is supported for piecewise cuda graph; "
+                f"got {type(topk_output).__name__} ({topk_output.format!r})"
+            )
             return torch.ops.sglang.moe_forward_piecewise_cuda_graph_impl(
                 hidden_states,
                 topk_output.topk_weights,
