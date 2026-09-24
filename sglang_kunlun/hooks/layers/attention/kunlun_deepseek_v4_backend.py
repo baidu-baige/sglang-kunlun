@@ -51,6 +51,32 @@ def _dsv4_dump_backend_layers():
     return layers
 
 
+def dsv4_stable_dsa_enabled() -> bool:
+    """One-switch entry point for a reproducible DSA forward pass.
+
+    The DSV4 compressed-attention path consumes two XSpeedGate operators whose
+    results depend on the KV physical page layout (measured on P800 with
+    DeepSeek-V4-Flash W8A8: the same request returns different tokens depending
+    on which pages the allocator handed out, which makes greedy output
+    non-reproducible and shows up as score jitter in thinking-mode evals):
+
+      * c4 indexer scores  -- ``mqa_logits_paged`` / ``c4a_paged_mqa_logits``
+      * compressed attention -- ``compressed_attention``
+
+    Setting ``DSV4_KUNLUN_STABLE_DSA=1`` routes exactly those two operators
+    through their Torch reference implementations (equivalent to setting
+    ``DSV4_KUNLUN_REFERENCE_C4=1`` plus ``DSV4_KUNLUN_REFERENCE_ATTN=1``), which
+    makes repeated runs bit-identical at a modest throughput cost.  Everything
+    else keeps using the vendor operators.
+
+    NOTE: the compressor operators (``dsv4_compress_forward_v2`` /
+    ``dsv4_compress_norm_rope_store_v2``) have no Torch reference hook yet, so a
+    small residual run-to-run variation can still remain; a fully deterministic
+    forward needs the vendor kernels to become layout-invariant.
+    """
+    return os.environ.get("DSV4_KUNLUN_STABLE_DSA", "0") == "1"
+
+
 def _dsv4_dump_enabled() -> bool:
     """Whether the attention-chain dump is on.
 
@@ -1196,6 +1222,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         if (
             os.environ.get("DSV4_KUNLUN_REFERENCE_ONLY") == "1"
             or os.environ.get("DSV4_KUNLUN_REFERENCE_ATTN") == "1"
+            or dsv4_stable_dsa_enabled()
             or _cp_short_prompt_needs_reference(forward_batch)
         ):
 
@@ -1733,6 +1760,7 @@ def _compute_c4_logits_kunlun(
     if (
         os.environ.get("DSV4_KUNLUN_REFERENCE_ONLY") == "1"
         or os.environ.get("DSV4_KUNLUN_REFERENCE_C4") == "1"
+        or dsv4_stable_dsa_enabled()
         or _cp_short_prompt_needs_reference(forward_batch)
     ):
         if is_target_verify:
