@@ -1,18 +1,51 @@
-# Python
+# Virtualenv
+/.venv/
+/venv/
+
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
-*.egg-info/
-.eggs/
-build/*
-!build/build.sh
-dist/
+
+# C extensions
 *.so
 
-# Env / editors
-.venv/
-venv/
-.idea/
-.vscode/
-.DS_Store
+# Distribution / packaging
+/bin/
+/build/
+!build/build.sh
+/develop-eggs/
+/dist/
+/eggs/
+/lib/
+/lib64/
+/output/
+/parts/
+/sdist/
+/var/
+/*.egg-info/
+/.installed.cfg
+/*.egg
+/.eggs
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+.tox/
+.coverage
+.cache
 .pytest_cache/
+nosetests.xml
+coverage.xml
+htmlcov/
+
+# Env / editors
+.vscode/
+.idea/
+.DS_Store
+
+# Pre-commit / linters
+.mypy_cache/
+.ruff_cache/

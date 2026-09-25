@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+
+contact_links:
+  - name: 📖 README & Quick Start
+    url: https://github.com/baidu-baige/sglang-kunlun
+    about: |
+      Please check the project README and quick-start instructions first.
+      Many common questions, usage examples, and best practices are covered there.
