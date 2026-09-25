@@ -1,0 +1,36 @@
+name: Code Style Check
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  pylint-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install pre-commit
+        run: pip install pre-commit
+
+      - name: Run pre-commit
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            pre-commit run \
+              --from-ref "origin/${{ github.base_ref }}" \
+              --to-ref HEAD
+          else
+            pre-commit run \
+              --from-ref HEAD~1 \
+              --to-ref HEAD
+          fi
