@@ -24,10 +24,10 @@ order.
 
 ## Maintainers
 
-| Name | Company |
-|:----:|:-------:|
-| [zhaoxin54](https://github.com/zzzhaoxin) | Baidu |
-| [yinzhijian](https://github.com/yinzhijian) | Baidu |
+|                                                                           |                        Name                         |    Company    |
+|:-------------------------------------------------------------------------:|:---------------------------------------------------:|:-------------:|
+| <img width="30px" src="https://avatars.githubusercontent.com/u/320367459"> | [zhaoxin54](https://github.com/zzzhaoxin)            |     Baidu     |
+| <img width="30px" src="https://avatars.githubusercontent.com/u/3899678">   | [yinzhijian](https://github.com/yinzhijian)          |     Baidu     |
 
 ## Responsibilities
 

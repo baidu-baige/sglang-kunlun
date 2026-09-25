@@ -1,0 +1,31 @@
+"kunlun-xpu":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "sglang_kunlun/**"
+          - "build/**"
+          - "setup_env.sh"
+          - "sitecustomize.py"
+
+"ci":
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/**"
+          - ".pre-commit-config.yaml"
+
+"documentation":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.md"
+
+"tests":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "test/**"
+          - "**/test_*.py"
+          - "**/*_test.py"
+
+"dependencies":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "requirements*.txt"
+          - "pyproject.toml"
