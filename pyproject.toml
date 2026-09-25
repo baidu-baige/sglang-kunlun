@@ -30,3 +30,10 @@ py-modules = ["sitecustomize"]
 
 [tool.setuptools.packages.find]
 include = ["sglang_kunlun*"]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+# The repository root has to be importable: the unit tests run against the
+# source tree, without installing the package.
+pythonpath = ["."]
+addopts = "-ra --strict-markers"

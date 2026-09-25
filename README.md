@@ -1,5 +1,23 @@
 # SGLang Kunlun
 
+<p align="center">
+  <a href="https://github.com/baidu-baige/sglang-kunlun"><b>📖 README</b></a> |
+  <a href="#quick-start"><b>🚀 Quick Start</b></a> |
+  <a href="#installation"><b>📦 Installation</b></a> |
+  <a href="#architecture"><b>🧩 Architecture</b></a> |
+  <a href="CONTRIBUTING.md"><b>💬 Contributing</b></a>
+</p>
+
+<p align="center">
+  <img alt="GitHub License" src="https://img.shields.io/github/license/baidu-baige/sglang-kunlun">
+  <img alt="GitHub Stars" src="https://img.shields.io/github/stars/baidu-baige/sglang-kunlun">
+  <img alt="GitHub Forks" src="https://img.shields.io/github/forks/baidu-baige/sglang-kunlun">
+  <img alt="GitHub Issues" src="https://img.shields.io/github/issues/baidu-baige/sglang-kunlun">
+  <img alt="Python Version" src="https://img.shields.io/badge/python-%3E%3D3.10-blue">
+</p>
+
+---
+
 SGLang Kunlun is an out-of-tree (OOT) hardware platform plugin for running
 [SGLang](https://github.com/sgl-project/sglang) on Kunlun XPU hardware. It
 registers the Kunlun platform through SGLang entry points and keeps Kunlun-
@@ -7,12 +25,16 @@ specific bootstrap, runtime hooks, and kernels outside the SGLang source tree.
 
 [Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md)
 
-## Latest News
+---
+
+## Latest News 🔥
 
 - **2026/06** — The `sglang-kunlun` package was created at version `0.1.0`.
 - **Current development** — Kunlun platform registration, runtime bootstrap,
   attention, KV-cache, MoE, quantization, speculative decoding, and
   disaggregation hooks are maintained in this repository.
+
+---
 
 ## Overview
 
@@ -27,7 +49,7 @@ The platform activation is conditional: on a machine where `torch_xmlir` is
 available, the plugin activates `KunlunSRTPlatform`; otherwise it returns
 `None` and does not take over platform discovery.
 
-### Key Features
+### ✨ Key Features
 
 - **Out-of-tree integration** — Integrates with SGLang through Python entry
   points and hooks instead of modifying the SGLang source tree.
@@ -46,6 +68,8 @@ available, the plugin activates `KunlunSRTPlatform`; otherwise it returns
 - **OpenAI-compatible serving** — Uses SGLang's OpenAI-compatible server
   interface once the Kunlun platform has been initialized.
 
+---
+
 ## Prerequisites
 
 - Kunlun XPU hardware; the deployment command below targets Kunlun3 P800.
@@ -60,7 +84,9 @@ The repository's Python packaging metadata is in
 [`pyproject.toml`](pyproject.toml), and the test/build dependencies are listed
 in [`requirements.txt`](requirements.txt).
 
-## Installation
+---
+
+## Installation 📦
 
 Set `YOUR_PATH` to the workspace containing `sglang-kunlun` and the compatible
 SGLang runtime, then install this package in editable mode:
@@ -70,7 +96,9 @@ YOUR_PATH=/path/to/your/workspace
 pip install -e "${YOUR_PATH}/sglang-kunlun"
 ```
 
-## Quick Start
+---
+
+## Quick Start 🚀
 
 ### Configure the Runtime
 
@@ -146,6 +174,8 @@ curl http://localhost:8806/v1/chat/completions \
   }'
 ```
 
+---
+
 ## Compatibility Notes
 
 This repository is a platform plugin rather than a complete SGLang
@@ -160,6 +190,8 @@ is not a complete compatibility matrix.
 | DeepSeek-V4 | DeepSeek-V4 model and KV-cache compatibility hooks | Runtime acceptance must be verified with the target SGLang/Kunlun versions. |
 | Other SGLang models | General platform, attention, KV-cache, MoE, and quantization hooks | Validate each model family and quantization mode separately. |
 
+---
+
 ## Version Matrix
 
 | Component | Version or branch | Source |
@@ -168,7 +200,9 @@ is not a complete compatibility matrix.
 | Development code | `main` | Current repository branch |
 | SGLang and Kunlun runtime | Deployment-specific | Must match the current plugin branch |
 
-## Architecture
+---
+
+## Architecture 🧩
 
 ```text
 sglang-kunlun/
@@ -194,6 +228,8 @@ sglang-kunlun/
 └── NOTICE                      # Copyright and third-party notices
 ```
 
+---
+
 ## Development and Validation
 
 Run the repository tests in an environment with the required Python
@@ -214,10 +250,18 @@ environment with the relevant model, quantization mode, parallelism, and
 graph/disaggregation settings. A passing unit-test run alone does not establish
 end-to-end inference or performance correctness.
 
+---
+
 ## Contributing
 
 We welcome contributions from the community. Please read the
 [Contributing Guide](CONTRIBUTING.md) before submitting a pull request.
+
+All contributors are expected to follow our
+[Code of Conduct](CODE_OF_CONDUCT.md). This project is maintained under the
+[Developer Certificate of Origin](DCO) — please sign off your commits with
+`git commit -s`. See [MAINTAINERS.md](MAINTAINERS.md) for the maintainer list
+and [SECURITY.md](SECURITY.md) for reporting security vulnerabilities.
 
 Recommended pull-request title prefixes are:
 
@@ -233,6 +277,8 @@ Recommended pull-request title prefixes are:
 - `[Test]` — Tests
 - `[CI]` — CI or packaging improvements
 - `[Misc]` — Other changes
+
+---
 
 ## License
 

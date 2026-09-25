@@ -1,0 +1,86 @@
+# Global configuration
+default_install_hook_types:  # Default hook types to install
+  - pre-commit   # Pre-commit checks
+  - commit-msg   # Commit message checks
+default_stages:  # Default run stages
+  - pre-commit   # Run on local commits
+  - manual       # Run manually in CI only
+repos:
+  # -----------------------
+  # Basic file format checks
+  # -----------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0  # Use fixed version for stability
+    hooks:
+      - id: end-of-file-fixer  # Ensure files end with newline
+      - id: trailing-whitespace  # Remove trailing whitespace
+      - id: check-yaml  # Check YAML syntax
+      - id: check-toml  # Check TOML syntax
+      - id: check-added-large-files  # Prevent accidental addition of large files
+        args: ["--maxkb=10240"]  # Maximum allowed file size (10MB)
+
+  # -----------------------
+  # Python Linting (Ruff)
+  # -----------------------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.14  # Ruff version
+    hooks:
+      - id: ruff-check  # Main linting checks
+        types_or: [python, pyi]  # Check .py and .pyi files
+        args: [--fix]  # Auto-fix fixable issues
+
+  # -----------------------
+  # Python import sorting (compatible with black)
+  # -----------------------
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2  # Version lock
+    hooks:
+      - id: isort
+        args: ["--profile=black"]  # Use black-compatible configuration
+
+  # -----------------------
+  # Python code formatting (Black)
+  # -----------------------
+  - repo: https://github.com/psf/black
+    rev: 26.1.0  # Black version
+    hooks:
+      - id: black
+        language_version: python3  # Specify Python version
+
+  - repo: https://github.com/jackdewinter/pymarkdown
+    rev: v0.9.29
+    hooks:
+    - id: pymarkdown
+      args: [fix]
+
+  - repo: local
+    hooks:
+      - id: signoff-commit
+        name: Sign-off Commit
+        entry: bash
+        args:
+          - -c
+          - |
+            if ! grep -q "^Signed-off-by: $(git config user.name) <$(git config user.email)>" "$(git rev-parse --git-path COMMIT_EDITMSG)"; then
+              printf "\nSigned-off-by: $(git config user.name) <$(git config user.email)>\n" >> "$(git rev-parse --git-path COMMIT_EDITMSG)"
+            fi
+        language: system
+        verbose: true
+        stages: [commit-msg]
+
+      - id: check-filenames
+        name: Check for spaces in all filenames
+        entry: bash
+        args:
+          - -c
+          - 'git ls-files | grep " " && echo "Filenames should not contain spaces!" && exit 1 || exit 0'
+        language: system
+        always_run: true
+        pass_filenames: false
+
+      - id: suggestion
+        name: Suggestion
+        entry: bash -c 'echo "To bypass pre-commit hooks, add --no-verify to git commit."'
+        language: system
+        verbose: true
+        pass_filenames: false

@@ -1,5 +1,8 @@
+# Build and test dependencies
 hatchling>=1.18.0
 build>=1.0.3
 pytest
+pytest-cov
 mock
+pre-commit
 -e .

@@ -58,13 +58,22 @@ Before submitting a pull request, please make sure that:
    any third-party file, and do not add our header to third-party files. If a
    file is adapted from another project, keep the upstream copyright and add a
    note stating that the file was modified.
-4. Your code passes the applicable linting and style checks.
-5. Your changes are fully tested, including relevant tests under `test/` when
+4. Your code passes the applicable linting and style checks. This project uses
+   [pre-commit](https://pre-commit.com/); install the hooks with
+   `pre-commit install` before committing.
+5. Your commits carry a `Signed-off-by:` line (`git commit -s`) as required by
+   the [Developer Certificate of Origin](DCO).
+6. Your changes are fully tested, including relevant tests under `test/` when
    applicable.
-6. You include the test environment, commands, and results in the pull request
+7. You include the test environment, commands, and results in the pull request
    description when they are relevant to the change.
-7. You submit the pull request against the target branch requested by the
+8. You submit the pull request against the target branch requested by the
    maintainers.
+
+## Code of Conduct
+
+All contributors are expected to follow the
+[Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## License
 
