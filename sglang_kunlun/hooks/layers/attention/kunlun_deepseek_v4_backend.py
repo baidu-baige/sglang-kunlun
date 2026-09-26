@@ -22,6 +22,9 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4MultiStepBackend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 from sglang_kunlun.kernels.kernel_ops import (
     dsv4_c4_paged_mqa_logits_torch,
@@ -425,6 +428,12 @@ def _make_cp_prefill_lod(core_metadata, num_queries: int, device: torch.device):
     ``seq_lens_casual`` is per-token and already CP-reindexed, so it is the exact
     KV context length for each local query row.
     """
+    # Memoize per forward: seq_lens_casual is identical across layers; skip under BCG (it bakes addresses).
+    memo = core_metadata is not None and not is_in_breakable_cuda_graph()
+    if memo:
+        cached = getattr(core_metadata, "_kunlun_cp_lod_memo", None)
+        if cached is not None and cached[0] == num_queries:
+            return cached[1]
     kv_lens_cpu = core_metadata.seq_lens_casual.to(
         "cpu", non_blocking=False
     ).to(torch.int32)
@@ -441,12 +450,18 @@ def _make_cp_prefill_lod(core_metadata, num_queries: int, device: torch.device):
         )
     kv_lens_cpu = torch.clamp(kv_lens_cpu, min=1).contiguous()
     q_lod_cpu = torch.arange(num_queries + 1, dtype=torch.int32)
-    return (
+    result = (
         q_lod_cpu,
         q_lod_cpu.to(device, non_blocking=False),
         kv_lens_cpu,
         kv_lens_cpu.to(device, non_blocking=False),
     )
+    if memo:
+        try:
+            core_metadata._kunlun_cp_lod_memo = (num_queries, result)
+        except AttributeError:
+            pass
+    return result
 
 
 def _refresh_graph_host_lengths(
