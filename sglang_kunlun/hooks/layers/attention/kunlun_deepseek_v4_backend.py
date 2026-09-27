@@ -1507,9 +1507,10 @@ def _build_c4_prefill_contract(
     """Build the request-level LoD contract used by the extend path."""
     global_extend_lens = [int(value) for value in forward_batch.extend_seq_lens_cpu]
     cp_ranks = _dsa_cp_prefill_ranks(forward_batch)
-    c4_flat = c4_seq_lens.reshape(-1).to("cpu", dtype=torch.int32)
 
     if cp_ranks is None:
+        # c4_flat is only used here; keeping it off the CP path avoids a dead per-layer D2H sync.
+        c4_flat = c4_seq_lens.reshape(-1).to("cpu", dtype=torch.int32)
         extend_lens = global_extend_lens
         qlod_cpu = torch.zeros(len(extend_lens) + 1, dtype=torch.int32)
         if extend_lens:
