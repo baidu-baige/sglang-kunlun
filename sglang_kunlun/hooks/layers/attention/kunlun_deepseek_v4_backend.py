@@ -1583,13 +1583,19 @@ def _build_c4_prefill_contract(
             [com_k_start_cpu, torch.zeros(pad_rows, dtype=torch.int32)]
         )
 
+    # One host->device copy instead of three (read-only LoD inputs; slices are safe).
+    _nq, _nk, _nc = qlod_cpu.numel(), klod_cpu.numel(), com_k_start_cpu.numel()
+    _packed_xpu = torch.cat([qlod_cpu, klod_cpu, com_k_start_cpu]).to(device)
+    qlod_xpu = _packed_xpu[:_nq]
+    klod_xpu = _packed_xpu[_nq : _nq + _nk]
+    com_k_start_xpu = _packed_xpu[_nq + _nk : _nq + _nk + _nc]
     return {
         "qlod_cpu": qlod_cpu,
-        "qlod_xpu": qlod_cpu.to(device),
+        "qlod_xpu": qlod_xpu,
         "klod_cpu": klod_cpu,
-        "klod_xpu": klod_cpu.to(device),
+        "klod_xpu": klod_xpu,
         "com_k_start_cpu": com_k_start_cpu,
-        "com_k_start_xpu": com_k_start_cpu.to(device),
+        "com_k_start_xpu": com_k_start_xpu,
         "per_req_k_lens": per_req_k_lens,
         "last_rows": last_rows,
         "cp_ranks": cp_ranks,
