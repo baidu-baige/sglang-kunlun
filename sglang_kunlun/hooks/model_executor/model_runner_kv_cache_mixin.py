@@ -13,7 +13,44 @@ no explicit ``empty_cache()`` is needed because:
 
 from __future__ import annotations
 
+import logging
+
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+
+logger = logging.getLogger(__name__)
+
+
+@plugin_hook(
+    "sglang.srt.model_executor.model_runner.ModelRunner.maybe_init_hisparse_coordinator",
+    type=HookType.AROUND,
+)
+def _skip_hisparse_coordinator_on_draft(original_fn, self):
+    """Do not build a HiSparse coordinator for the DSPARK draft worker.
+
+    The draft's DeepSeek-V4 pool is sized with
+    ``COMPRESS_RATIO_NEXTN_LAYER == 0`` for every effective layer, so
+    ``DeepSeekV4TokenToKVPool`` creates the C4 sub-pool with zero layers and
+    never calls ``create_buffer`` -- the call that defines
+    ``bytes_per_page_padded``.  ``HiSparseCoordinator.__init__`` then dies on
+    that missing attribute.  The draft has no compressed layer at all, so there
+    is nothing for the coordinator to manage (and the hisparse swap-in only
+    runs on a plain decode forward, never on the draft's target-verify one).
+    """
+    if getattr(self, "is_draft_worker", False):
+        from sglang.srt.mem_cache.allocator.hisparse import (
+            DeepSeekV4HiSparseTokenToKVPoolAllocator,
+        )
+
+        allocator = getattr(self, "token_to_kv_pool_allocator", None)
+        if isinstance(allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator) and not hasattr(
+            allocator.hisparse_kvcache, "bytes_per_page_padded"
+        ):
+            logger.info(
+                "sglang-kunlun: draft worker has no C4 layers; skipping the "
+                "HiSparse coordinator."
+            )
+            return None
+    return original_fn(self)
 
 
 @plugin_hook(
