@@ -5406,6 +5406,9 @@ def _hisparse_load_cache_to_device_buffer(
 
     src_rank_scratch = torch.zeros(top_k + 1, dtype=torch.int64, device=device)
     dst_rank_scratch = torch.zeros(top_k + 1, dtype=torch.int32, device=device)
+    # lru_slots is int16 and XPU's advanced indexing rejects int16, so stage the
+    # whole table through int32 for the per-row gather/scatter.
+    lru_all = lru_slots.to(torch.int32)
 
     _hisparse_trace(
         f"swap_in bs={batch_size} top_k={top_k} hot={hot} "
@@ -5414,17 +5417,21 @@ def _hisparse_load_cache_to_device_buffer(
 
     for row in range(batch_size):
         real = row < num_real_scalar
-        rid = req_pool_indices[row].to(torch.int64).clamp(0, max_slots - 1)
+        # A 0-dim device index is bounds-checked on the host, which reads a
+        # value that is not materialised yet during CUDA-graph capture (the
+        # clamp is only recorded, not executed).  A 1-D index is a pure
+        # device-side gather, so index with [rid] and drop the leading axis.
+        rid = req_pool_indices[row].to(torch.int64).clamp(0, max_slots - 1).reshape(1)
         seq_len = seq_lens[row].to(torch.int64)
         # Padded rows never enter the long path, so they cannot mutate the
         # LRU order or the device-buffer token bookkeeping of a live request.
         use_fast = torch.logical_or(torch.logical_not(real), seq_len <= hot)
 
         tok = top_k_tokens[row].to(torch.int64)
-        dev_tok = device_buffer_tokens[rid]
-        dev_loc = device_buffer_locs[rid]
-        host_row = host_cache_locs[rid]
-        lru = lru_slots[rid].to(torch.int64)
+        dev_tok = device_buffer_tokens[rid].reshape(-1)
+        dev_loc = device_buffer_locs[rid].reshape(-1)
+        host_row = host_cache_locs[rid].reshape(-1)
+        lru = lru_all[rid].reshape(-1).to(torch.int64)
 
         # ---------------- fast path: seq_len <= hot ----------------
         # Short sequences hold every token in order in the device buffer.
@@ -5492,11 +5499,12 @@ def _hisparse_load_cache_to_device_buffer(
         )
 
         # ---------------- device-buffer token bookkeeping ----------------
-        device_buffer_tokens[rid, torch.where(miss_mask, miss_slot, scratch_idx)] = (
-            torch.where(miss_mask, tok, neg_one.to(torch.int64)).to(
-                device_buffer_tokens.dtype
-            )
-        )
+        device_buffer_tokens[
+            rid.reshape(1, 1),
+            torch.where(miss_mask, miss_slot, scratch_idx).reshape(1, -1),
+        ] = torch.where(miss_mask, tok, neg_one.to(torch.int64)).to(
+            device_buffer_tokens.dtype
+        ).reshape(1, -1)
 
         # ---------------- miss plan for the skip-layer prefetch ----------------
         if miss_src is not None:
@@ -5529,7 +5537,9 @@ def _hisparse_load_cache_to_device_buffer(
             ),
         )
         new_lru = lru[torch.argsort(slot_class * hot + lru_pos)]
-        lru_slots[rid] = torch.where(use_fast, lru, new_lru).to(lru_slots.dtype)
+        lru_all[rid] = torch.where(use_fast, lru, new_lru).to(torch.int32).reshape(
+            1, -1
+        )
 
         # ---------------- host -> device copy of the misses ----------------
         # Only the misses carry real IO.  To keep the index set static-sized
@@ -5560,6 +5570,8 @@ def _hisparse_load_cache_to_device_buffer(
                 item_size_bytes,
                 is_dsv4_layout,
             )
+
+    lru_slots.copy_(lru_all.to(lru_slots.dtype))
 
 
 @register_jit_op(
@@ -5608,6 +5620,7 @@ def hisparse_load_cache_to_device_buffer_dsv4_mla(
         miss_count=miss_count,
         skip_io=skip_io,
     )
+
 
 
 @register_jit_op(
