@@ -53,18 +53,19 @@ def copy_items(
         return
     src_locs = src_locs.reshape(-1).to(torch.int64)
     dst_locs = dst_locs.reshape(-1).to(torch.int64)
+    # Host<->device transfers put the two ends on different devices, so each
+    # side gets its own index tensors (the cross-device assignment carries the
+    # data across).
+    src_locs_src = src_locs.to(src.device)
+    dst_locs_dst = dst_locs.to(dst.device)
 
-    if is_dsv4_layout and src.shape[1] == page_size * item_size_bytes:
-        # One token is a contiguous ``item_size_bytes`` run and a page row is
-        # exactly ``page_size`` of them, so token ``t`` starts at
-        # ``t * item_size_bytes``.
-        is_dsv4_layout = False
-
-    if is_dsv4_layout:
-        src_page = src_locs >> DSV4_PAGE_BITS
-        dst_page = dst_locs >> DSV4_PAGE_BITS
-        src_off = src_locs & DSV4_PAGE_MASK
-        dst_off = dst_locs & DSV4_PAGE_MASK
+    if is_dsv4_layout and src.shape[1] != page_size * item_size_bytes:
+        # Upstream's padded C4 row: 64 x 576B values, then 64 x 8B scales, then
+        # padding, so values and scales are two separate runs of the page row.
+        src_page = src_locs_src >> DSV4_PAGE_BITS
+        dst_page = dst_locs_dst >> DSV4_PAGE_BITS
+        src_off = src_locs_src & DSV4_PAGE_MASK
+        dst_off = dst_locs_dst & DSV4_PAGE_MASK
         src_value = src.as_strided(
             (src.shape[0], DSV4_PAGE_SIZE, DSV4_VALUE_BYTES),
             (src.stride(0), DSV4_VALUE_BYTES, 1),
@@ -75,7 +76,7 @@ def copy_items(
             (dst.stride(0), DSV4_VALUE_BYTES, 1),
             0,
         )
-        dst_value[dst_page, dst_off] = src_value[src_page, src_off]
+        dst_value[dst_page, dst_off] = src_value[src_page, src_off].to(dst.device)
 
         src_scale = src.as_strided(
             (src.shape[0], DSV4_PAGE_SIZE, DSV4_SCALE_BYTES),
@@ -87,12 +88,23 @@ def copy_items(
             (dst.stride(0), DSV4_SCALE_BYTES, 1),
             DSV4_SCALE_BYTE_OFFSET,
         )
-        dst_scale[dst_page, dst_off] = src_scale[src_page, src_off]
+        dst_scale[dst_page, dst_off] = src_scale[src_page, src_off].to(dst.device)
         return
 
-    src_flat = src.reshape(-1)
-    dst_flat = dst.reshape(-1)
-    offset = torch.arange(item_size_bytes, dtype=torch.int64, device=src.device)
-    dst_flat[(dst_locs * item_size_bytes)[:, None] + offset] = src_flat[
-        (src_locs * item_size_bytes)[:, None] + offset
-    ]
+    # Contiguous token runs.  A DSv4 page row is exactly ``page_size`` runs of
+    # ``item_size_bytes``; the generic MLA layout is one flat run per token.
+    if is_dsv4_layout:
+        rows, block = src.shape[0], page_size
+    else:
+        rows, block = src.reshape(-1).numel() // item_size_bytes, 1
+    src_items = src.reshape(-1).as_strided(
+        (rows, block, item_size_bytes), (block * item_size_bytes, item_size_bytes, 1), 0
+    )
+    dst_items = dst.reshape(-1).as_strided(
+        (rows, block, item_size_bytes), (block * item_size_bytes, item_size_bytes, 1), 0
+    )
+    # XPU index_put_ rejects a source on another device, so gather first and
+    # move the items across explicitly.
+    dst_items[dst_locs_dst // block, dst_locs_dst % block] = src_items[
+        src_locs_src // block, src_locs_src % block
+    ].to(dst.device)
