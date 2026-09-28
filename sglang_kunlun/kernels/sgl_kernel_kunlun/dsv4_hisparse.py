@@ -36,24 +36,28 @@ def copy_items(
     dst_locs: torch.Tensor,
     item_size_bytes: int,
     is_dsv4_layout: bool,
+    page_size: int = DSV4_PAGE_SIZE,
 ) -> None:
     """Copy one KV item per ``(src_locs[i] -> dst_locs[i])`` pair, in place.
 
     A pair whose source and destination coincide is a no-op read/write of the
     same item, which lets callers keep a static-sized index set by parking
     irrelevant entries on a self-copy.
+
+    ``is_dsv4_layout`` selects the paged C4 addressing.  When a page row is
+    exactly ``page_size * item_size_bytes`` the buffer is a flat token array
+    (the Kunlun half-cache layout) and the split value/scale addressing of
+    upstream's padded row is skipped.
     """
     if src_locs.numel() == 0:
         return
     src_locs = src_locs.reshape(-1).to(torch.int64)
     dst_locs = dst_locs.reshape(-1).to(torch.int64)
 
-    if is_dsv4_layout and src.shape[1] == DSV4_PAGE_SIZE * item_size_bytes:
-        # Kunlun's DSv4 C4 half-cache keeps one token in a contiguous
-        # ``item_size_bytes`` run and pads a page row to exactly
-        # ``page_size * item_size_bytes``, so the paged buffer is a plain flat
-        # token array.  Only upstream's 576B-value + 8B-scale padded row needs
-        # the split addressing below.
+    if is_dsv4_layout and src.shape[1] == page_size * item_size_bytes:
+        # One token is a contiguous ``item_size_bytes`` run and a page row is
+        # exactly ``page_size`` of them, so token ``t`` starts at
+        # ``t * item_size_bytes``.
         is_dsv4_layout = False
 
     if is_dsv4_layout:
