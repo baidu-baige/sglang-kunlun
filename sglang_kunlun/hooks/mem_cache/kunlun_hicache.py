@@ -20,10 +20,7 @@ from sglang_kunlun.kernels.sgl_kernel_kunlun.dsv4_hicache import (
     transfer_kv_all_layer_mla,
     transfer_kv_per_layer_mla,
 )
-from sglang_kunlun.kernels.sgl_kernel_kunlun.dsv4_hisparse import (
-    DSV4_ROW_BYTES,
-    copy_items,
-)
+from sglang_kunlun.kernels.sgl_kernel_kunlun.dsv4_hisparse import copy_items
 
 from . import shared_host_kv
 
@@ -38,8 +35,14 @@ def _require_matching_size(pool, host_indices, device_indices) -> None:
         )
 
 
-def _is_dsv4_c4_pool(pool) -> bool:
-    return _pool_item_bytes(pool) == DSV4_ROW_BYTES
+def _supports_token_granular(pool) -> bool:
+    """True when the pool exposes per-layer buffers a token copy can address.
+
+    Only the paged C4/C128 host pools carry ``device_buffers``; the state host
+    pool does not (it uses ``device_page_views``), and its layout is not the C4
+    item layout anyway.
+    """
+    return hasattr(pool, "device_buffers") and pool.layout == "layer_first"
 
 
 def _is_full_page_transfer(pool, host_indices, device_indices) -> bool:
@@ -50,8 +53,8 @@ def _is_full_page_transfer(pool, host_indices, device_indices) -> bool:
     )
 
 
-def _copy_token_granular(src_buffers, dst_buffers, src_indices, dst_indices) -> None:
-    """Move DSv4 C4 tokens one by one through the torch-native item mover."""
+def _copy_token_granular(pool, src_buffers, dst_buffers, src_indices, dst_indices) -> None:
+    """Move C4 tokens one by one through the torch-native item mover."""
     src_indices = src_indices.to(torch.int64)
     dst_indices = dst_indices.to(torch.int64)
     for layer_id in range(len(src_buffers)):
@@ -60,8 +63,9 @@ def _copy_token_granular(src_buffers, dst_buffers, src_indices, dst_indices) -> 
             dst_buffers[layer_id],
             src_indices,
             dst_indices,
-            DSV4_ROW_BYTES,
+            _pool_item_bytes(pool),
             is_dsv4_layout=True,
+            page_size=_pool_page_size(pool),
         )
 
 
@@ -91,7 +95,7 @@ def _transfer_all_layer(pool, host_indices, device_indices, io_backend: str) -> 
         return
     _require_supported_layout(pool, io_backend)
     if not _is_full_page_transfer(pool, host_indices, device_indices):
-        if not _is_dsv4_c4_pool(pool):
+        if not _supports_token_granular(pool):
             raise ValueError(
                 f"{pool.pool_name} DeepSeek V4 HiCache only supports full-page "
                 f"transfer: host_numel={host_indices.numel()}, "
@@ -101,7 +105,7 @@ def _transfer_all_layer(pool, host_indices, device_indices, io_backend: str) -> 
         # HiSparse stages the prefill tail and one eager-backup token per
         # compress_ratio decode steps; those are token-granular.
         _copy_token_granular(
-            pool.device_buffers, pool.data_refs, device_indices, host_indices
+            pool, pool.device_buffers, pool.data_refs, device_indices, host_indices
         )
         return
     page_size = _pool_page_size(pool)
@@ -128,7 +132,7 @@ def _transfer_per_layer(
         else pool.device_page_views
     )
     if not _is_full_page_transfer(pool, host_indices, device_indices):
-        if not _is_dsv4_c4_pool(pool):
+        if not _supports_token_granular(pool):
             raise ValueError(
                 f"{pool.pool_name} DeepSeek V4 HiCache only supports full-page "
                 f"transfer: host_numel={host_indices.numel()}, "
@@ -137,6 +141,7 @@ def _transfer_per_layer(
             )
         # Short-sequence HiSparse preload is token-granular.
         _copy_token_granular(
+            pool,
             pool.data_refs[layer_id : layer_id + 1],
             device_buffers[layer_id : layer_id + 1],
             host_indices,
