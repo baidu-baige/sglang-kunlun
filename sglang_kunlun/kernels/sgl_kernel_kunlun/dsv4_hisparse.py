@@ -51,6 +51,14 @@ def copy_items(
     """
     if src_locs.numel() == 0:
         return
+    # Address both ends in bytes: the paged host pool is uint8 while the device
+    # half-cache is bf16, so a token spans a different number of elements on
+    # each side.  ``view(torch.uint8)`` is metadata-only for these contiguous
+    # rows.
+    if src.dtype != torch.uint8:
+        src = src.view(torch.uint8)
+    if dst.dtype != torch.uint8:
+        dst = dst.view(torch.uint8)
     src_locs = src_locs.reshape(-1).to(torch.int64)
     dst_locs = dst_locs.reshape(-1).to(torch.int64)
     # Host<->device transfers put the two ends on different devices, so each
