@@ -114,10 +114,16 @@ def _fix_dsv4_swa_allocator(
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 
     hisparse_wrapped = isinstance(result, DeepSeekV4HiSparseTokenToKVPoolAllocator)
+    # A passed-in allocator belongs to the target worker and is shared with the
+    # draft: upstream's draft branch has already registered the *target's* SWA
+    # mapping on this pool, and disaggregation asserts that identity.  Rebuilding
+    # here would give the draft its own mapping and break that check.
+    shared = token_to_kv_pool_allocator is not None
     if (
         not self.is_hybrid_swa
         or not isinstance(token_to_kv_pool, BaseSWAKVPool)
-        or (isinstance(result, SWATokenToKVPoolAllocator) and not hisparse_wrapped)
+        or isinstance(result, SWATokenToKVPoolAllocator)
+        or (hisparse_wrapped and shared)
     ):
         return result
 
