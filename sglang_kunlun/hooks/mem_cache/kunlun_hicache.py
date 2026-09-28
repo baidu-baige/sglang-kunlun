@@ -20,7 +20,12 @@ from sglang_kunlun.kernels.sgl_kernel_kunlun.dsv4_hicache import (
     transfer_kv_all_layer_mla,
     transfer_kv_per_layer_mla,
 )
-from sglang_kunlun.kernels.sgl_kernel_kunlun.dsv4_hisparse import copy_items
+from sglang_kunlun.kernels.sgl_kernel_kunlun.dsv4_hisparse import (
+    DSV4_ROW_BYTES,
+    DSV4_SCALE_BYTES,
+    DSV4_VALUE_BYTES,
+    copy_items,
+)
 
 from . import shared_host_kv
 
@@ -53,17 +58,39 @@ def _is_full_page_transfer(pool, host_indices, device_indices) -> bool:
     )
 
 
+def _pool_token_bytes(pool) -> int:
+    """Bytes one token occupies inside a host page row.
+
+    The paged host pool is built with ``item_bytes`` = the *page row* size
+    (``device_pool.bytes_per_page_padded``).  Upstream's C4 row is
+    ``DSV4_ROW_BYTES`` (64 x 576B values + 64 x 8B scales + padding), so a token
+    is 584B there; Kunlun's half-cache row is page_size x token_bytes, so the
+    token size is the row divided by the slot page size.
+    """
+    row_bytes = _pool_item_bytes(pool)
+    if row_bytes == DSV4_ROW_BYTES:
+        return DSV4_VALUE_BYTES + DSV4_SCALE_BYTES
+    page_size = _pool_page_size(pool)
+    if row_bytes % page_size != 0:
+        raise ValueError(
+            f"{pool.pool_name}: host page row {row_bytes}B is not a multiple of "
+            f"the slot page size {page_size}"
+        )
+    return row_bytes // page_size
+
+
 def _copy_token_granular(pool, src_buffers, dst_buffers, src_indices, dst_indices) -> None:
     """Move C4 tokens one by one through the torch-native item mover."""
     src_indices = src_indices.to(torch.int64)
     dst_indices = dst_indices.to(torch.int64)
+    item_size_bytes = _pool_token_bytes(pool)
     for layer_id in range(len(src_buffers)):
         copy_items(
             src_buffers[layer_id],
             dst_buffers[layer_id],
             src_indices,
             dst_indices,
-            _pool_item_bytes(pool),
+            item_size_bytes,
             is_dsv4_layout=True,
             page_size=_pool_page_size(pool),
         )
