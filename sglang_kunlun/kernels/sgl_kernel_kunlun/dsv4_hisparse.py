@@ -48,6 +48,14 @@ def copy_items(
     src_locs = src_locs.reshape(-1).to(torch.int64)
     dst_locs = dst_locs.reshape(-1).to(torch.int64)
 
+    if is_dsv4_layout and src.shape[1] == DSV4_PAGE_SIZE * item_size_bytes:
+        # Kunlun's DSv4 C4 half-cache keeps one token in a contiguous
+        # ``item_size_bytes`` run and pads a page row to exactly
+        # ``page_size * item_size_bytes``, so the paged buffer is a plain flat
+        # token array.  Only upstream's 576B-value + 8B-scale padded row needs
+        # the split addressing below.
+        is_dsv4_layout = False
+
     if is_dsv4_layout:
         src_page = src_locs >> DSV4_PAGE_BITS
         dst_page = dst_locs >> DSV4_PAGE_BITS
