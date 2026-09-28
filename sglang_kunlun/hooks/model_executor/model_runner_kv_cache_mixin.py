@@ -59,17 +59,28 @@ def _fix_dsv4_swa_allocator(
         self-consistent and must be left alone.
     Rebuild what upstream would have built, mirroring its branch on
     ``full_max_total_num_tokens == 0``.
+
+    DeepSeek V4 + ``--enable-hisparse`` arrives here already wrapped in
+    ``DeepSeekV4HiSparseTokenToKVPoolAllocator`` (upstream wraps the OOT paged
+    allocator at the end of the original function).  Rebuilding the SWA
+    allocator would silently drop that wrapper -- the coordinator then gets a
+    plain SWA allocator and dies on ``allocator.compress_ratio`` -- so re-apply
+    it on top of the rebuilt SWA allocator.
     """
+    from sglang.srt.mem_cache.allocator.hisparse import (
+        DeepSeekV4HiSparseTokenToKVPoolAllocator,
+    )
     from sglang.srt.mem_cache.allocator.swa import (
         PureSWATokenToKVPoolAllocator,
         SWATokenToKVPoolAllocator,
     )
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 
+    hisparse_wrapped = isinstance(result, DeepSeekV4HiSparseTokenToKVPoolAllocator)
     if (
         not self.is_hybrid_swa
         or not isinstance(token_to_kv_pool, BaseSWAKVPool)
-        or isinstance(result, SWATokenToKVPoolAllocator)
+        or (isinstance(result, SWATokenToKVPoolAllocator) and not hisparse_wrapped)
     ):
         return result
 
@@ -94,6 +105,8 @@ def _fix_dsv4_swa_allocator(
             need_sort=need_sort,
         )
     token_to_kv_pool.register_mapping(allocator.full_to_swa_index_mapping)
+    if hisparse_wrapped:
+        allocator = DeepSeekV4HiSparseTokenToKVPoolAllocator(allocator)
     if hasattr(req_to_token_pool, "register_dsv4_allocator"):
         req_to_token_pool.register_dsv4_allocator(allocator)
     return allocator
