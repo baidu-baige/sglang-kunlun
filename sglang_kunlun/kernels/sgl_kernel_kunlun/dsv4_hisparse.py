@@ -101,15 +101,24 @@ def copy_items(
 
     # Contiguous token runs.  A DSv4 page row is exactly ``page_size`` runs of
     # ``item_size_bytes``; the generic MLA layout is one flat run per token.
+    # The two ends have independent token spaces (the host pool is sized by
+    # host_to_device_ratio), so each side gets its own row count.
     if is_dsv4_layout:
-        rows, block = src.shape[0], page_size
+        block = page_size
+        src_rows, dst_rows = src.shape[0], dst.shape[0]
     else:
-        rows, block = src.reshape(-1).numel() // item_size_bytes, 1
+        block = 1
+        src_rows = src.reshape(-1).numel() // item_size_bytes
+        dst_rows = dst.reshape(-1).numel() // item_size_bytes
     src_items = src.reshape(-1).as_strided(
-        (rows, block, item_size_bytes), (block * item_size_bytes, item_size_bytes, 1), 0
+        (src_rows, block, item_size_bytes),
+        (block * item_size_bytes, item_size_bytes, 1),
+        0,
     )
     dst_items = dst.reshape(-1).as_strided(
-        (rows, block, item_size_bytes), (block * item_size_bytes, item_size_bytes, 1), 0
+        (dst_rows, block, item_size_bytes),
+        (block * item_size_bytes, item_size_bytes, 1),
+        0,
     )
     # XPU index_put_ rejects a source on another device, so gather first and
     # move the items across explicitly.
