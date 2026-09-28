@@ -5314,3 +5314,380 @@ def swiglu_no_interleaved_with_alpha_and_limit_kunlun(
         True,
     )
     return output.view(x.shape[:-1] + (x.shape[-1] // 2,))
+
+# ===========================================================================
+# HiSparse (hierarchical sparse attention) swap-in / prefetch.
+#
+# Upstream drives the decode-side KV swap-in with JIT CUDA kernels
+# (``sglang/kernels/jit/csrc/kvcacheio/hisparse.cuh``) that cannot be built on
+# Kunlun.  The three symbols below are the complete runtime hot path of the
+# DeepSeek-V4 hisparse decode: the fused top-k/hit/miss/LRU swap-in, the
+# copy-only replay used by the shared-index prefetch, and (for completeness)
+# the generic MLA variant.  Each is reimplemented with plain torch ops that
+# reproduce the CUDA kernel's semantics:
+#
+#   * per request, the ``top_k`` selected token positions are matched against
+#     the LRU-ordered device-buffer slots (hit / newest-token / miss);
+#   * misses evict the LRU-most non-hit slots, the miss plan is recorded for
+#     the skip-layer prefetch and the LRU order is rewritten as
+#     [miss-evicted evictables][remaining evictables][hits];
+#   * the missed host->device items are copied with the layout-specific
+#     addressing (DSv4 page-padded C4 row, or a flat byte stride).
+#
+# All shapes are static (batch, top_k, hot_buffer_size) and no host
+# synchronisation is issued, so the ops stay usable inside a captured decode
+# CUDA graph.  ``SGLANG_KUNLUN_HISPARSE_TRACE=1`` prints the first few calls.
+# ===========================================================================
+
+from sglang_kunlun.kernels.sgl_kernel_kunlun.dsv4_hisparse import (
+    DSV4_PAGE_SIZE as _HISPARSE_DSV4_PAGE_SIZE,
+    copy_items as _hisparse_copy_items,
+)
+
+_HISPARSE_TRACE_CALLS = 0
+
+
+def _hisparse_trace(msg: str) -> None:
+    """Opt-in one-shot tracing of the hisparse hot path (bring-up only)."""
+    global _HISPARSE_TRACE_CALLS
+    if os.environ.get("SGLANG_KUNLUN_HISPARSE_TRACE") != "1":
+        return
+    if _HISPARSE_TRACE_CALLS < 5:
+        logger.info("sglang-kunlun hisparse: %s", msg)
+    _HISPARSE_TRACE_CALLS += 1
+
+
+def _hisparse_load_cache_to_device_buffer(
+    *,
+    is_dsv4_layout: bool,
+    top_k_tokens: torch.Tensor,
+    device_buffer_tokens: torch.Tensor,
+    host_cache_locs: torch.Tensor,
+    device_buffer_locs: torch.Tensor,
+    host_cache: torch.Tensor,
+    device_buffer: torch.Tensor,
+    top_k_device_locs: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    lru_slots: torch.Tensor,
+    item_size_bytes: int,
+    hot_buffer_size: int,
+    num_real_reqs: Optional[torch.Tensor],
+    miss_src: Optional[torch.Tensor],
+    miss_dst: Optional[torch.Tensor],
+    miss_count: Optional[torch.Tensor],
+    skip_io: bool,
+) -> None:
+    """Torch-native replacement for ``load_cache_to_device_buffer{,_dsv4}_mla``."""
+    batch_size, top_k = top_k_tokens.shape
+    if batch_size == 0:
+        return
+    device = top_k_tokens.device
+    hot = int(hot_buffer_size)
+    max_slots = device_buffer_tokens.shape[0]
+    buffer_len = device_buffer_tokens.shape[1]
+    host_stride = host_cache_locs.shape[1]
+    # Slot `hot` is the reserved newest-token slot: it sits outside the LRU
+    # window ([0, hot)) and its token entry is pinned to -1, so it doubles as
+    # the scratch destination for the no-op writes of padded/irrelevant rows.
+    scratch_slot = hot
+
+    if num_real_reqs is None:
+        num_real = torch.full((1,), batch_size, dtype=torch.int32, device=device)
+    else:
+        num_real = num_real_reqs.reshape(-1)[:1]
+    num_real_scalar = num_real.to(torch.int64).reshape(())
+
+    k_ids = torch.arange(top_k, dtype=torch.int64, device=device)
+    lru_pos = torch.arange(hot, dtype=torch.int64, device=device)
+    out_sentinel = k_ids.new_full((), top_k)
+    scratch_idx = lru_pos.new_full((), scratch_slot)
+    neg_one = torch.zeros((), dtype=torch.int32, device=device) - 1
+
+    src_rank_scratch = torch.zeros(top_k + 1, dtype=torch.int64, device=device)
+    dst_rank_scratch = torch.zeros(top_k + 1, dtype=torch.int32, device=device)
+
+    _hisparse_trace(
+        f"swap_in bs={batch_size} top_k={top_k} hot={hot} "
+        f"dsv4={is_dsv4_layout} record_plan={miss_src is not None}"
+    )
+
+    for row in range(batch_size):
+        real = row < num_real_scalar
+        rid = req_pool_indices[row].to(torch.int64).clamp(0, max_slots - 1)
+        seq_len = seq_lens[row].to(torch.int64)
+        # Padded rows never enter the long path, so they cannot mutate the
+        # LRU order or the device-buffer token bookkeeping of a live request.
+        use_fast = torch.logical_or(torch.logical_not(real), seq_len <= hot)
+
+        tok = top_k_tokens[row].to(torch.int64)
+        dev_tok = device_buffer_tokens[rid]
+        dev_loc = device_buffer_locs[rid]
+        host_row = host_cache_locs[rid]
+        lru = lru_slots[rid].to(torch.int64)
+
+        # ---------------- fast path: seq_len <= hot ----------------
+        # Short sequences hold every token in order in the device buffer.
+        fast_out = dev_loc[tok.clamp(0, buffer_len - 1)].to(torch.int32)
+        fast_active = torch.logical_and(
+            use_fast, torch.logical_and(k_ids < seq_len, tok >= 0)
+        )
+
+        # ---------------- long path ----------------
+        newest = seq_len - 1
+        tok_host = tok.clamp(0, host_stride - 1)
+        is_newest = tok == newest
+        # The newest token is bound to the reserved slot, not to the hash.
+        tok_key = torch.where(is_newest, tok.new_full((), -1), tok)
+        order = torch.argsort(tok_key)
+        sorted_key = tok_key[order]
+        buf_token = dev_tok[lru].to(torch.int64)
+        pos = torch.searchsorted(sorted_key, buf_token)
+        pos_c = pos.clamp(max=top_k - 1)
+        matched = torch.logical_and(pos < top_k, sorted_key[pos_c] == buf_token)
+        matched = torch.logical_and(matched, buf_token >= 0)
+        match_idx = order[pos_c]
+
+        long_active = torch.logical_not(use_fast)
+        hit_active = torch.logical_and(long_active, matched)
+        newest_active = torch.logical_and(long_active, is_newest)
+
+        hit_topk = torch.zeros(top_k + 1, dtype=torch.bool, device=device)
+        hit_topk.scatter_(0, torch.where(matched, match_idx, out_sentinel), matched)
+        hit_topk = hit_topk[:top_k]
+
+        miss_mask = torch.logical_and(
+            torch.logical_not(hit_topk), torch.logical_not(is_newest)
+        )
+        miss_mask = torch.logical_and(miss_mask, long_active)
+        miss_rank = torch.cumsum(miss_mask.to(torch.int64), dim=0) - 1
+
+        # Evictables are the non-hit LRU slots, in LRU order; a miss takes the
+        # LRU-most one (rank == miss index).
+        evict_mask = torch.logical_not(matched)
+        evict_rank = torch.cumsum(evict_mask.to(torch.int64), dim=0) - 1
+        slot_of_rank = torch.zeros(hot + 1, dtype=torch.int64, device=device)
+        slot_of_rank[torch.where(evict_mask, evict_rank, scratch_idx)] = lru
+        rank_for_miss = torch.where(miss_mask, miss_rank, scratch_idx)
+        miss_slot = slot_of_rank[rank_for_miss]
+
+        # ---------------- assemble the output slot table ----------------
+        # Mutually exclusive groups, each inactive entry parked on the sentinel.
+        out_pad = torch.full((top_k + 1,), -1, dtype=torch.int32, device=device)
+        out_pad.scatter_(0, torch.where(fast_active, k_ids, out_sentinel), fast_out)
+        out_pad.scatter_(
+            0,
+            torch.where(hit_active, match_idx, out_sentinel),
+            dev_loc[lru].to(torch.int32),
+        )
+        newest_val = dev_loc[hot].to(torch.int32).reshape(1).expand(top_k)
+        out_pad.scatter_(0, torch.where(newest_active, k_ids, out_sentinel), newest_val)
+        out_pad.scatter_(
+            0,
+            torch.where(miss_mask, k_ids, out_sentinel),
+            dev_loc[miss_slot].to(torch.int32),
+        )
+        top_k_device_locs[row].copy_(
+            torch.where(real, out_pad[:top_k], neg_one.expand(top_k))
+        )
+
+        # ---------------- device-buffer token bookkeeping ----------------
+        device_buffer_tokens[rid, torch.where(miss_mask, miss_slot, scratch_idx)] = (
+            torch.where(miss_mask, tok, neg_one.to(torch.int64)).to(
+                device_buffer_tokens.dtype
+            )
+        )
+
+        # ---------------- miss plan for the skip-layer prefetch ----------------
+        if miss_src is not None:
+            miss_src_row = miss_src[row]
+            src_rank_scratch[:top_k].copy_(miss_src_row)
+            src_rank_scratch.scatter_(
+                0, rank_for_miss, host_row[tok_host]
+            )
+            miss_src_row.copy_(src_rank_scratch[:top_k])
+
+            miss_dst_row = miss_dst[row]
+            dst_rank_scratch[:top_k].copy_(miss_dst_row)
+            dst_rank_scratch.scatter_(
+                0, rank_for_miss, dev_loc[miss_slot].to(torch.int32)
+            )
+            miss_dst_row.copy_(dst_rank_scratch[:top_k])
+
+            miss_count[row].copy_(miss_mask.to(torch.int32).sum())
+
+        # ---------------- LRU rewrite ----------------
+        # [evictables not used by a miss][miss-evicted evictables][hits]
+        total_misses = miss_mask.to(torch.int64).sum()
+        slot_class = torch.where(
+            matched,
+            lru_pos.new_full((), 2),
+            torch.where(
+                evict_rank >= total_misses,
+                lru_pos.new_full((), 0),
+                lru_pos.new_full((), 1),
+            ),
+        )
+        new_lru = lru[torch.argsort(slot_class * hot + lru_pos)]
+        lru_slots[rid] = torch.where(use_fast, lru, new_lru).to(lru_slots.dtype)
+
+        # ---------------- host -> device copy of the misses ----------------
+        # Only the misses carry real IO.  To keep the index set static-sized
+        # (and therefore capturable) the irrelevant entries are redirected to
+        # the spare tail token of each pool: the device C4 buffer always has at
+        # least one page beyond the allocator's range, so writing there is
+        # harmless, and reading a spare host token is harmless too.
+        if not skip_io:
+            src_locs = host_row[tok_host]
+            dst_locs = dev_loc[miss_slot].to(torch.int64)
+            if is_dsv4_layout:
+                dev_scratch = dst_locs.new_full(
+                    (), device_buffer.shape[0] * _HISPARSE_DSV4_PAGE_SIZE - 1
+                )
+                host_scratch = src_locs.new_full(
+                    (), host_cache.shape[0] * _HISPARSE_DSV4_PAGE_SIZE - 1
+                )
+                src_locs = torch.where(miss_mask, src_locs, host_scratch)
+                dst_locs = torch.where(miss_mask, dst_locs, dev_scratch)
+            else:
+                src_locs = src_locs[miss_mask]
+                dst_locs = dst_locs[miss_mask]
+            _hisparse_copy_items(
+                host_cache,
+                device_buffer,
+                src_locs,
+                dst_locs,
+                item_size_bytes,
+                is_dsv4_layout,
+            )
+
+
+@register_jit_op(
+    "sglang.kernels.ops.kvcache.hisparse", "load_cache_to_device_buffer_dsv4_mla"
+)
+def hisparse_load_cache_to_device_buffer_dsv4_mla(
+    top_k_tokens: torch.Tensor,
+    device_buffer_tokens: torch.Tensor,
+    host_cache_locs: torch.Tensor,
+    device_buffer_locs: torch.Tensor,
+    host_cache: torch.Tensor,
+    device_buffer: torch.Tensor,
+    top_k_device_locs: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    lru_slots: torch.Tensor,
+    item_size_bytes: int,
+    num_top_k: int,
+    hot_buffer_size: int,
+    page_size: int = 1,
+    block_size: int = 256,
+    num_real_reqs: Optional[torch.Tensor] = None,
+    miss_src: Optional[torch.Tensor] = None,
+    miss_dst: Optional[torch.Tensor] = None,
+    miss_count: Optional[torch.Tensor] = None,
+    skip_io: bool = False,
+) -> None:
+    """DSv4 hisparse swap-in (page-padded device + page-padded host C4)."""
+    _hisparse_load_cache_to_device_buffer(
+        is_dsv4_layout=True,
+        top_k_tokens=top_k_tokens,
+        device_buffer_tokens=device_buffer_tokens,
+        host_cache_locs=host_cache_locs,
+        device_buffer_locs=device_buffer_locs,
+        host_cache=host_cache,
+        device_buffer=device_buffer,
+        top_k_device_locs=top_k_device_locs,
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        lru_slots=lru_slots,
+        item_size_bytes=item_size_bytes,
+        hot_buffer_size=hot_buffer_size,
+        num_real_reqs=num_real_reqs,
+        miss_src=miss_src,
+        miss_dst=miss_dst,
+        miss_count=miss_count,
+        skip_io=skip_io,
+    )
+
+
+@register_jit_op(
+    "sglang.kernels.ops.kvcache.hisparse", "load_cache_to_device_buffer_mla"
+)
+def hisparse_load_cache_to_device_buffer_mla(
+    top_k_tokens: torch.Tensor,
+    device_buffer_tokens: torch.Tensor,
+    host_cache_locs: torch.Tensor,
+    device_buffer_locs: torch.Tensor,
+    host_cache: torch.Tensor,
+    device_buffer: torch.Tensor,
+    top_k_device_locs: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    lru_slots: torch.Tensor,
+    item_size_bytes: int,
+    num_top_k: int,
+    hot_buffer_size: int,
+    page_size: int = 1,
+    block_size: int = 256,
+    num_real_reqs: Optional[torch.Tensor] = None,
+    miss_src: Optional[torch.Tensor] = None,
+    miss_dst: Optional[torch.Tensor] = None,
+    miss_count: Optional[torch.Tensor] = None,
+    skip_io: bool = False,
+) -> None:
+    """Generic MLA hisparse swap-in (linear device + linear host stride)."""
+    _hisparse_load_cache_to_device_buffer(
+        is_dsv4_layout=False,
+        top_k_tokens=top_k_tokens,
+        device_buffer_tokens=device_buffer_tokens,
+        host_cache_locs=host_cache_locs,
+        device_buffer_locs=device_buffer_locs,
+        host_cache=host_cache,
+        device_buffer=device_buffer,
+        top_k_device_locs=top_k_device_locs,
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        lru_slots=lru_slots,
+        item_size_bytes=item_size_bytes,
+        hot_buffer_size=hot_buffer_size,
+        num_real_reqs=num_real_reqs,
+        miss_src=miss_src,
+        miss_dst=miss_dst,
+        miss_count=miss_count,
+        skip_io=skip_io,
+    )
+
+
+@register_jit_op("sglang.kernels.ops.kvcache.hisparse", "copy_cache_planned_mla")
+def hisparse_copy_cache_planned_mla(
+    *,
+    miss_src: torch.Tensor,
+    miss_dst: torch.Tensor,
+    miss_count: torch.Tensor,
+    num_real_reqs: torch.Tensor,
+    host_cache: torch.Tensor,
+    device_buffer: torch.Tensor,
+    item_size_bytes: int,
+    num_blocks: int = 4,
+    block_size: int = 1024,
+    is_dsv4_layout: bool = False,
+    skip_io: bool = False,
+) -> None:
+    """Replay a recorded miss plan (host -> device) for a shared-index layer."""
+    del num_blocks, block_size
+    if skip_io:
+        return
+    counts = miss_count.reshape(-1).to(torch.int64)
+    n_rows, capacity = miss_src.shape
+    row_ids = torch.arange(n_rows, device=miss_src.device).unsqueeze(1).expand(
+        n_rows, capacity
+    )
+    col_ids = torch.arange(capacity, device=miss_src.device).unsqueeze(0).expand(
+        n_rows, capacity
+    )
+    valid = col_ids < counts.unsqueeze(1)
+    src_locs = miss_src[row_ids[valid], col_ids[valid]]
+    dst_locs = miss_dst[row_ids[valid], col_ids[valid]]
+    _hisparse_copy_items(
+        host_cache, device_buffer, src_locs, dst_locs, item_size_bytes, is_dsv4_layout
+    )
