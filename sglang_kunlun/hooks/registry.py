@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 HOOK_MODULES = (
     "sglang_kunlun.hooks.utils.common",
     "sglang_kunlun.hooks.layers",
+    "sglang_kunlun.hooks.hisparse",
     "sglang_kunlun.hooks.mem_cache",
     "sglang_kunlun.hooks.model_loader",
     "sglang_kunlun.hooks.model_executor",
