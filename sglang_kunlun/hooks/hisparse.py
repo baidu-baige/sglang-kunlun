@@ -69,3 +69,33 @@ def _grow_hisparse_row_buffers(original_fn, self, *args, **kwargs):
         self._miss_src = torch.zeros((rows, top_k), dtype=torch.int64, device=device)
         self._miss_dst = torch.zeros((rows, top_k), dtype=torch.int32, device=device)
         self._miss_count = torch.zeros((rows,), dtype=torch.int32, device=device)
+
+
+@plugin_hook(
+    "sglang.srt.model_executor.model_runner.ModelRunner.init_cuda_graphs",
+    type=HookType.AROUND,
+)
+def _eager_decode_for_hisparse(original_fn, self, capture_decode_cuda_graph=True):
+    """Run the hisparse decode eagerly instead of capturing it.
+
+    The swap-in copies KV out of pinned host memory using host-side index
+    tensors.  During capture those indices are only recorded, not materialised,
+    so the host bounds check reads garbage and the copy cannot be expressed at
+    all -- and on XPU a device kernel cannot reach the 25GB host pool either
+    (mapped host memory caps at 4KB/256MB).  Until the device-side swap-in
+    lands, point the decode phase at the eager runner.
+
+    ``capture_decode_cuda_graph=False`` is the same knob the spec draft workers
+    use for their own graphs; it leaves the prefill graph untouched.
+    """
+    if getattr(self, "enable_hisparse", False) and not getattr(
+        self, "is_draft_worker", False
+    ):
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "sglang-kunlun: --enable-hisparse runs decode eagerly (no decode "
+            "CUDA graph); the swap-in host copy cannot be captured yet."
+        )
+        capture_decode_cuda_graph = False
+    return original_fn(self, capture_decode_cuda_graph=capture_decode_cuda_graph)
