@@ -50,7 +50,16 @@ def _skip_hisparse_coordinator_on_draft(original_fn, self):
                 "HiSparse coordinator."
             )
             return None
-    return original_fn(self)
+    original_fn(self)
+    # Only the target's cold pool moves onto the device: the swap-in that has to
+    # be captured into the decode graph runs on the target's forward, and a
+    # second device-resident pool (the draft also builds a coordinator) does not
+    # fit alongside it.  The draft keeps upstream's host-resident pool.
+    if not getattr(self, "is_draft_worker", False):
+        from sglang_kunlun.hooks.hisparse import move_cold_pool_to_device
+
+        move_cold_pool_to_device(getattr(self, "hisparse_coordinator", None))
+    return None
 
 
 @plugin_hook(

@@ -5404,10 +5404,8 @@ def _hisparse_load_cache_to_device_buffer(
     scratch_idx = lru_pos.new_full((), scratch_slot)
     neg_one = torch.zeros((), dtype=torch.int32, device=device) - 1
 
-    src_rank_scratch = torch.zeros(top_k + 1, dtype=torch.int64, device=device)
-    dst_rank_scratch = torch.zeros(top_k + 1, dtype=torch.int32, device=device)
     # lru_slots is int16 and XPU's advanced indexing rejects int16, so stage the
-    # whole table through int32 for the per-row gather/scatter.
+    # whole table through int32 for the gather/scatter.
     lru_all = lru_slots.to(torch.int32)
 
     _hisparse_trace(
@@ -5415,161 +5413,118 @@ def _hisparse_load_cache_to_device_buffer(
         f"dsv4={is_dsv4_layout} record_plan={miss_src is not None}"
     )
 
-    for row in range(batch_size):
-        real = row < num_real_scalar
-        # A 0-dim device index is bounds-checked on the host, which reads a
-        # value that is not materialised yet during CUDA-graph capture (the
-        # clamp is only recorded, not executed).  A 1-D index is a pure
-        # device-side gather, so index with [rid] and drop the leading axis.
-        rid = req_pool_indices[row].to(torch.int64).clamp(0, max_slots - 1).reshape(1)
-        seq_len = seq_lens[row].to(torch.int64)
-        # Padded rows never enter the long path, so they cannot mutate the
-        # LRU order or the device-buffer token bookkeeping of a live request.
-        use_fast = torch.logical_or(torch.logical_not(real), seq_len <= hot)
+    # ================= vectorized planner (batch folded into dim 0) =================
+    # The row loop above launched batch x ~15 ops over hot-sized tensors every
+    # decode step; folding the batch into dim 0 turns that into one op per stage
+    # (~6x fewer XPU kernel launches).  Bit-exact vs the loop on distinct-rid
+    # inputs; rows sharing a rid (DSPARK verify) write identical values so the
+    # duplicate index_put is order-independent.  See doc/hisparse_perf_opt.md.
+    Kd = top_k
+    rids = req_pool_indices.to(torch.int64).clamp(0, max_slots - 1)          # (B,)
+    seq_l = seq_lens.to(torch.int64).reshape(batch_size, 1)                   # (B,1)
+    real = (torch.arange(batch_size, device=device) < num_real_scalar).reshape(batch_size, 1)
+    use_fast = torch.logical_or(torch.logical_not(real), seq_l <= hot)        # (B,1)
+    long_active = torch.logical_not(use_fast)                                 # (B,1)
+    k_row = k_ids.reshape(1, Kd)                                              # (1,K)
+    sent = out_sentinel
 
-        tok = top_k_tokens[row].to(torch.int64)
-        dev_tok = device_buffer_tokens[rid].reshape(-1)
-        dev_loc = device_buffer_locs[rid].reshape(-1)
-        host_row = host_cache_locs[rid].reshape(-1)
-        lru = lru_all[rid].reshape(-1).to(torch.int64)
+    tok = top_k_tokens.to(torch.int64)                                        # (B,K)
+    dev_tok = device_buffer_tokens[rids]                                      # (B,L)
+    dev_loc = device_buffer_locs[rids]                                        # (B,L)
+    host_row = host_cache_locs[rids]                                          # (B,H)
+    lru = lru_all[rids].to(torch.int64)                                       # (B,hot)
 
-        # ---------------- fast path: seq_len <= hot ----------------
-        # Short sequences hold every token in order in the device buffer.
-        fast_out = dev_loc[tok.clamp(0, buffer_len - 1)].to(torch.int32)
-        fast_active = torch.logical_and(
-            use_fast, torch.logical_and(k_ids < seq_len, tok >= 0)
+    fast_out = torch.gather(dev_loc, 1, tok.clamp(0, buffer_len - 1)).to(torch.int32)
+    fast_active = use_fast & (k_row < seq_l) & (tok >= 0)
+
+    newest = seq_l - 1
+    tok_host = tok.clamp(0, host_stride - 1)
+    is_newest = tok == newest
+    tok_key = torch.where(is_newest, tok.new_full((), -1), tok)
+    order = torch.argsort(tok_key, dim=1)
+    sorted_key = torch.gather(tok_key, 1, order)
+    buf_token = torch.gather(dev_tok, 1, lru).to(torch.int64)
+    pos = torch.searchsorted(sorted_key, buf_token)
+    pos_c = pos.clamp(0, Kd - 1)
+    matched = (pos < Kd) & (torch.gather(sorted_key, 1, pos_c) == buf_token) & (buf_token >= 0)
+    match_idx = torch.gather(order, 1, pos_c)                                 # (B,hot)
+
+    hit_active = long_active & matched
+    newest_active = long_active & is_newest
+
+    hit_topk = torch.zeros(batch_size, Kd + 1, dtype=torch.bool, device=device)
+    hit_topk.scatter_(1, torch.where(matched, match_idx, sent), matched)
+    hit_topk = hit_topk[:, :Kd]
+
+    miss_mask = torch.logical_not(hit_topk) & torch.logical_not(is_newest) & long_active
+    miss_rank = torch.cumsum(miss_mask.to(torch.int64), dim=1) - 1
+    evict_mask = torch.logical_not(matched)
+    evict_rank = torch.cumsum(evict_mask.to(torch.int64), dim=1) - 1
+    slot_of_rank = torch.zeros(batch_size, hot + 1, dtype=torch.int64, device=device)
+    slot_of_rank.scatter_(
+        1, torch.where(evict_mask, evict_rank, scratch_idx).clamp_(0, hot), lru
+    )
+    rank_for_miss = torch.where(miss_mask, miss_rank, scratch_idx).clamp_(0, hot)
+    miss_slot = torch.gather(slot_of_rank, 1, rank_for_miss)                  # (B,K)
+
+    out_pad = torch.full((batch_size, Kd + 1), -1, dtype=torch.int32, device=device)
+    out_pad.scatter_(1, torch.where(fast_active, k_row, sent), fast_out)
+    out_pad.scatter_(
+        1, torch.where(hit_active, match_idx, sent),
+        torch.gather(dev_loc, 1, lru).to(torch.int32),
+    )
+    newest_val = dev_loc[:, hot].reshape(batch_size, 1).expand(batch_size, Kd).to(torch.int32)
+    out_pad.scatter_(1, torch.where(newest_active, k_row, sent), newest_val)
+    out_pad.scatter_(
+        1, torch.where(miss_mask, k_row, sent),
+        torch.gather(dev_loc, 1, miss_slot).to(torch.int32),
+    )
+    top_k_device_locs.copy_(torch.where(real, out_pad[:, :Kd], neg_one))
+
+    # device-buffer token bookkeeping (misses write their token id into the slot)
+    write_slot = torch.where(miss_mask, miss_slot, scratch_idx)
+    write_val = torch.where(miss_mask, tok, neg_one.to(torch.int64)).to(device_buffer_tokens.dtype)
+    device_buffer_tokens[rids.reshape(batch_size, 1).expand(batch_size, Kd), write_slot] = write_val
+
+    # miss plan for the shared-index prefetch (park non-misses at the sentinel col Kd)
+    if miss_src is not None:
+        plan_rank = torch.where(miss_mask, miss_rank.to(torch.int32), miss_rank.new_full((), Kd)).clamp_(0, Kd)
+        src_plan = torch.full((batch_size, Kd + 1), 0, dtype=miss_src.dtype, device=device)
+        src_plan[:, :Kd].copy_(miss_src)
+        src_plan.scatter_(1, plan_rank.to(torch.int64), torch.gather(host_row, 1, tok_host).to(miss_src.dtype))
+        miss_src.copy_(src_plan[:, :Kd])
+        dst_plan = torch.full((batch_size, Kd + 1), 0, dtype=miss_dst.dtype, device=device)
+        dst_plan[:, :Kd].copy_(miss_dst)
+        dst_plan.scatter_(1, plan_rank.to(torch.int64), torch.gather(dev_loc, 1, miss_slot).to(miss_dst.dtype))
+        miss_dst.copy_(dst_plan[:, :Kd])
+        miss_count.copy_(miss_mask.to(torch.int32).sum(dim=1))
+
+    # LRU rewrite: [evictables not used by a miss][miss-evicted evictables][hits]
+    lru_row = lru_pos.reshape(1, hot)
+    total_misses = miss_mask.to(torch.int64).sum(dim=1, keepdim=True)
+    slot_class = torch.where(
+        matched, lru_pos.new_full((), 2),
+        torch.where(evict_rank >= total_misses, lru_pos.new_full((), 0), lru_pos.new_full((), 1)),
+    )
+    new_lru = torch.gather(lru, 1, torch.argsort(slot_class * hot + lru_row, dim=1))
+    lru_all[rids] = torch.where(use_fast, lru, new_lru).to(torch.int32)
+
+    # host -> device copy of the misses (single batched call)
+    if not skip_io:
+        src_locs = torch.gather(host_row, 1, tok_host).reshape(-1)
+        dst_locs = torch.gather(dev_loc, 1, miss_slot).to(torch.int64).reshape(-1)
+        mm_flat = miss_mask.reshape(-1)
+        if is_dsv4_layout:
+            dev_scratch = dst_locs.new_full((), device_buffer.shape[0] * _HISPARSE_DSV4_PAGE_SIZE - 1)
+            host_scratch = src_locs.new_full((), host_cache.shape[0] * _HISPARSE_DSV4_PAGE_SIZE - 1)
+            src_locs = torch.where(mm_flat, src_locs, host_scratch)
+            dst_locs = torch.where(mm_flat, dst_locs, dev_scratch)
+        else:
+            src_locs = src_locs[mm_flat]
+            dst_locs = dst_locs[mm_flat]
+        _hisparse_copy_items(
+            host_cache, device_buffer, src_locs, dst_locs, item_size_bytes, is_dsv4_layout
         )
-
-        # ---------------- long path ----------------
-        newest = seq_len - 1
-        tok_host = tok.clamp(0, host_stride - 1)
-        is_newest = tok == newest
-        # The newest token is bound to the reserved slot, not to the hash.
-        tok_key = torch.where(is_newest, tok.new_full((), -1), tok)
-        order = torch.argsort(tok_key)
-        sorted_key = tok_key[order]
-        buf_token = dev_tok[lru].to(torch.int64)
-        pos = torch.searchsorted(sorted_key, buf_token)
-        pos_c = pos.clamp(max=top_k - 1)
-        matched = torch.logical_and(pos < top_k, sorted_key[pos_c] == buf_token)
-        matched = torch.logical_and(matched, buf_token >= 0)
-        match_idx = order[pos_c]
-
-        long_active = torch.logical_not(use_fast)
-        hit_active = torch.logical_and(long_active, matched)
-        newest_active = torch.logical_and(long_active, is_newest)
-
-        hit_topk = torch.zeros(top_k + 1, dtype=torch.bool, device=device)
-        hit_topk.scatter_(0, torch.where(matched, match_idx, out_sentinel), matched)
-        hit_topk = hit_topk[:top_k]
-
-        miss_mask = torch.logical_and(
-            torch.logical_not(hit_topk), torch.logical_not(is_newest)
-        )
-        miss_mask = torch.logical_and(miss_mask, long_active)
-        miss_rank = torch.cumsum(miss_mask.to(torch.int64), dim=0) - 1
-
-        # Evictables are the non-hit LRU slots, in LRU order; a miss takes the
-        # LRU-most one (rank == miss index).
-        evict_mask = torch.logical_not(matched)
-        evict_rank = torch.cumsum(evict_mask.to(torch.int64), dim=0) - 1
-        slot_of_rank = torch.zeros(hot + 1, dtype=torch.int64, device=device)
-        slot_of_rank[torch.where(evict_mask, evict_rank, scratch_idx)] = lru
-        rank_for_miss = torch.where(miss_mask, miss_rank, scratch_idx)
-        miss_slot = slot_of_rank[rank_for_miss]
-
-        # ---------------- assemble the output slot table ----------------
-        # Mutually exclusive groups, each inactive entry parked on the sentinel.
-        out_pad = torch.full((top_k + 1,), -1, dtype=torch.int32, device=device)
-        out_pad.scatter_(0, torch.where(fast_active, k_ids, out_sentinel), fast_out)
-        out_pad.scatter_(
-            0,
-            torch.where(hit_active, match_idx, out_sentinel),
-            dev_loc[lru].to(torch.int32),
-        )
-        newest_val = dev_loc[hot].to(torch.int32).reshape(1).expand(top_k)
-        out_pad.scatter_(0, torch.where(newest_active, k_ids, out_sentinel), newest_val)
-        out_pad.scatter_(
-            0,
-            torch.where(miss_mask, k_ids, out_sentinel),
-            dev_loc[miss_slot].to(torch.int32),
-        )
-        top_k_device_locs[row].copy_(
-            torch.where(real, out_pad[:top_k], neg_one.expand(top_k))
-        )
-
-        # ---------------- device-buffer token bookkeeping ----------------
-        device_buffer_tokens[
-            rid.reshape(1, 1),
-            torch.where(miss_mask, miss_slot, scratch_idx).reshape(1, -1),
-        ] = torch.where(miss_mask, tok, neg_one.to(torch.int64)).to(
-            device_buffer_tokens.dtype
-        ).reshape(1, -1)
-
-        # ---------------- miss plan for the skip-layer prefetch ----------------
-        if miss_src is not None:
-            miss_src_row = miss_src[row]
-            src_rank_scratch[:top_k].copy_(miss_src_row)
-            src_rank_scratch.scatter_(
-                0, rank_for_miss, host_row[tok_host]
-            )
-            miss_src_row.copy_(src_rank_scratch[:top_k])
-
-            miss_dst_row = miss_dst[row]
-            dst_rank_scratch[:top_k].copy_(miss_dst_row)
-            dst_rank_scratch.scatter_(
-                0, rank_for_miss, dev_loc[miss_slot].to(torch.int32)
-            )
-            miss_dst_row.copy_(dst_rank_scratch[:top_k])
-
-            miss_count[row].copy_(miss_mask.to(torch.int32).sum())
-
-        # ---------------- LRU rewrite ----------------
-        # [evictables not used by a miss][miss-evicted evictables][hits]
-        total_misses = miss_mask.to(torch.int64).sum()
-        slot_class = torch.where(
-            matched,
-            lru_pos.new_full((), 2),
-            torch.where(
-                evict_rank >= total_misses,
-                lru_pos.new_full((), 0),
-                lru_pos.new_full((), 1),
-            ),
-        )
-        new_lru = lru[torch.argsort(slot_class * hot + lru_pos)]
-        lru_all[rid] = torch.where(use_fast, lru, new_lru).to(torch.int32).reshape(
-            1, -1
-        )
-
-        # ---------------- host -> device copy of the misses ----------------
-        # Only the misses carry real IO.  To keep the index set static-sized
-        # (and therefore capturable) the irrelevant entries are redirected to
-        # the spare tail token of each pool: the device C4 buffer always has at
-        # least one page beyond the allocator's range, so writing there is
-        # harmless, and reading a spare host token is harmless too.
-        if not skip_io:
-            src_locs = host_row[tok_host]
-            dst_locs = dev_loc[miss_slot].to(torch.int64)
-            if is_dsv4_layout:
-                dev_scratch = dst_locs.new_full(
-                    (), device_buffer.shape[0] * _HISPARSE_DSV4_PAGE_SIZE - 1
-                )
-                host_scratch = src_locs.new_full(
-                    (), host_cache.shape[0] * _HISPARSE_DSV4_PAGE_SIZE - 1
-                )
-                src_locs = torch.where(miss_mask, src_locs, host_scratch)
-                dst_locs = torch.where(miss_mask, dst_locs, dev_scratch)
-            else:
-                src_locs = src_locs[miss_mask]
-                dst_locs = dst_locs[miss_mask]
-            _hisparse_copy_items(
-                host_cache,
-                device_buffer,
-                src_locs,
-                dst_locs,
-                item_size_bytes,
-                is_dsv4_layout,
-            )
 
     lru_slots.copy_(lru_all.to(lru_slots.dtype))
 

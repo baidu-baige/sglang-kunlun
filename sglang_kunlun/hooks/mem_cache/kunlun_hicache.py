@@ -100,6 +100,29 @@ def _page_rows(indices: torch.Tensor, page_size: int) -> torch.Tensor:
     return indices.reshape(-1, page_size)[:, 0] // page_size
 
 
+def _same_device(a: torch.Tensor, b: torch.Tensor) -> bool:
+    return a.device == b.device
+
+
+def _copy_full_page(pool, src_buffers, dst_buffers, src_indices, dst_indices) -> None:
+    """Move whole page rows with plain torch indexing.
+
+    ``transfer_kv_all_layer_mla`` / ``transfer_kv_per_layer_mla`` hardcode the
+    transfer direction (D2H / H2D) -- see the comments in the XSpeedGate
+    wrappers.  That is fine while the host pool really is host memory, but the
+    HiSparse cold pool is re-homed onto the device (so its swap-in can be
+    captured into the decode graph), and then both ends are device memory and
+    the direction has to come from the tensors.
+    """
+    page_size = _pool_page_size(pool)
+    src_rows = _page_rows(src_indices, page_size)
+    dst_rows = _page_rows(dst_indices, page_size)
+    for src_buffer, dst_buffer in zip(src_buffers, dst_buffers):
+        dst_buffer[dst_rows.to(dst_buffer.device)] = src_buffer[
+            src_rows.to(src_buffer.device)
+        ].to(dst_buffer.device)
+
+
 def _pool_page_size(pool) -> int:
     return pool.slot_page_size if hasattr(pool, "slot_page_size") else pool.swa_page_size
 
@@ -132,6 +155,11 @@ def _transfer_all_layer(pool, host_indices, device_indices, io_backend: str) -> 
         # HiSparse stages the prefill tail and one eager-backup token per
         # compress_ratio decode steps; those are token-granular.
         _copy_token_granular(
+            pool, pool.device_buffers, pool.data_refs, device_indices, host_indices
+        )
+        return
+    if _same_device(pool.data_refs[0], pool.device_buffers[0]):
+        _copy_full_page(
             pool, pool.device_buffers, pool.data_refs, device_indices, host_indices
         )
         return
@@ -168,6 +196,15 @@ def _transfer_per_layer(
             )
         # Short-sequence HiSparse preload is token-granular.
         _copy_token_granular(
+            pool,
+            pool.data_refs[layer_id : layer_id + 1],
+            device_buffers[layer_id : layer_id + 1],
+            host_indices,
+            device_indices,
+        )
+        return
+    if _same_device(pool.data_refs[layer_id], device_buffers[layer_id]):
+        _copy_full_page(
             pool,
             pool.data_refs[layer_id : layer_id + 1],
             device_buffers[layer_id : layer_id + 1],
