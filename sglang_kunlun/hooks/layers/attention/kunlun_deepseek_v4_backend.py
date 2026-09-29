@@ -511,6 +511,21 @@ def _refresh_graph_host_lengths(
 _DSV4_PAGE_TABLE_SPAN_LOGGED = False
 
 
+def _page_slack() -> int:
+    """One page of slack for the page-table span (see _dsv4_page_table_span)."""
+    return upstream.PAGE_INDEX_ALIGNED_SIZE if hasattr(upstream, "PAGE_INDEX_ALIGNED_SIZE") else 64
+
+
+def _draft_token_count() -> int:
+    """Number of draft tokens a verify row carries (0 when not speculative."""
+    try:
+        from sglang.srt.runtime_context import get_spec
+
+        return int(get_spec().speculative_num_draft_tokens or 0)
+    except Exception:  # noqa: BLE001 - spec context is absent in unit tests
+        return 0
+
+
 def _dsv4_page_table_span(max_seq_len: int, seq_lens_casual: torch.Tensor) -> int:
     """Return a page-table span that covers every row's causal length.
 
@@ -524,6 +539,18 @@ def _dsv4_page_table_span(max_seq_len: int, seq_lens_casual: torch.Tensor) -> in
     """
     if os.environ.get("DSV4_PAGE_TABLE_COVER_CASUAL", "1") != "1":
         return max_seq_len
+    if torch.cuda.is_current_stream_capturing():
+        # The span is a Python slice bound, so the real maximum needs a host
+        # sync.  That cannot run inside capture -- and during capture the tensor
+        # holds uninitialised memory, so the sync sized the page table from
+        # garbage (spans around 8e8 were observed) and the attention then read
+        # past it: "load/store operation exceed memory size".  Take the static
+        # upper bound instead: verify rows reach committed + num_draft_tokens.
+        # ``scores`` is the full compressed logits width and the page table is
+        # gathered with ``raw_indices >> page_bits``, so the span has to cover
+        # the logits width, not just the causal length.  One page of slack keeps
+        # the last page fully described.
+        return max_seq_len + _draft_token_count() + _page_slack()
     if seq_lens_casual.numel() == 0:
         return max_seq_len
     needed = int(seq_lens_casual.max().item())

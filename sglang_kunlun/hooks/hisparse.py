@@ -11,11 +11,28 @@ Kunlun serves DeepSeek-V4 with fp16 (see
 ``hooks/layers/attention/dsv4/dtype_restore.py``), the DSv4 C4 half-cache is a
 2-byte layout for either dtype, and ``--kv-cache-dtype bfloat16`` collapses
 DSPARK acceptance on this build, so honour the requested dtype for DeepSeek-V4.
+
+The cold pool is also moved onto the XPU device here.  The swap-in has to run
+inside the captured decode graph, and a CUDA graph only records device work:
+``copy_items`` gathers with host index tensors, which executes at capture time
+on uninitialised values.  A device-resident cold pool makes the whole swap-in
+(planning, LRU, copy) plain device indexing, so it captures.  The cost is that
+the cold pool -- which is the *entire* compressed KV, 21 x 18313 x 65536B =
+25.2GB -- now competes with the device KV budget, so ``--mem-fraction-static``
+must be lowered to make room.
 """
 
 from __future__ import annotations
 
+import logging
+
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+
+logger = logging.getLogger(__name__)
+
+# The coordinator's own cold pool (``hisparse_coordinator.py``), distinct from
+# the HiCache pools the hybrid pool assembler builds.
+_HISPARSE_COLD_POOL = "dsv4_hisparse_c4"
 
 
 @plugin_hook(
@@ -71,31 +88,79 @@ def _grow_hisparse_row_buffers(original_fn, self, *args, **kwargs):
         self._miss_count = torch.zeros((rows,), dtype=torch.int32, device=device)
 
 
+def move_cold_pool_to_device(coordinator) -> None:
+    """Re-home the hisparse cold pool from pinned host memory onto the XPU.
+
+    ``DeepSeekV4PagedHostPool`` builds its buffers through
+    ``ALLOC_MEMORY_FUNCS`` -> ``HostTensorAllocator.allocate``, which asserts
+    ``device == "cpu"``, so the pool cannot simply be constructed with
+    ``device="cuda"``.  Allocate the equivalent device tensors here instead and
+    drop the host ones; the pool starts empty, so nothing has to be copied.
+
+    Called for the target worker only (``model_runner_kv_cache_mixin``): the
+    DSPARK draft also builds a coordinator, but its swap-in never runs, and a
+    second device-resident cold pool does not fit alongside the target's.
+    """
+    import torch
+
+    if coordinator is None:
+        return
+    pool = getattr(coordinator, "mem_pool_host", None)
+    buffers = getattr(pool, "kv_buffer", None)
+    if not buffers:
+        return
+    gpu = pool.gpu_device
+    if str(pool.device) == str(gpu):
+        return
+
+    shapes = [b.shape for b in buffers]
+    dtypes = [b.dtype for b in buffers]
+    total_gb = sum(s.numel() * d.itemsize for s, d in zip(shapes, dtypes)) / 1e9
+    try:
+        free_gb = torch.cuda.mem_get_info(gpu)[0] / 1e9
+    except Exception:  # noqa: BLE001 - informational only
+        free_gb = float("nan")
+    logger.warning(
+        "sglang-kunlun: hisparse cold pool -> device (%s, %.2f GB; %.2f GB free). "
+        "The swap-in runs in the decode CUDA graph, so the cold pool cannot stay "
+        "in host memory; lower --mem-fraction-static if this does not fit.",
+        gpu,
+        total_gb,
+        free_gb,
+    )
+
+    # Replace the host buffers with device ones.  ``data_refs`` is the layer
+    # order the transfer hooks walk, and ``data_ptrs`` is read by the PD
+    # transfer path, so both have to be rebuilt from the new tensors.
+    pool.kv_buffer = [
+        torch.zeros(shape, dtype=dtype, device=gpu)
+        for shape, dtype in zip(shapes, dtypes)
+    ]
+    pool.data_refs = list(pool.kv_buffer)
+    pool.device = gpu
+    pool.pin_memory = False
+    pool.data_ptrs = torch.tensor(
+        [b.data_ptr() for b in pool.kv_buffer], dtype=torch.uint64, device=gpu
+    )
+
+
 @plugin_hook(
-    "sglang.srt.model_executor.model_runner.ModelRunner.init_cuda_graphs",
+    "sglang.srt.mem_cache.memory_pool_host.DeepSeekV4PagedHostPool.__init__",
     type=HookType.AROUND,
 )
-def _eager_decode_for_hisparse(original_fn, self, capture_decode_cuda_graph=True):
-    """Run the hisparse decode eagerly instead of capturing it.
+def _skip_host_register_for_hisparse_cold_pool(original_fn, self, *args, **kwargs):
+    """Allocate the hisparse cold pool without ``cudaHostRegister``.
 
-    The swap-in copies KV out of pinned host memory using host-side index
-    tensors.  During capture those indices are only recorded, not materialised,
-    so the host bounds check reads garbage and the copy cannot be expressed at
-    all -- and on XPU a device kernel cannot reach the 25GB host pool either
-    (mapped host memory caps at 4KB/256MB).  Until the device-side swap-in
-    lands, point the decode phase at the eager runner.
-
-    ``capture_decode_cuda_graph=False`` is the same knob the spec draft workers
-    use for their own graphs; it leaves the prefill graph untouched.
+    The cold pool is host-allocated only so ``DeepSeekV4PagedHostPool.__init__``
+    runs unchanged; the target's copy is re-homed onto the XPU right after
+    (``move_cold_pool_to_device``) and the draft's is never used.  The
+    registration is wasted work and, at 16GB, fails on XPU with a vendor error
+    the cudart shim cannot even stringify (``cudaGetErrorString(): ... Invoked
+    with: 712``).  Turning ``pin_memory`` off routes the pool to the plain
+    mmap allocator with no registration.
     """
-    if getattr(self, "enable_hisparse", False) and not getattr(
-        self, "is_draft_worker", False
-    ):
-        import logging
+    pool_name = kwargs.get("pool_name", args[0] if args else None)
+    if pool_name == _HISPARSE_COLD_POOL:
+        kwargs["pin_memory"] = False
+    return original_fn(self, *args, **kwargs)
 
-        logging.getLogger(__name__).warning(
-            "sglang-kunlun: --enable-hisparse runs decode eagerly (no decode "
-            "CUDA graph); the swap-in host copy cannot be captured yet."
-        )
-        capture_decode_cuda_graph = False
-    return original_fn(self, capture_decode_cuda_graph=capture_decode_cuda_graph)
