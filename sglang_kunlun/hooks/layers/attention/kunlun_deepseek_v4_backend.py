@@ -737,15 +737,18 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         indexer_capturer = upstream_indexer.get_global_indexer_capturer()
         capture_enabled = indexer_capturer is not None
         hisparse_coordinator = self.hisparse_coordinator
-        hisparse_decode = (
-            hisparse_coordinator is not None
-            and forward_batch.forward_mode.is_decode()
+        # DSPARK drives the target forward as TARGET_VERIFY, not DECODE, so the
+        # swap-in has to fire there too.  A verify batch carries
+        # `bs * num_draft_tokens` query rows, each selecting its own top-k.
+        hisparse_swap = hisparse_coordinator is not None and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
         )
 
         raw_indices = None
         if capture_enabled:
             raw_indices = torch.empty_like(c4_sparse_page_indices)
-        elif hisparse_decode:
+        elif hisparse_swap:
             raw_indices = hisparse_coordinator.raw_indices_buffer[
                 : c4_sparse_page_indices.size(0)
             ]
@@ -781,14 +784,27 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             )
 
         if hisparse_coordinator is not None:
-            if hisparse_decode:
+            if hisparse_swap:
                 compress_layer_id = token_to_kv_pool.layer_mapping[
                     c4_indexer.layer_id
                 ].compress_layer_id
+                # The coordinator is per-request, but a verify batch has one
+                # query row per draft token; expand the request-indexed inputs
+                # to one entry per row so every row swaps in its own top-k.
+                swap_req_indices = forward_batch.req_pool_indices
+                swap_seq_lens = indexer_metadata.c4_seq_lens
+                rows = raw_indices.size(0)
+                n_reqs = swap_req_indices.size(0)
+                if rows > n_reqs and n_reqs > 0 and rows % n_reqs == 0:
+                    per_req = rows // n_reqs
+                    swap_req_indices = swap_req_indices.repeat_interleave(per_req)
+                    if swap_seq_lens.size(0) == n_reqs:
+                        swap_seq_lens = swap_seq_lens.repeat_interleave(per_req)
+                hisparse_coordinator.num_real_reqs.fill_(rows)
                 core_metadata.c4_sparse_page_indices = (
                     hisparse_coordinator.swap_in_selected_pages(
-                        req_pool_indices=forward_batch.req_pool_indices,
-                        compressed_seq_lens=indexer_metadata.c4_seq_lens,
+                        req_pool_indices=swap_req_indices,
+                        compressed_seq_lens=swap_seq_lens,
                         top_k_result=raw_indices,
                         layer_id=compress_layer_id,
                     )
