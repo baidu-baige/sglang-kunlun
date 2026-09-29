@@ -19,6 +19,8 @@ Phase 3 (Wave 1) scope:
 
 from __future__ import annotations
 
+import logging
+
 from sglang.srt.platforms.interface import SRTPlatform
 
 from .device import KunlunDeviceMixin
@@ -80,6 +82,20 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
         """
         if getattr(server_args, "page_size", None) is None:
             server_args.page_size = 128
+
+        # HiSparse's swap-in copies KV from pinned host memory using host-side
+        # index tensors, which a captured decode CUDA graph cannot express (the
+        # indices are only materialised after replay).  Run the hisparse decode
+        # eagerly until the device-side swap-in lands.
+        if getattr(server_args, "enable_hisparse", False) and not getattr(
+            server_args, "disable_cuda_graph", False
+        ):
+            server_args.disable_cuda_graph = True
+            logging.getLogger(__name__).warning(
+                "sglang-kunlun: --enable-hisparse forces eager decode "
+                "(--disable-cuda-graph); the swap-in host copy cannot be "
+                "captured yet."
+            )
 
         # DeepSeek-V4's upstream defaults run after this hook and select
         # ``dsv4`` unconditionally. Preserve the user's public Kunlun name
