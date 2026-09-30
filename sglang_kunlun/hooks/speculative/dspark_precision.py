@@ -18,7 +18,7 @@
 """
 
 from __future__ import annotations
-
+import re
 import logging
 import re
 
@@ -393,3 +393,19 @@ def write_target_hidden_kv_with_correction_kunlun(
         )
 
 
+@plugin_hook(
+    "sglang.srt.speculative.dspark_components.dspark_worker_v2."
+    "DSparkWorkerV2.forward_batch_generation",
+    type=HookType.AROUND,
+)
+def dspark_forward_batch_generation_kunlun(original_fn, *args, **kwargs):
+    """Drop ``pp_proxy_tensors`` from the DSpark worker call.
+
+    4.1's scheduler still calls ``DSparkWorkerV2.forward_batch_generation(...,
+    pp_proxy_tensors=...)`` (spec + non-overlap path) while 4.1 upstream removed
+    the parameter from the worker entirely (upstream caller/callee mismatch).
+    ``pp_proxy_tensors`` only carries PP proxy state; our configs run pp_size=1,
+    where it is always None, so accepting and discarding it is lossless.
+    """
+    kwargs.pop("pp_proxy_tensors", None)
+    return original_fn(*args, **kwargs)

@@ -18,10 +18,24 @@ def _enable_kunlun_attention_choice(module) -> None:
     try:
         annotations = module.ServerArgs.__annotations__
         raw_annotation = annotations["kv_cache_dtype"]
-        if isinstance(raw_annotation, str) and "'fp16'" not in raw_annotation:
-            annotations["kv_cache_dtype"] = raw_annotation.replace(
-                "'fp4_e2m1']", "'fp4_e2m1', 'fp16']"
-            )
+        # dsv4.1 把这个字段声明成 `Annotated[str, Arg(choices=[...])]`，老版本是字符串化
+        # 的 `Literal[...]`。argparse 读的是前者的列表，所以往那里追加；`Arg` 可能是
+        # frozen dataclass，就地改列表可以避免重新赋值属性。
+        appended = False
+        for meta in getattr(raw_annotation, "__metadata__", ()) or ():
+            choices = getattr(meta, "choices", None)
+            if isinstance(choices, list):
+                if "fp16" not in choices:
+                    choices.append("fp16")
+                appended = True
+        if (
+            not appended
+            and isinstance(raw_annotation, str)
+            and "'fp16'" not in raw_annotation
+            and raw_annotation.rstrip().endswith("]")
+        ):
+            stripped = raw_annotation.rstrip()
+            annotations["kv_cache_dtype"] = stripped[:-1] + ", 'fp16']"
     except Exception:
         pass
 

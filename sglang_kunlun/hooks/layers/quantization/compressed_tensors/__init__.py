@@ -3,6 +3,10 @@
 from .compressed_tensors import (
     KunlunCompressedTensorsConfig,
 )
+
+# Importing this module registers its ``@plugin_hook`` targets in
+# ``HookRegistry``; the install happens via ``HookRegistry.apply_hooks()``.
+from .kimi_k3 import kimi_k3_expert_scheme_dict  # noqa: F401
 from .schemes import (
     INT4_SIGNED_SCALE_MULT,
     INT4_UNSIGNED_SCALE_MULT,
@@ -35,6 +39,7 @@ __all__ = [
     "dequant_int4",
     "dequant_int4_moe",
     "dynamic_quantize_int8",
+    "kimi_k3_expert_scheme_dict",
     "moe_fc",
     "moe_post",
     "moe_pre_sorted",

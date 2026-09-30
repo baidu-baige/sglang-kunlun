@@ -16,6 +16,46 @@ logger = logging.getLogger(__name__)
 
 
 @plugin_hook(
+    "sglang.srt.mem_cache.kv_cache_dtype.configure_kv_cache_dtype",
+    type=HookType.AROUND,
+)
+def configure_kv_cache_dtype_kunlun(original_fn, **kwargs):
+    """把 `--kv-cache-dtype fp16` 解析成 `torch.float16`。
+
+    昆仑的 DSV4 池子是 fp16/bf16 的"半 cache"（见下面 `dsv4_create_buffer_kunlun`），
+    所以本平台跑 fp16 KV cache。上游的解析表没有 fp16 分支，会落到
+    `raise ValueError(f"Unsupported kv_cache_dtype: ...")`，因此在这里拦掉。字符串槽返回
+    None —— 上游用 None 表示未量化池（auto 分支就不设这个标记，backend 靠它判断是否 descale）。
+
+    配套改动：`sitecustomize.py` 把 fp16 加回 argparse choices；`platform/srt.py` 在上游
+    DeepSeek-V4 hook 断言这个值时先换成 bfloat16、跑完再声明回来。
+    """
+    if kwargs.get("server_args_kv_cache_dtype") == "fp16":
+        return None, torch.float16
+    return original_fn(**kwargs)
+
+
+@plugin_hook(
+    "sglang.srt.mem_cache.allocator.swa.SWATokenToKVPoolAllocator._free_swa_pages_cuda",
+    type=HookType.REPLACE,
+)
+def free_swa_pages_kunlun(self, full_page_representatives: torch.Tensor):
+    """Free SWA pages through upstream's torch path instead of its Triton one.
+
+    main fused the resolve-and-clear of `full_to_swa_index_mapping` into
+    `get_and_clear_swa_pages_kernel`, picked by `free_index.is_cuda`. XPU
+    tensors answer True there, and the Kunlun triton shim hands back the plain
+    function behind `@triton.jit`, so the launch dies with "'function' object is
+    not subscriptable" the first time a request finishes.
+
+    `_free_swa_pages_none_cuda` is upstream's own non-CUDA branch with the same
+    contract (same mapping clear, same `_SWA_PEER_MAPPED` expectation, same
+    debug assertions) and is what this platform ran before the fusion landed.
+    """
+    return self._free_swa_pages_none_cuda(full_page_representatives)
+
+
+@plugin_hook(
     "sglang.srt.mem_cache.allocator.paged.PagedTokenToKVPoolAllocator.alloc_decode",
     type=HookType.REPLACE,
 )
@@ -135,6 +175,72 @@ def _alloc_2m_aligned(total_bytes: int, dtype: torch.dtype, device: str):
 
 
 @plugin_hook(
+    "sglang.srt.model_executor.pool_configurator.DSV4PoolConfigurator.__init__",
+    type=HookType.AFTER,
+)
+def dsv4_pool_configurator_kv_bytes_kunlun(result, self, kvc):
+    """按昆仑半 cache 的槽位大小定 DSV4 各池子的容量。
+
+    `DSV4PoolConfigurator` 自己算 `kv_bytes = qk_nope + qk_rope*2 + 8`（448+128+8=584 B，
+    N 卡 FlashMLA 的 fp8 nope + bf16 rope + ue8m0 scale 打包），**从不问 pool 的
+    `get_bytes_per_token()`**，所以上面那个 `dsv4_get_bytes_per_token_kunlun` 影响不到容量。
+    昆仑一个槽位是 `(qk_nope + qk_rope)` 个 fp16 元素 = 1024 B，比它大 1.75 倍，于是
+    configurator 发的 token 额度是实际能装下的 1.72 倍（`bytes_per_full_token` 口径
+    3966 → 应为 6826，full_token 5804544 → 3372544）。表现是 `--mem-fraction-static 0.75`
+    在建池阶段 OOM（0.6 只是踩着卡的物理上限侥幸过关），以及 `full token usage` 恒为 0.00。
+
+    上游自己的 bf16 latent 池就是 `attn_head_dim * 2`（`self._unified` 分支），这里取同一个值。
+
+    只改 `kv_bytes` 不够：`bytes_per_full_token` 在 `__init__` 内就算完了，所以要连带重算
+    依赖它的四个缓存值。不依赖 `kv_bytes` 的 `swa_cap_tokens` / `swa_prefix_tails` 不用动，
+    而 `_get_swa_fixed_bytes()` 是调用时才读 `kv_bytes` 的方法，会自动跟上。
+    """
+    if self.kv_cache_dtype_str not in ("fp16", "float16", "bf16", "bfloat16"):
+        return result
+    if getattr(self, "_unified", False):
+        return result  # unified KV 本来就按 bf16 latent 定容量
+
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+        get_dsv4_indexer_bytes_per_token,
+    )
+
+    old_kv_bytes = self.kv_bytes
+    self.kv_bytes = self.attn_head_dim * 2  # fp16/bf16 各 2 字节
+
+    if self.encoder_replay:
+        # `request_window_bytes` 也按 kv_bytes 算，但只在 encoder bounded replay 下非零。
+        raise NotImplementedError(
+            "encoder SWA bounded replay 的 request_window_bytes 未按昆仑半 cache 重算"
+        )
+
+    cfg = kvc.model_config
+    low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
+        self.indexer_head_dim, use_fp4_indexer=True
+    )
+    self.low_ratio_bytes_per_full_token = sum(
+        (self.kv_bytes + low_ratio_index_bytes) / cfg.compress_ratios[l]
+        for l in cfg.hf_config.kv_source_layer_ids
+        if kvc.layer_info.start_layer <= l < kvc.layer_info.end_layer
+        and cfg.compress_ratios[l] in (1, 2)
+    )
+    self.bytes_per_swa_token = self._get_bytes_per_swa_token()
+    self.bytes_per_full_token = self._get_bytes_per_full_token()
+    if self.is_speculative:
+        self.bytes_per_full_token *= self._spec_infl
+        self.bytes_per_swa_token *= self._spec_infl
+
+    logger.info(
+        "Kunlun half-cache DSV4 pool sizing: kv_bytes %d -> %d, "
+        "bytes_per_full_token %.2f, bytes_per_swa_token %.2f",
+        old_kv_bytes,
+        self.kv_bytes,
+        self.bytes_per_full_token,
+        self.bytes_per_swa_token,
+    )
+    return result
+
+
+@plugin_hook(
     "sglang.srt.mem_cache.deepseek_v4_memory_pool.DeepSeekV4IndexerPool._create_buffer",
     type=HookType.AROUND,
 )
@@ -216,3 +322,21 @@ def compress_state_alloc_kv_score_buffer_kunlun(
                 )
             )
     self.kv_score_buffer.clear()
+
+
+@plugin_hook(
+    "sglang.srt.mem_cache.memory_pool.MambaPool._should_fuse_slot_ops",
+    type=HookType.AROUND,
+)
+def disable_fused_mamba_slot_ops(original_fn, self) -> bool:
+    """Disable fused slot operations only on the Kunlun platform.
+
+    Returns:
+        ``False`` on Kunlun so the upstream Torch clear/copy fallback runs;
+        ``True`` elsewhere so native fused operations remain unchanged.
+    """
+    from sglang.srt.platforms import current_platform
+
+    if getattr(current_platform, "device_name", None) == "kunlun":
+        return False
+    return original_fn(self)

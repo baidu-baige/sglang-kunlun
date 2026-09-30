@@ -36,8 +36,21 @@ from sglang.srt.utils import (
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
 
-from deep_ep import Config
-from deep_ep.buffer_v2 import BufferV2 as Buffer
+# DeepEP is optional: the wheel is absent on single-node TP-only hosts, and
+# upstream only imports it lazily inside the dispatcher methods
+# (``srt/layers/moe/token_dispatcher/deepep.py:52``).  Importing it at module
+# scope here made the whole hook package unimportable.  Every use of
+# Config/Buffer below sits in a method body, so an absent wheel now surfaces
+# only if a DeepEP dispatcher is actually constructed.
+try:
+    from deep_ep import Config
+    from deep_ep.buffer_v2 import BufferV2 as Buffer
+except ImportError:  # pragma: no cover - depends on the host wheel set
+    Config = None
+    Buffer = None
+    logging.getLogger(__name__).warning(
+        "deep_ep not installed; DeepEP dispatcher hooks registered but unusable"
+    )
 
 from enum import Enum, IntEnum, auto
 

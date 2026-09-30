@@ -40,6 +40,9 @@ DEBUG_HOOK_MODULES = (
     "debug.dsv4_mtp_nextn_probes",
     "debug.mtp_alignment_plugin",
     "debug.ragged_draft_attention_probe",
+    # T002: CP × MoE 四个观测点探针。只在 DSV41_CP_PROBE_DIR 设置时才注册 hook，
+    # 未设置时模块本身不 import torch/sglang、完全空转。
+    "debug.dsv41_cp_moe_probe",
 )
 
 
@@ -50,9 +53,26 @@ def register_all() -> None:
 
     _kunlun_pre_shim()
     env_compat.install()
+
+    # Gate off Kimi-K3 fused features that have no Kunlun equivalent. Must run
+    # before any ServerArgs/model code reads the corresponding env variables.
+    from sglang_kunlun.platform.k3_capabilities import disable_unsupported_k3_features
+
+    disable_unsupported_k3_features()
     from sglang_kunlun.kernels import deep_geem_hook as _deep_geem_hook  # noqa: F401
     from sglang_kunlun.kernels import flashinfer_hook as _flashinfer_hook  # noqa: F401
-    from sglang_kunlun.kernels import kernel_ops
+    from sglang_kunlun.kernels import k3_conv_registry as _k3_conv_registry  # noqa: F401
+    from sglang_kunlun.kernels import kernel_ops, kernel_registry
+
+    # V4.1 low-ratio (compress_ratio 1/2) kernel replacements. Must be imported
+    # before kernel_ops.install(), which snapshots the registration tables.
+    from sglang_kunlun.kernels import dsv41_low_ratio as _dsv41_low_ratio  # noqa: F401
+    from sglang_kunlun.kernels import dsv41_mhc as _dsv41_mhc  # noqa: F401
+
+    # Must precede kernel_ops.install(): ``sglang.kernels.selector`` caches
+    # resolved callables (``lru_cache`` on ``_resolve``), so the override has to
+    # be in place before any op is resolved for the first time.
+    kernel_registry.install()
 
     # MiniMax-M3 lives in one self-contained package: importing it applies the
     # Triton compatibility patches the upstream sparse modules need at import
@@ -74,6 +94,7 @@ def register_all() -> None:
             len(legacy_jit_specs),
         )
     kernel_ops.install()
+    kernel_registry.log_resolution_report_once()
     for module_name in HOOK_MODULES:
         importlib.import_module(module_name)
     debug_modules = 0
@@ -86,9 +107,11 @@ def register_all() -> None:
             debug_modules += 1
     logger.info(
         "sglang-kunlun: %d hook modules registered, %d debug hook modules "
-        "registered, %d triton ops and %d jit ops installed",
+        "registered, %d triton ops, %d jit ops and %d kernel-registry overrides "
+        "installed",
         len(HOOK_MODULES),
         debug_modules,
         len(kernel_ops.registered_triton_ops()),
         len(kernel_ops.registered_jit_ops()),
+        len(kernel_registry.registered_overrides()),
     )
