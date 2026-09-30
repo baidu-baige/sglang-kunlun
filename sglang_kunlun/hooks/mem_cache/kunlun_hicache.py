@@ -12,9 +12,14 @@ unavailable JIT kernel.  The pool-shape adaptation and hook wiring stay here.
 
 from __future__ import annotations
 
+import logging
+
 import torch
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+
+logger = logging.getLogger(__name__)
+_DIAG = {"copy_full_page": False}
 
 from sglang_kunlun.kernels.sgl_kernel_kunlun.dsv4_hicache import (
     transfer_kv_all_layer_mla,
@@ -118,6 +123,26 @@ def _copy_full_page(pool, src_buffers, dst_buffers, src_indices, dst_indices) ->
     src_rows = _page_rows(src_indices, page_size)
     dst_rows = _page_rows(dst_indices, page_size)
     for src_buffer, dst_buffer in zip(src_buffers, dst_buffers):
+        s_max = int(src_rows.max()) if src_rows.numel() else -1
+        d_max = int(dst_rows.max()) if dst_rows.numel() else -1
+        oob = s_max >= src_buffer.shape[0] or d_max >= dst_buffer.shape[0]
+        if oob or not _DIAG["copy_full_page"]:
+            _DIAG["copy_full_page"] = True
+            logger.error(
+                "HISPARSE_DIAG copy_full_page pool=%s page_size=%d n_layers=%d "
+                "src_idx[min=%d max=%d n=%d] dst_idx[min=%d max=%d n=%d] "
+                "src_rows[max=%d] dst_rows[max=%d] src_buf=%s dst_buf=%s OOB=%s",
+                getattr(pool, "pool_name", "?"), page_size, len(src_buffers),
+                int(src_indices.min()), int(src_indices.max()), src_indices.numel(),
+                int(dst_indices.min()), int(dst_indices.max()), dst_indices.numel(),
+                s_max, d_max, tuple(src_buffer.shape), tuple(dst_buffer.shape), oob,
+            )
+        if oob:
+            # Skip instead of letting the XPU index_put hard-fault (which crashes
+            # the whole scheduler).  A skipped preload just leaves those tokens out
+            # of the device buffer for that request; keeps the server alive so the
+            # geometry logged above can be read and the real fix derived.
+            continue
         dst_buffer[dst_rows.to(dst_buffer.device)] = src_buffer[
             src_rows.to(src_buffer.device)
         ].to(dst_buffer.device)
@@ -159,7 +184,7 @@ def _transfer_all_layer(pool, host_indices, device_indices, io_backend: str) -> 
         )
         return
     if _same_device(pool.data_refs[0], pool.device_buffers[0]):
-        _copy_full_page(
+        _copy_token_granular(
             pool, pool.device_buffers, pool.data_refs, device_indices, host_indices
         )
         return
@@ -204,7 +229,7 @@ def _transfer_per_layer(
         )
         return
     if _same_device(pool.data_refs[layer_id], device_buffers[layer_id]):
-        _copy_full_page(
+        _copy_token_granular(
             pool,
             pool.data_refs[layer_id : layer_id + 1],
             device_buffers[layer_id : layer_id + 1],
