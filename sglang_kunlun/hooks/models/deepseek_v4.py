@@ -288,43 +288,8 @@ def hc_pre_kunlun(
     return y, post, comb, False
 
 
-@plugin_hook(
-    "sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayer.hc_post",
-    type=HookType.REPLACE,
-)
-def hc_post_kunlun(
-    self,
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    post: torch.Tensor,
-    comb: torch.Tensor,
-):
-    """Kunlun MHC post preserving empty shape and output dtype."""
-    if x.shape[0] == 0:
-        return torch.empty(
-            (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
-        )
-
-    assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
-    assert post.shape == (x.shape[0], self.hc_mult)
-    assert comb.shape == (x.shape[0], self.hc_mult, self.hc_mult)
-    from kunlun_ops import hc_post_kunlun_impl
-
-    batch, hidden_size = x.shape[0], x.shape[-1]
-    out = torch.empty(
-        (batch, self.hc_mult, hidden_size), dtype=x.dtype, device=x.device
-    )
-    hc_post_kunlun_impl(
-        post.contiguous(),
-        x.contiguous(),
-        comb.contiguous(),
-        residual.contiguous(),
-        out,
-        batch,
-        self.hc_mult,
-        hidden_size,
-    )
-    return out
+# hc_post 的 REPLACE hook 统一由 deepseek_v4_precision.py 提供（那份额外带 fp16
+# nan_to_num 兜底），此处不再重复注册。
 
 
 # ---------------------------------------------------------------------------
