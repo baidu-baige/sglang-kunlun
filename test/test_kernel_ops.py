@@ -1092,7 +1092,7 @@ class KernelOpsTest(unittest.TestCase):
         )
         from sglang_kunlun.kernels import kernel_ops
 
-        result = kernel_ops.dsv4_expand_prefill_causally_torch(
+        result = kernel_ops.dsv4_expand_prefill_causally_kunlun(
             ExpandPrefillCausally,
             req_pool_indices=torch.tensor([5, 9], dtype=torch.int64),
             seq_lens=torch.tensor([6, 10], dtype=torch.int64),
@@ -1115,7 +1115,7 @@ class KernelOpsTest(unittest.TestCase):
         req_pool_indices = torch.tensor([1, 2], dtype=torch.int64)
         req_to_token = torch.arange(3 * 16, dtype=torch.int32).view(3, 16)
         full_to_state = torch.arange(3 * 16, dtype=torch.int64)
-        plan = kernel_ops.dsv4_compressor_decode_plan_torch(
+        plan = kernel_ops.dsv4_compressor_decode_plan_kunlun(
             4,
             req_pool_indices,
             req_to_token,
@@ -1137,7 +1137,7 @@ class KernelOpsTest(unittest.TestCase):
 
         req_to_token = torch.arange(3 * 256, dtype=torch.int32).view(3, 256)
         full_to_state = torch.arange(3 * 256, dtype=torch.int64)
-        c4 = kernel_ops.dsv4_compressor_prefill_plan_torch(
+        c4 = kernel_ops.dsv4_compressor_prefill_plan_kunlun(
             4,
             torch.tensor([0], dtype=torch.int64),
             torch.tensor([10], dtype=torch.int64),
@@ -1157,7 +1157,7 @@ class KernelOpsTest(unittest.TestCase):
             [[ragged_id, ragged_id] for ragged_id in range(4, 10)],
         )
 
-        c128 = kernel_ops.dsv4_compressor_prefill_plan_torch(
+        c128 = kernel_ops.dsv4_compressor_prefill_plan_kunlun(
             128,
             torch.tensor([2], dtype=torch.int64),
             torch.tensor([130], dtype=torch.int64),
@@ -1177,7 +1177,7 @@ class KernelOpsTest(unittest.TestCase):
     def test_dsv4_c128_short_prefill_keeps_empty_compress_plan(self):
         from sglang_kunlun.kernels import kernel_ops
 
-        plan = kernel_ops.dsv4_compressor_prefill_plan_torch(
+        plan = kernel_ops.dsv4_compressor_prefill_plan_kunlun(
             128,
             torch.tensor([0], dtype=torch.int64),
             torch.tensor([8], dtype=torch.int64),
@@ -1200,7 +1200,7 @@ class KernelOpsTest(unittest.TestCase):
 
         req_to_token = torch.arange(16, dtype=torch.int32).view(1, 16)
         full_to_state = torch.arange(16, dtype=torch.int64)
-        plan = kernel_ops.dsv4_compressor_prefill_plan_torch(
+        plan = kernel_ops.dsv4_compressor_prefill_plan_kunlun(
             4,
             torch.tensor([0], dtype=torch.int64),
             torch.tensor([8], dtype=torch.int64),
@@ -1225,7 +1225,7 @@ class KernelOpsTest(unittest.TestCase):
     def test_dsv4_prefill_plan_supports_empty_batch(self):
         from sglang_kunlun.kernels import kernel_ops
 
-        plan = kernel_ops.dsv4_compressor_prefill_plan_torch(
+        plan = kernel_ops.dsv4_compressor_prefill_plan_kunlun(
             128,
             torch.empty(0, dtype=torch.int64),
             torch.empty(0, dtype=torch.int64),
@@ -1331,7 +1331,7 @@ class KernelOpsTest(unittest.TestCase):
         ), mock.patch.object(
             kernel_ops, "_dsv4_hadamard_torch", side_effect=lambda value: value
         ):
-            kernel_ops.dsv4_compress_norm_rope_store_v2_torch(
+            kernel_ops.dsv4_compress_norm_rope_store_v2_kunlun(
                 kv,
                 plan,
                 norm_weight=torch.ones(128),
@@ -1369,7 +1369,7 @@ class KernelOpsTest(unittest.TestCase):
         plan_raw = torch.tensor([[4, 3, 1, 0]], dtype=torch.int32)
         plan = CompressorDecodePlan(4, plan_raw.view(torch.uint8))
 
-        actual = kernel_ops.dsv4_compress_forward_v2_torch(
+        actual = kernel_ops.dsv4_compress_forward_v2_kunlun(
             state,
             kv_score_input,
             torch.zeros((8, head_dim), dtype=torch.float32),
@@ -1401,7 +1401,7 @@ class KernelOpsTest(unittest.TestCase):
         )
         kv_score_input = torch.tensor([[100.0, 0.0]], dtype=torch.float32)
 
-        actual = kernel_ops.dsv4_compress_forward_v2_torch(
+        actual = kernel_ops.dsv4_compress_forward_v2_kunlun(
             state,
             kv_score_input,
             torch.zeros((128, 1), dtype=torch.float32),

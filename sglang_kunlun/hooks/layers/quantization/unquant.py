@@ -1,4 +1,18 @@
-"""unquant"""
+"""REPLACE ``UnquantizedFusedMoEMethod.apply`` with a kunlun_ops moe path.
+
+Source: kunlun-0.5.10-mimo: sgl-kernel/.../patch/layers/quantization/unquant.py.
+
+The mimo branch monkey-patches ``UnquantizedFusedMoEMethod.apply`` to a
+kunlun_ops-backed pipeline (gen_block_statistic -> moe_pre_sorted ->
+moe_fc -> swiglu -> moe_fc -> moe_post). Here we surface the same
+behaviour through a method-level ``REPLACE`` plugin hook.
+
+The hook expects ``dispatch_output.topk_output`` to be a 4-tuple
+``(topk_weights, topk_ids, router_logits, block_statistic)`` as produced
+by the kunlun ``select_experts`` REPLACE in ``layers/moe/topk.py``
+(Wave 3). On a non-Kunlun host the original upstream apply is used, so
+nothing changes there.
+"""
 
 from __future__ import annotations
 
@@ -106,6 +120,15 @@ def unquantized_fused_moe_apply_kunlun(
     )
 
     d = y.shape[-1] // 2
+    # GLM-5-Next sets swiglu_limit=10.0 and upstream clamps gate/up *before*
+    # silu_and_mul (moe_runner/triton_utils/fused_moe.py:637-640; the kunlun
+    # w8a8_int8 hook does the same at w8a8_int8.py:371-377). kunlun_ops.swiglu
+    # takes no limit, so without this clamp the routed experts run unclamped.
+    swiglu_limit = self.moe_runner_config.swiglu_limit
+    if swiglu_limit is not None:
+        _lim = float(swiglu_limit)
+        y[..., :d].clamp_(max=_lim)
+        y[..., d:].clamp_(min=-_lim, max=_lim)
     out1 = torch.empty(y.shape[:-1] + (d,), dtype=y.dtype, device=y.device)
     kunlun_ops.swiglu(x=y, y=out1)
     out1 = out1.reshape(-1, out1.shape[-1])
@@ -137,5 +160,22 @@ def unquantized_fused_moe_apply_kunlun(
         dequant_scale=dequant_scale,
         y=hidden_states,
     )
+
+    # Upstream passes `apply_routed_scaling_factor=not
+    # layer.should_fuse_routed_scaling_factor_in_topk` into its moe runner, i.e.
+    # whenever the topk weights do not already carry routed_scaling_factor the
+    # MoE method itself must apply it. DeepseekV2MoE depends on that: its CUDA
+    # branch deliberately skips `final_hidden_states *= routed_scaling_factor`.
+    # moe_post only applies normed_scale/dequant_scale, so without this the
+    # whole routed output (incl. the fused shared expert, whose topk weight is
+    # routed_sum / routed_scaling_factor) comes out routed_scaling_factor times
+    # too small -- measured as a uniform 2.4956x deficit on GLM-5-Next.
+    routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
+    if (
+        not getattr(layer, "should_fuse_routed_scaling_factor_in_topk", False)
+        and routed_scaling_factor is not None
+        and routed_scaling_factor != 1.0
+    ):
+        hidden_states.mul_(routed_scaling_factor)
 
     return StandardCombineInput(hidden_states=hidden_states)

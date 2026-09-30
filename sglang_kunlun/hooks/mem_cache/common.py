@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
     type=HookType.AROUND,
 )
 def calculate_mla_kv_cache_dim_kunlun(
-    original_fn, *, model_config, kv_cache_dtype, server_args
+    original_fn, *, model_config, kv_cache_dtype, **kwargs
 ):
     """Report the int8 mixed layout's per-token width to the pool sizer.
 
@@ -33,6 +33,10 @@ def calculate_mla_kv_cache_dim_kunlun(
     write path uses (``dsv4_get_bytes_per_token_kunlun`` /
     ``index_buf_accessor_v4.py``), keyed off ``qk_nope_head_dim`` rather than
     the semantically different ``kv_lora_rank``.
+
+    ``**kwargs`` absorbs ``server_args``, which newer sglang passes but the
+    0.5.14-era ``calculate_mla_kv_cache_dim`` does not, so the hook works
+    against both signatures.
     """
     if kv_cache_dtype == torch.int8:
         return mixed_int8_bytes_per_token(
@@ -42,7 +46,7 @@ def calculate_mla_kv_cache_dim_kunlun(
     return original_fn(
         model_config=model_config,
         kv_cache_dtype=kv_cache_dtype,
-        server_args=server_args,
+        **kwargs,
     )
 
 
@@ -151,10 +155,15 @@ def dsv4_create_buffer_kunlun(original_fn, self, *, num_pages: int):
             dim_per_token,
         )
         dsv4_create_buffer_kunlun._probe_logged = True
-    dim_per_page = self.page_size * dim_per_token
-    total_bytes = num_pages * dim_per_page * self.store_dtype.itemsize
-    return _alloc_2m_aligned(total_bytes, self.store_dtype, self.device).reshape(
-        num_pages, dim_per_page
+    # Plain allocation on purpose: the bf16/fp16 half-cache is NOT 2MB-aligned.
+    # Kunlun peermem translates the XPU address per allocation, so we keep this
+    # buffer as a single ordinary block rather than carving it out of an
+    # over-allocated aligned region.
+    return torch.zeros(
+        num_pages,
+        self.page_size * dim_per_token,
+        dtype=self.store_dtype,
+        device=self.device,
     )
 
 

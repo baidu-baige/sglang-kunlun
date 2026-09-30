@@ -253,43 +253,12 @@ def hc_pre_kunlun(
     return y, post, comb, False
 
 
-@plugin_hook(
-    "sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayer.hc_post",
-    type=HookType.REPLACE,
-)
-def hc_post_kunlun(
-    self,
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    post: torch.Tensor,
-    comb: torch.Tensor,
-):
-    """Kunlun MHC post preserving empty shape and output dtype."""
-    if x.shape[0] == 0:
-        return torch.empty(
-            (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
-        )
-
-    assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
-    assert post.shape == (x.shape[0], self.hc_mult)
-    assert comb.shape == (x.shape[0], self.hc_mult, self.hc_mult)
-    from kunlun_ops import hc_post_kunlun_impl
-
-    batch, hidden_size = x.shape[0], x.shape[-1]
-    out = torch.empty(
-        (batch, self.hc_mult, hidden_size), dtype=x.dtype, device=x.device
-    )
-    hc_post_kunlun_impl(
-        post.contiguous(),
-        x.contiguous(),
-        comb.contiguous(),
-        residual.contiguous(),
-        out,
-        batch,
-        self.hc_mult,
-        hidden_size,
-    )
-    return out
+# NOTE: the REPLACE hook for ``DeepseekV4DecoderLayer.hc_post`` lives in
+# ``deepseek_v4_precision.py``. That module is imported after this one (see
+# ``sglang_kunlun/models/__init__.py``), so a second registration here was
+# always silently overridden and only produced a "Multiple REPLACE hooks"
+# warning at startup. The precision version is a superset: same fused
+# ``hc_post_kunlun_impl`` call plus an fp16 ``nan_to_num`` guard.
 
 
 # ---------------------------------------------------------------------------
@@ -412,5 +381,3 @@ def fuse_wqkv_a_weight_scale_kunlun(original_fn, self, weights, *args, **kwargs)
     if not _environ.envs.SGLANG_OPT_FUSE_WQA_WKV.get():
         return original_fn(self, weights, *args, **kwargs)
     return original_fn(self, _fuse_wqkv_a_weight_scales(weights), *args, **kwargs)
-
-

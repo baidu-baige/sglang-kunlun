@@ -10,14 +10,34 @@ breaking ``_check_platform``. We force ``"cuda"`` so platform resolves to
 
 from __future__ import annotations
 
+import importlib
 import logging
 
 logger = logging.getLogger(__name__)
 
+# GLM-5.3-Flash-era sglang moved fla under sglang.kernels.ops; keep the legacy
+# path as a fallback so the plugin works against both trees.
+_FLA_UTILS_PATHS = (
+    "sglang.kernels.ops.attention.fla.utils",
+    "sglang.srt.layers.attention.fla.utils",
+)
+
+
+def _import_fla_utils():
+    """Return the fla utils module from whichever path this sglang exposes."""
+
+    for path in _FLA_UTILS_PATHS:
+        try:
+            return importlib.import_module(path), path
+        except ImportError:
+            continue
+    raise ImportError(f"none of {_FLA_UTILS_PATHS} is importable")
+
 
 try:
     import torch
-    import sglang.srt.layers.attention.fla.utils as _fla_utils
+
+    _fla_utils, _fla_utils_path = _import_fla_utils()
 
     def _get_available_device() -> str:
         return "cuda"
@@ -28,6 +48,6 @@ try:
     _fla_utils.device_platform = "nvidia"
     _fla_utils.is_amd = False
     _fla_utils.is_intel = False
-    logger.info("Kunlun: fla.utils.get_available_device -> 'cuda'")
+    logger.info("Kunlun: %s.get_available_device -> 'cuda'", _fla_utils_path)
 except Exception as e:  # pragma: no cover
     logger.warning("fla utils kunlun patch failed: %s", e)

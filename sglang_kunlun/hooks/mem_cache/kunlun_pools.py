@@ -253,3 +253,46 @@ class KunlunMLATokenToKVPool(MLATokenToKVPool):
 class KunlunNSATokenToKVPool(DSATokenToKVPool):
     """Kunlun DSA/NSA KV pool with int8 index buffer dtype."""
     index_k_with_scale_buffer_dtype = torch.int8
+
+    def __init__(self, *args, **kwargs):
+        """Restore the kpool-compress arguments the OOT builder drops.
+
+        ``KVCacheConfigurator._build_oot_dsa_kv_pool`` (the path every
+        out-of-tree platform takes) passes neither ``index_kpool`` nor
+        ``index_kpool_compress`` / ``tail_extra_slots`` /
+        ``max_running_requests``, so the pool falls back to ``index_kpool=1,
+        compress=False`` while the DSA indexer -- which reads the same two
+        fields straight off ``hf_config`` -- still takes its compress path and
+        trips ``kpool_decode_update_index_cache called when kpool compress is
+        disabled``.
+
+        The in-tree builders pass all four from the model config, so read them
+        from the same place. This only bites the MTP draft model: the target is
+        hybrid (KDA + DSA) and its DSA pool is built by the hybrid path, which
+        does forward them.
+        """
+
+        if "index_kpool" not in kwargs:
+            from sglang.srt.configs.model_config import (
+                get_dsa_index_kpool,
+                get_dsa_index_kpool_compress,
+            )
+            from sglang.srt.server_args import get_global_server_args
+
+            server_args = get_global_server_args()
+            hf_config = server_args.get_model_config().hf_config
+            index_kpool = get_dsa_index_kpool(hf_config)
+            index_kpool_compress = get_dsa_index_kpool_compress(hf_config)
+            if index_kpool > 1 and index_kpool_compress:
+                max_running_requests = server_args.max_running_requests
+                assert max_running_requests is not None, (
+                    "kpool compress sizes its per-request tail buffers off "
+                    "max_running_requests; pass --max-running-requests"
+                )
+                kwargs["index_kpool"] = index_kpool
+                kwargs["index_kpool_compress"] = index_kpool_compress
+                kwargs["max_running_requests"] = max_running_requests
+                kwargs["tail_extra_slots"] = (
+                    server_args.max_speculative_num_draft_tokens or 0
+                )
+        super().__init__(*args, **kwargs)

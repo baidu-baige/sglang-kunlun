@@ -7,7 +7,15 @@ def _patch_fla_utils_if_loaded() -> None:
     import sys
     import torch
 
-    module = sys.modules.get("sglang.srt.layers.attention.fla.utils")
+    # GLM-5.3-Flash-era sglang moved fla to sglang.kernels.ops; accept both.
+    module = None
+    for path in (
+        "sglang.kernels.ops.attention.fla.utils",
+        "sglang.srt.layers.attention.fla.utils",
+    ):
+        module = sys.modules.get(path)
+        if module is not None:
+            break
     if module is None:
         return
 

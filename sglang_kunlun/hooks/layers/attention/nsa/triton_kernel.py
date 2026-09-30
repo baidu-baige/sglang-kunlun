@@ -32,5 +32,9 @@ def act_quant_kunlun(
     )
     quant2d(x, quantized, scale, force_sdnn=True)
     quantized = quantized.view(x_shape)
-    scale = scale.view(x_shape[0], -1)
+    # Upstream returns the scale as `x.shape[:-1] + (N // block_size,)`, i.e. 3-D
+    # for a [tokens, heads, dim] query. The kpool indexer relies on that:
+    # `_get_logits_head_gate` does `weights.unsqueeze(-1) * q_scale`, which with a
+    # flat [tokens, heads] scale silently broadcasts to [tokens, heads, heads].
+    scale = scale.view(*x_shape[:-1], x_shape[-1] // block_size)
     return quantized, scale

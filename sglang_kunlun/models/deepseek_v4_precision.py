@@ -11,6 +11,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 from sglang_kunlun.kernels.kernel_ops import dsv4_mqa_wo_a_einsum_kunlun
 
+
 def _dsv4_dump(self, name, value):
     callback = getattr(self, "_dsv4_tensor_dump_callback", None)
     if callback is not None and isinstance(value, torch.Tensor):
@@ -20,8 +21,10 @@ def _dsv4_dump(self, name, value):
 _FP16_DTYPE_NAMES = frozenset(("fp16", "float16", "half"))
 
 
-# Golden keeps this hook disabled so the upstream Torch hc_pre runs and the
-# mHC post/comb stay fp32; the Kunlun fused hc_pre returns fp16.
+# Enabled on the v0.5.17-dev (DeepSeek-V4) path. Note the precision tradeoff the
+# GLM-5.3-Flash branch relied on when it kept this hook disabled: with the hook off,
+# the upstream Torch hc_pre runs and the mHC post/comb stay fp32, whereas the Kunlun
+# fused hc_pre returns fp16. Disable this decorator again if you need the fp32 chain.
 @plugin_hook(
     "sglang.srt.models.deepseek_v4.DeepseekV4DecoderLayer.hc_pre",
     type=HookType.REPLACE,
@@ -183,7 +186,9 @@ def initialize_mqa_attention_parameter_dtype_kunlun(result, self, *args, **kwarg
     type=HookType.AFTER,
 )
 def initialize_mqa_rope_policy_kunlun(result, self, config, *args, **kwargs):
-    """Restore the dense-layer RoPE contract."""
+    """Restore the FP16 wo_a and dense-layer RoPE contracts."""
+    _restore_requested_fp16_parameter_dtype(self.wo_a)
+
     if self.compress_ratio:
         return result
 

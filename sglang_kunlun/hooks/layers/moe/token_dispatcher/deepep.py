@@ -898,18 +898,19 @@ class DeepEPDispatcher(BaseDispatcher):
 
     def _get_impl(self) -> _DeepEPDispatcherImplBase:
         """_get_impl"""
-        # KUNLUN_LL_IDLE_PAD: use the NORMAL dispatcher only for AUTO/NORMAL modes. An explicit
-        # --deepep-mode low_latency decode MUST use the capturable LL path: NORMAL dispatch calls
-        # bkcl_notify_dispatch_standard (dynamic, blocking) which deadlocks inside the decode
-        # CUDA-graph capture -> notify_dispatch timeout. Idle DP ranks (the reason the old code
-        # force-fell-back to NORMAL under dp-attention) are handled by the 1-token padding in
-        # _DeepEPDispatcherImplLowLatency.dispatch_a/combine_b above, so LL is now idle-tolerant.
-        if self.deepep_mode.enable_normal():
+        # An explicit --deepep-mode low_latency decode MUST use the capturable LL path:
+        # NORMAL dispatch calls bkcl_notify_dispatch_standard (dynamic, blocking) which
+        # deadlocks inside the decode CUDA-graph capture -> notify_dispatch timeout.
+        # For AUTO we must resolve by batch content (NOT short-circuit to NORMAL, since
+        # AUTO.enable_normal() is True): extend/prefill -> NORMAL (LL can't prefill),
+        # decode -> LOW_LATENCY (graph-capturable; idle DP ranks handled by the 1-token
+        # padding in _DeepEPDispatcherImplLowLatency.dispatch_a/combine_b).
+        if self.deepep_mode == DeepEPMode.NORMAL:
             return self._ensure_normal_dispatcher()
         is_extend_in_batch = get_is_extend_in_batch()
         resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
         if resolved_deepep_mode == DeepEPMode.NORMAL:
-            return self._normal_dispatcher
+            return self._ensure_normal_dispatcher()
         elif resolved_deepep_mode == DeepEPMode.LOW_LATENCY:
             return self._low_latency_dispatcher
         else:

@@ -158,19 +158,25 @@ def install() -> None:
     sys.modules["sgl_kernel.utils"].is_arch_support_pdl = lambda: False  # type: ignore[attr-defined]
 
     # Bind real Kunlun implementations for sgl_kernel top-k APIs.
-    # fast_topk: pure-Python fallback (no XPU kernel needed), identical to
-    #   the mimo-branch reference in sgl-kernel/python/sgl_kernel/top_k.py.
-    # fast_topk_v2 / fast_topk_transform_* rely on CUDA kernels
-    #   (torch.ops.sgl_kernel.*) only available in the CUDA sgl_kernel build
-    #   (NSA path). They are intentionally left as _StubModule callables and
-    #   will raise NotImplementedError if called.
+    # fast_topk / fast_topk_v2: pure-torch fallbacks (no XPU kernel needed).
+    #   fast_topk matches the mimo-branch reference in
+    #   sgl-kernel/python/sgl_kernel/top_k.py; fast_topk_v2 matches the upstream
+    #   reference in sglang/kernels/aot/tests/test_topk.py. fast_topk_v2 is
+    #   reached whenever SGLANG_DSA_FUSE_TOPK is off, via
+    #   DSATopKBackend.topk_func with the (default) SGL_KERNEL backend.
+    # fast_topk_transform_* still rely on CUDA kernels (torch.ops.sgl_kernel.*)
+    #   only available in the CUDA sgl_kernel build (NSA path). They are
+    #   intentionally left as _StubModule callables and will raise
+    #   NotImplementedError if called.
     from sglang_kunlun.kernels.sgl_kernel_kunlun.top_k import (
         fast_topk as _fast_topk,
+        fast_topk_v2 as _fast_topk_v2,
         moe_fused_gate as _moe_fused_gate,
     )
 
     for module in (root, sys.modules["sgl_kernel.top_k"]):
         module.fast_topk = _fast_topk  # type: ignore[attr-defined]
+        module.fast_topk_v2 = _fast_topk_v2  # type: ignore[attr-defined]
         module.moe_fused_gate = _moe_fused_gate  # type: ignore[attr-defined]
 
     # Bind real Kunlun implementations for sgl_kernel sampling APIs used by

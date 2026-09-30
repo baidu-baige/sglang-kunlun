@@ -11,7 +11,7 @@ from typing import List, Literal, Optional, Tuple
 
 import logging
 import os
-import cocopod  # noqa: F401  # Registers DSV4 XSpeedGate attention operators.
+# import cocopod  # noqa: F401  # Registers DSV4 XSpeedGate attention operators.
 import torch
 
 from sglang.srt.environ import envs
@@ -424,11 +424,20 @@ def _make_cp_prefill_lod(core_metadata, num_queries: int, device: torch.device):
     )
 
 
+def _graph_replay_bs(raw_bs: int, cached_bs_values) -> "int | None":
+    """Return the captured batch size a raw batch of ``raw_bs`` replays into.
+
+    The runner pads the batch up to the smallest captured bucket, so the host
+    length buffers that belong to that bucket -- not to ``raw_bs`` -- are the
+    ones the replayed graph reads.
+    """
+    candidates = sorted({bs for bs in cached_bs_values if bs >= raw_bs})
+    return candidates[0] if candidates else None
+
+
+
 def _refresh_graph_host_lengths(
-    forward_batch,
-    attention_decode_aux,
-    c4_decode_aux,
-    graph_extend_aux,
+    forward_batch, attention_decode_aux, c4_decode_aux, graph_extend_aux
 ) -> None:
     """Refresh pointer-stable backend lengths before graph replay."""
     seq_lens = _seq_lens_cpu_i32(forward_batch)
@@ -468,7 +477,345 @@ def _refresh_graph_host_lengths(
         _copy_host_lengths_(kv_lens_cpu, seq_lens, fill_value=1)
         kv_lens.copy_(kv_lens_cpu)
         torch.maximum(kv_lens, query_lens, out=kv_lens)
+
+
+_MTP_ROW0_TRACE_CALLS: dict = {}
+
+
+_ROW0_SELFCHECK_CALLS: dict = {}
+
+
+_ROW0_DUMP_STEPS: dict = {}
+
+
+_CACHE_WRITE_TRACE_CALLS: dict = {}
+
+
+def _log_cache_write_slots(forward_batch, layer, save_kv_cache, backend=None) -> None:
+    """Log which cache slots each forward mode writes, once per mode per layer 0."""
+    import os
+
+    if os.getenv("DSV4_MTP_ROW0_TRACE", "0") != "1":
+        return
+    if getattr(layer, "layer_id", None) != 0:
+        return
+    mode = str(forward_batch.forward_mode)
+    seen = _CACHE_WRITE_TRACE_CALLS.get(mode, 0)
+    if seen >= 6:
+        return
+    _CACHE_WRITE_TRACE_CALLS[mode] = seen + 1
+    loc = forward_batch.out_cache_loc
+    pool = getattr(backend, "token_to_kv_pool", None)
+    swa_pool = getattr(pool, "swa_kv_pool", None)
+    swa_ptr = (
+        swa_pool.kv_buffer[0].data_ptr()
+        if swa_pool is not None and getattr(swa_pool, "kv_buffer", None) is not None
+        else None
+    )
+    logger.warning(
+        "[DSV4_CACHE_WRITE] call=%s mode=%s save_kv_cache=%s rows=%s loc=%s "
+        "seq_lens=%s backend=%s pool=%s swa_buf=%s",
+        seen,
+        mode,
+        save_kv_cache,
+        None if loc is None else int(loc.numel()),
+        None if loc is None else loc[: min(6, loc.numel())].tolist(),
+        forward_batch.seq_lens[: min(2, forward_batch.batch_size)].tolist(),
+        hex(id(backend)) if backend is not None else None,
+        hex(id(pool)) if pool is not None else None,
+        hex(swa_ptr) if swa_ptr is not None else None,
+    )
+
+
+def _dump_row0_layer_tensors(
+    forward_batch, layer, q, out, win_lengths, extra_lengths
+) -> None:
+    """Save row 0 per-layer attention tensors for the first post-prefill forward."""
+    import os
+
+    tag = os.getenv("DSV4_ROW0_DUMP_TAG")
+    if not tag:
+        return
+    mode = forward_batch.forward_mode
+    if not (mode.is_decode() or mode.is_target_verify()):
+        return
+    layer_id = getattr(layer, "layer_id", None)
+    if layer_id is None:
+        return
+    step = _ROW0_DUMP_STEPS.get(layer_id, 0)
+    _ROW0_DUMP_STEPS[layer_id] = step + 1
+    if step != 0:
+        return
+
+    directory = f"/tmp/dsv4_row0_{tag}"
+    os.makedirs(directory, exist_ok=True)
+    payload = {
+        "mode": str(mode),
+        "q_rows": int(q.shape[0]),
+        "q_row0": q[0].detach().float().cpu(),
+        "out_row0": out[0].detach().float().cpu(),
+        "win_len_row0": None if win_lengths is None else int(win_lengths[0]),
+        "extra_len_row0": None if extra_lengths is None else int(extra_lengths[0]),
+    }
+    torch.save(payload, f"{directory}/layer{layer_id:03d}.pt")
+
+
+def _check_verify_row0_independence(
+    *,
+    forward_batch,
+    layer,
+    reference_out,
+    q,
+    win_cache,
+    win_indices,
+    win_lengths,
+    softmax_scale,
+    attn_sink,
+    extra_cache,
+    extra_indices,
+    extra_lengths,
+) -> None:
+    """Recompute verify row 0 alone and compare with row 0 of the batched call."""
+    import os
+
+    if os.getenv("DSV4_VERIFY_ROW0_SELFCHECK", "0") != "1":
+        return
+    if not forward_batch.forward_mode.is_target_verify():
+        return
+    layer_id = getattr(layer, "layer_id", None)
+    if layer_id not in (0, 3):
+        return
+    seen = _ROW0_SELFCHECK_CALLS.get(layer_id, 0)
+    if seen >= 4:
+        return
+    _ROW0_SELFCHECK_CALLS[layer_id] = seen + 1
+
+    def row0(tensor):
+        return None if tensor is None else tensor[:1]
+
+    single = dsv4_compressed_attention_torch(
+        q=q[:1],
+        win_cache=win_cache,
+        win_indices=row0(win_indices),
+        win_lengths=row0(win_lengths),
+        softmax_scale=softmax_scale,
+        attn_sink=attn_sink,
+        extra_cache=extra_cache,
+        extra_indices=row0(extra_indices),
+        extra_lengths=row0(extra_lengths),
+    )
+    diff = (single.float() - reference_out[:1].float()).abs().max().item()
+    logger.warning(
+        "[DSV4_ROW0_SELFCHECK] layer=%s call=%s q_rows=%s max_abs_diff=%s "
+        "row0_norm=%s",
+        layer_id,
+        seen,
+        q.shape[0],
+        diff,
+        reference_out[:1].float().abs().max().item(),
+    )
+
+
+def _log_verify_row0_window(
+    forward_batch, core, layer, win_lengths, extra_lengths, win_indices
+) -> None:
+    """Log layer 0 row 0 window metadata for the first forwards of each mode."""
+    import os
+
+    if os.getenv("DSV4_MTP_ROW0_TRACE", "0") != "1":
+        return
+    layer_id = getattr(layer, "layer_id", None)
+    if layer_id not in (0, 3):
+        return
+    mode = f"{forward_batch.forward_mode}/L{layer_id}"
+    seen = _MTP_ROW0_TRACE_CALLS.get(mode, 0)
+    if seen >= 6:
+        return
+    _MTP_ROW0_TRACE_CALLS[mode] = seen + 1
+
+    def head(tensor, count):
+        if tensor is None:
+            return None
+        flat = tensor.reshape(-1)
+        return flat[: min(count, flat.numel())].tolist()
+
+    logger.warning(
+        "[DSV4_ROW0] call=%s mode=%s bs=%s q_rows=%s seq_lens=%s "
+        "seq_lens_casual=%s win_len_row0=%s win_idx_row0=%s extra_len_row0=%s",
+        seen,
+        mode,
+        forward_batch.batch_size,
+        win_indices.shape[0] if win_indices is not None else None,
+        head(forward_batch.seq_lens, 2),
+        head(getattr(core, "seq_lens_casual", None), 6),
+        head(win_lengths, 6),
+        win_indices[0, :8].tolist() if win_indices is not None else None,
+        head(extra_lengths, 6),
+    )
+
+
+_MTP_ROW_LEN_SEEN: set = set()
+
+
+def _log_row_lengths(
+    forward_batch, core, q_lod_cpu, kv_lens_cpu, win_lengths, extra_lengths
+) -> None:
+    """Dump the per-row causal/window lengths handed to the operator."""
+    import os
+
+    if os.getenv("DSV4_MTP_LOD_DEBUG", "0") != "1":
+        return
+    signature = (str(forward_batch.forward_mode), forward_batch.batch_size)
+    if signature in _MTP_ROW_LEN_SEEN:
+        return
+    _MTP_ROW_LEN_SEEN.add(signature)
+
+    def head(tensor, count=8):
+        if tensor is None:
+            return None
+        flat = tensor.reshape(-1)
+        return flat[: min(count, flat.numel())].tolist()
+
+    logger.warning(
+        "[DSV4_MTP_ROW_LEN] mode=%s bs=%s seq_lens=%s q_lod=%s kv_lens_cpu=%s "
+        "seq_lens_casual=%s win_lengths=%s extra_lengths=%s",
+        forward_batch.forward_mode,
+        forward_batch.batch_size,
+        head(forward_batch.seq_lens, 4),
+        head(q_lod_cpu, 5),
+        head(kv_lens_cpu, 4),
+        head(getattr(core, "seq_lens_casual", None)),
+        head(win_lengths),
+        head(extra_lengths),
+    )
+
+
+_MTP_LOD_ROUTE_SEEN: set = set()
+
+
+def _log_lod_route(forward_batch, num_queries: int) -> None:
+    """Record which lod branch each forward mode takes, once per signature."""
+    import os
+
+    if os.getenv("DSV4_MTP_LOD_DEBUG", "0") != "1":
+        return
+    signature = (
+        str(forward_batch.forward_mode),
+        forward_batch.batch_size,
+        num_queries,
+    )
+    if signature in _MTP_LOD_ROUTE_SEEN:
+        return
+    _MTP_LOD_ROUTE_SEEN.add(signature)
+    logger.warning(
+        "[DSV4_MTP_LOD_ROUTE] mode=%s bs=%s num_queries=%s ragged_draft=%s "
+        "seq_lens=%s extend_lens=%s",
+        forward_batch.forward_mode,
+        forward_batch.batch_size,
+        num_queries,
+        getattr(forward_batch, "_kunlun_ragged_draft_extend", None),
+        forward_batch.seq_lens[: min(4, forward_batch.batch_size)].tolist(),
+        forward_batch.extend_seq_lens_cpu,
+    )
+
+
+_MTP_LOD_DEBUG_SEEN: set = set()
+
+
+def _log_graph_extend_lod(
+    forward_batch, num_queries, q_lod_cpu, kv_lens_cpu, kv_lens, query_lens
+) -> None:
+    """Log the verify-extend lod once per (mode, bs, num_queries) signature."""
+    import os
+
+    if os.getenv("DSV4_MTP_LOD_DEBUG", "0") != "1":
+        return
+    signature = (
+        str(forward_batch.forward_mode),
+        forward_batch.batch_size,
+        num_queries,
+    )
+    if signature in _MTP_LOD_DEBUG_SEEN:
+        return
+    _MTP_LOD_DEBUG_SEEN.add(signature)
+    logger.warning(
+        "[DSV4_MTP_LOD] mode=%s bs=%s num_queries=%s seq_lens=%s q_lod=%s "
+        "query_lens=%s kv_lens_cpu=%s kv_lens_dev=%s",
+        forward_batch.forward_mode,
+        forward_batch.batch_size,
+        num_queries,
+        forward_batch.seq_lens[: min(4, forward_batch.batch_size)].tolist(),
+        q_lod_cpu[: min(5, q_lod_cpu.numel())].tolist(),
+        query_lens[: min(4, query_lens.numel())].tolist(),
+        kv_lens_cpu[: min(4, kv_lens_cpu.numel())].tolist(),
+        kv_lens[: min(4, kv_lens.numel())].tolist(),
+    )
+
+
+_DSV4_SWA_MAP_TRACE_CALLS = [0]
+
+
+def _dsv4_trace_swa_mapping(backend, seq_lens_casual, req_pool_indices_repeated,
+                            raw_indices, mapped) -> None:
+    """Log slot and SWA mapping for the newest positions near a page boundary."""
+    if os.environ.get("DSV4_SWA_LEN_TRACE", "0") != "1":
+        return
+    if seq_lens_casual.numel() == 0 or _DSV4_SWA_MAP_TRACE_CALLS[0] >= 40:
+        return
+    longest = int(seq_lens_casual.max().item())
+    phase = longest % 256
+    if not (phase <= 3 or phase >= 253):
+        return
+    _DSV4_SWA_MAP_TRACE_CALLS[0] += 1
+    row = int(torch.argmax(seq_lens_casual).item())
+    mapping = backend.token_to_kv_pool.full_to_swa_index_mapping
+    logger.warning(
+        "[DSV4_SWA_MAP] rows=%s row=%s causal=%s rid=%s raw_newest=%s "
+        "mapped_newest=%s mapping_len=%s mapping_at_raw=%s",
+        int(seq_lens_casual.numel()),
+        row,
+        longest,
+        int(req_pool_indices_repeated[row].item()),
+        raw_indices[row, :4].tolist(),
+        mapped[row, :4].tolist(),
+        None if mapping is None else int(mapping.numel()),
+        None
+        if mapping is None
+        else mapping.index_select(0, raw_indices[row, :4].to(torch.int64)).tolist(),
+    )
+
+
+_DSV4_SWA_TRACE_CALLS = [0]
 _DSV4_PAGE_TABLE_SPAN_LOGGED = False
+
+
+def _dsv4_trace_swa_window(
+    forward_mode_name, seq_lens_casual, swa_page_indices, effective_swa_len, clamped
+) -> None:
+    """Log window lengths for rows sitting near a page boundary."""
+    if os.environ.get("DSV4_SWA_LEN_TRACE", "0") != "1":
+        return
+    if seq_lens_casual.numel() == 0:
+        return
+    longest = int(seq_lens_casual.max().item())
+    phase = longest % 256
+    if not (phase <= 4 or phase >= 252):
+        return
+    if _DSV4_SWA_TRACE_CALLS[0] >= 40:
+        return
+    _DSV4_SWA_TRACE_CALLS[0] += 1
+    zeros = int((swa_page_indices == 0).sum().item())
+    logger.warning(
+        "[DSV4_SWA_LEN] mode=%s rows=%s seq_lens=%s effective=%s clamped=%s "
+        "zero_entries=%s width=%s",
+        forward_mode_name,
+        int(seq_lens_casual.numel()),
+        seq_lens_casual[: min(4, seq_lens_casual.numel())].tolist(),
+        effective_swa_len[: min(4, effective_swa_len.numel())].tolist(),
+        clamped[: min(4, clamped.numel())].tolist(),
+        zeros,
+        int(swa_page_indices.shape[1]),
+    )
 
 
 def _dsv4_page_table_span(max_seq_len: int, seq_lens_casual: torch.Tensor) -> int:
@@ -589,6 +936,9 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         mapped = mapping[
             raw_indices.clamp(min=0, max=mapping.shape[0] - 1)
         ].to(torch.int32)
+        _dsv4_trace_swa_mapping(
+            self, seq_lens_casual, req_pool_indices_repeated, raw_indices, mapped
+        )
         return mapped
 
     def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
@@ -904,6 +1254,13 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             torch.clamp(seq_lens_casual, max=upstream.SWA_WINDOW),
             effective_swa_len,
         )
+        _dsv4_trace_swa_window(
+            "prefill" if is_prefill else "other",
+            seq_lens_casual,
+            swa_page_indices,
+            effective_swa_len,
+            torch.clamp(seq_lens_casual, max=upstream.SWA_WINDOW),
+        )
         page_table = req_to_token[
             req_pool_indices_repeated,
             : _dsv4_page_table_span(max_seq_len, seq_lens_casual) : self.page_size,
@@ -1048,6 +1405,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         return q_lod_cpu, q_lod, kv_lens_cpu, kv_lens
 
     def _make_lod(self, forward_batch, num_queries: int, device: torch.device):
+        _log_lod_route(forward_batch, num_queries)
         if forward_batch.forward_mode.is_decode_or_idle():
             batch_size = num_queries
             aux = self._attention_decode_aux.get(batch_size)
@@ -1097,6 +1455,9 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             )
             kv_lens.copy_(forward_batch.seq_lens[:batch_size].to(torch.int32))
             torch.maximum(kv_lens, query_lens, out=kv_lens)
+            _log_graph_extend_lod(
+                forward_batch, num_queries, q_lod_cpu, kv_lens_cpu, kv_lens, query_lens
+            )
             return q_lod_cpu, q_lod, kv_lens_cpu, kv_lens
 
         if _dsa_cp_prefill_ranks(forward_batch) is not None:
@@ -1196,6 +1557,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
             return q.new_empty(q.shape[0], q.shape[1], layer.v_head_dim)
         assert k is v, "DeepseekV4 shares k and v"
+        _log_cache_write_slots(forward_batch, layer, save_kv_cache, self)
         if save_kv_cache:
             self.store_cache(layer.layer_id, k, forward_batch)
 
@@ -1252,9 +1614,28 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         extra_lengths = self._match_queries(extra_lengths, q.shape[0], 0)
         q_3d = q.squeeze(1) if q.ndim == 4 else q
         local_sink = attn_sink
+        # Diagnostic: drop the padded TP head slots before the operator so a
+        # padded-head dependency inside the vendor kernel becomes observable.
         padded_q_heads = None
+        local_heads_probe = getattr(layer, "tp_q_head_num", None)
+        if (
+            os.environ.get("DSV4_KUNLUN_LOCAL_Q_ONLY") == "1"
+            and q_3d.ndim == 3
+            and local_heads_probe
+            and q_3d.shape[1] > local_heads_probe
+        ):
+            padded_q_heads = q_3d.shape[1]
+            q_3d = q_3d[:, :local_heads_probe].contiguous()
+            if local_sink is not None and local_sink.numel() == padded_q_heads:
+                local_sink = local_sink[:local_heads_probe].contiguous()
         original_dtype = q_3d.dtype
 
+        _log_row_lengths(
+            forward_batch, core, None, None, win_lengths, extra_lengths
+        )
+        _log_verify_row0_window(
+            forward_batch, core, layer, win_lengths, extra_lengths, win_indices
+        )
         if (
             os.environ.get("DSV4_KUNLUN_REFERENCE_ONLY") == "1"
             or os.environ.get("DSV4_KUNLUN_REFERENCE_ATTN") == "1"
@@ -1293,6 +1674,23 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             )
             _dsv4_dump_backend_tensor(
                 self, "compressed_attention.output.out", reference_out, layer
+            )
+            _dump_row0_layer_tensors(
+                forward_batch, layer, q_3d, reference_out, win_lengths, extra_lengths
+            )
+            _check_verify_row0_independence(
+                forward_batch=forward_batch,
+                layer=layer,
+                reference_out=reference_out,
+                q=q_3d,
+                win_cache=win_cache,
+                win_indices=win_indices,
+                win_lengths=win_lengths,
+                softmax_scale=self.softmax_scale,
+                attn_sink=local_sink,
+                extra_cache=extra_cache,
+                extra_indices=extra_indices,
+                extra_lengths=extra_lengths,
             )
             return reference_out
 
@@ -1563,9 +1961,9 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 effective_ratio,
                 compressed_topk,
                 attn_sink_op,
-                # # Keep the C4 producer on the caller stream so PyTorch owns the
-                # # lifetime of the contiguous temporary inputs.
-                # side_stream=torch.cuda.current_stream().cuda_stream,
+                # Keep the C4 producer on the caller stream so PyTorch owns the
+                # lifetime of the contiguous temporary inputs.
+                side_stream=torch.cuda.current_stream().cuda_stream,
             )
         for name, value in () if not _dsv4_dump_enabled() else (
             ("compressed_attention.output.out_pre_rope", out_op[:, :local_q_heads]),
@@ -1583,14 +1981,12 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         return out.to(original_dtype) if out.dtype != original_dtype else out
 
 
-@plugin_hook(
-    "sglang.srt.layers.attention.dsv4.compressor.Compressor.forward_cuda",
-    type=HookType.REPLACE,
-)
-def _compressor_forward_cuda_kunlun(self, x, forward_batch, attn_backend=None):
-    """Restore the Compressor.forward path for Kunlun's CUDA dispatch key."""
-
-    return self.forward_native(x, forward_batch, attn_backend=attn_backend)
+# ``Compressor.forward_cuda`` no longer exists: ``BaseFusedOp`` only defines the
+# kernel-backend forwards and a platform forward exists exactly when a subclass
+# declares it. ``Compressor`` declares neither ``capabilities`` nor a
+# ``forward_cuda``, so dispatch already falls through to ``forward_native`` on
+# Kunlun - the old REPLACE hook that restored that path is now a no-op and only
+# produced an ``AttributeError`` at registration time.
 
 
 def _build_c4_prefill_contract(

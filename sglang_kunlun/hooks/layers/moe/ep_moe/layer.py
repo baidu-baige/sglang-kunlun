@@ -28,6 +28,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.server_args import get_global_server_args
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import get_bool_env_var, dispose_tensor
 from sglang.srt.layers.activation import SiluAndMul
 
@@ -80,11 +81,55 @@ class _DSV4ClampedSiluAndMul(torch.nn.Module):
         self.limit = float(limit)
 
     def forward(self, x):
-        """Clamp the SwiGLU gate/up to swiglu_limit, then SiLU-multiply."""
+        """Clamp the SwiGLU gate/up to swiglu_limit, then SiLU-multiply.
+
+        ``xspeedgate_ops.silu_and_mul_with_swiglu_limit`` does the two clamps and
+        the SiLU-multiply in one kernel. The eager fallback below has to chunk,
+        clamp twice, upcast both halves to fp32 and cast back, i.e. five extra
+        passes plus four temporaries over an ``[M, 2F]`` tensor on every routed
+        MoE forward -- measurable on long-context prefill. Same op the DSV4
+        ``silu_and_mul_clamp`` JIT hook uses, so the numerics are the sanctioned
+        ones; keep the fallback for builds whose vendor lib predates it.
+        """
+
+        op = getattr(torch.ops.xspeedgate_ops, "silu_and_mul_with_swiglu_limit", None)
+        if op is not None:
+            return op(x, self.limit)
+
         gate, up = x.chunk(2, dim=-1)
         gate = gate.clamp(max=self.limit)
         up = up.clamp(min=-self.limit, max=self.limit)
         return (torch.nn.functional.silu(gate.float()) * up.float()).to(x.dtype)
+
+
+# Scratch allocations for the deepep-normal MoE path. ``_init_new`` builds a fresh
+# buffer pair on every routed MoE forward (see ``forward_deepgemm_contiguous``),
+# and each one is hundreds of MB, so once zero-init became a correctness
+# requirement the memset started costing ~3% of long-context prefill throughput.
+#
+# What the zero-init actually guards against is *uninitialised* memory: the
+# buffers get reinterpreted as bf16/fp16 while the grouped GEMMs only write the
+# rows of experts that received tokens, so fresh bytes read back as NaN and a
+# single NaN row poisons the int8 quantisation. Holding the allocation and
+# zeroing it only when we (re)allocate keeps that invariant -- the bytes are
+# never uninitialised -- while taking the memset off the per-forward path.
+#
+# One buffer per role is enough because routed MoE forwards run sequentially
+# within a model forward; nothing holds two buffer pairs live at once.
+_MOE_SCRATCH_BUFFERS: dict = {}
+
+
+def _acquire_zeroed_scratch(role: str, size_in_bytes: int, device) -> torch.Tensor:
+    """Return a cached zero-initialised uint8 scratch buffer of >= ``size_in_bytes``."""
+
+    # Round up so the uint8 buffer stays reinterpretable as any dtype we view it as.
+    size_in_bytes = (size_in_bytes + 7) & ~7
+    key = (role, str(device))
+    buffer = _MOE_SCRATCH_BUFFERS.get(key)
+    if buffer is None or buffer.numel() < size_in_bytes:
+        buffer = torch.zeros(size_in_bytes, dtype=torch.uint8, device=device)
+        _MOE_SCRATCH_BUFFERS[key] = buffer
+    return buffer
 
 
 class ReusedBuffer:
@@ -168,11 +213,13 @@ class Bfp16orFp16NormalMoeBuffer:
             # tokens. Uninitialised bytes read back as NaN, and a single NaN row
             # poisons the shared-scale int8 quantisation (and therefore every
             # token) on the first forward, before any expert has filled them.
+            # Cached across forwards so that guarantee costs one memset per
+            # allocation instead of one per MoE layer (see _acquire_zeroed_scratch).
             self.buffer0 = ReusedBuffer(
-                torch.zeros(buffer0_size, dtype=torch.uint8, device=self.device)
+                _acquire_zeroed_scratch("normal.buffer0", buffer0_size, self.device)
             )
             self.buffer1 = ReusedBuffer(
-                torch.zeros(buffer1_size, dtype=torch.uint8, device=self.device)
+                _acquire_zeroed_scratch("normal.buffer1", buffer1_size, self.device)
             )
         except Exception as e:
             logger.info(
@@ -269,12 +316,13 @@ class W8A8NormalMoeBuffer:
             self.M * self.H * 1, self.M * self.F * 2, self.N * self.H * 2
         )
         buffer1_size = max(self.M * 2 * self.F * 2, self.M * self.H * 2)
-        # Zero-initialised for the same reason as Bfp16orFp16NormalMoeBuffer.
+        # Zero-initialised for the same reason as Bfp16orFp16NormalMoeBuffer, and
+        # cached for the same reason (see _acquire_zeroed_scratch).
         self.buffer0 = ReusedBuffer(
-            torch.zeros(buffer0_size, dtype=torch.uint8, device=self.device)
+            _acquire_zeroed_scratch("w8a8.buffer0", buffer0_size, self.device)
         )
         self.buffer1 = ReusedBuffer(
-            torch.zeros(buffer1_size, dtype=torch.uint8, device=self.device)
+            _acquire_zeroed_scratch("w8a8.buffer1", buffer1_size, self.device)
         )
 
     @property

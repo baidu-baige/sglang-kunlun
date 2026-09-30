@@ -2,8 +2,10 @@ import ast
 from contextlib import ExitStack
 import importlib.util
 import inspect
+import logging
 from pathlib import Path
 import sys
+import time
 import types
 import unittest
 from unittest import mock
@@ -743,6 +745,23 @@ class ProductionPrecisionContractTest(unittest.TestCase):
         upstream.TRTLLMHAAttnBackend = type("TRTHA", (), {})
         upstream.TokenspeedMLABackend = type("Tokenspeed", (), {})
         upstream.FlashInferAttnBackend = type("FlashInfer", (), {})
+        upstream.time = time
+        upstream.logger = logging.getLogger(__name__)
+        upstream.log_info_on_rank0 = lambda *_args, **_kwargs: None
+        upstream.get_available_gpu_memory = lambda *_args, **_kwargs: 1.0
+        upstream.get_batch_sizes_to_capture = lambda *_args: ([1, 2], None)
+        upstream.get_exec = lambda: types.SimpleNamespace(
+            graph=types.SimpleNamespace(
+                cuda_graph_config=types.SimpleNamespace(
+                    decode=types.SimpleNamespace(backend="full")
+                )
+            )
+        )
+        upstream.envs = types.SimpleNamespace(
+            SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH=types.SimpleNamespace(
+                get=lambda: False
+            )
+        )
 
         backend_module = types.ModuleType(
             "sglang_kunlun.hooks.layers.attention.kunlun_deepseek_v4_backend"
@@ -758,6 +777,12 @@ class ProductionPrecisionContractTest(unittest.TestCase):
             target_worker=types.SimpleNamespace(device="cuda"),
             draft_attn_backend=None,
             draft_extend_attn_backend=backend,
+            device="cuda",
+            gpu_id=0,
+            draft_runner=object(),
+            speculative_num_draft_tokens=2,
+            _specialized_graph_memory_usage={},
+            _specialized_graph_time_usage={},
         )
         original_flashinfer = upstream.FlashInferAttnBackend
 

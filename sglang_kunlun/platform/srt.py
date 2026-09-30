@@ -106,6 +106,32 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
                 apply_deepseek_v4_defaults._kunlun_compressed = True
                 deepseek_v4_hook.apply_deepseek_v4_defaults = apply_deepseek_v4_defaults
 
+        # Allow an explicit fp16 KV cache for DeepSeek DSA on Kunlun. Upstream's
+        # ``_dsa_kv_cache_dtype_default`` post-process asserts bf16/fp8_e4m3 only
+        # and only skips on a real ``is_xpu()`` build; here torch_xmlir
+        # masquerades as CUDA so that assert runs and rejects float16. Wrap the
+        # pass so a float16/fp16 request passes through untouched (the fp16 pool
+        # wiring itself is handled by model_runner_kv_cache_mixin); every other
+        # dtype defers to the original pass byte-for-byte.
+        from sglang.srt.arg_groups import overrides as _ov
+
+        _orig_dsa_kv = _ov._dsa_kv_cache_dtype_default
+        if not getattr(_orig_dsa_kv, "_kunlun_fp16_kv", False):
+
+            def _dsa_kv_cache_dtype_default(view):
+                kvd = getattr(view, "kv_cache_dtype", None)
+                if kvd in ("fp16", "float16", "half"):
+                    return {"kv_cache_dtype": kvd}
+                return _orig_dsa_kv(view)
+
+            _dsa_kv_cache_dtype_default._kunlun_fp16_kv = True
+            _ov._dsa_kv_cache_dtype_default = _dsa_kv_cache_dtype_default
+            # POST_PROCESS_PASSES stores the pass by reference; keep it in sync.
+            passes = getattr(_ov, "POST_PROCESS_PASSES", None) or []
+            for _i, _f in enumerate(passes):
+                if _f is _orig_dsa_kv:
+                    passes[_i] = _dsa_kv_cache_dtype_default
+
     # ------------------------------------------------------------------
     # Subsystem factory methods
     # ------------------------------------------------------------------

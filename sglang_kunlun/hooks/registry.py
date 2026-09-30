@@ -47,6 +47,9 @@ def register_all() -> None:
     _kunlun_pre_shim()
     from sglang_kunlun.kernels import deep_geem_hook as _deep_geem_hook  # noqa: F401
     from sglang_kunlun.kernels import flashinfer_hook as _flashinfer_hook  # noqa: F401
+    from sglang_kunlun.kernels import kpool_hook as _kpool_hook  # noqa: F401
+    from sglang_kunlun.kernels import kda_hook as _kda_hook  # noqa: F401
+    from sglang_kunlun.kernels import mamba_state_hook as _mamba_state_hook  # noqa: F401
     from sglang_kunlun.kernels import kernel_ops
 
     legacy_jit_specs = [
