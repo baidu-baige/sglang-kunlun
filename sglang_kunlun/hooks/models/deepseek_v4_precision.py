@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import torch
 from kunlun_ops import hc_post_kunlun_impl
+from typing import Optional
+from torch import nn
 
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 from sglang_kunlun.kernels.kernel_ops import dsv4_mqa_wo_a_einsum_kunlun
-# fp16 dtype 恢复工具在 hooks/layers/attention/dsv4/dtype_restore.py（镜像上游
-# layers/attention/dsv4 的层级），这里复用。
-from sglang_kunlun.hooks.layers.attention.dsv4.dtype_restore import (
-    restore_requested_fp16_parameter_dtype,
-)
+
+
+def _dsv4_dump(self, name, value):
+    callback = getattr(self, "_dsv4_tensor_dump_callback", None)
+    if callback is not None and isinstance(value, torch.Tensor):
+        callback(name, value)
+
+
+_FP16_DTYPE_NAMES = frozenset(("fp16", "float16", "half"))
 
 
 # Golden keeps this hook disabled so the upstream Torch hc_pre runs and the
@@ -95,6 +102,71 @@ def hc_post_kunlun(
 
 
 @plugin_hook(
+    "sglang.srt.models.deepseek_v2.MoEGate.forward",
+    type=HookType.AROUND,
+)
+def moe_gate_forward_half_precision_kunlun(
+    original_fn,
+    self,
+    hidden_states,
+    gemm_output_zero_allocator=None,
+    forward_batch=None,
+):
+    """Match the direct half-precision DSV4 router GEMM contract."""
+    if (
+        self.is_deepseek_v4
+        and hidden_states.dtype == self.weight.dtype
+        and hidden_states.dtype in (torch.bfloat16, torch.float16)
+    ):
+        return hidden_states @ self.weight.T
+    return original_fn(
+        self,
+        hidden_states,
+        gemm_output_zero_allocator,
+        forward_batch,
+    )
+
+
+def _restore_requested_fp16_parameter_dtype(*linears):
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+    from sglang_kunlun.compat import server_arg
+
+    if server_arg("dtype") not in _FP16_DTYPE_NAMES:
+        return
+
+    for linear in linears:
+        if not isinstance(
+            getattr(linear, "quant_method", None), UnquantizedLinearMethod
+        ):
+            continue
+        linear.params_dtype = torch.float16
+        weight = getattr(linear, "weight", None)
+        if weight is not None and weight.dtype != torch.float16:
+            weight.data = weight.data.to(dtype=torch.float16)
+
+
+@plugin_hook(
+    "sglang.srt.layers.attention.dsv4.indexer.C4Indexer.__init__",
+    type=HookType.AFTER,
+)
+def initialize_c4_indexer_parameter_dtype_kunlun(result, self, *args, **kwargs):
+    """Restore the requested dtype for C4 indexer projections."""
+    _restore_requested_fp16_parameter_dtype(self.wq_b, self.weights_proj)
+    return result
+
+
+@plugin_hook(
+    "sglang.srt.layers.attention.dsv4.compressor.Compressor.__init__",
+    type=HookType.AFTER,
+)
+def initialize_compressor_parameter_dtype_kunlun(result, self, *args, **kwargs):
+    """Restore the requested dtype for the compressor gate projection."""
+    _restore_requested_fp16_parameter_dtype(self.wkv_gate)
+    return result
+
+
+@plugin_hook(
     "sglang.srt.models.deepseek_v4.MqaAttentionBase.__init__",
     type=HookType.AFTER,
 )
@@ -104,7 +176,7 @@ def initialize_mqa_attention_parameter_dtype_kunlun(result, self, *args, **kwarg
     上游在共享基类里把 wo_a 的 params_dtype 硬编码成 bf16，而 target 的 MQALayer
     和 DSpark draft 的 DSparkAttention 都是它的子类，所以必须挂在基类上。
     """
-    restore_requested_fp16_parameter_dtype(self.wo_a)
+    _restore_requested_fp16_parameter_dtype(self.wo_a)
     return result
 
 
@@ -140,13 +212,37 @@ def initialize_mqa_rope_policy_kunlun(result, self, config, *args, **kwargs):
     type=HookType.REPLACE,
 )
 def compute_q_b_kunlun(self, q, positions, q_out=None):
-    """Write Q norm/RoPE into contiguous local storage before a TP-slice copy."""
-    from sglang.srt.models.deepseek_v4 import fused_q_norm_rope
+    """Write Q norm/RoPE into contiguous local storage before a TP-slice copy.
 
+    The per-head RMSNorm is V4-only: V4.1 sets ``config.q_head_norm = False``
+    and upstream ``MQALayer._compute_q_b`` skips the norm entirely, applying
+    RoPE alone. This used to call the fused norm+RoPE unconditionally, so under
+    CP (the one arm that reaches this hook) every V4.1 layer normalized Q a
+    second time. Keep the predicate, with the same spelling as the plugin's
+    other q implementation (``hooks/models/deepseek_v4.py``): a missing
+    attribute means the V4 contract, i.e. do the norm.
+    """
+    from sglang.srt.models.deepseek_v4 import fused_q_norm_rope, fused_rope_inplace
+
+    _dsv4_dump(self, "self_attn.wq_b.input.q_norm", q)
     q, _ = self.wq_b(q)
+    _dsv4_dump(self, "self_attn.wq_b.output", q)
     q = q.view(-1, self.n_local_heads, self.head_dim)
+    if not getattr(self, "q_head_norm", True):
+        # RoPE-only arm, upstream-equivalent: rope `q` in place in the buffer
+        # `wq_b` just produced, then move it to the caller's (possibly
+        # strided) destination with a plain copy.
+        fused_rope_inplace(
+            q[..., -self.qk_rope_head_dim :], None, self.freqs_cis, positions=positions
+        )
+        _dsv4_dump(self, "self_attn.q_local_after_norm_rope", q)
+        if q_out is None:
+            return q
+        q_out.copy_(q)
+        return q_out
     local_q_out = torch.empty_like(q)
     fused_q_norm_rope(q, local_q_out, self.eps, self.freqs_cis, positions)
+    _dsv4_dump(self, "self_attn.q_local_after_norm_rope", local_q_out)
     if q_out is None:
         return local_q_out
     q_out.copy_(local_q_out)
@@ -267,8 +363,12 @@ def mqa_forward_global_head_layout_kunlun(
         )
 
     attn_k = kv if kv is not None else q
+    _dsv4_dump(self, "self_attn.q_local_after_prepare", q)
+    if q_global is not None:
+        _dsv4_dump(self, "self_attn.q_global_after_prepare", q_global)
     if is_unified_kv_triton():
         attn_q = q_out if q_out is not None else q
+        _dsv4_dump(self, "self_attn.q_backend", attn_q)
         o = attn_backend.forward(
             q=attn_q,
             k=attn_k,
@@ -281,6 +381,7 @@ def mqa_forward_global_head_layout_kunlun(
         )
     else:
         attn_q = q_global if q_global is not None else q
+        _dsv4_dump(self, "self_attn.q_backend", attn_q)
         save_kv_cache = False
         if (
             forward_batch.forward_mode.is_extend()
@@ -329,6 +430,11 @@ def mqa_forward_global_head_layout_kunlun(
             inverse=True,
         )
 
+    _dsv4_dump(
+        self,
+        "self_attn.compressed_attention.output.out_local_post_rope",
+        o,
+    )
     o = o.view(o.shape[0], self.n_local_groups, -1)
     if upstream._FP8_WO_A_GEMM:
         import deep_gemm
@@ -363,9 +469,14 @@ def mqa_forward_global_head_layout_kunlun(
         o = output
     else:
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        _dsv4_dump(self, "self_attn.wo_a.input.o", o)
+        _dsv4_dump(self, "self_attn.wo_a.input.weight", wo_a)
         o = dsv4_mqa_wo_a_einsum_kunlun(o, wo_a)
+        _dsv4_dump(self, "self_attn.wo_a.output", o)
 
     o, _ = self.wo_b(o.flatten(1))
+    _dsv4_dump(self, "self_attn.wo_b.output", o)
     if self.attn_tp_size > 1 and self.attn_tp_size < upstream.get_parallel().tp_size:
         o = upstream.attn_tp_all_reduce(o)
+    _dsv4_dump(self, "self_attn.output", o)
     return o

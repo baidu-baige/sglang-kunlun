@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import importlib
 import inspect
 import logging
@@ -216,18 +217,85 @@ def dsv4_mqa_forward_with_full_sink_kunlun(original_fn, self, *args, **kwargs):
         self._attn_sink_local = original_local_sink
 
 
+_OP_TRACE_COUNTS: Dict[KernelKey, int] = {}
+
+
+def _op_trace_enabled() -> bool:
+    """Whether to count replacement invocations (``SGLANG_KUNLUN_OP_TRACE``)."""
+
+    return os.getenv("SGLANG_KUNLUN_OP_TRACE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _traced(spec: KernelSpec, impl: Callable) -> Callable:
+    """Count calls so a launch log can prove the replacement really ran.
+
+    Registration alone does not mean a symbol is reachable: several upstream
+    call sites sit behind platform or dtype gates, so a patched-but-never-called
+    replacement looks identical to a working one. `functools.wraps` keeps
+    `inspect.signature` intact, which `KernelLauncher` relies on to decide
+    whether the impl takes `grid`.
+    """
+
+    key = (spec.module_path, spec.kernel_name)
+
+    @functools.wraps(impl)
+    def wrapper(*args, **kwargs):
+        """Record one invocation, then delegate unchanged."""
+
+        count = _OP_TRACE_COUNTS.get(key, 0) + 1
+        _OP_TRACE_COUNTS[key] = count
+        if count == 1:
+            logger.warning("[op-trace] first call: %s.%s", *key)
+        return impl(*args, **kwargs)
+
+    return wrapper
+
+
+def op_trace_counts() -> Dict[KernelKey, int]:
+    """Per-symbol invocation counts gathered under ``SGLANG_KUNLUN_OP_TRACE``."""
+
+    return dict(_OP_TRACE_COUNTS)
+
+
+def note_op_path(name: str, variant: str) -> None:
+    """Record that `name` took the `variant` branch (``xspeedgate`` / ``torch``).
+
+    `_traced` only proves the *symbol* ran. Several replacements dispatch between
+    an XSpeedGate op and a torch fallback at call time (dtype, contiguity, table
+    residency), and some call an op from a hook that is not a registered symbol
+    at all, so the launch log cannot tell which body executed. Call sites report
+    their branch here and the first one of each pair shows up as an `[op-trace]`
+    line next to the symbol lines.
+    """
+
+    if not _op_trace_enabled():
+        return
+    key = (name, variant)
+    count = _OP_TRACE_COUNTS.get(key, 0) + 1
+    _OP_TRACE_COUNTS[key] = count
+    if count == 1:
+        logger.warning("[op-trace] first call: %s [%s]", name, variant)
+
+
 def install() -> None:
     """Install all registered Kunlun kernel replacements into upstream modules."""
 
+    trace = _op_trace_enabled()
     for spec in _TRITON_OPS.values():
+        impl = _traced(spec, spec.impl) if trace else spec.impl
         replacement = (
-            spec.impl
+            impl
             if spec.metadata.get("call_style") == "direct"
-            else KernelLauncher(spec.kernel_name, spec.impl)
+            else KernelLauncher(spec.kernel_name, impl)
         )
         _patch_symbol(spec, replacement)
     for spec in _JIT_OPS.values():
-        _patch_symbol(spec, spec.impl)
+        _patch_symbol(spec, _traced(spec, spec.impl) if trace else spec.impl)
 
 
 def _dsv4_plan_payload(plan):
@@ -236,6 +304,32 @@ def _dsv4_plan_payload(plan):
     if getattr(plan, "is_decode", False):
         return plan.seq_lens, None, 1
     return plan.compress_plan, plan.write_plan, 0
+
+
+def _assert_v4_kv_layout(layout, where: str) -> None:
+    """拒绝 V4.1 的打包 KV 布局。
+
+    DSV4.1 给每个 paged KV 写入路径都带上 `KVLayout`（V4=584B fp8+bf16、V41=528B、
+    V41_FP4=288B）。昆仑池存的是 plain fp16/bf16 latent，对应上游的 V4 slot；其余打包
+    格式没有 XSpeedGate 写入实现，所以必须显式报错，不能静默写成 reader 解析不了的布局
+    —— 这类不匹配的表现是 attention 输出 NaN，而不是报错。
+    """
+    if layout is None:
+        return
+    name = getattr(layout, "value", layout)
+    if name not in ("v4", "V4"):
+        raise NotImplementedError(
+            f"{where}: KV layout {name!r} has no Kunlun implementation; "
+            "the half-cache pool only speaks the V4 layout"
+        )
+    if layout is None:
+        return
+    name = getattr(layout, "value", layout)
+    if name not in ("v4", "V4"):
+        raise NotImplementedError(
+            f"{where}: KV layout {name!r} has no Kunlun implementation; "
+            "the half-cache pool only speaks the V4 layout"
+        )
 
 
 @register_jit_op("sglang.kernels.ops.attention.dsv4.compress_old", "compress_forward")
@@ -325,11 +419,16 @@ def dsv4_create_paged_compress_data_kunlun(
     extend_seq_lens: torch.Tensor,
     req_to_token: torch.Tensor,
     full_to_swa_index_mapping: torch.Tensor,
+    use_req_ring: bool = False,
     block: int = 128,
 ):
     """Create compressor-v1 paged indices using the Kunlun fused op."""
 
     del block
+    if use_req_ring:
+        raise NotImplementedError(
+            "use_req_ring is not supported by the Kunlun compress plan builder"
+        )
     return torch.ops.xspeedgate_ops.create_paged_compress_data(
         req_pool_indices=req_pool_indices.to(torch.int64),
         seq_lens=seq_lens.to(torch.int32).contiguous(),
@@ -345,10 +444,10 @@ def dsv4_create_paged_compress_data_kunlun(
 
 def _dsv4_topk_torch_fallback(*args, **kwargs) -> None:
     from sglang.srt.layers.attention.dsv4.indexer import (
-        topk_transform_512_pytorch_vectorized,
+        topk_transform_pytorch_vectorized,
     )
 
-    topk_transform_512_pytorch_vectorized(*args, **kwargs)
+    topk_transform_pytorch_vectorized(*args, **kwargs)
 
 
 _C4_LOGITS_CHUNK_BYTES_ENV = "SGLANG_KUNLUN_C4_LOGITS_CHUNK_BYTES"
@@ -613,7 +712,7 @@ def _dsv4_topk_transform_graph_safe(
     out_page_indices.copy_(page_indices.to(torch.int32))
 
 
-@register_jit_op("sglang.kernels.ops.attention.dsv4.topk", "topk_transform_512")
+@register_jit_op("sglang.kernels.ops.attention.dsv4.topk", "topk_transform_paged")
 def dsv4_topk_transform_512_kunlun(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -688,7 +787,7 @@ def dsv4_topk_transform_512_kunlun(
     )
 
 
-@register_jit_op("sglang.kernels.ops.attention.dsv4.topk", "topk_transform_512_v2")
+@register_jit_op("sglang.kernels.ops.attention.dsv4.topk", "topk_transform_paged_v2")
 def dsv4_topk_transform_512_v2_kunlun(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -730,16 +829,169 @@ def dsv4_init_compression_metadata_kunlun(
     page_size: int = 0,
     compute_page_indices: bool = True,
 ):
-    return torch.ops.xspeedgate_ops.init_compressed_attn_metadata_v2(
-        seq_lens,
-        positions,
+    # Prefill CP pads the metadata row count (seq_lens/positions) to a multiple
+    # of cp_size while raw_out_loc lists only the real tokens. The padding rows
+    # carry seq_len 1 / position 0, so the kernel does NOT skip them -- feeding
+    # them a padded raw_out_loc would write their compressed KV into a real
+    # cache slot. Upstream sizes the write buffers (*_out_loc) unpadded and masks
+    # rows >= num_write_tokens. Emulate that: run the Kunlun op over the real
+    # rows only, then restore the length/position/page outputs to the padded
+    # size with the padded rows' own seq_lens/positions.
+    bs = seq_lens.shape[0]
+    n = raw_out_loc.shape[0]
+    if n > bs:
+        raise RuntimeError(
+            "dsv4 init_compression_metadata: raw_out_loc longer than seq_lens "
+            f"({tuple(raw_out_loc.shape)} vs {tuple(seq_lens.shape)})"
+        )
+    if n == bs:
+        return torch.ops.xspeedgate_ops.init_compressed_attn_metadata_v2(
+            seq_lens,
+            positions,
+            raw_out_loc,
+            page_table,
+            page_size,
+            compute_page_indices,
+        )
+
+    page_table_r = (
+        page_table[:n] if page_table is not None and page_table.shape[0] > n else page_table
+    )
+    (
+        c4_out,
+        c4_pos,
+        c4_raw,
+        c4_clamp,
+        c128_out,
+        c128_pos,
+        c128_raw,
+        c128_clamp,
+        c128_pages,
+    ) = torch.ops.xspeedgate_ops.init_compressed_attn_metadata_v2(
+        seq_lens[:n],
+        positions[:n],
         raw_out_loc,
-        page_table,
+        page_table_r,
         page_size,
         compute_page_indices,
     )
+    pad_rows = bs - n
+    seq_lens_tail = seq_lens[n:].to(torch.int32)
+    positions_tail = positions[n:].to(torch.int32)
+    ones_tail = seq_lens_tail.clamp_min(1)
+
+    def _pad(x, tail):
+        return torch.cat([x, tail.to(x.dtype, copy=False)])
+
+    c4_pos = _pad(c4_pos, positions_tail)
+    c4_raw = _pad(c4_raw, seq_lens_tail)
+    c4_clamp = _pad(c4_clamp, ones_tail)
+    c128_pos = _pad(c128_pos, positions_tail)
+    c128_raw = _pad(c128_raw, seq_lens_tail)
+    c128_clamp = _pad(c128_clamp, ones_tail)
+    if c128_pages is not None:
+        c128_pages = torch.cat(
+            [
+                c128_pages,
+                torch.full(
+                    (pad_rows, c128_pages.shape[1]),
+                    -1,
+                    dtype=c128_pages.dtype,
+                    device=c128_pages.device,
+                ),
+            ]
+        )
+    return (
+        c4_out,
+        c4_pos,
+        c4_raw,
+        c4_clamp,
+        c128_out,
+        c128_pos,
+        c128_raw,
+        c128_clamp,
+        c128_pages,
+    )
     
 
+
+
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4_attn_metadata_kernels",
+    "expand_prefill_causally_triton",
+)
+def expand_prefill_causally_kunlun(
+    *,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    num_tokens: int,
+    padded_num_tokens: Optional[int],
+):
+    """Expand prefill metadata causally on the XSpeedGate kernel.
+
+    Replaces the whole launcher (``dsv4_attn_metadata_kernels.py:194``) instead
+    of just ``_expand_prefill_causally_kernel``: the op cumsums
+    ``extend_seq_lens`` on device and allocates both outputs itself, so the
+    upstream ``torch.empty`` pair and the grid math disappear.
+
+    Unlike the older list-based ``expand_prefill_casually``, this one takes
+    ``seq_lens`` / ``extend_seq_lens`` as device tensors, so nothing forces the
+    D2H copy that the CPU-mirror contract used to require -- which is also what
+    makes it usable under a captured graph.
+
+    The op pins every integer input to int32 and requires contiguity, while
+    upstream builds ``req_pool_indices`` as int64 in some paths, so the three
+    length/index vectors are normalized per call. ``padded_num_tokens`` is only
+    forwarded when it actually pads (upstream treats ``<= num_tokens`` as "no
+    padding", the op rejects ``< num_tokens``).
+    """
+
+    from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
+        ExpandPrefillCausallyResult,
+    )
+
+    op = "expand_prefill_causally_dsv41"
+    bs = req_pool_indices.shape[0]
+    _dspark_require(
+        req_pool_indices.dim() == 1
+        and seq_lens.dim() == 1
+        and extend_seq_lens.dim() == 1,
+        op,
+        "req_pool_indices/seq_lens/extend_seq_lens must be 1D, got dims "
+        f"{req_pool_indices.dim()}/{seq_lens.dim()}/{extend_seq_lens.dim()}",
+    )
+    _dspark_require(
+        seq_lens.shape[0] >= bs and extend_seq_lens.shape[0] >= bs,
+        op,
+        f"seq_lens {seq_lens.shape[0]} / extend_seq_lens "
+        f"{extend_seq_lens.shape[0]} shorter than req_pool_indices {bs}",
+    )
+
+    def _i32(tensor: torch.Tensor) -> torch.Tensor:
+        """Give the op the int32 contiguous vector it dispatches on."""
+        if tensor.dtype != torch.int32:
+            tensor = tensor.to(torch.int32)
+        return tensor.contiguous()
+
+    padded_arg = None
+    if padded_num_tokens is not None and padded_num_tokens > num_tokens:
+        padded_arg = padded_num_tokens
+
+    seq_lens_casual, req_pool_indices_repeated = (
+        torch.ops.xspeedgate_ops.expand_prefill_causally_dsv41(
+            _i32(req_pool_indices),
+            _i32(seq_lens[:bs]),
+            _i32(extend_seq_lens[:bs]),
+            num_tokens,
+            padded_arg,
+        )
+    )
+
+    return ExpandPrefillCausallyResult(
+        seq_lens_casual=seq_lens_casual,
+        req_pool_indices_repeated=req_pool_indices_repeated,
+    )
 
 
 @plugin_hook(
@@ -759,44 +1011,41 @@ def dsv4_expand_prefill_causally_kunlun(
     num_tokens: int,
     padded_num_tokens: Optional[int],
 ):
-    """Expand target-verify metadata with graph-safe Torch tensor operations."""
+    """Route the DSV4 prefill expansion to the Kunlun kernel.
 
-    del extend_start_loc
-    from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
-        ExpandPrefillCausallyResult,
-    )
+    ``execute`` stays hooked rather than relying on the upstream
+    ``_inputs_on_cuda`` dispatch so the device path is picked by the one thing
+    the kernel actually needs -- inputs that live on the XPU -- instead of the
+    CPU mirrors the call sites happen to pass. ``extend_start_loc`` and the two
+    ``*_cpu`` lists only ever fed the torch fallback; the kernel derives the
+    same start offsets from ``extend_seq_lens`` on device.
+    """
 
-    if seq_lens_cpu is None:
-        seq_lens_cpu = seq_lens.cpu().tolist()
+    del extend_start_loc, seq_lens_cpu, extend_seq_lens_cpu
 
-    if extend_seq_lens_cpu is None:
-        extend_seq_lens_cpu = extend_seq_lens.cpu().tolist()
-
-    if req_pool_indices.dtype != torch.int32:
-        req_pool_indices_i32 = req_pool_indices.to(torch.int32)
-    else:
-        req_pool_indices_i32 = req_pool_indices
-
-    if not req_pool_indices_i32.is_contiguous():
-        req_pool_indices_i32 = req_pool_indices_i32.contiguous()
-
-    padded_arg = None
-    if padded_num_tokens is not None and padded_num_tokens > num_tokens:
-        padded_arg = padded_num_tokens
-
-    seq_lens_casual, req_pool_indices_repeated = (
-        torch.ops.xspeedgate_ops.expand_prefill_casually(
-            num_tokens,
-            seq_lens_cpu,
-            extend_seq_lens_cpu,
-            req_pool_indices_i32,
-            padded_arg,
+    # This hook, not the registered ``expand_prefill_causally_triton`` symbol, is
+    # the entry point every call site reaches, so ``_traced`` never sees it --
+    # report the branch explicitly or the launch log cannot show this op ran.
+    if not req_pool_indices.is_cuda:
+        note_op_path("expand_prefill_causally", "torch")
+        return cls.torch(
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            extend_seq_lens=extend_seq_lens,
+            extend_start_loc=None,
+            seq_lens_cpu=seq_lens.tolist(),
+            extend_seq_lens_cpu=extend_seq_lens.tolist(),
+            num_tokens=num_tokens,
+            padded_num_tokens=padded_num_tokens,
         )
-    )
 
-    return ExpandPrefillCausallyResult(
-        seq_lens_casual=seq_lens_casual,
-        req_pool_indices_repeated=req_pool_indices_repeated,
+    note_op_path("expand_prefill_causally", "xspeedgate")
+    return expand_prefill_causally_kunlun(
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        extend_seq_lens=extend_seq_lens,
+        num_tokens=num_tokens,
+        padded_num_tokens=padded_num_tokens,
     )
 
 import logging as _dsv4_logging
@@ -888,11 +1137,18 @@ def dsv4_compressor_decode_plan_kunlun(
     seq_lens: torch.Tensor,
     swa_page_size: int,
     ring_size: int,
+    use_req_ring: bool = False,
 ):
     """dsv4_compressor_decode_plan_kunlun"""
     from sglang.kernels.ops.attention.dsv4.compress import CompressorDecodePlan
     if compress_ratio not in (4, 128):
         raise ValueError(f"unsupported compression ratio: {compress_ratio}")
+    # 与上游自己的 XPU 分支一致：request-ring 的 plan 布局（unified KV、ratio 4）没有
+    # XSpeedGate 实现。昆仑池不是 `_unified_kv`，所以调用方传的恒为 False。
+    if use_req_ring:
+        raise NotImplementedError(
+            "use_req_ring is not supported by the Kunlun compress plan builder"
+        )
     plan_d = torch.ops.xspeedgate_ops.dsv4_compressor_decode_plan(
         req_pool_indices,
         req_to_token,
@@ -965,9 +1221,9 @@ def _dsv4_num_draft_tokens() -> int | None:
     """投机的 draft token 数；拿不到就返回 None（不阻塞启动）。"""
 
     try:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang_kunlun.compat import server_arg
 
-        return get_global_server_args().speculative_num_draft_tokens
+        return server_arg("speculative_num_draft_tokens")
     except Exception:  # pragma: no cover - 仅用于日志与断言
         return None
 
@@ -1062,11 +1318,16 @@ def dsv4_compressor_prefill_plan_kunlun(
     ring_size: int,
     num_q_tokens: int,
     use_cuda_graph: bool = False,
+    use_req_ring: bool = False,
 ):
     """dsv4_compressor_prefill_plan_kunlun"""
     from sglang.kernels.ops.attention.dsv4.compress import CompressorPrefillPlan
     if compress_ratio not in (4, 128):
         raise ValueError(f"unsupported compression ratio: {compress_ratio}")
+    if use_req_ring:
+        raise NotImplementedError(
+            "use_req_ring is not supported by the Kunlun compress plan builder"
+        )
     if num_q_tokens < req_pool_indices.shape[0]:
         raise ValueError("num_q_tokens must be at least the batch size")
     pin_buffer = torch.empty(
@@ -1373,11 +1634,34 @@ def dsv4_compress_norm_rope_store_v2_kunlun(
     page_size: int,
     use_fp4: bool = False,
     bf16_store: bool = False,
+    # 4.1 added these three for the HIP FP4 writer; the XPU branch of upstream
+    # `compress_norm_rope_store` does not consume them either.
+    kvcache_scale: Optional[torch.Tensor] = None,
+    rope_cache=None,
+    fp4_k_write_metadata=None,
+    # 4.1 给每个 paged KV 写入都带上布局标记；昆仑池是 plain fp16/bf16 半 cache，
+    # 对应上游的 V4 布局。
+    layout=None,
+    # main added the fp8 two-pool ("unified KV") store: the packed pair goes to
+    # a separate rope pool instead of the single half cache.
+    fp8_2buff: bool = False,
+    kvcache_rope: Optional[torch.Tensor] = None,
 ) -> None:
     """Apply v2 post-compression transforms and store into Kunlun cache pages."""
 
     if use_fp4:
         raise NotImplementedError("FP4 indexer is not enabled for the Torch reference")
+    if fp8_2buff or kvcache_rope is not None:
+        # Only reachable with SGLANG_DSV4_UNIFIED_KV_FP8=1, which also needs the
+        # Triton unified-KV kernels. The Kunlun operator writes one plain
+        # fp16/bf16 half cache and has nowhere to put the rope pool, so refuse
+        # rather than silently dropping the rope half of every stored pair.
+        raise NotImplementedError(
+            "fp8 two-pool unified_kv store (fp8_2buff/kvcache_rope) is not "
+            "supported by the Kunlun compress store; run with "
+            "SGLANG_DSV4_UNIFIED_KV_FP8=0"
+        )
+    _assert_v4_kv_layout(layout, "compress_norm_rope_store")
     plan_raw = plan[1].contiguous()
     if plan_raw.shape[0] == 0:
         return
@@ -1691,6 +1975,273 @@ def page_table_positions_kernel(
     positions_out_ptr.copy_(positions)
     page_table_ptr.copy_(page_table)
     topk_out_ptr.copy_(topk)
+
+
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4_attn_metadata_kernels",
+    "build_causal_swa_page_indices_triton",
+)
+def build_causal_swa_page_indices_kunlun(
+    *,
+    req_to_token: torch.Tensor,
+    full_to_swa_mapping: torch.Tensor,
+    req_pool_indices_repeated: torch.Tensor,
+    seq_lens_casual: torch.Tensor,
+    swa_window: int,
+    page_index_aligned_size: int,
+    swa_replay_start: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Build the causal SWA window page-index table on the XSpeedGate kernel.
+
+    Replaces the whole launcher (``dsv4_attn_metadata_kernels.py:544``) instead
+    of just ``_causal_swa_page_indices_kernel``: the op derives
+    ``padded_width`` from the same ceil-div and allocates its own
+    ``[num_qo, padded_width]`` int32 output, so the upstream ``torch.empty`` and
+    the copy back into it both disappear.
+
+    Semantics match ``build_causal_swa_page_indices`` (the torch baseline)
+    element for element, including the ``full < 0 -> -1`` slots: the op checks
+    the sign explicitly, where the torch path only lands on ``-1`` because
+    ``full_to_swa_mapping[-1]`` is the sentinel and the Triton path reads out of
+    bounds there.
+
+    ``full_to_swa_mapping`` is int64 upstream (the SWA allocator builds it that
+    way) and the op dispatches on int32, so it is cast per call -- same contract
+    as the DSpark sibling ``swa_page_indices_kernel`` above.
+    """
+
+    op = "causal_swa_page_indices_kernel"
+    _dspark_require(
+        req_to_token.dim() == 2
+        and req_to_token.dtype == torch.int32
+        and req_to_token.stride(1) == 1,
+        op,
+        f"req_to_token must be 2D int32 with row-contiguous rows, got "
+        f"dim={req_to_token.dim()} dtype={req_to_token.dtype} "
+        f"strides={req_to_token.stride()}",
+    )
+    _dspark_require(
+        req_pool_indices_repeated.shape[0] == seq_lens_casual.shape[0],
+        op,
+        f"req_pool_indices_repeated length {req_pool_indices_repeated.shape[0]} "
+        f"!= seq_lens_casual length {seq_lens_casual.shape[0]}",
+    )
+    _dspark_require(
+        swa_window > 0 and page_index_aligned_size > 0,
+        op,
+        f"swa_window={swa_window} / "
+        f"page_index_aligned_size={page_index_aligned_size} must be > 0",
+    )
+
+    # int32/int64 are the two pool-index template instances; anything else
+    # (upstream builds this from req_pool_indices) is normalized to int32.
+    if req_pool_indices_repeated.dtype not in (torch.int32, torch.int64):
+        req_pool_indices_repeated = req_pool_indices_repeated.to(torch.int32)
+
+    return torch.ops.xspeedgate_ops.causal_swa_page_indices_kernel(
+        req_to_token,
+        full_to_swa_mapping.to(torch.int32).contiguous(),
+        req_pool_indices_repeated.contiguous(),
+        seq_lens_casual.to(torch.int32).contiguous(),
+        swa_window,
+        page_index_aligned_size,
+        None
+        if swa_replay_start is None
+        else swa_replay_start.to(torch.int32).contiguous(),
+    )
+
+
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.attn",
+    "get_paged_mqa_logits_metadata",
+)
+def get_paged_mqa_logits_metadata_kunlun(
+    seq_lens: torch.Tensor, page_size: int, num_sm: int
+) -> torch.Tensor:
+    """Build the paged-MQA-logits SM schedule on the XSpeedGate kernel.
+
+    Replaces the whole launcher (``dsv4/attn.py:56``): the op flattens and casts
+    ``seq_lens`` itself, allocates the ``[num_sm + 1, 2]`` metadata, and sizes
+    its own multi-block workspace with the same ``kMBTileSize = 4096`` split, so
+    the upstream ``new_empty`` pair and the ``bs > 2048`` branch disappear.
+
+    ``page_size`` is passed through only to keep the upstream 64/128 assert --
+    the schedule is a 256-token split of the sequence lengths and does not
+    depend on it.
+    """
+
+    op = "get_paged_mqa_logits_metadata"
+    _dspark_require(
+        page_size in (64, 128), op, f"page_size must be 64 or 128, got {page_size}"
+    )
+    _dspark_require(1 <= num_sm <= 1024, op, f"num_sm must be in [1, 1024], got {num_sm}")
+
+    return torch.ops.xspeedgate_ops.get_paged_mqa_logits_metadata(
+        seq_lens, page_size, num_sm
+    )
+
+
+@register_jit_op(
+    "sglang.kernels.ops.moe.moe_align_small_numel",
+    "moe_align_small_numel",
+)
+def moe_align_small_numel_kunlun(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+) -> None:
+    """Single-launch MoE align for tiny batches on the XSpeedGate kernel.
+
+    Replaces the launcher (``moe/moe_align_small_numel.py:114``). The op writes
+    the three buffers in place under the same "+1 offset" convention
+    (``num_experts`` is ``E + 1``, bucket 0 is the EP-filtered ``-1`` expert),
+    and like the triton kernel it leaves ``sorted_token_ids`` beyond
+    ``num_tokens_post_pad`` unwritten.
+
+    Intra-bucket order may differ from the triton kernel's pair-index order --
+    both are valid permutations within a bucket and ``fused_moe`` only reads the
+    block-padded layout, which is identical.
+
+    The op caps ``numel`` at 1024 (the kernel's pairwise tensors), above the
+    upstream ``SMALL_NUMEL_LIMIT = 64`` gate, so every call the call site routes
+    here fits.
+    """
+
+    op = "moe_align_small_numel"
+    _dspark_require(
+        topk_ids.dtype == torch.int32,
+        op,
+        f"topk_ids must be int32, got {topk_ids.dtype}",
+    )
+    _dspark_require(
+        sorted_token_ids.dtype == torch.int32
+        and expert_ids.dtype == torch.int32
+        and num_tokens_post_pad.dtype == torch.int32,
+        op,
+        "sorted_token_ids/expert_ids/num_tokens_post_pad must be int32, got "
+        f"{sorted_token_ids.dtype}/{expert_ids.dtype}/{num_tokens_post_pad.dtype}",
+    )
+    _dspark_require(
+        topk_ids.numel() <= 1024,
+        op,
+        f"numel {topk_ids.numel()} exceeds the kernel's 1024 capacity",
+    )
+
+    torch.ops.xspeedgate_ops.moe_align_small_numel(
+        topk_ids.contiguous(),
+        num_experts,
+        block_size,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_pad,
+    )
+
+
+@register_jit_op(
+    "sglang.kernels.ops.embeddings.vocab_parallel_embedding",
+    "vocab_parallel_embedding",
+)
+def vocab_parallel_embedding_kunlun(
+    input_: torch.Tensor,
+    weight: torch.Tensor,
+    org_vocab_start_index: int,
+    org_vocab_end_index: int,
+    num_org_vocab_padding: int,
+    added_vocab_start_index: int,
+    added_vocab_end_index: int,
+) -> torch.Tensor:
+    """Fused vocab-parallel embedding lookup on the XSpeedGate kernel.
+
+    Replaces the launcher (``embeddings/vocab_parallel_embedding.py:56``): the
+    op allocates the ``input_.shape + [hidden]`` output itself and zeroes the
+    rows whose token falls outside this shard's two vocab windows, matching the
+    upstream masked-load semantics.
+
+    Both int32/int64 ids and fp32/fp16/bf16 weights are native template
+    instances, so nothing is cast here.
+    """
+
+    op = "vocab_parallel_embedding"
+    _dspark_require(
+        input_.dtype in (torch.int32, torch.int64),
+        op,
+        f"input must be int32 or int64, got {input_.dtype}",
+    )
+    _dspark_require(
+        weight.dim() == 2 and weight.stride(1) == 1,
+        op,
+        f"weight must be 2D with contiguous rows, got dim={weight.dim()} "
+        f"strides={weight.stride()}",
+    )
+
+    return torch.ops.xspeedgate_ops.vocab_parallel_embedding(
+        input_.contiguous(),
+        weight.contiguous(),
+        org_vocab_start_index,
+        org_vocab_end_index,
+        num_org_vocab_padding,
+        added_vocab_start_index,
+        added_vocab_end_index,
+    )
+
+
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.q_rope_store",
+    "q_rope_store",
+)
+def q_rope_store_kunlun(
+    q: torch.Tensor,
+    output: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> None:
+    """Rotate Q's 64-wide tail into ``output`` on the XSpeedGate kernel.
+
+    Replaces the launcher (``dsv4/q_rope_store.py:69``), which picks between a
+    decode and a prefill triton kernel by shape; the op covers both from one
+    entry point.
+
+    ``output`` keeps whatever Q padding the call site allocated: only lanes
+    ``[448, 512)`` are rotated, lanes ``[0, 448)`` are copied verbatim, and rows
+    /heads outside the passed views are never touched -- verified against the
+    torch reference on the strided ``heads < padded_heads`` layout the real call
+    site uses.
+    """
+
+    op = "q_rope_store"
+    _dspark_require(
+        q.dim() == 3 and q.shape[2] == 512,
+        op,
+        f"q must be [rows, heads, 512], got {tuple(q.shape)}",
+    )
+    _dspark_require(
+        q.shape == output.shape and q.dtype == output.dtype,
+        op,
+        f"output must match q shape/dtype, got {tuple(output.shape)}/{output.dtype} "
+        f"vs {tuple(q.shape)}/{q.dtype}",
+    )
+    _dspark_require(
+        q.stride(1) == 512 and output.stride(1) == 512,
+        op,
+        f"q/output head stride must be 512, got {q.stride(1)}/{output.stride(1)}",
+    )
+    _dspark_require(
+        freqs_cis.dtype == torch.complex64 and freqs_cis.is_contiguous(),
+        op,
+        f"freqs_cis must be contiguous complex64, got {freqs_cis.dtype}",
+    )
+    _dspark_require(
+        positions.dtype in (torch.int32, torch.int64),
+        op,
+        f"positions must be int32 or int64, got {positions.dtype}",
+    )
+
+    torch.ops.xspeedgate_ops.q_rope_store(
+        q, output, freqs_cis, positions.contiguous()
+    )
 
 
 def _dspark_kernel_out(
@@ -3065,7 +3616,7 @@ def mask_topk_ids(topk_ids: torch.Tensor, num_token_non_padded: torch.Tensor) ->
 
 @register_jit_op("sglang.kernels.ops.moe.moe_fused_gate", "moe_fused_gate")
 def moe_fused_gate_dsv4_kunlun(
-    input: torch.Tensor,
+    scores: torch.Tensor,
     bias: torch.Tensor,
     topk: int,
     scoring_func: str = "sigmoid",
@@ -3076,12 +3627,46 @@ def moe_fused_gate_dsv4_kunlun(
     moe_softcapping: float = 0.0,
     num_expert_group: int = 1,
     topk_group: int = 1,
+    *,
+    bias_alt: Optional[torch.Tensor] = None,
+    input_ids: Optional[torch.Tensor] = None,
+    bias_alt_token_id: Optional[int] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    renormalize_epsilon: float = 0.0,
+    packed_out: Optional[torch.Tensor] = None,
+    sqrtsoftplus_log1p: bool = False,
 ):
-    """Match the monkey-patched DeepSeek-V4 fused MoE gate."""
+    """Match the monkey-patched DeepSeek-V4 fused MoE gate.
+
+    4.1 added the V4.1 vision-language routing contract: ``bias_alt`` replaces
+    ``bias`` on rows whose ``input_ids == bias_alt_token_id``, rows at or past
+    the device scalar ``num_token_non_padded`` become zero weight / id -1, and
+    ``renormalize_epsilon`` selects ``sum + eps`` over the zero-sum guard. The
+    Kunlun op takes one bias vector, so a per-row alternative bias is handled by
+    running the gate once per bias and selecting per row -- only the VL routing
+    path (``vl_routing.vision_topk``) passes ``bias_alt``, so text-only routing
+    pays nothing.
+    """
+    import kunlun_ops
+
     if num_expert_group != 1 or topk_group != 1:
         raise ValueError("grouped routing is not supported by the DSV4 fused gate")
     if moe_softcapping != 0.0:
         raise ValueError("MoE softcapping is not supported by the DSV4 fused gate")
+    if packed_out is not None:
+        raise NotImplementedError(
+            "packed_out (FlashInfer routed-MoE form) is not supported by the "
+            "Kunlun fused gate"
+        )
+    # `sqrtsoftplus_log1p` (True for every deepseek_v41 checkpoint) only selects
+    # how upstream's Triton kernel evaluates softplus: `log1p(exp(x))` guarded at
+    # x > 20, instead of the open-coded `max(x, 0) + log1p(exp(-|x|))`. Both are
+    # the same function to float32 rounding, and the second effect -- ranking
+    # NaNs first rather than last -- can only matter on a row whose logits are
+    # already NaN. The Kunlun `moe_fused_gate_dsv4` op computes sqrtsoftplus in
+    # its own stable form, which is what the validated V4.1 baseline ran with,
+    # so the flag is accepted and deliberately not forwarded.
+    del sqrtsoftplus_log1p
 
     if scoring_func == "sigmoid" and apply_routed_scaling_factor_on_output:
         # MiniMax-M3 contract (its only caller is the MiniMax sigmoid branch in
@@ -3092,7 +3677,7 @@ def moe_fused_gate_dsv4_kunlun(
         )
 
         return moe_fused_gate_minimax(
-            input,
+            scores,
             bias,
             topk,
             num_fused_shared_experts=num_fused_shared_experts,
@@ -3101,27 +3686,43 @@ def moe_fused_gate_dsv4_kunlun(
             apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
         )
 
-    import kunlun_ops
+    num_rows = scores.shape[0]
 
-    num_rows = input.shape[0]
-    topk_weights = torch.empty(
-        num_rows, topk, dtype=torch.float32, device=input.device
+    def run(inp: torch.Tensor, bias_vec: torch.Tensor):
+        weights = torch.empty(num_rows, topk, dtype=torch.float32, device=inp.device)
+        indices = torch.empty(num_rows, topk, dtype=torch.int32, device=inp.device)
+        kunlun_ops.moe_fused_gate_dsv4(
+            inp.to(torch.float32),
+            bias_vec,
+            weights,
+            indices,
+            topk,
+            scoring_func,
+            num_fused_shared_experts,
+            renormalize,
+            routed_scaling_factor,
+            apply_routed_scaling_factor_on_output,
+        )
+        return weights, indices
+
+    use_alt = (
+        bias_alt is not None and input_ids is not None and bias_alt_token_id is not None
     )
-    topk_indices = torch.empty(
-        num_rows, topk, dtype=torch.int32, device=input.device
-    )
-    kunlun_ops.moe_fused_gate_dsv4(
-        input.to(torch.float32),
-        bias,
-        topk_weights,
-        topk_indices,
-        topk,
-        scoring_func,
-        num_fused_shared_experts,
-        renormalize,
-        routed_scaling_factor,
-        apply_routed_scaling_factor_on_output,
-    )
+    if use_alt:
+        alt = (input_ids.to(torch.int64) == int(bias_alt_token_id)).unsqueeze(-1)
+        w_main, i_main = run(scores, bias)
+        w_alt, i_alt = run(scores, bias_alt)
+        topk_weights = torch.where(alt, w_alt, w_main)
+        topk_indices = torch.where(alt, i_alt, i_main)
+    else:
+        topk_weights, topk_indices = run(scores, bias)
+
+    if num_token_non_padded is not None:
+        # Device scalar; keep this tensor-only so it stays graph-capturable.
+        limit = num_token_non_padded.to(device=scores.device).reshape(())
+        padded = (torch.arange(num_rows, device=scores.device) >= limit).unsqueeze(-1)
+        topk_weights = topk_weights.masked_fill(padded, 0.0)
+        topk_indices = topk_indices.masked_fill(padded, -1)
     return topk_weights, topk_indices
 
 
@@ -3201,12 +3802,16 @@ def set_mla_kv_buffer_kernel(
 
     from kunlun_ops import set_mla_kv_buffer_triton as impl
 
-    impl(
+    status = impl(
         kv_buffer,
         loc,
         cache_k_nope.contiguous().view(cache_k_nope.shape[0], cache_k_nope.shape[-1]),
         cache_k_rope.contiguous().view(cache_k_rope.shape[0], cache_k_rope.shape[-1]),
     )
+    if status != 0:
+        raise RuntimeError(
+            f"Kunlun MLA cache set returned non-zero status {status}"
+        )
 
 
 @register_triton_op("sglang.srt.mem_cache.utils", "get_mla_kv_buffer_kernel")
@@ -4454,7 +5059,9 @@ def compute_position_kernel(
 
 
 _DSV4_FREQS_REAL_CACHE: dict[tuple[object, ...], torch.Tensor] = {}
+_DSV4_FREQS_INTERLEAVED_CACHE: dict[tuple[object, ...], torch.Tensor] = {}
 _DSV4_IDENTITY_MAPPING_CACHE: dict[tuple[object, ...], torch.Tensor] = {}
+_DSV4_ROPE_DIM = 64
 
 
 def _dsv4_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
@@ -4507,6 +5114,59 @@ def _dsv4_rotate_gptj_tail(
     result[..., -rope_dim:].copy_(rotated.reshape(rope_shape))
     return result
 
+def _dsv4_freqs_real_interleaved(freqs_cis: torch.Tensor) -> torch.Tensor:
+    """Return the pointer-stable interleaved [max_seq, 64] fp32 table for the native op.
+
+    ``xspeedgate_ops.fused_rope_inplace`` expects the CUDA JIT layout
+    ``view_as_real(freqs_cis).flatten(-2)`` (real/imag interleaved), which differs from
+    the ``[real | imag]`` split cache that ``flashinfer_rotary_embedding`` consumes.
+    """
+
+    key = (
+        freqs_cis.data_ptr(),
+        tuple(freqs_cis.shape),
+        freqs_cis.dtype,
+        freqs_cis.device,
+    )
+    cached = _DSV4_FREQS_INTERLEAVED_CACHE.get(key)
+    if cached is None:
+        cached = torch.view_as_real(freqs_cis).flatten(-2).contiguous().float()
+        _DSV4_FREQS_INTERLEAVED_CACHE[key] = cached
+    return cached
+
+
+def _dsv4_native_rope_supported(
+    q: torch.Tensor,
+    k: Optional[torch.Tensor],
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> bool:
+    """Whether the native XPU op can take this call without any staging copy.
+
+    The op is bf16-only, rope_dim=64, ``[batch, heads, 64]`` with a unit last-dim stride
+    (batch/head strides are free, so the production ``x[..., -64:]`` views land natively).
+    """
+
+    if not hasattr(torch.ops.xspeedgate_ops, "fused_rope_inplace"):
+        return False
+    if not freqs_cis.is_complex() or freqs_cis.dim() != 2:
+        return False
+    if freqs_cis.shape[-1] != _DSV4_ROPE_DIM // 2:
+        return False
+    if positions.dim() != 1 or positions.dtype not in (torch.int32, torch.int64):
+        return False
+    for value in (q, k):
+        if value is None:
+            continue
+        if value.dtype is not torch.bfloat16 or not value.is_cuda:
+            return False
+        if value.dim() not in (2, 3) or value.shape[-1] != _DSV4_ROPE_DIM:
+            return False
+        if value.stride(-1) != 1 or value.shape[0] != q.shape[0]:
+            return False
+    return positions.shape[0] == q.shape[0] and q.device == freqs_cis.device
+
+
 @register_jit_op(
     "sglang.kernels.ops.attention.dsv4.elementwise", "fused_rope_inplace"
 )
@@ -4522,6 +5182,22 @@ def dsv4_fused_rope_inplace_kunlun(
     if q.shape[0] == 0:
         return
 
+    if _dsv4_native_rope_supported(q, k, freqs_cis, positions):
+        # Native single-launch op: writes the strided views in place, so no
+        # contiguous()/copy_() round trip around the kernel.
+        note_op_path("dsv4_fused_rope_inplace", "xspeedgate:fused_rope_inplace")
+        q_view = q if q.dim() == 3 else q.unsqueeze(1)
+        k_view = None if k is None else (k if k.dim() == 3 else k.unsqueeze(1))
+        torch.ops.xspeedgate_ops.fused_rope_inplace(
+            q_view,
+            k_view,
+            _dsv4_freqs_real_interleaved(freqs_cis),
+            positions if positions.is_contiguous() else positions.contiguous(),
+            inverse,
+        )
+        return
+
+    note_op_path("dsv4_fused_rope_inplace", "xspeedgate:flashinfer_rotary_embedding")
     freqs_real = _dsv4_cos_sin_cache(freqs_cis)
     rotary_dim = q.shape[-1]
     q_shape = q.shape
@@ -4698,9 +5374,11 @@ def dsv4_fused_k_norm_rope_flashmla_kunlun(
     out_loc: torch.Tensor,
     kvcache: torch.Tensor,
     page_size: int,
+    layout=None,
 ) -> None:
     """Use the normalize/rotate/store sequence for the 0.5.14 K path."""
 
+    _assert_v4_kv_layout(layout, "fused_k_norm_rope_flashmla")
     if kv.shape[0] == 0:
         return
 
@@ -5307,9 +5985,9 @@ def fused_dsa_draft_extend_metadata(
 
 @register_triton_op(
     "sglang.kernels.ops.attention.dsa.cp_split",
-    "dsa_cp_round_robin_split_q_seqs_kernel",
+    "dsa_cp_interleave_q_seqs_kernel",
 )
-def dsa_cp_round_robin_split_q_seqs_kernel(
+def dsa_cp_interleave_q_seqs_kernel(
     in_seqs: torch.Tensor,
     out_seqs: torch.Tensor,
     bs_idx: torch.Tensor,
@@ -5332,7 +6010,7 @@ def dsa_cp_round_robin_split_q_seqs_kernel(
     selected = torch.nonzero(per_seq > 0, as_tuple=False).flatten()
     if selected.numel() != out_seqs.numel():
         raise RuntimeError(
-            "dsa_cp_round_robin_split_q_seqs: selected rows do not match the "
+            "dsa_cp_interleave_q_seqs: selected rows do not match the "
             f"preallocated output ({selected.numel()} vs {out_seqs.numel()}; "
             f"tokens={tokens}, cp_size={cp_size}, cp_rank={cp_rank})"
         )
@@ -5728,3 +6406,150 @@ def hisparse_copy_cache_planned_mla(
     _hisparse_copy_items(
         host_cache, device_buffer, src_locs, dst_locs, item_size_bytes, is_dsv4_layout
     )
+@register_jit_op(
+    "sglang.kernels.ops.mamba.mamba_state_indices_triton",
+    "fused_replay_state_indices",
+)
+def fused_replay_state_indices(
+    *,
+    req_pool_indices: torch.Tensor,
+    mamba_index_mapping: torch.Tensor,
+    out_state_indices: torch.Tensor,
+    valid_bs: int,
+    total_bs: int,
+) -> torch.Tensor:
+    """Torch form of the mamba replay state-indices fusion."""
+    valid = max(0, min(int(valid_bs), int(total_bs)))
+    total = int(total_bs)
+
+    # Gather first: the Triton kernel masks its load to the valid rows, so the
+    # padding zero-fill below cannot influence the gathered values. Doing it in
+    # this order keeps that true no matter how the buffers alias.
+    if valid > 0:
+        req = req_pool_indices[:valid].to(torch.long)
+        out_state_indices[:valid] = mamba_index_mapping[req].to(
+            out_state_indices.dtype
+        )
+    if total > valid:
+        # -1 is the sentinel mamba kernels test with `state_idx < 0`.
+        out_state_indices[valid:total] = -1
+        # Side effect the reference chain relies on: padded rows of the static
+        # req_pool_indices buffer are zeroed so captured kernels that gather
+        # with them stay in bounds.
+        req_pool_indices[valid:total] = 0
+    return out_state_indices[:total]
+
+
+@register_triton_op(
+    "sglang.kernels.ops.attention.dsv4.sparse_prefill_kernels",
+    "_combine_topk_swa_indices_kernel",
+)
+def _combine_topk_swa_indices_kernel(
+    combined_indices: torch.Tensor,
+    combined_indices_stride: int,
+    combined_lens: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_indices_stride: int,
+    query_start_loc: torch.Tensor,
+    query_pos: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor,
+    compressed_base: torch.Tensor,
+    swa_base: torch.Tensor,
+    *,
+    top_k: int,
+    COMPRESS_RATIO: int,
+    WINDOW_SIZE: int,
+    PADDED_TOP_K: int,
+    grid: "tuple[int, ...] | None" = None,
+    **kwargs,
+) -> None:
+    """Per-query topk + SWA sparse index rows, on the XSpeedGate kernel.
+
+    Replaces the Triton kernel rather than `combine_topk_swa_indices`
+    (`srt/layers/attention/dsv4/sparse_prefill_utils.py:114`), so the launcher
+    keeps doing the dtype asserts, the `ceil_align(topk + window_size, 128)`
+    width and the output allocation the op requires of its caller. The op takes
+    the two output buffers first and derives `num_tokens` / `topk_width` /
+    `combined_stride` / `num_reqs` from the tensors, so the strides and
+    `PADDED_TOP_K` the Triton signature carries are unused here.
+
+    The op writes each row in full, `-1` padding included, so it does not need
+    the launcher's `-1` prefill and reusing a preallocated `out_indices` stays
+    correct. Its bounds: every tensor int32, contiguous and on device;
+    `topk_indices` 2D with width >= `top_k`; `num_reqs <= 4096` (the kernel's SM
+    cache for the per-request metadata).
+    """
+    torch.ops.xspeedgate_ops.combine_topk_swa_indices(
+        combined_indices,
+        combined_lens,
+        topk_indices,
+        query_start_loc,
+        query_pos,
+        seq_lens,
+        gather_lens,
+        compressed_base,
+        swa_base,
+        WINDOW_SIZE,
+        COMPRESS_RATIO,
+        top_k,
+    )
+
+
+@register_jit_op(
+    "sglang.srt.layers.attention.dsv4.sparse_prefill_utils",
+    "build_swa_token_ids",
+)
+def build_swa_token_ids(
+    seq_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    full_to_swa: torch.Tensor,
+    swa_window: int,
+    total_swa: int,
+) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]":
+    """SWA geometry + physical SWA-cache token ids, on the XSpeedGate kernel.
+
+    Replaces the whole `build_swa_token_ids`
+    (`srt/layers/attention/dsv4/sparse_prefill_utils.py:197`) rather than just
+    its Triton kernel, because the op also fuses the geometry the upstream
+    launcher builds with torch ops: `swa_gather_lens = min(seq_lens,
+    extend_seq_lens + swa_window - 1)`, `swa_first_pos = seq_lens -
+    swa_gather_lens` and the exclusive cumsum into `swa_offsets`. Only the four
+    output allocations stay here, so `torch.zeros`/`torch.cumsum` disappear from
+    the chunk-setup path.
+
+    `total_swa` keeps the upstream contract: it must equal
+    `sum(swa_gather_lens)`, computed by the caller on host lengths. Neither the
+    wrapper nor the kernel can check it without a d2h sync, and a short buffer
+    is an out-of-bounds write. Other bounds: int32 everywhere except int64
+    `full_to_swa`, all tensors contiguous and on device, `req_to_token` 2D,
+    `swa_window >= 0`, `num_reqs <= 4096` (the kernel's SM cache for the
+    per-request metadata).
+    """
+    num_reqs = seq_lens.shape[0]
+    device = seq_lens.device
+    swa_token_ids = torch.empty(total_swa, dtype=torch.int32, device=device)
+    swa_first_pos = torch.empty(num_reqs, dtype=torch.int32, device=device)
+    swa_gather_lens = torch.empty(num_reqs, dtype=torch.int32, device=device)
+    if num_reqs == 0:
+        # The op returns early on an empty batch, so `swa_offsets[0] == 0` — the
+        # one element upstream callers still index — has to be materialized here.
+        swa_offsets = torch.zeros(1, dtype=torch.int32, device=device)
+        return swa_token_ids, swa_first_pos, swa_gather_lens, swa_offsets
+
+    swa_offsets = torch.empty(num_reqs + 1, dtype=torch.int32, device=device)
+    torch.ops.xspeedgate_ops.build_swa_token_ids(
+        swa_token_ids,
+        swa_first_pos,
+        swa_gather_lens,
+        swa_offsets,
+        seq_lens,
+        extend_seq_lens,
+        req_pool_indices,
+        req_to_token,
+        full_to_swa,
+        swa_window,
+    )
+    return swa_token_ids, swa_first_pos, swa_gather_lens, swa_offsets

@@ -18,7 +18,7 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
     "sglang.srt.layers.moe.fused_moe_triton.layer.create_moe_dispatcher",
     type=HookType.REPLACE,
 )
-def create_moe_dispatcher_kunlun(moe_runner_config):
+def create_moe_dispatcher_kunlun(moe_runner_config, quant_method=None):
     """Kunlun MoE dispatcher selection."""
     from sglang.srt.batch_overlap.two_batch_overlap import (
         MaybeTboDeepEPDispatcher,

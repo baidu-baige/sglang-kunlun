@@ -1,4 +1,4 @@
-"""Hooks for DeepseekV4 NextN / MTP model methods.
+"""Kunlun method hooks for the upstream DeepSeek V4 NextN / MTP model.
 
 权重命名 mapper 与 packed_modules_mapping 的注入已收敛到
 ``hooks/model_loader/quant_injection.py``（loader 消费点之前的 BEFORE hook），
