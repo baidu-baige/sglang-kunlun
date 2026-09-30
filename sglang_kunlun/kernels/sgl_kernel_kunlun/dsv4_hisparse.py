@@ -99,6 +99,25 @@ def copy_items(
         dst_scale[dst_page, dst_off] = src_scale[src_page, src_off].to(dst.device)
         return
 
+    # Fused XPU kernel for the contiguous layout (device<->device only): one
+    # gather-copy that replaces the as_strided + advanced-index path below
+    # (~24x faster than the torch gather, and CUDA-graph safe).  Falls back to
+    # torch for cross-device transfers or when the op isn't built into this
+    # xspeedgate_ops.  Byte offset of a token loc is loc*item_size for both the
+    # DSv4 half-cache (row = page_size*item_size) and the flat layout, matching
+    # the kernel's addressing.
+    if (
+        src.device == dst.device
+        and src.is_cuda
+        and src.is_contiguous()
+        and dst.is_contiguous()
+        and hasattr(torch.ops.xspeedgate_ops, "hisparse_copy_items")
+    ):
+        torch.ops.xspeedgate_ops.hisparse_copy_items(
+            src, dst, src_locs_src, dst_locs_dst, item_size_bytes
+        )
+        return
+
     # Contiguous token runs.  A DSv4 page row is exactly ``page_size`` runs of
     # ``item_size_bytes``; the generic MLA layout is one flat run per token.
     # The two ends have independent token spaces (the host pool is sized by
