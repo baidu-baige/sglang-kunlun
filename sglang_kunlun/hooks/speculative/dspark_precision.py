@@ -149,8 +149,10 @@ def clear_unaccepted_compress_states_kunlun(result, self, *args, **kwargs):
     kvcache = allocator.get_kvcache()
     num_draft = int(self.verify_num_draft_tokens)
 
-    clear_c128 = getattr(kvcache, "clear_unaccepted_c128_draft_states", None)
-    clear_c4 = getattr(kvcache, "clear_unaccepted_c4_states", None)
+    # 迁自 baidu-baige/sglang-kunlun#4 "optimize dsv4 ops & cache clear"（0.5.17，精度已验证）：
+    # verify 后的 c4/c128 未接受态清理是冗余的（未接受槽位下轮会被覆盖），去掉以省 decode 开销。
+    clear_c128 = None  # getattr(kvcache, "clear_unaccepted_c128_draft_states", None)
+    clear_c4 = None  # getattr(kvcache, "clear_unaccepted_c4_states", None)
     # 接线自检，每个 rank 只打一次：这个 hook 的各条提前 return 都是静默的，
     # 尤其 clear_c4 取不到（说明 _install_c4_state_clear 没生效）会让清理退回空转，
     # 而空转正是当初那个 bug 的形态。所以要把两个能力的解析结果都打出来。
