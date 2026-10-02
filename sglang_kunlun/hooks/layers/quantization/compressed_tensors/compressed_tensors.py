@@ -155,17 +155,41 @@ class KunlunCompressedTensorsConfig(CompressedTensorsConfig):
         return super().get_scheme_dict(layer, layer_name, matched_target)
 
     def get_linear_scheme(
-        self, layer: torch.nn.Module, layer_name: Optional[str] = None
+        self,
+        layer: torch.nn.Module,
+        layer_name: Optional[str] = None,
+        matched_target: Optional[str] = None,
     ):
-        """Resolve the linear scheme with the format of the matched group."""
-        scheme_dict = self.get_scheme_dict(layer, layer_name)
+        """Resolve the linear scheme with the format of the matched group.
+
+        ``matched_target`` mirrors upstream's 0.5.19 signature
+        (``srt/layers/quantization/compressed_tensors/compressed_tensors.py:906-911``);
+        ``get_lm_head_scheme`` (``:992``) calls this with three keywords at
+        ``:1038``, so omitting it raises ``TypeError`` on any checkpoint whose
+        config names the head.
+        """
+        try:
+            scheme_dict = self.get_scheme_dict(layer, layer_name, matched_target)
+        except ValueError:
+            # No config group matches this linear at all. Kimi-K3 leaves its
+            # non-expert linears out of ``targets`` entirely, so let the base
+            # method raise from inside ``get_linear_scheme_kunlun``
+            # (``kimi_k3.py``), which classifies that case and answers ``None``
+            # -> ``UnquantizedLinearMethod`` -> BF16.
+            return super().get_linear_scheme(
+                layer=layer, layer_name=layer_name, matched_target=matched_target
+            )
         group_format = scheme_dict.get("format") if scheme_dict else None
         if not group_format or group_format == self.quant_format:
-            return super().get_linear_scheme(layer=layer, layer_name=layer_name)
+            return super().get_linear_scheme(
+                layer=layer, layer_name=layer_name, matched_target=matched_target
+            )
 
         saved_format, self.quant_format = self.quant_format, group_format
         try:
-            return super().get_linear_scheme(layer=layer, layer_name=layer_name)
+            return super().get_linear_scheme(
+                layer=layer, layer_name=layer_name, matched_target=matched_target
+            )
         finally:
             self.quant_format = saved_format
 
@@ -208,6 +232,21 @@ class KunlunCompressedTensorsConfig(CompressedTensorsConfig):
         self, layer: torch.nn.Module, layer_name: Optional[str] = None
     ):
         """Choose Kunlun MoE schemes while reusing upstream config parsing."""
+        from .kimi_k3 import kimi_k3_expert_scheme_dict
+
+        # Kimi-K3 names its expert projections ``.0.w1/.0.w3/.0.w2``, not
+        # ``.0.gate_proj/.0.up_proj/.0.down_proj``. A no-op for every other
+        # architecture. The ``get_moe_scheme`` AROUND in ``kimi_k3.py`` covers
+        # the same remap for the un-subclassed upstream config; this call is
+        # what makes it effective here, because this override never reaches
+        # ``super()`` for a matched expert layer.
+        with kimi_k3_expert_scheme_dict(self, layer_name):
+            return self._get_moe_scheme_inner(layer, layer_name)
+
+    def _get_moe_scheme_inner(
+        self, layer: torch.nn.Module, layer_name: Optional[str] = None
+    ):
+        """Kunlun MoE scheme selection over already-remapped layer names."""
         self._add_fused_moe_to_target_scheme_map()
         layer_name = layer_name or ""
         unfused_names = [

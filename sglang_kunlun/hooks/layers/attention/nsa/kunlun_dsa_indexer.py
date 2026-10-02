@@ -32,7 +32,12 @@ from einops import rearrange
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
-from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
+try:
+    from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
+except ImportError:  # dsv4.1 删掉了 DSA prefill-CP 的 in-seq-split 模式
+    def is_dsa_prefill_cp_in_seq_split() -> bool:
+        """上游只保留 interleave / round-robin 模式，这个符号守着的分支永远不会激活。"""
+        return False
 from sglang.srt.layers.cp.utils import get_cp_strategy, is_cp_v2_active
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.layers.attention.dsa.dsa_indexer import (

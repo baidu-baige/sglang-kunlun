@@ -21,6 +21,16 @@ def main() -> None:
             choices.append("kunlun")
     except Exception:
         pass
+    # Repeat the platform's registration here, because the platform runs it too
+    # early to be effective: KunlunSRTPlatform.__init__ fires while
+    # sglang.srt.server_args is still executing, past ATTENTION_BACKEND_CHOICES
+    # (``server_args.py:171``) but before
+    # CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS (``:220``), so the
+    # getattr there returns None and the list is silently left alone. By this
+    # point the module is fully imported. Idempotent -- it checks membership.
+    from sglang_kunlun.platform.srt import KunlunSRTPlatform
+
+    KunlunSRTPlatform._extend_attention_backend_choices()
     import sglang_kunlun.hooks.layers.attention.attention_registry  # noqa: F401
 
     runpy.run_module("sglang.launch_server", run_name="__main__")

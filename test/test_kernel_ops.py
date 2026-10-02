@@ -1092,7 +1092,7 @@ class KernelOpsTest(unittest.TestCase):
         )
         from sglang_kunlun.kernels import kernel_ops
 
-        result = kernel_ops.dsv4_expand_prefill_causally_torch(
+        result = kernel_ops.dsv4_expand_prefill_causally_kunlun(
             ExpandPrefillCausally,
             req_pool_indices=torch.tensor([5, 9], dtype=torch.int64),
             seq_lens=torch.tensor([6, 10], dtype=torch.int64),
@@ -1108,6 +1108,90 @@ class KernelOpsTest(unittest.TestCase):
         self.assertEqual(
             result.req_pool_indices_repeated.tolist(), [5, 5, 9, 9, 9, 9, 9]
         )
+
+    def test_dsv4_causal_swa_page_indices_matches_torch_baseline(self):
+        from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
+            build_causal_swa_page_indices,
+        )
+        from sglang_kunlun.kernels import kernel_ops
+
+        swa_window, aligned = 16, 8
+        req_to_token = torch.randint(0, 200, (4, 64), dtype=torch.int32)
+        req_to_token[1, 3] = -1  # unallocated slot: -1 without a mapping lookup
+        # int64 upstream (the SWA allocator builds it that way), -1 sentinel last
+        mapping = torch.cat(
+            [torch.arange(200, dtype=torch.int64) * 2, torch.tensor([-1])]
+        )
+        req_pool_indices_repeated = torch.tensor([0, 1, 1, 3], dtype=torch.int64)
+        # Row 0 is shorter than the window, so it exercises the causal floor.
+        seq_lens_casual = torch.tensor([4, 20, 40, 63], dtype=torch.int32)
+
+        def reference_operator(
+            req_table, swa_mapping, req_pool, seq_lens, window, pad_to, replay
+        ):
+            padded = ((window + pad_to - 1) // pad_to) * pad_to
+            out = torch.full((seq_lens.shape[0], padded), -1, dtype=torch.int32)
+            for row in range(seq_lens.shape[0]):
+                pos = int(seq_lens[row]) - 1
+                floor = 0 if replay is None else max(0, int(replay[row]))
+                for col in range(window):
+                    off = pos - col
+                    if off < floor:
+                        continue
+                    full = int(req_table[int(req_pool[row]), off])
+                    out[row, col] = -1 if full < 0 else int(swa_mapping[full])
+            return out
+
+        for replay in (None, torch.tensor([0, 15, 20, 60], dtype=torch.int32)):
+            with self.subTest(swa_replay_start=replay is not None):
+                op = mock.Mock(side_effect=reference_operator)
+                with mock.patch.object(
+                    torch.ops.xspeedgate_ops, "causal_swa_page_indices_kernel", op
+                ):
+                    actual = kernel_ops.build_causal_swa_page_indices_kunlun(
+                        req_to_token=req_to_token,
+                        full_to_swa_mapping=mapping,
+                        req_pool_indices_repeated=req_pool_indices_repeated,
+                        seq_lens_casual=seq_lens_casual,
+                        swa_window=swa_window,
+                        page_index_aligned_size=aligned,
+                        swa_replay_start=replay,
+                    )
+
+                expected = build_causal_swa_page_indices(
+                    req_to_token=req_to_token,
+                    full_to_swa_mapping=mapping,
+                    req_pool_indices_repeated=req_pool_indices_repeated,
+                    seq_lens_casual=seq_lens_casual,
+                    swa_window=swa_window,
+                    page_index_aligned_size=aligned,
+                    swa_replay_start=replay,
+                )
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+                args = op.call_args.args
+                self.assertEqual(args[0].dtype, torch.int32)  # req_to_token
+                self.assertEqual(args[1].dtype, torch.int32)  # full_to_swa_mapping
+                self.assertTrue(args[1].is_contiguous())
+                self.assertEqual(args[3].dtype, torch.int32)  # seq_lens_casual
+                self.assertEqual(args[4:6], (swa_window, aligned))
+                if replay is None:
+                    self.assertIsNone(args[6])
+                else:
+                    self.assertEqual(args[6].dtype, torch.int32)
+
+    def test_dsv4_causal_swa_page_indices_rejects_broken_req_to_token(self):
+        from sglang_kunlun.kernels import kernel_ops
+
+        with self.assertRaises(AssertionError):
+            kernel_ops.build_causal_swa_page_indices_kunlun(
+                req_to_token=torch.zeros(4, 64, dtype=torch.int64),
+                full_to_swa_mapping=torch.zeros(8, dtype=torch.int64),
+                req_pool_indices_repeated=torch.zeros(2, dtype=torch.int64),
+                seq_lens_casual=torch.ones(2, dtype=torch.int32),
+                swa_window=16,
+                page_index_aligned_size=8,
+            )
 
     def test_dsv4_c4_decode_plan_matches_v2_byte_abi(self):
         from sglang_kunlun.kernels import kernel_ops

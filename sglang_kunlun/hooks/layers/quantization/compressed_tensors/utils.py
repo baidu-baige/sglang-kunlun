@@ -309,16 +309,29 @@ def moe_post(
     算子不接受，会报 "moe_post not support x/normed_scale dtype"。
     所以 normed_scale 统一升到 fp32（实测对 bf16/fp16 的 x 都合法），
     输出再按 output_dtype 落回模型 dtype。
+
+    EP 下路由到别的 rank 的 (token, top-k) lane，`sorted_tokens_idx` 是 -1，且 `down`
+    里没有对应行被写（`moe_fc` 用 `torch.empty` 分配）。`kunlun_ops.moe_post` 不跳过
+    这些 lane，于是每个 rank 都把未初始化内存乘上真实路由权重加进去，EP all-reduce 再
+    累 8 份 —— 实测 routed 贡献大 7 倍、对参考实现 cos 0.48（shared expert cos 0.9999、
+    `moe_fc` 单算子 cos 0.99996，都是对的）。
+
+    所以在这里把外来 lane 掩掉：权重置 0，索引 clamp 到 0 保证不寻址负行。
     """
     import kunlun_ops
 
     out_dtype = down.dtype if output_dtype is None else output_dtype
     output = torch.empty(output_shape, dtype=down.dtype, device=down.device)
+    moe_index = sorted_tokens_idx.view_as(topk_weights)
+    owned = moe_index >= 0
+    # 无条件的逐元素运算，不做 host 同步，可以进 CUDA graph。
+    normed_scale = topk_weights.to(torch.float32) * owned
+    moe_index = moe_index.clamp_min(0)
     dequant_scale = torch.ones_like(topk_weights, dtype=torch.float32)
     kunlun_ops.moe_post(
         x=down.reshape(-1, down.shape[-1]),
-        moe_index=sorted_tokens_idx.view_as(topk_weights),
-        normed_scale=topk_weights.to(torch.float32),
+        moe_index=moe_index,
+        normed_scale=normed_scale,
         dequant_scale=dequant_scale,
         y=output,
     )

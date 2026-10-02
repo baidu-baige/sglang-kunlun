@@ -56,8 +56,54 @@ def _get_mhc_ops_kunlun():
     returns fp16 ``post``/``comb``. Golden reaches the Kunlun replacement
     registered on the layernorm module, whose outputs follow the fp32 ``mixes``
     dtype, so route through that module to keep the mHC boundary aligned.
+
+    ``MhcOps`` gained ``mhc_fused_post_pre``, ``mhc_pre``, ``mhc_post`` and
+    ``fused_hc_head`` in 4.1 (the V4-Flash model never resolved this NamedTuple).
+    XPU takes the ``_is_xpu`` branches that call ``mhc_pre`` / ``mhc_post`` /
+    ``fused_hc_head``, so each is bound to the repo's own torch reference; the
+    TileLang/DeepGEMM kernels behind them are gated off by this deployment's
+    ``SGLANG_OPT_USE_TILELANG_MHC_PRE`` / ``..._MHC_POST`` / ``DEEPGEMM_HC_PRENORM``.
     """
     from sglang.srt.models.deepseek_v4 import MhcOps
+    from sglang.srt.models import deepseek_v4 as dsv4
     from sglang.kernels.ops.layernorm import mhc as mhc_module
 
-    return MhcOps(mhc_module.hc_split_sinkhorn, None, None)
+    def mhc_pre_torch(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        norm_weight=None,
+        norm_eps=None,
+    ):
+        """Kernel-signature wrapper over `_mhc_pre_torch` (3-tuple, no norm).
+
+        The norm variant is only produced by the TileLang kernel, which this
+        deployment disables, so `norm_weight`/`norm_eps` are accepted and
+        ignored to preserve the caller's contract.
+        """
+        return mhc_module._mhc_pre_torch(
+            residual=residual,
+            fn=fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_pre_eps,
+            hc_sinkhorn_eps=hc_sinkhorn_eps,
+            hc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
+        )
+
+    return MhcOps(
+        hc_split_sinkhorn=mhc_module.hc_split_sinkhorn,
+        mhc_fused_post_pre=None,
+        npu_hc_pre=None,
+        mhc_pre=mhc_pre_torch,
+        mhc_post=mhc_module._mhc_post_torch,
+        fused_hc_head=dsv4.hc_head_torch,
+    )

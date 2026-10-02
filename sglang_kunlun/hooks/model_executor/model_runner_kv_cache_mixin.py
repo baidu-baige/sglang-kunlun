@@ -13,7 +13,77 @@ no explicit ``empty_cache()`` is needed because:
 
 from __future__ import annotations
 
+import logging
+
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+
+logger = logging.getLogger(__name__)
+
+
+@plugin_hook(
+    "sglang.srt.model_executor.model_runner.ModelRunner._forward_raw",
+    type=HookType.AROUND,
+)
+def _set_dsv4_hisparse_real_rows(original_fn, self, forward_batch, *args, **kwargs):
+    """Keep TARGET_VERIFY HiSparse padding separate from live verify rows.
+
+    ``ForwardBatch.batch_size`` is request-count based, while DSV4 TARGET_VERIFY
+    expands each request to ``num_tokens_per_req`` query rows.  The graph runner
+    pads the row tensors to the captured shape, so using the tensor shape as the
+    HiSparse ``num_real_reqs`` count makes padded rows participate in swap-in and
+    corrupts speculative acceptance.
+    """
+    coordinator = getattr(self, "hisparse_coordinator", None)
+    if (
+        coordinator is not None
+        and forward_batch.forward_mode.is_target_verify()
+    ):
+        spec_info = getattr(forward_batch, "spec_info", None)
+        rows_per_req = int(getattr(spec_info, "num_tokens_per_req", 1) or 1)
+        coordinator.num_real_reqs.fill_(forward_batch.batch_size * rows_per_req)
+    return original_fn(self, forward_batch, *args, **kwargs)
+
+
+@plugin_hook(
+    "sglang.srt.model_executor.model_runner.ModelRunner.maybe_init_hisparse_coordinator",
+    type=HookType.AROUND,
+)
+def _skip_hisparse_coordinator_on_draft(original_fn, self):
+    """Do not build a HiSparse coordinator for the DSPARK draft worker.
+
+    The draft's DeepSeek-V4 pool is sized with
+    ``COMPRESS_RATIO_NEXTN_LAYER == 0`` for every effective layer, so
+    ``DeepSeekV4TokenToKVPool`` creates the C4 sub-pool with zero layers and
+    never calls ``create_buffer`` -- the call that defines
+    ``bytes_per_page_padded``.  ``HiSparseCoordinator.__init__`` then dies on
+    that missing attribute.  The draft has no compressed layer at all, so there
+    is nothing for the coordinator to manage (and the hisparse swap-in only
+    runs on a plain decode forward, never on the draft's target-verify one).
+    """
+    if getattr(self, "is_draft_worker", False):
+        from sglang.srt.mem_cache.allocator.hisparse import (
+            DeepSeekV4HiSparseTokenToKVPoolAllocator,
+        )
+
+        allocator = getattr(self, "token_to_kv_pool_allocator", None)
+        if isinstance(allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator) and not hasattr(
+            allocator.hisparse_kvcache, "bytes_per_page_padded"
+        ):
+            logger.info(
+                "sglang-kunlun: draft worker has no C4 layers; skipping the "
+                "HiSparse coordinator."
+            )
+            return None
+    original_fn(self)
+    # Only the target's cold pool moves onto the device: the swap-in that has to
+    # be captured into the decode graph runs on the target's forward, and a
+    # second device-resident pool (the draft also builds a coordinator) does not
+    # fit alongside it.  The draft keeps upstream's host-resident pool.
+    if not getattr(self, "is_draft_worker", False):
+        from sglang_kunlun.hooks.hisparse import move_cold_pool_to_device
+
+        move_cold_pool_to_device(getattr(self, "hisparse_coordinator", None))
+    return None
 
 
 @plugin_hook(
@@ -59,17 +129,34 @@ def _fix_dsv4_swa_allocator(
         self-consistent and must be left alone.
     Rebuild what upstream would have built, mirroring its branch on
     ``full_max_total_num_tokens == 0``.
+
+    DeepSeek V4 + ``--enable-hisparse`` arrives here already wrapped in
+    ``DeepSeekV4HiSparseTokenToKVPoolAllocator`` (upstream wraps the OOT paged
+    allocator at the end of the original function).  Rebuilding the SWA
+    allocator would silently drop that wrapper -- the coordinator then gets a
+    plain SWA allocator and dies on ``allocator.compress_ratio`` -- so re-apply
+    it on top of the rebuilt SWA allocator.
     """
+    from sglang.srt.mem_cache.allocator.hisparse import (
+        DeepSeekV4HiSparseTokenToKVPoolAllocator,
+    )
     from sglang.srt.mem_cache.allocator.swa import (
         PureSWATokenToKVPoolAllocator,
         SWATokenToKVPoolAllocator,
     )
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 
+    hisparse_wrapped = isinstance(result, DeepSeekV4HiSparseTokenToKVPoolAllocator)
+    # A passed-in allocator belongs to the target worker and is shared with the
+    # draft: upstream's draft branch has already registered the *target's* SWA
+    # mapping on this pool, and disaggregation asserts that identity.  Rebuilding
+    # here would give the draft its own mapping and break that check.
+    shared = token_to_kv_pool_allocator is not None
     if (
         not self.is_hybrid_swa
         or not isinstance(token_to_kv_pool, BaseSWAKVPool)
         or isinstance(result, SWATokenToKVPoolAllocator)
+        or (hisparse_wrapped and shared)
     ):
         return result
 
@@ -94,6 +181,8 @@ def _fix_dsv4_swa_allocator(
             need_sort=need_sort,
         )
     token_to_kv_pool.register_mapping(allocator.full_to_swa_index_mapping)
+    if hisparse_wrapped:
+        allocator = DeepSeekV4HiSparseTokenToKVPoolAllocator(allocator)
     if hasattr(req_to_token_pool, "register_dsv4_allocator"):
         req_to_token_pool.register_dsv4_allocator(allocator)
     return allocator
