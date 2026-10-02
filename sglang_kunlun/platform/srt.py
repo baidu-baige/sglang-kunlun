@@ -19,6 +19,8 @@ Phase 3 (Wave 1) scope:
 
 from __future__ import annotations
 
+import logging
+
 from sglang.srt.platforms.interface import SRTPlatform
 
 from .device import KunlunDeviceMixin
@@ -26,22 +28,6 @@ from .device import KunlunDeviceMixin
 
 class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
     supported_quantization = ["int8", "w8a8_int8", "compressed-tensors"]
-
-    def get_quantization_config(self, quantization: str):
-        """Return the Kunlun quantization config class.
-
-        上游在 ``layers/quantization/__init__.py`` 里对 out-of-tree 平台会先问
-        ``current_platform.get_quantization_config(quantization)``，返回 None 才回落到
-        ``QUANTIZATION_METHODS``。不接这个口子的话 compressed-tensors 会走上游实现，
-        W4A8/W8A8 的 int8 fused MoE 在那边只有 NPU 分支、直接抛 NotImplementedError。
-        """
-        if quantization == "compressed-tensors":
-            from sglang_kunlun.hooks.layers.quantization.compressed_tensors import (
-                KunlunCompressedTensorsConfig,
-            )
-
-            return KunlunCompressedTensorsConfig
-        return None
 
     def __init__(self) -> None:
         super().__init__()
@@ -54,6 +40,14 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
     def init_backend(self):
         """Initialize Kunlun backend registrations."""
         super().init_backend()
+        # Must happen here, not in __init__: this is the point upstream reserves
+        # for it (``model_runner.py:248`` calls init_backend, and the
+        # chunked-prefix gate runs later in the same function at ``:394``).
+        # __init__ is too early -- it fires while sglang.srt.server_args is
+        # still executing, before CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
+        # exists -- and launch.py is too narrow, because the scheduler
+        # subprocesses are spawned fresh and never run it.
+        self._extend_attention_backend_choices()
 
     @staticmethod
     def _extend_attention_backend_choices() -> None:
@@ -66,6 +60,27 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
                 for backend in ("kunlun", "kunlun_compressed"):
                     if backend not in choices:
                         choices.append(backend)
+
+            # Declare that the Kunlun MLA path reads the chunked prefix-cache
+            # layout. Without this, `maybe_disable_chunked_prefix_cache`
+            # (``model_runner_components/misc_utils.py:40``) silently forces
+            # ``disable_chunked_prefix_cache=True`` because "kunlun" is not in
+            # the whitelist, ``ForwardBatch.attn_attend_prefix_cache`` stays
+            # None, and any prompt longer than --chunked-prefill-size dies in
+            # ``KunlunK3MLAAttnBackend._forward_extend_mla`` with "query LOD
+            # total != KV LOD total outside the chunked-prefix path".
+            # ``add_chunked_prefix_cache_attention_backend`` (``server_args.py:231``)
+            # is the extension point upstream documents for OOT platforms.
+            add_backend = getattr(
+                server_args, "add_chunked_prefix_cache_attention_backend", None
+            )
+            supported = getattr(
+                server_args, "CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS", None
+            )
+            if add_backend is not None and supported is not None:
+                for backend in ("kunlun", "kunlun_compressed"):
+                    if backend not in supported:
+                        add_backend(backend)
         except Exception:
             pass
 
@@ -81,6 +96,20 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
         if getattr(server_args, "page_size", None) is None:
             server_args.page_size = 128
 
+        # HiSparse's swap-in copies KV from pinned host memory using host-side
+        # index tensors, which a captured decode CUDA graph cannot express (the
+        # indices are only materialised after replay).  Run the hisparse decode
+        # eagerly until the device-side swap-in lands.
+        if getattr(server_args, "enable_hisparse", False) and not getattr(
+            server_args, "disable_cuda_graph", False
+        ):
+            server_args.disable_cuda_graph = True
+            logging.getLogger(__name__).warning(
+                "sglang-kunlun: --enable-hisparse forces eager decode "
+                "(--disable-cuda-graph); the swap-in host copy cannot be "
+                "captured yet."
+            )
+
         # DeepSeek-V4's upstream defaults run after this hook and select
         # ``dsv4`` unconditionally. Preserve the user's public Kunlun name
         # through that later model-specific adjustment.
@@ -90,18 +119,40 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
             original = deepseek_v4_hook.apply_deepseek_v4_defaults
             if not getattr(original, "_kunlun_compressed", False):
                 def apply_deepseek_v4_defaults(args, model_arch):
+                    # 新解析管线禁止在这里写 server_args 字段，决策要声明进 stash，
+                    # 同一字段以最后一次声明为准。
+                    from sglang.srt.arg_groups.overrides import (
+                        declare_resolution,
+                        resolving_view,
+                    )
+
                     requested = args.attention_backend
                     requested_kv_dtype = args.kv_cache_dtype
-                    if requested == "kunlun_compressed" and requested_kv_dtype == "fp16":
-                        args.kv_cache_dtype = "bfloat16"
+                    if requested != "kunlun_compressed":
+                        original(args, model_arch)
+                        return
+
+                    if requested_kv_dtype == "fp16":
+                        # `_deepseek_v4_kv_cache_dtype` 只接受 fp8_e4m3/bfloat16，
+                        # 先把 fp16 藏起来，跑完再声明回去。
+                        declare_resolution(
+                            args,
+                            "kunlun_compressed",
+                            kv_cache_dtype="bfloat16",
+                        )
+
                     original(args, model_arch)
-                    if requested == "kunlun_compressed":
-                        args.attention_backend = requested
-                        args.kv_cache_dtype = requested_kv_dtype
-                        if args.prefill_attention_backend in (None, "dsv4"):
-                            args.prefill_attention_backend = requested
-                        if args.decode_attention_backend in (None, "dsv4"):
-                            args.decode_attention_backend = requested
+
+                    cfg = resolving_view(args)
+                    declared = {
+                        "attention_backend": requested,
+                        "kv_cache_dtype": requested_kv_dtype,
+                    }
+                    if cfg.prefill_attention_backend in (None, "dsv4"):
+                        declared["prefill_attention_backend"] = requested
+                    if cfg.decode_attention_backend in (None, "dsv4"):
+                        declared["decode_attention_backend"] = requested
+                    declare_resolution(args, "kunlun_compressed", **declared)
 
                 apply_deepseek_v4_defaults._kunlun_compressed = True
                 deepseek_v4_hook.apply_deepseek_v4_defaults = apply_deepseek_v4_defaults
@@ -112,6 +163,22 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
 
     def get_default_attention_backend(self) -> str:
         return "kunlun"
+
+    def get_quantization_config(self, quantization: str):
+        """Route ``compressed-tensors`` to the Kunlun config subclass.
+
+        上游在 ``layers/quantization/__init__.py`` 里对 out-of-tree 平台会先问
+        ``current_platform.get_quantization_config(quantization)``，返回 None 才回落到
+        ``QUANTIZATION_METHODS``。不接这个口子的话 compressed-tensors 会走上游实现，
+        W4A8/W8A8 的 int8 fused MoE 在那边只有 NPU 分支、直接抛 NotImplementedError。
+        """
+        if quantization == "compressed-tensors":
+            from sglang_kunlun.hooks.layers.quantization.compressed_tensors import (
+                KunlunCompressedTensorsConfig,
+            )
+
+            return KunlunCompressedTensorsConfig
+        return None
 
     def get_draft_prefill_attention_backend_cls(self) -> type | None:
         """Return the Kunlun draft prefill attention backend class."""

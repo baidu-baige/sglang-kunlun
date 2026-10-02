@@ -156,7 +156,23 @@ class KunlunMHATokenToKVPool(MHATokenToKVPool):
         reshape_and_cache(k_bhd, v_bhd, k4, v4, loc.to(torch.int32), None, None, 0)
 
     def get_contiguous_buf_infos(self):
-        """Return contiguous buffer pointers, byte lengths, and item sizes."""
+        """Return contiguous buffer pointers, byte lengths, and item sizes.
+
+        The PD transfer addresses the pool by *page* (upstream builds the same
+        triple from ``_kv_buffer_descs`` via ``item_len_bytes(page_size)``), so
+        ``item_lens`` must be the bytes of one page. The two layouts created in
+        :meth:`_create_buffers` differ in what ``buffer[0]`` is:
+
+        * 3D NHD slot-row (``head_dim == v_head_dim``, the MiniMax sparse path):
+          ``buffer[0]`` is a single *token row*, so one page is ``page_size`` rows.
+        * 4D paged (``head_dim != v_head_dim``): ``buffer[0]`` is already a page.
+
+        Reporting the raw ``buffer[0].nbytes`` for the 3D layout made every PD
+        transfer advance one token row per page index, so the decode side only
+        received 1/``page_size`` of each page and generated garbage after the
+        prefill-produced first token.
+        """
+        page_rows = 1 if self.head_dim != self.v_head_dim else self.page_size
         kv_data_ptrs = [
             self._get_key_buffer(i).data_ptr()
             for i in range(self.start_layer, self.start_layer + self.layer_num)
@@ -172,10 +188,10 @@ class KunlunMHATokenToKVPool(MHATokenToKVPool):
             for i in range(self.start_layer, self.start_layer + self.layer_num)
         ]
         kv_item_lens = [
-            self._get_key_buffer(i)[0].nbytes
+            self._get_key_buffer(i)[0].nbytes * page_rows
             for i in range(self.start_layer, self.start_layer + self.layer_num)
         ] + [
-            self._get_value_buffer(i)[0].nbytes
+            self._get_value_buffer(i)[0].nbytes * page_rows
             for i in range(self.start_layer, self.start_layer + self.layer_num)
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens

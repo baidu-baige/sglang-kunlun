@@ -3,7 +3,8 @@
 Side effects on import:
 1. Triton driver pre-shim (backend="cuda") for fla platform detection.
 2. Imports attention_registry (registers kunlun / kunlun_compressed / kunlun_nsa).
-3. Imports nsa, fla submodules for hook side effects.
+3. Imports kunlun_vision_backend (QKV_BACKEND_IMPL['xpu_attn']), nsa, fla
+   submodules for hook side effects.
 4. Imports vision (registers the ``kunlun`` multimodal attention backend and
    widens ``--mm-attention-backend`` choices).
 """
@@ -22,6 +23,7 @@ _kunlun_pre_shim()
 # Submodules with their own hook / setattr-time side effects.
 from . import attention_registry  # noqa: E402,F401
 from . import kunlun_deepseek_v4_backend  # noqa: E402,F401
+from . import kunlun_vision_backend  # noqa: E402,F401
 from . import nsa  # noqa: E402,F401
 from . import dsv4  # noqa: E402,F401
 from . import fla  # noqa: E402,F401

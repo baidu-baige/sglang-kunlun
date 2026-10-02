@@ -16,6 +16,26 @@ logger = logging.getLogger(__name__)
 
 
 @plugin_hook(
+    "sglang.srt.mem_cache.kv_cache_dtype.configure_kv_cache_dtype",
+    type=HookType.AROUND,
+)
+def configure_kv_cache_dtype_kunlun(original_fn, **kwargs):
+    """把 `--kv-cache-dtype fp16` 解析成 `torch.float16`。
+
+    昆仑的 DSV4 池子是 fp16/bf16 的"半 cache"（见下面 `dsv4_create_buffer_kunlun`），
+    所以本平台跑 fp16 KV cache。上游的解析表没有 fp16 分支，会落到
+    `raise ValueError(f"Unsupported kv_cache_dtype: ...")`，因此在这里拦掉。字符串槽返回
+    None —— 上游用 None 表示未量化池（auto 分支就不设这个标记，backend 靠它判断是否 descale）。
+
+    配套改动：`sitecustomize.py` 把 fp16 加回 argparse choices；`platform/srt.py` 在上游
+    DeepSeek-V4 hook 断言这个值时先换成 bfloat16、跑完再声明回来。
+    """
+    if kwargs.get("server_args_kv_cache_dtype") == "fp16":
+        return None, torch.float16
+    return original_fn(**kwargs)
+
+
+@plugin_hook(
     "sglang.srt.mem_cache.allocator.paged.PagedTokenToKVPoolAllocator.alloc_decode",
     type=HookType.REPLACE,
 )
@@ -135,6 +155,57 @@ def _alloc_2m_aligned(total_bytes: int, dtype: torch.dtype, device: str):
 
 
 @plugin_hook(
+    "sglang.srt.model_executor.pool_configurator.DSV4PoolConfigurator.__init__",
+    type=HookType.AFTER,
+)
+def dsv4_pool_configurator_kv_bytes_kunlun(result, self, kvc):
+    """按昆仑半 cache 的槽位大小定 DSV4 各池子的容量。
+
+    `DSV4PoolConfigurator` 自己算 `kv_bytes = qk_nope + qk_rope*2 + 8`（448+128+8=584 B，
+    N 卡 FlashMLA 的 fp8 nope + bf16 rope + ue8m0 scale 打包），**从不问 pool 的
+    `get_bytes_per_token()`**，所以上面那个 `dsv4_get_bytes_per_token_kunlun` 影响不到容量。
+    昆仑一个槽位是 `(qk_nope + qk_rope)` 个 fp16 元素 = 1024 B，比它大 1.75 倍，于是
+    configurator 发的 token 额度是实际能装下的 1.72 倍（`bytes_per_full_token` 口径
+    3966 → 应为 6826，full_token 5804544 → 3372544）。表现是 `--mem-fraction-static 0.75`
+    在建池阶段 OOM（0.6 只是踩着卡的物理上限侥幸过关），以及 `full token usage` 恒为 0.00。
+
+    上游自己的 bf16 latent 池就是 `attn_head_dim * 2`（`self._unified` 分支），这里取同一个值。
+
+    0.5.19 已把容量计算收拢为 `bytes_per_full_token`，不再保存
+    `self.kv_bytes` / `_spec_infl` 等旧字段。因此这里在构造完成后只修正
+    `bytes_per_full_token` 中与 KV 槽位相关的那一项，保持 indexer/state
+    的上游计算不变。
+    """
+    if self.kv_cache_dtype_str not in ("fp16", "float16", "bf16", "bfloat16"):
+        return result
+    if getattr(self, "_unified", False):
+        return result  # unified KV 本来就按 bf16 latent 定容量
+
+    del kvc
+    old_kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+    new_kv_bytes = (self.qk_nope_head_dim + self.qk_rope_head_dim) * 2
+    kv_coeff = (
+        self.swa_ratio * self.num_layers_total
+        + (1 / (4 * self.c4_shrink_factor)) * self.num_layers_ca4
+        + (1 / 128) * self.num_layers_ca128
+    )
+    delta = (new_kv_bytes - old_kv_bytes) * kv_coeff
+    if self.is_speculative:
+        target_layers = self.num_layers_total
+        delta *= (target_layers + 1) / target_layers
+    self.bytes_per_full_token += delta
+
+    logger.info(
+        "Kunlun half-cache DSV4 pool sizing: kv_bytes %d -> %d, "
+        "bytes_per_full_token %.2f",
+        old_kv_bytes,
+        new_kv_bytes,
+        self.bytes_per_full_token,
+    )
+    return result
+
+
+@plugin_hook(
     "sglang.srt.mem_cache.deepseek_v4_memory_pool.DeepSeekV4IndexerPool._create_buffer",
     type=HookType.AROUND,
 )
@@ -216,3 +287,21 @@ def compress_state_alloc_kv_score_buffer_kunlun(
                 )
             )
     self.kv_score_buffer.clear()
+
+
+@plugin_hook(
+    "sglang.srt.mem_cache.memory_pool.MambaPool._should_fuse_slot_ops",
+    type=HookType.AROUND,
+)
+def disable_fused_mamba_slot_ops(original_fn, self) -> bool:
+    """Disable fused slot operations only on the Kunlun platform.
+
+    Returns:
+        ``False`` on Kunlun so the upstream Torch clear/copy fallback runs;
+        ``True`` elsewhere so native fused operations remain unchanged.
+    """
+    from sglang.srt.platforms import current_platform
+
+    if getattr(current_platform, "device_name", None) == "kunlun":
+        return False
+    return original_fn(self)
