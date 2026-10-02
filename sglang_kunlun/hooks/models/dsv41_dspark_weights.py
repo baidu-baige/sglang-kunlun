@@ -96,6 +96,10 @@ def load_weights_around_kunlun(original_fn, self, weights):
     """load_weights_around_kunlun"""
     import os
 
+    from sglang_kunlun.hooks.speculative.dspark_precision import (
+        _strip_correction_blocks,
+    )
+
     params_dict = dict(self.named_parameters())
 
     # Parameters registered on the draft include the bf16 placeholders for the
@@ -115,9 +119,8 @@ def load_weights_around_kunlun(original_fn, self, weights):
     stats: Optional[dict] = (
         {} if os.environ.get("DSV4_KUNLUN_DIAG_DSPARK_W") == "1" else None
     )
-    result = original_fn(
-        self, dequantize_unmatched_int8_attn(weights, params_dict, remap, stats)
-    )
+    weights = _strip_correction_blocks(self, weights)
+    result = original_fn(self, dequantize_unmatched_int8_attn(weights, params_dict, remap, stats))
     if stats is not None:
         print(
             "[diag-dspark-w] "

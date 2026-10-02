@@ -28,14 +28,19 @@ def _enable_kunlun_attention_choice(module) -> None:
                 if "fp16" not in choices:
                     choices.append("fp16")
                 appended = True
-        if (
-            not appended
-            and isinstance(raw_annotation, str)
-            and "'fp16'" not in raw_annotation
-            and raw_annotation.rstrip().endswith("]")
-        ):
-            stripped = raw_annotation.rstrip()
-            annotations["kv_cache_dtype"] = stripped[:-1] + ", 'fp16']"
+        if not appended and isinstance(raw_annotation, str):
+            choices_start = raw_annotation.find("choices=[")
+            choices_end = raw_annotation.find("]", choices_start)
+            if (
+                choices_start >= 0
+                and choices_end > choices_start
+                and "'fp16'" not in raw_annotation[choices_start:choices_end]
+            ):
+                annotations["kv_cache_dtype"] = (
+                    raw_annotation[:choices_end]
+                    + ", 'fp16'"
+                    + raw_annotation[choices_end:]
+                )
     except Exception:
         pass
 
