@@ -6151,16 +6151,104 @@ def _hisparse_load_cache_to_device_buffer(
         f"dsv4={is_dsv4_layout} record_plan={miss_src is not None}"
     )
 
+    # DSV4 TARGET_VERIFY has multiple rows for the same request.  Their
+    # newest tokens and top-k sets are different, so the request-level
+    # reserved slot and the per-column LRU update cannot represent them
+    # safely.  Use a stable, row-owned slot range for the whole call.
+    Kd = top_k
+    rids = req_pool_indices.to(torch.int64).clamp(0, max_slots - 1)
+    seq_l = seq_lens.to(torch.int64).reshape(batch_size, 1)
+    real = (
+        torch.arange(batch_size, device=device) < num_real_scalar
+    ).reshape(batch_size, 1)
+    k_row = torch.arange(Kd, dtype=torch.int64, device=device).reshape(1, Kd)
+    tok = top_k_tokens.to(torch.int64)
+    dev_loc = device_buffer_locs[rids]
+    host_row = host_cache_locs[rids]
+
+    if is_dsv4_layout:
+        # Rows belonging to one request are contiguous after
+        # repeat_interleave in the backend.  Each row gets Kd stable slots.
+        row_id = torch.arange(batch_size, dtype=torch.int64, device=device)
+        boundary = torch.ones(batch_size, dtype=torch.bool, device=device)
+        if batch_size > 1:
+            boundary[1:] = rids[1:] != rids[:-1]
+        run_start = torch.cummax(
+            torch.where(boundary, row_id, torch.zeros_like(row_id)), dim=0
+        ).values
+        row_rank = row_id - run_start
+        max_rows = max(1, hot // Kd)
+        row_overflow = row_rank >= max_rows
+        safe_rank = row_rank.clamp(0, max_rows - 1)
+        row_slot = safe_rank.reshape(batch_size, 1) * Kd + k_row
+        row_slot = row_slot.clamp(0, hot - 1)
+
+        newest = seq_l - 1
+        valid = (
+            real
+            & ~row_overflow.reshape(batch_size, 1)
+            & (tok >= 0)
+            & (k_row < seq_l)
+        )
+        is_newest = valid & (tok == newest)
+        cold_valid = valid & ~is_newest
+        tok_host = tok.clamp(0, host_stride - 1)
+        row_locs = torch.gather(dev_loc, 1, row_slot).to(torch.int32)
+        newest_locs = dev_loc[:, hot].reshape(batch_size, 1).expand(
+            batch_size, Kd
+        ).to(torch.int32)
+        top_k_device_locs.copy_(
+            torch.where(
+                is_newest,
+                newest_locs,
+                torch.where(valid, row_locs, neg_one),
+            )
+        )
+
+        write_slot = torch.where(cold_valid, row_slot, scratch_idx)
+        write_val = torch.where(cold_valid, tok, neg_one.to(torch.int64)).to(
+            device_buffer_tokens.dtype
+        )
+        device_buffer_tokens[
+            rids.reshape(batch_size, 1).expand(batch_size, Kd), write_slot
+        ] = write_val
+
+        if miss_src is not None:
+            miss_src.zero_()
+            miss_dst.zero_()
+            miss_count.zero_()
+
+        if not skip_io:
+            src_locs = torch.gather(host_row, 1, tok_host).reshape(-1)
+            dst_locs = row_locs.to(torch.int64).reshape(-1)
+            valid_flat = cold_valid.reshape(-1)
+            dev_scratch = dst_locs.new_full(
+                (), device_buffer.shape[0] * _HISPARSE_DSV4_PAGE_SIZE - 1
+            )
+            host_scratch = src_locs.new_full(
+                (), host_cache.shape[0] * _HISPARSE_DSV4_PAGE_SIZE - 1
+            )
+            _hisparse_copy_items(
+                host_cache,
+                device_buffer,
+                torch.where(valid_flat, src_locs, host_scratch),
+                torch.where(valid_flat, dst_locs, dev_scratch),
+                item_size_bytes,
+                is_dsv4_layout,
+            )
+
+        lru_all[rids] = lru_pos
+        lru_slots.copy_(lru_all.to(lru_slots.dtype))
+        return
+
     # ================= vectorized planner (batch folded into dim 0) =================
     # The row loop above launched batch x ~15 ops over hot-sized tensors every
     # decode step; folding the batch into dim 0 turns that into one op per stage
     # (~6x fewer XPU kernel launches).  Bit-exact vs the loop on distinct-rid
     # inputs; rows sharing a rid (DSPARK verify) write identical values so the
     # duplicate index_put is order-independent.  See doc/hisparse_perf_opt.md.
-    Kd = top_k
-    rids = req_pool_indices.to(torch.int64).clamp(0, max_slots - 1)          # (B,)
-    seq_l = seq_lens.to(torch.int64).reshape(batch_size, 1)                   # (B,1)
-    real = (torch.arange(batch_size, device=device) < num_real_scalar).reshape(batch_size, 1)
+    # The common path below handles non-DSV4 requests with distinct request
+    # ids and keeps the original LRU planner semantics.
     use_fast = torch.logical_or(torch.logical_not(real), seq_l <= hot)        # (B,1)
     long_active = torch.logical_not(use_fast)                                 # (B,1)
     k_row = k_ids.reshape(1, Kd)                                              # (1,K)

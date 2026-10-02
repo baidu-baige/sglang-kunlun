@@ -18,7 +18,7 @@
 """
 
 from __future__ import annotations
-import re
+
 import logging
 import re
 
@@ -120,6 +120,68 @@ def _rejected_locs(batch, num_draft: int):
     return loc.view(bs, num_draft)
 
 
+def _backup_committed_c4_positions(*, batch, prefix_lens, new_seq_lens, num_draft, model_runner):
+    """Back up every newly committed DSV4 C4 row after DSPARK verify."""
+    coordinator = getattr(model_runner, "hisparse_coordinator", None)
+    if coordinator is None or not getattr(coordinator, "is_dsv4_hisparse", False):
+        return
+    if int(getattr(coordinator, "compress_ratio", 0)) != 4:
+        return
+    if new_seq_lens is None:
+        return
+    out_cache_loc = getattr(batch, "out_cache_loc", None)
+    bs = batch.req_pool_indices.numel()
+    if out_cache_loc is None or out_cache_loc.numel() != bs * num_draft:
+        return
+    prefix_cpu = prefix_lens.detach().cpu().tolist()
+    new_seq_cpu = new_seq_lens.detach().cpu().tolist()
+    req_pool_cpu = batch.req_pool_indices.detach().cpu().tolist()
+    loc_2d = out_cache_loc.view(bs, num_draft)
+    allocator = model_runner.token_to_kv_pool_allocator
+    mem_pool_device = coordinator.mem_pool_device
+    source_locs, host_locs = [], []
+    for row, (prefix, new_seq, req_idx) in enumerate(
+        zip(prefix_cpu, new_seq_cpu, req_pool_cpu, strict=True)
+    ):
+        for position in range(int(prefix), min(int(new_seq), int(prefix) + num_draft)):
+            if (position + 1) % 4 != 0:
+                continue
+            offset = position - int(prefix)
+            full_loc = loc_2d[row, offset : offset + 1]
+            compressed_loc = allocator.get_last_loc_compressed(full_loc)
+            source_loc = mem_pool_device._translate_loc_to_hisparse_device(
+                compressed_loc
+            )
+            compressed_pos = (position + 1) // 4 - 1
+            host_loc = coordinator.mem_pool_host.alloc_paged_token_slots(
+                coordinator.req_to_host_pool,
+                coordinator.req_to_host_pool_allocated_len,
+                req_idx,
+                compressed_pos,
+                1,
+            )
+            source_locs.append(source_loc)
+            host_locs.append(host_loc)
+    if not source_locs:
+        return
+    source_locs = torch.cat(source_locs)
+    host_locs = torch.cat(host_locs)
+    coordinator.wait_for_pending_backup()
+    device_module = torch.get_device_module(model_runner.device)
+    schedule_stream = device_module.current_stream()
+    with device_module.stream(coordinator.decode_backup_stream):
+        coordinator.decode_backup_stream.wait_stream(schedule_stream)
+        if coordinator.decode_producer_stream is not None:
+            coordinator.decode_backup_stream.wait_stream(
+                coordinator.decode_producer_stream
+            )
+        coordinator.mem_pool_host.backup_from_device_all_layer(
+            mem_pool_device, host_locs, source_locs, io_backend="kernel"
+        )
+        coordinator._backup_done_event.record()
+    coordinator._has_pending_backup = True
+
+
 @plugin_hook(
     "sglang.srt.speculative.dspark_components.dspark_worker_v2.DSparkWorkerV2."
     "_commit_target_mamba_states_after_verify",
@@ -149,10 +211,8 @@ def clear_unaccepted_compress_states_kunlun(result, self, *args, **kwargs):
     kvcache = allocator.get_kvcache()
     num_draft = int(self.verify_num_draft_tokens)
 
-    # 迁自 baidu-baige/sglang-kunlun#4 "optimize dsv4 ops & cache clear"（0.5.17，精度已验证）：
-    # verify 后的 c4/c128 未接受态清理是冗余的（未接受槽位下轮会被覆盖），去掉以省 decode 开销。
-    clear_c128 = None  # getattr(kvcache, "clear_unaccepted_c128_draft_states", None)
-    clear_c4 = None  # getattr(kvcache, "clear_unaccepted_c4_states", None)
+    clear_c128 = getattr(kvcache, "clear_unaccepted_c128_draft_states", None)
+    clear_c4 = getattr(kvcache, "clear_unaccepted_c4_states", None)
     # 接线自检，每个 rank 只打一次：这个 hook 的各条提前 return 都是静默的，
     # 尤其 clear_c4 取不到（说明 _install_c4_state_clear 没生效）会让清理退回空转，
     # 而空转正是当初那个 bug 的形态。所以要把两个能力的解析结果都打出来。
@@ -178,6 +238,13 @@ def clear_unaccepted_compress_states_kunlun(result, self, *args, **kwargs):
         offsets = torch.arange(num_draft, device=loc_2d.device).reshape(1, num_draft)
         rejected = offsets >= keep
         clear_c4(loc_2d, mask=rejected)
+    _backup_committed_c4_positions(
+        batch=batch,
+        prefix_lens=seq_lens_pre_verify,
+        new_seq_lens=kwargs.get("seq_lens_post_verify"),
+        num_draft=num_draft,
+        model_runner=self.target_worker.model_runner,
+    )
     return result
 
 
@@ -334,15 +401,6 @@ def _strip_correction_blocks(model, weights):
         logger.info(
             "[DSPARK_R1] 已挂上 %d 个旋转补偿矩阵: %s", len(found), ", ".join(sorted(found))
         )
-
-
-@plugin_hook(
-    "sglang.srt.models.deepseek_v4_dspark.DeepseekV4ForCausalLMDSpark.load_weights",
-    type=HookType.AROUND,
-)
-def load_dspark_correction_blocks_kunlun(original_fn, self, weights, *args, **kwargs):
-    """补偿矩阵不是注册参数，先从权重流里摘出来挂好，剩下的交给上游 loader。"""
-    return original_fn(self, _strip_correction_blocks(self, weights), *args, **kwargs)
 
 
 @plugin_hook(

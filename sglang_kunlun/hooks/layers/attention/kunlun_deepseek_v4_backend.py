@@ -303,12 +303,12 @@ class KunlunDSV4AttnMetadata(DSV4AttnMetadata):
             return
         # V4.1 low-ratio (1/2) sparse top-k buffers. The indexer fills them in
         # place; the attention op reads them as (slot, -1-padded) extra indices.
-        for ratio, lengths in (
-            (1, self.c1_topk_lengths_clamp1),
-            (2, self.c2_topk_lengths_clamp1),
-        ):
-            if ratio not in self.low_ratios:
-                continue
+        for ratio in self.low_ratios:
+            # 0.5.19's upstream metadata has only c4/c128 fields.  The
+            # c1/c2 fields exist only on the V4.1 low-ratio metadata layout,
+            # so do not even evaluate those attributes for the V4-Flash
+            # ratio set (0/4/128).
+            lengths = getattr(self, f"c{ratio}_topk_lengths_clamp1", None)
             assert lengths is not None, (
                 f"present low ratio {ratio} without its topk lengths"
             )
@@ -644,6 +644,24 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # The Kunlun metadata builder was written against the 4.1 field names.
+        # 0.5.19's upstream backend still exposes the same values as
+        # ``c4_topk`` and does not publish ratio tuples on the backend object.
+        # Normalize the compatibility fields once at construction time.
+        self.index_topk = getattr(self, "index_topk", self.c4_topk)
+        ratios = tuple(
+            getattr(self.model_runner.model_config, "compress_ratios", ())
+        )
+        if not ratios:
+            ratios = tuple(
+                getattr(
+                    self.model_runner.model_config.hf_text_config,
+                    "compress_ratios",
+                    (),
+                )
+            )
+        self.present_ratios = tuple(sorted(set(ratios)))
+        self.low_ratios = tuple(r for r in (1, 2) if r in self.present_ratios)
         self._verify_row_lod_aux = {}
         self._attention_decode_aux = {}
         self._attention_graph_extend_aux = {}
@@ -1003,7 +1021,12 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             raw_indices = core_metadata.c4_sparse_raw_indices
 
         if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
-            upstream_indexer.topk_transform_pytorch_vectorized(
+            topk_transform = getattr(
+                upstream_indexer,
+                "topk_transform_pytorch_vectorized",
+                upstream_indexer.topk_transform_512_pytorch_vectorized,
+            )
+            topk_transform(
                 logits,
                 c4_seq_lens,
                 page_table,
@@ -1012,16 +1035,32 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 raw_indices,
             )
         elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
-            upstream_indexer.topk_transform_paged_v2(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                indexer_metadata.topk_metadata,
-            )
+            topk_transform = getattr(upstream_indexer, "topk_transform_paged_v2", None)
+            if topk_transform is None:
+                upstream_indexer.topk_transform_512_pytorch_vectorized(
+                    logits,
+                    c4_seq_lens,
+                    page_table,
+                    c4_sparse_page_indices,
+                    indexer_metadata.c4_page_size,
+                    raw_indices,
+                )
+            else:
+                topk_transform(
+                    logits,
+                    c4_seq_lens,
+                    page_table,
+                    c4_sparse_page_indices,
+                    indexer_metadata.c4_page_size,
+                    indexer_metadata.topk_metadata,
+                )
         else:
-            upstream_indexer.topk_transform_paged(
+            topk_transform = getattr(
+                upstream_indexer,
+                "topk_transform_paged",
+                upstream_indexer.topk_transform_512_pytorch_vectorized,
+            )
+            topk_transform(
                 logits,
                 c4_seq_lens,
                 page_table,
@@ -1042,12 +1081,18 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 swap_seq_lens = indexer_metadata.c4_seq_lens
                 rows = raw_indices.size(0)
                 n_reqs = swap_req_indices.size(0)
+                real_rows = n_reqs
                 if rows > n_reqs and n_reqs > 0 and rows % n_reqs == 0:
                     per_req = rows // n_reqs
                     swap_req_indices = swap_req_indices.repeat_interleave(per_req)
                     if swap_seq_lens.size(0) == n_reqs:
                         swap_seq_lens = swap_seq_lens.repeat_interleave(per_req)
-                hisparse_coordinator.num_real_reqs.fill_(rows)
+                    real_rows = n_reqs * per_req
+                # ``rows`` is the captured tensor shape and includes graph
+                # padding.  Only the expanded live request rows are real.
+                # Keep this scalar stable across C4-layer re-entry.
+                if not capture_enabled:
+                    hisparse_coordinator.num_real_reqs.fill_(real_rows)
                 core_metadata.c4_sparse_page_indices = (
                     hisparse_coordinator.swap_in_selected_pages(
                         req_pool_indices=swap_req_indices,
@@ -1146,7 +1191,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         # bounded-replay feature is on. That path also needs `swa_out_cache_loc`
         # and write-loc plumbing the Kunlun op does not have, so fail loudly
         # instead of silently approximating it.
-        assert self.token_to_kv_pool.request_window is None, (
+        assert getattr(self.token_to_kv_pool, "request_window", None) is None, (
             "4.1 request-window (encoder SWA bounded replay) is not supported by "
             "the Kunlun DSV4 backend"
         )
@@ -1196,10 +1241,14 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             page_table=(page_table // self.page_size).to(torch.int32),
             swa_page_indices=swa_page_indices,
             swa_topk_lengths=torch.clamp(seq_lens_casual, max=upstream.SWA_WINDOW),
-            index_topk=self.index_topk,
-            present_ratios=self.present_ratios,
-            low_ratios=self.low_ratios,
+            c4_sparse_topk=self.index_topk,
         )
+        # 0.5.19 keeps the upstream dataclass constructor contract
+        # (``c4_sparse_topk``); the 4.1 compatibility fields are consumed by
+        # KunlunDSV4AttnMetadata.init_flashmla_related().
+        metadata.index_topk = self.index_topk
+        metadata.present_ratios = self.present_ratios
+        metadata.low_ratios = self.low_ratios
         # Apply the effective-length contract after construction as well;
         # this keeps the value correct if upstream metadata initialization resets it.
         metadata.swa_topk_lengths = swa_topk_lengths
@@ -1275,10 +1324,11 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             page_table=(page_table // self.page_size).to(torch.int32),
             swa_page_indices=swa_page_indices,
             swa_topk_lengths=swa_topk_lengths,
-            index_topk=self.index_topk,
-            present_ratios=self.present_ratios,
-            low_ratios=self.low_ratios,
+            c4_sparse_topk=self.index_topk,
         )
+        metadata.index_topk = self.index_topk
+        metadata.present_ratios = self.present_ratios
+        metadata.low_ratios = self.low_ratios
         metadata.swa_topk_lengths = swa_topk_lengths
         metadata.c4_sparse_topk_lengths = None
         metadata.c4_sparse_page_indices = None
@@ -2525,41 +2575,3 @@ def _dense_fp4_indexer_usable() -> bool:
     except Exception:  # noqa: BLE001 - 任何导入失败都说明不可用
         return False
     return True
-
-
-@plugin_hook(
-    "sglang.srt.layers.attention.deepseek_v4_backend.DeepseekV4AttnBackend."
-    "_low_ratio_index_topk_dense",
-    type=HookType.AROUND,
-)
-def low_ratio_index_topk_dense_kunlun(
-    original_fn, self, layer, x, q_lora, pos, forward_batch, q_lens, q_lens_cpu
-):
-    """CP 预填索引器在昆仑上改走上游的纯 torch 实现。"""
-    if _dense_fp4_indexer_usable():
-        return original_fn(self, layer, x, q_lora, pos, forward_batch, q_lens, q_lens_cpu)
-
-    if not getattr(upstream, "_kunlun_dense_indexer_warned", False):
-        upstream._kunlun_dense_indexer_warned = True
-        logging.getLogger(__name__).warning(
-            "低 ratio 预填索引器：dense fp4（deep_gemm fp8_fp4_mqa_logits）不可用，"
-            "改用上游 _low_ratio_index_topk_torch。SGLANG_DSV41_TORCH_PREFILL_INDEXER=%s，"
-            "本次请求 %d 个（本地）请求、%d 行。",
-            envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get(),
-            len(q_lens_cpu),
-            int(x.shape[0]),
-        )
-
-    # `req` 必须是**全局请求池下标**，不能是 batch 内序号 ——
-    # torch 版会拿它去索引 `self.req_to_token[r, j * ratio]` 取该请求的压缩 K 行，
-    # 用 batch 内序号会读错请求 → 稀疏索引全错 → 输出乱码。
-    # 上游 `dsv41_sparse.token_req_indices` 的语义就是
-    # `repeat_interleave(req_pool_indices, 每请求行数)`；CP 下这里要用**本地**
-    # 每请求行数（`q_lens_cpu`，= `interleave_rows_per_request(extend_seq_lens_cpu,
-    # attn_cp_rank, attn_cp_size)`），因为本 rank 只算自己的行、且按请求连续排列。
-    req = torch.repeat_interleave(
-        forward_batch.req_pool_indices.to(torch.int64),
-        torch.as_tensor(q_lens_cpu, device=x.device, dtype=torch.int64),
-        output_size=int(x.shape[0]),
-    )
-    return self._low_ratio_index_topk_torch(layer, x, q_lora, req, pos)

@@ -21,6 +21,30 @@ logger = logging.getLogger(__name__)
 
 
 @plugin_hook(
+    "sglang.srt.model_executor.model_runner.ModelRunner._forward_raw",
+    type=HookType.AROUND,
+)
+def _set_dsv4_hisparse_real_rows(original_fn, self, forward_batch, *args, **kwargs):
+    """Keep TARGET_VERIFY HiSparse padding separate from live verify rows.
+
+    ``ForwardBatch.batch_size`` is request-count based, while DSV4 TARGET_VERIFY
+    expands each request to ``num_tokens_per_req`` query rows.  The graph runner
+    pads the row tensors to the captured shape, so using the tensor shape as the
+    HiSparse ``num_real_reqs`` count makes padded rows participate in swap-in and
+    corrupts speculative acceptance.
+    """
+    coordinator = getattr(self, "hisparse_coordinator", None)
+    if (
+        coordinator is not None
+        and forward_batch.forward_mode.is_target_verify()
+    ):
+        spec_info = getattr(forward_batch, "spec_info", None)
+        rows_per_req = int(getattr(spec_info, "num_tokens_per_req", 1) or 1)
+        coordinator.num_real_reqs.fill_(forward_batch.batch_size * rows_per_req)
+    return original_fn(self, forward_batch, *args, **kwargs)
+
+
+@plugin_hook(
     "sglang.srt.model_executor.model_runner.ModelRunner.maybe_init_hisparse_coordinator",
     type=HookType.AROUND,
 )

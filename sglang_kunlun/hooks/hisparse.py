@@ -71,6 +71,11 @@ def _grow_hisparse_row_buffers(original_fn, self, *args, **kwargs):
     draft = int(get_spec().speculative_num_draft_tokens or 1)
     slots = self.req_to_token_pool.req_to_token.shape[0]
     rows = slots * max(1, draft)
+    if getattr(self, "is_dsv4_hisparse", False) and draft > 1:
+        # TARGET_VERIFY now uses a row-owned stable-slot path.  A shared-index
+        # plan is request-row based and cannot safely replay this multi-row
+        # miss set, so keep correctness on the synchronous path.
+        self.enable_prefetch = False
     if rows <= self.top_k_device_locs_buffer.shape[0]:
         return
 
@@ -163,4 +168,3 @@ def _skip_host_register_for_hisparse_cold_pool(original_fn, self, *args, **kwarg
     if pool_name == _HISPARSE_COLD_POOL:
         kwargs["pin_memory"] = False
     return original_fn(self, *args, **kwargs)
-
