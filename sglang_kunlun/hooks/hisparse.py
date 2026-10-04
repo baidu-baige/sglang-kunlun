@@ -268,6 +268,55 @@ def _hisparse_decode_capacity_logical_only(original_fn, self, *args, **kwargs):
 
 
 # ---------------------------------------------------------------------------
+# HiSparse available-size: report the LOGICAL (host-backed) capacity, not the
+# small C4 DEVICE hot-cache.
+#
+# ``DeepSeekV4HiSparseTokenToKVPoolAllocator.available_size()`` /
+# ``full_available_size()`` return
+#   min(logical_attn_allocator.available_size(),
+#       hisparse_attn_allocator.available_size() * compress_ratio)
+# The second term is the C4 *device* pool -- a hot cache sized at only
+# ``c4_size`` (10896) compressed slots, i.e. ``c4_size * compress_ratio`` (43584)
+# logical tokens, while the real compressed KV is host-backed at
+# ``c4_logical_size`` (87168, = host_to_device_ratio x device) == the full
+# logical pool. The device term therefore pins the min() at ~43584 regardless of
+# true usage, so the scheduler's pool stats read ``full token usage ~= 0.88``
+# even at ``#running-req: 1`` with the C4 device pool 2-4% used (observed
+# 2026-10-04). That misleads every consumer that reads available_size()/usage to
+# decide admission, so concurrency is throttled far below what the host-backed
+# pool can hold.
+#
+# The C4 *device* pool is a swap cache (pages are brought in on demand by the
+# coordinator), NOT the token-capacity limit; the per-request *device buffer*
+# reservation -- the thing the device pool actually bounds -- is enforced
+# separately by the coordinator's alloc_device_buffer and by
+# --max-running-requests. So report the logical pool for the token-capacity
+# views and let concurrency be bounded by max-running-requests. Mirrors the
+# decode-capacity gate above.
+# ---------------------------------------------------------------------------
+@plugin_hook(
+    "sglang.srt.mem_cache.allocator.hisparse.DeepSeekV4HiSparseTokenToKVPoolAllocator.available_size",
+    type=HookType.AROUND,
+)
+def _hisparse_available_size_logical_only(original_fn, self, *args, **kwargs):
+    try:
+        return self.logical_attn_allocator.available_size()
+    except Exception:
+        return original_fn(self, *args, **kwargs)
+
+
+@plugin_hook(
+    "sglang.srt.mem_cache.allocator.hisparse.DeepSeekV4HiSparseTokenToKVPoolAllocator.full_available_size",
+    type=HookType.AROUND,
+)
+def _hisparse_full_available_size_logical_only(original_fn, self, *args, **kwargs):
+    try:
+        return self.logical_attn_allocator.full_available_size()
+    except Exception:
+        return original_fn(self, *args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
 # HiSparse C4 compressed-KV DEVICE-POOL LEAK fix (root cause of the repeated
 # "Prefill out of memory, available 0" crashes).
 #
