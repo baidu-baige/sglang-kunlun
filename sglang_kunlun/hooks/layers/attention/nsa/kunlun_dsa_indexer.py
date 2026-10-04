@@ -26,11 +26,20 @@ new semantics here, rather than diffing this file.
 
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
+import os
+
 import torch
 import kunlun_ops
 from einops import rearrange
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+
+# Experimental DSA prefix attention-sink: number of leading positions to pin
+# into the selected top-k, and the additive logit boost that guarantees it.
+# ``DSV4_HISPARSE_PREFIX_SINK`` tokens, 0 = disabled (default). See the sink
+# block in ``_get_topk_paged``.
+_PREFIX_SINK = int(os.environ.get("DSV4_HISPARSE_PREFIX_SINK", "0"))
+_PREFIX_SINK_BOOST = 1.0e4
 
 try:
     from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
@@ -365,6 +374,24 @@ def _get_topk_paged(
     )
     
     logits = logits.reshape(-1, max_seq_len)
+
+    # --- DSA prefix "attention sink" (experimental, env-gated) --------------
+    # DSV4-Flash's DSA indexer selects only ``index_topk`` (=512) positions per
+    # query. Once a request's sequence exceeds 512 tokens, the prompt-prefix --
+    # which carries global format instructions ("no commas", "all lowercase") --
+    # scores low against the content-generation query and is dropped from the
+    # selected set, so the model forgets the constraint. Empirically ifeval
+    # format-constraint cases fail 0%->100% as the output grows past ~512 total
+    # tokens, while gsm8k/longbench (content, not format) are unaffected.
+    #
+    # Force the first ``_PREFIX_SINK`` positions (the prompt head, where the
+    # instruction usually sits) to always win selection by additively boosting
+    # their indexer logits. Additive keeps invalid (-inf) positions excluded and
+    # preserves ordering among the sunk prefix. Decode only; off unless the env
+    # var is set, so it is a clean A/B.
+    if _PREFIX_SINK > 0 and logits.shape[1] > 0:
+        sink = min(_PREFIX_SINK, logits.shape[1])
+        logits[:, :sink] += _PREFIX_SINK_BOOST
 
     # ``topk_transform`` maps the selected positions through
     # ``attn_metadata.page_table_1``, which is padded per request just like the
