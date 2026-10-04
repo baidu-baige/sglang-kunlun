@@ -268,6 +268,137 @@ def _hisparse_decode_capacity_logical_only(original_fn, self, *args, **kwargs):
 
 
 # ---------------------------------------------------------------------------
+# HiSparse C4 compressed-KV DEVICE-POOL LEAK fix (root cause of the repeated
+# "Prefill out of memory, available 0" crashes).
+#
+# ``DeepSeekV4HiSparseTokenToKVPoolAllocator.free_full()`` frees the logical
+# pool but NOT the C4 compressed-KV device slots (``hisparse_attn_allocator``).
+# So every completed request leaks its C4 device slots: the decode-batch
+# ``#gpu token`` usage climbs monotonically across a run (observed 0.16 -> 1.00
+# over ~400 ifeval requests at #running-req=1, #prealloc-req=0) until the C4
+# device pool is full, after which ``alloc_extend`` returns None and
+# ``alloc_paged_token_slots_extend`` fail-louds -> scheduler exit -3. Short
+# prompts (gsm8k/ifeval) finish many requests quickly and hit the wall fast;
+# long prompts (longbench) finish few and usually complete before leaking out.
+#
+# The sibling non-SWA allocator's ``free()`` already releases BOTH pools
+# (``logical_attn_allocator.free`` + ``self.free_hisparse``). The SWA-hybrid
+# allocator's ``free_full`` path simply omitted the ``free_hisparse`` call.
+# Mirror it: after the logical full-free actually happens (immediate path),
+# release the mapped C4 device slots. Deferred frees are re-driven through
+# ``free_full`` by ``free_group_end`` with ``free_group=None``, so they land
+# here too and are released on flush.
+# ---------------------------------------------------------------------------
+@plugin_hook(
+    "sglang.srt.mem_cache.allocator.hisparse.DeepSeekV4HiSparseTokenToKVPoolAllocator.free_full",
+    type=HookType.AROUND,
+)
+def _hisparse_free_full_release_c4(original_fn, self, free_indices, *args, **kwargs):
+    original_fn(self, free_indices, *args, **kwargs)
+    try:
+        if free_indices is None or free_indices.numel() == 0:
+            return
+        # Only release C4 device slots once the logical free has actually been
+        # applied (immediate path); the deferred path re-enters here on flush.
+        if getattr(self, "free_group", None) is None:
+            self.free_hisparse(free_indices)
+    except Exception:
+        # Never let the leak-fix break the free path.
+        pass
+
+
+# Same C4 leak, the ``free()`` path: completed requests mostly release through
+# ``free()`` (not ``free_full``), and it too drops only the logical slots. Mirror
+# the sibling non-SWA allocator (whose single ``free`` releases both pools) by
+# also releasing the mapped C4 device slots. ``free_hisparse`` is idempotent
+# (clears the full->hisparse mapping and filters indices<=0), so SWA-only indices
+# with no C4 mapping are a safe no-op.
+@plugin_hook(
+    "sglang.srt.mem_cache.allocator.hisparse.DeepSeekV4HiSparseTokenToKVPoolAllocator.free",
+    type=HookType.AROUND,
+)
+def _hisparse_free_release_c4(original_fn, self, free_index, *args, **kwargs):
+    original_fn(self, free_index, *args, **kwargs)
+    try:
+        if free_index is None or free_index.numel() == 0:
+            return
+        if getattr(self, "free_group", None) is None:
+            self.free_hisparse(free_index)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# DSV4 HiSparse C4 device-pool leak: release the request's orphaned C4 pages at
+# completion, BEFORE the coordinator clears the full->hisparse mapping.
+#
+# The per-step spec-decode allocation (``alloc_for_spec_decode`` -> hisparse
+# ``alloc_extend``) maps a fresh C4 device page for each draft token.  The DSV4
+# decode remap (``map_last_loc_to_buffer``) only re-points the *newest* entry at
+# the request's fixed device-buffer slot; the other draft pages keep their
+# freshly allocated mapping.  On completion the coordinator clears the whole
+# request's mapping (``full_to_hisparse_device_index_mapping[compressed_locs]=0``)
+# *before* ``release_kv_cache`` reaches ``allocator.free_full``/``free`` -- so by
+# the time the (leak-fix) free hooks run, the mapping is already zero and
+# ``free_hisparse`` is a no-op.  Those C4 pages are therefore never returned:
+# measured 2026-10-04 the C4 device pool drains monotonically (~20 tokens per
+# short ifeval request), exhausting the full/32-sized C4 pool after a few hundred
+# requests and fail-louding the scheduler in ``alloc_for_spec_decode``.
+#
+# Free them here instead, while the mapping is still live, excluding the device
+# buffer slots (freed separately by the coordinator's own ``request_finished``,
+# so re-freeing them would double-free).  A request's slots are dead at this
+# point, so -- unlike the mid-flight remap -- this is safe.
+#
+# Ordering matters: the coordinator's ``request_finished`` first waits for the
+# decode producer stream and any pending backup (its own lines ~891-893) before
+# it releases anything, because the previous overlapped batch may still be
+# reading this request's KV.  So *capture* the orphan set up front (the mapping
+# is still populated) but *free* it only after the original returns, i.e. after
+# that synchronisation.  Freeing before it (as an earlier revision did) races
+# the in-flight forward and corrupts generation.
+# ---------------------------------------------------------------------------
+@plugin_hook(
+    "sglang.srt.managers.hisparse_coordinator.HiSparseCoordinator.request_finished",
+    type=HookType.AROUND,
+)
+def _hisparse_free_orphan_c4_on_finish(original_fn, self, req, *args, **kwargs):
+    orphan = None
+    try:
+        if getattr(self, "is_dsv4_hisparse", False):
+            import torch
+
+            mapping = self.mem_pool_device.full_to_hisparse_device_index_mapping
+            allocated_len = int(req.kv.kv_allocated_len)
+            if allocated_len > 0:
+                locs = self.req_to_token_pool.req_to_token[
+                    req.kv.req_pool_idx, :allocated_len
+                ]
+                compressed_locs = (
+                    self.mem_pool_device.translate_loc_from_full_to_compressed(locs)
+                )
+                mapped = mapping[compressed_locs]
+                keep = mapped == 0
+                cap = int(self.req_device_buffer_size[req.kv.req_pool_idx])
+                if cap > 0:
+                    devbuf = self.req_to_device_buffer[req.kv.req_pool_idx, :cap]
+                    keep = keep | torch.isin(mapped, devbuf)
+                orphan = torch.unique(mapped[~keep])
+    except Exception:
+        orphan = None
+
+    out = original_fn(self, req, *args, **kwargs)
+
+    try:
+        if orphan is not None and orphan.numel() > 0:
+            self.token_to_kv_pool_allocator.free_hisparse_indices(orphan)
+    except Exception:
+        # Never let the leak-fix break request teardown.
+        pass
+    return out
+
+
+# ---------------------------------------------------------------------------
 # HiSparse PD-decode admission: bound by the DEVICE logical pool, not the
 # host-backed capacity.
 #
