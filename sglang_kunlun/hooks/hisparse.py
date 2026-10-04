@@ -168,3 +168,166 @@ def _skip_host_register_for_hisparse_cold_pool(original_fn, self, *args, **kwarg
     if pool_name == _HISPARSE_COLD_POOL:
         kwargs["pin_memory"] = False
     return original_fn(self, *args, **kwargs)
+
+
+@plugin_hook(
+    "sglang.srt.managers.hisparse_coordinator.HiSparseCoordinator.admit_request_direct",
+    type=HookType.AROUND,
+)
+def _admit_request_direct_fake_safe(original_fn, self, req):
+    """Make the PD-warmup fake-bootstrap request admit safely under HiSparse.
+
+    The boot-time PD disaggregation warmup posts one ``FAKE_BOOTSTRAP_HOST``
+    request per DP rank.  ``admit_request_direct`` assumes a real RDMA'd host
+    pool entry; the fake request has none, so ``_preload_to_device_buffer``
+    reads uninitialised ``req_to_host_pool`` indices.  Under DP attention this
+    desyncs the ranks and the warmup all_gather dead-locks (observed
+    2026-10-03: ranks split between ``all_gather`` and ``recv_requests``,
+    ``num_running_reqs == 0``, zero warmup POSTs completing).
+
+    For a fake request we only allocate the device buffer and leave its tokens
+    marked resident, so the swap-in reads on-device (zero) KV, the forward
+    emits a token, and the DP warmup all_gather completes.  Real requests
+    (``bootstrap_host != FAKE_BOOTSTRAP_HOST``) take the original path
+    untouched, so eval-time accuracy is unaffected.
+    """
+    try:
+        from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+    except Exception:
+        return original_fn(self, req)
+
+    if getattr(req, "bootstrap_host", None) == FAKE_BOOTSTRAP_HOST:
+        self.alloc_device_buffer(req)
+        req.hisparse_staging = False
+        try:
+            self._skip_first_backup[req.kv.req_pool_idx] = True
+        except Exception:
+            pass
+        logger.warning(
+            "sglang-kunlun: hisparse admit fast-path for fake-bootstrap warmup "
+            "req %s (on-device zeros, no host preload).",
+            getattr(req, "rid", "?"),
+        )
+        return None
+    return original_fn(self, req)
+
+
+# ---------------------------------------------------------------------------
+# HiSparse decode-capacity gate: use the logical pool, not the device buffer pool
+#
+# ``ScheduleBatch.check_decode_mem`` asks the allocator
+# ``check_decode_capacity(num_tokens)`` whether the next decode step fits, and on
+# a False it runs ``retract_decode`` -> ``release_req`` -> (PD decode) cpu_tensor
+# ``offload_kv_cache`` -> ``allocator.get_cpu_copy`` which is ``NotImplementedError``
+# for the HiSparse allocator -> scheduler crash (observed 2026-10-03 on the first
+# gsm8k batch).
+#
+# The base check is ``available_size() >= num_tokens``.  For
+# ``DeepSeekV4HiSparseTokenToKVPoolAllocator`` ``available_size()`` is
+# ``min(logical_attn_allocator.available_size(),
+#      hisparse_attn_allocator.available_size() * compress_ratio)``.  The second
+# term is the C4 *device-buffer* pool, which is an admission-time cache sized for
+# concurrency: once budget-many requests are admitted it is saturated by design,
+# so the min collapses to a tiny value and the gate fails *spuriously* -- even
+# though the next decode token is allocated only from the logical pool
+# (``alloc_decode`` -> ``logical_attn_allocator.alloc_decode``; the device buffer
+# is a fixed per-request ring reused via swap-in, never grown per step).
+#
+# Gate HiSparse decode on the logical pool only (same units as the base compare,
+# we just drop the device-buffer term from the min).  Non-HiSparse allocators are
+# untouched.  This removes the spurious retraction; genuine logical-pool pressure
+# still retracts as before.
+# ---------------------------------------------------------------------------
+@plugin_hook(
+    "sglang.srt.mem_cache.allocator.base.BaseTokenToKVPoolAllocator.check_decode_capacity",
+    type=HookType.AROUND,
+)
+def _hisparse_decode_capacity_logical_only(original_fn, self, *args, **kwargs):
+    try:
+        from sglang.srt.mem_cache.allocator.hisparse import (
+            DeepSeekV4HiSparseTokenToKVPoolAllocator,
+        )
+    except Exception:
+        return original_fn(self, *args, **kwargs)
+
+    if not isinstance(self, DeepSeekV4HiSparseTokenToKVPoolAllocator):
+        return original_fn(self, *args, **kwargs)
+
+    num_tokens = kwargs.get("num_tokens")
+    if num_tokens is None and args:
+        num_tokens = args[0]
+    tree_cache = kwargs.get("tree_cache")
+    if tree_cache is None and len(args) > 1:
+        tree_cache = args[1]
+
+    try:
+        self.evict_to_free_tokens(tree_cache, num_tokens)
+    except Exception:
+        pass
+    return self.logical_attn_allocator.available_size() >= num_tokens
+
+
+# ---------------------------------------------------------------------------
+# HiSparse PD-decode admission: bound by the DEVICE logical pool, not the
+# host-backed capacity.
+#
+# ``DecodePreallocQueue._check_if_req_exceed_kv_capacity`` aborts a bootstrapped
+# request only when it is larger than the admission capacity.  For HiSparse that
+# capacity is ``model_runner.max_token_pool_size`` -- the HOST-backed logical
+# capacity (host_to_device_ratio x the device pool), which is far larger than the
+# device logical pool actually used to grow KV each decode step
+# (``max_total_num_tokens`` = 131584 at mem-fraction 0.66).  So an over-long
+# longbench prompt (idx 89 ~590k, idx 117 ~220k tokens -- the prefill side runs at
+# the model's native 1048576 context and transfers the full KV) passes the host
+# check, is admitted, then overflows the device pool mid-decode inside
+# ``alloc_for_spec_decode`` and fail-louds the scheduler (observed 2026-10-04:
+# "Prefill out of memory ... allocate 256 tokens, available 0" -> scheduler exit -3
+# -> SIGTERM the server).  Such a prompt can NEVER fit the device pool with
+# generation headroom, so admission looping on it would also stall the whole eval.
+#
+# Bound HiSparse admission by the device pool minus the generation reserve
+# (SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION, the same headroom the prealloc gate
+# reserves) and abort the oversized request fast with BAD_REQUEST -- the eval
+# harness runs with --ignore-errors, so those few cases are recorded and skipped
+# instead of crashing the server.  Everything that CAN fit (<= device pool - reserve,
+# e.g. idx 160 ~102k) is left to the normal admission path untouched.
+# ---------------------------------------------------------------------------
+@plugin_hook(
+    "sglang.srt.disaggregation.decode.DecodePreallocQueue._check_if_req_exceed_kv_capacity",
+    type=HookType.AROUND,
+)
+def _hisparse_prealloc_capacity_device_bound(original_fn, self, req, *args, **kwargs):
+    import logging
+
+    logger = logging.getLogger("sglang_kunlun.hisparse")
+    try:
+        scheduler = getattr(self, "scheduler", None)
+        if scheduler is None or not getattr(scheduler, "enable_hisparse", False):
+            return original_fn(self, req, *args, **kwargs)
+
+        device_capacity = int(self.max_total_num_tokens)
+        # Reserve the full longbench generation (16384) + spec-draft slack, NOT the
+        # default CLIP (4096): a single admitted request grows by its generation, so
+        # input + full-gen must fit the device pool or it over-subscribes mid-decode.
+        reserve = 16896
+
+        input_len = int(self._rebootstrap_prefill_len(req))
+        if input_len + reserve > device_capacity:
+            from http import HTTPStatus
+
+            from sglang.srt.disaggregation.decode import prepare_abort
+
+            message = (
+                f"Request {req.rid} input ({input_len} tokens) + generation reserve "
+                f"({reserve}) exceeds the HiSparse decode DEVICE pool ({device_capacity}); "
+                f"it cannot be served without overflowing the pool. Aborting."
+            )
+            logger.error(message)
+            prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
+            scheduler.output_streamer.stream_output([req], req.return_logprob)
+            return True
+    except Exception:
+        # Never let the guard break admission -- fall back to upstream behaviour.
+        return original_fn(self, req, *args, **kwargs)
+
+    return original_fn(self, req, *args, **kwargs)
