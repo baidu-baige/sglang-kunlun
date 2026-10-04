@@ -96,18 +96,23 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
         if getattr(server_args, "page_size", None) is None:
             server_args.page_size = 128
 
-        # HiSparse's swap-in copies KV from pinned host memory using host-side
-        # index tensors, which a captured decode CUDA graph cannot express (the
-        # indices are only materialised after replay).  Run the hisparse decode
-        # eagerly until the device-side swap-in lands.
-        if getattr(server_args, "enable_hisparse", False) and not getattr(
+        # The device-side swap-in has landed: ``move_cold_pool_to_device``
+        # re-homes the hisparse cold pool onto the XPU, so planning, LRU and the
+        # copy are all plain device indexing and the decode graph can capture
+        # them.  Forcing eager here would ALSO break the swap-in: the fast
+        # ``hisparse_copy_items`` XPU op requires ``src.device == dst.device``,
+        # and the torch fallback indexes with plan rows that the eager path
+        # leaves uninitialised (observed 2026-10-03 as
+        # ``IndexError: index 99186171877734160 is out of bounds`` inside
+        # ``copy_items``).  Keep the captured path, which is what the HiSparse
+        # work summary validated (cuda graph=True, 64/64 concurrent prompts).
+        if getattr(server_args, "enable_hisparse", False) and getattr(
             server_args, "disable_cuda_graph", False
         ):
-            server_args.disable_cuda_graph = True
             logging.getLogger(__name__).warning(
-                "sglang-kunlun: --enable-hisparse forces eager decode "
-                "(--disable-cuda-graph); the swap-in host copy cannot be "
-                "captured yet."
+                "sglang-kunlun: --enable-hisparse with --disable-cuda-graph is "
+                "unsupported; the device-resident cold pool swap-in needs the "
+                "captured decode graph."
             )
 
         # DeepSeek-V4's upstream defaults run after this hook and select

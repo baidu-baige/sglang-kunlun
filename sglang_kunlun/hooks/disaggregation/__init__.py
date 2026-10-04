@@ -78,3 +78,64 @@ plugin_hook(
     "sglang.srt.disaggregation.prefill.PrefillBootstrapQueue._init_kv_manager",
     type=HookType.AROUND,
 )(_kunlun_init_kv_manager_around)
+
+
+# ---------------------------------------------------------------------------
+# HiSparse + real-PD decode warmup
+#
+# The boot-time PD disaggregation warmup posts ``dp_size`` fake-bootstrap
+# requests (``FAKE_BOOTSTRAP_HOST``) straight into the decode transfer queue.
+# With ``--enable-hisparse`` those requests hit ``admit_request_direct`` /
+# ``_preload_to_device_buffer``, which assume a real RDMA'd host-pool entry; a
+# fake request has none, so some DP ranks never produce their warmup token and
+# the DP-attention all_gather in ``get_next_disagg_decode_batch_to_run``
+# dead-locks (py-spy 2026-10-03: ranks split between ``all_gather`` and
+# ``recv_requests``, ``num_running_reqs == 0``, zero warmup POSTs completed).
+#
+# The decode CUDA graph is already captured before warmup runs, so the only
+# thing the warmup still does is flip ``server_status`` to ``Up``.  When
+# ``DSV4_HS_SKIP_PD_WARMUP=1`` we return success without sending the fake
+# requests; readiness is then proven by the pipeline's real router smoke
+# (a genuine prefill -> decode request), which is a stronger gate than the
+# fake-bootstrap self-warmup it replaces.
+# ---------------------------------------------------------------------------
+import os as _os
+
+
+@plugin_hook(
+    "sglang.srt.entrypoints.http_server._send_disaggregation_warmup_requests",
+    type=HookType.AROUND,
+)
+async def _skip_hisparse_pd_warmup(original_fn, *args, **kwargs):
+    # Decide from the http-server process's own global state, which is where
+    # this warmup runs. Env vars do not propagate to sglang's tokenizer workers
+    # (verified 2026-10-03), and the ``memory`` runtime namespace may not be
+    # published in that process, so read enable_hisparse off the live
+    # TokenizerManager's server_args, with get_memory() as a fallback.
+    enabled = False
+    try:
+        from sglang.srt.entrypoints import http_server as _hs
+
+        gs = getattr(_hs, "_global_state", None)
+        sa = getattr(getattr(gs, "tokenizer_manager", None), "server_args", None)
+        if sa is not None:
+            enabled = bool(getattr(sa, "enable_hisparse", False))
+    except Exception:
+        enabled = False
+    if not enabled:
+        try:
+            from sglang.srt.runtime_context import get_memory
+
+            enabled = bool(get_memory().enable_hisparse)
+        except Exception:
+            enabled = False
+    if enabled:
+        from sglang.srt.runtime_context import get_parallel
+
+        dp_size = get_parallel().dp_size
+        logger.warning(
+            "sglang-kunlun: skipping fake-bootstrap PD warmup for HiSparse "
+            "decode (graph already captured); router smoke will gate readiness."
+        )
+        return [200] * dp_size
+    return await original_fn(*args, **kwargs)
