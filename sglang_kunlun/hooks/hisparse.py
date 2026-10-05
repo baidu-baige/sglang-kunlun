@@ -448,6 +448,54 @@ def _hisparse_free_orphan_c4_on_finish(original_fn, self, req, *args, **kwargs):
 
 
 # ---------------------------------------------------------------------------
+# HiSparse device-buffer stale-resident-slot fix (root cause of runaway /
+# repetition degeneration on DSV4 HiSparse).
+#
+# ``HiSparseCoordinator.alloc_device_buffer`` marks the WHOLE device buffer
+# resident for the swap-in kernel (req_device_buffer_tokens[:, idx, :dbs] =
+# arange(dbs)), but a DSV4 request only has ``compressed_len`` (= prompt_len //
+# compress_ratio, ~20-150) real compressed tokens; slots [compressed_len:dbs]
+# are leftovers from whatever PREVIOUS request reused this per-request buffer
+# row. Marking them resident makes the swap-in treat another request's stale
+# compressed KV as cache hits, so decode attends to garbage and runs away:
+# 47/541 ifeval cases degenerate to the 8192-token cap (well-formed JSON then
+# "2.2.2.2..."), while the dense baseline finishes in 100-2000 tokens.
+# REFERENCE_C4/ATTN/topk do NOT help -- the bug is coordinator bookkeeping.
+#
+# Keep only the real ``compressed_len`` slots resident; reset the rest to -1
+# (not cached -> swap-in loads from host). DSV4 decode keeps generated tokens on
+# host + the single reserved slot, so slots past the prompt are genuinely
+# non-resident. Verified 2026-10-05: 9/9 sampled runaway cases finish with
+# `stop` at baseline-matching lengths (3506 1781/1766, 3724 126/124, 1127
+# 360/343); 10/10 good short cases unchanged.
+# ---------------------------------------------------------------------------
+@plugin_hook(
+    "sglang.srt.managers.hisparse_coordinator.HiSparseCoordinator.alloc_device_buffer",
+    type=HookType.AROUND,
+)
+def _hisparse_mark_only_real_resident_slots(original_fn, self, req, *args, **kwargs):
+    out = original_fn(self, req, *args, **kwargs)
+    try:
+        if not getattr(self, "is_dsv4_hisparse", False):
+            return out
+        allocated_len = int(req.extend_range.end)
+        if allocated_len <= 0:
+            return out
+        compressed = self.mem_pool_device.translate_loc_from_full_to_compressed(
+            self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :allocated_len]
+        )
+        dbs = int(self.device_buffer_size)
+        resident = min(int(compressed.numel()), dbs)
+        if resident < dbs:
+            self.req_device_buffer_tokens[
+                :, req.kv.req_pool_idx, resident:dbs
+            ] = -1
+    except Exception:
+        pass
+    return out
+
+
+# ---------------------------------------------------------------------------
 # HiSparse PD-decode admission: bound by the DEVICE logical pool, not the
 # host-backed capacity.
 #
