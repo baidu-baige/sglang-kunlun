@@ -6115,6 +6115,7 @@ def _hisparse_load_cache_to_device_buffer(
     miss_dst: Optional[torch.Tensor],
     miss_count: Optional[torch.Tensor],
     skip_io: bool,
+    backed_up_len: Optional[torch.Tensor] = None,
 ) -> None:
     """Torch-native replacement for ``load_cache_to_device_buffer{,_dsv4}_mla``."""
     batch_size, top_k = top_k_tokens.shape
@@ -6165,6 +6166,8 @@ def _hisparse_load_cache_to_device_buffer(
     tok = top_k_tokens.to(torch.int64)
     dev_loc = device_buffer_locs[rids]
     host_row = host_cache_locs[rids]
+    # Host slot backing each selected position (-1 == never backed up).
+    src_host_early = torch.gather(host_row, 1, tok.clamp(0, host_stride - 1))
 
     if is_dsv4_layout:
         # Rows belonging to one request are contiguous after
@@ -6183,15 +6186,51 @@ def _hisparse_load_cache_to_device_buffer(
         row_slot = safe_rank.reshape(batch_size, 1) * Kd + k_row
         row_slot = row_slot.clamp(0, hot - 1)
 
+        # Row-owned slot ranges need hot >= rows_per_req * Kd.  The production
+        # config has hot == Kd == 512, so max_rows == 1 and every DSPARK verify
+        # row but the first was dropped (locs = -1), i.e. 11 of 12 rows attended
+        # to nothing.  Whenever the whole compressed sequence fits the hot
+        # window, a token's slot is simply its own id (alloc_device_buffer seeds
+        # tokens[j] = j), and that mapping is request-level: all rows of the
+        # request can share it, exactly like the generic planner's fast path
+        # below.  Fall back to the row-owned ranges only past the hot window.
+        fits = seq_l <= hot
+        row_slot = torch.where(fits, tok.clamp(0, hot - 1), row_slot)
+
         newest = seq_l - 1
         valid = (
             real
-            & ~row_overflow.reshape(batch_size, 1)
+            & (row_overflow.reshape(batch_size, 1).logical_not() | fits)
             & (tok >= 0)
             & (k_row < seq_l)
         )
+        # Causal bound on the SELECTED POSITION (tok is the compressed position,
+        # seq_l the row's compressed length).  The sparse attention consumes raw
+        # device locs with no per-row causal mask, so without this a verify row
+        # attends to tokens it has not produced yet.
+        valid = valid & (tok < seq_l)
+        # Non-fits only: drop attended entries with NO host backing.  Past the
+        # hot window a token's device slot is its top-k RANK, not its position,
+        # so an un-backed-up entry would read a slot still holding a recycled
+        # position's KV.  The fits regime must NOT be gated (there slot ==
+        # position, so the untouched slot is already correct).
+        valid = valid & ((src_host_early >= 0) | fits)
+        # The newest compressed position has no host copy yet (advance registers
+        # it at the next step's prepare) and its device-buffer slot is one of
+        # alloc_device_buffer's spare slots, i.e. recycled residue.  Route it to
+        # the reserved slot instead, which the coordinator points at the real
+        # mapped location.
         is_newest = valid & (tok == newest)
+
         cold_valid = valid & ~is_newest
+        # Per-request watermark of compressed positions actually backed up to
+        # host.  An attended entry with tok >= wm has no host refresh this step,
+        # so its device-buffer slot may still hold a recycled request's KV.
+        wm = (
+            backed_up_len.to(torch.int64)[rids].reshape(batch_size, 1)
+            if backed_up_len is not None
+            else None
+        )
         tok_host = tok.clamp(0, host_stride - 1)
         row_locs = torch.gather(dev_loc, 1, row_slot).to(torch.int32)
         newest_locs = dev_loc[:, hot].reshape(batch_size, 1).expand(
@@ -6205,8 +6244,17 @@ def _hisparse_load_cache_to_device_buffer(
             )
         )
 
-        write_slot = torch.where(cold_valid, row_slot, scratch_idx)
-        write_val = torch.where(cold_valid, tok, neg_one.to(torch.int64)).to(
+        # Mark a slot resident only where its data was actually copied in.
+        # The host-loc guard above suppresses the copy for positions that have
+        # no host backing, but the token table was still being stamped for them
+        # -- so the next step saw "slot holds token tok" while the slot still
+        # held whatever the PREVIOUS owner of that recycled pool slot left.
+        # Benign on the first pass after a boot (slots are zero) and poison on
+        # every later pass, which is exactly the measured collapse pattern.
+        src_host_mark = torch.gather(host_row, 1, tok_host)
+        cold_loaded = cold_valid & (src_host_mark >= 0)
+        write_slot = torch.where(cold_loaded, row_slot, scratch_idx)
+        write_val = torch.where(cold_loaded, tok, neg_one.to(torch.int64)).to(
             device_buffer_tokens.dtype
         )
         device_buffer_tokens[
@@ -6219,9 +6267,30 @@ def _hisparse_load_cache_to_device_buffer(
             miss_count.zero_()
 
         if not skip_io:
-            src_locs = torch.gather(host_row, 1, tok_host).reshape(-1)
+            src_host = torch.gather(host_row, 1, tok_host)
+            src_locs = src_host.reshape(-1)
             dst_locs = row_locs.to(torch.int64).reshape(-1)
-            valid_flat = cold_valid.reshape(-1)
+            # A compressed position only has a host copy once it has been backed
+            # up; ``req_to_host_pool`` holds -1 until then.  Copying from loc -1
+            # reads out of bounds and OVERWRITES the device-buffer slot that is
+            # about to be attended to with garbage (observed sporadically on
+            # real decodes, ~20-60 per 100 steps per DP rank -- exactly the
+            # "occasional repeat collapses" shape of the ifeval regression).
+            # Entries without a host copy are already correct in the device
+            # buffer (alloc_device_buffer seeds slot j with token j and staging
+            # filled it), so the right action is to skip the copy, not to clamp
+            # the address.
+            copy_mask = cold_valid & (src_host >= 0)
+            if wm is not None:
+                # Refresh a slot from host ONLY when that position was actually
+                # backed up.  req_to_host_pool is page-granular, so an
+                # un-backed-up position still carries a >=0 loc whose page holds
+                # the previous owner's KV; copying it overwrites the correctly
+                # preloaded device-buffer slot with foreign data.  The entry is
+                # still attended (from the device buffer), unlike the refuted
+                # "drop the entry" arm.
+                copy_mask = copy_mask & (tok < wm)
+            valid_flat = copy_mask.reshape(-1)
             dev_scratch = dst_locs.new_full(
                 (), device_buffer.shape[0] * _HISPARSE_DSV4_PAGE_SIZE - 1
             )
@@ -6388,6 +6457,7 @@ def hisparse_load_cache_to_device_buffer_dsv4_mla(
     miss_dst: Optional[torch.Tensor] = None,
     miss_count: Optional[torch.Tensor] = None,
     skip_io: bool = False,
+    backed_up_len: Optional[torch.Tensor] = None,
 ) -> None:
     """DSv4 hisparse swap-in (page-padded device + page-padded host C4)."""
     _hisparse_load_cache_to_device_buffer(
@@ -6409,6 +6479,7 @@ def hisparse_load_cache_to_device_buffer_dsv4_mla(
         miss_dst=miss_dst,
         miss_count=miss_count,
         skip_io=skip_io,
+        backed_up_len=backed_up_len,
     )
 
 
@@ -6437,6 +6508,7 @@ def hisparse_load_cache_to_device_buffer_mla(
     miss_dst: Optional[torch.Tensor] = None,
     miss_count: Optional[torch.Tensor] = None,
     skip_io: bool = False,
+    backed_up_len: Optional[torch.Tensor] = None,
 ) -> None:
     """Generic MLA hisparse swap-in (linear device + linear host stride)."""
     _hisparse_load_cache_to_device_buffer(
@@ -6458,6 +6530,7 @@ def hisparse_load_cache_to_device_buffer_mla(
         miss_dst=miss_dst,
         miss_count=miss_count,
         skip_io=skip_io,
+        backed_up_len=backed_up_len,
     )
 
 
