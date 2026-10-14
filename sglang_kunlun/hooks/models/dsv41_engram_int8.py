@@ -125,11 +125,9 @@ class EngramEmbeddingKunlun(EngramEmbedding):
         self.weight_scale.weight_loader = self._load_rows
 
     def _init_host_table_int8(self, num_embeddings: int, dim: int, layer_id: int):
-        # Upstream dropped `_HostTable.choose_layout` and the per-call `pin`
-        # flag: the layout is taken straight from the env var ("shared" or
-        # "per_rank", the old "private"), and the mapping is always registered
-        # with cudaHostRegister. Mirror `EngramEmbedding._init_host_table`.
-        layout = envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get()
+        layout = engram_mod._HostTable.choose_layout(
+            envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get()
+        )
         n = num_embeddings if layout == "shared" else self.rows
         w_bytes = n * dim  # int8 payload
         s_bytes = n * 2  # one bf16 scale per row
@@ -138,6 +136,7 @@ class EngramEmbeddingKunlun(EngramEmbedding):
             max(1, w_bytes + s_bytes),  # mmap needs storage even for an empty shard
             f"sglang_engram_{layer_id}",
             get_tp_group(),
+            pin=envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN.get(),
         )
         raw = self.host_table.bytes[: w_bytes + s_bytes]
         weight = raw[:w_bytes].view(torch.int8).view(n, dim)

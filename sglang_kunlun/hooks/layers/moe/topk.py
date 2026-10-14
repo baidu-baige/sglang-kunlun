@@ -120,19 +120,8 @@ def select_experts_kunlun(
     layer_id: Optional[int] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
-    dynamic_expert_bias: Optional[torch.Tensor] = None,
 ) -> StandardTopKOutput:
     """select_experts"""
-    if dynamic_expert_bias is not None:
-        # Upstream's per-token routing bias (bailing_moe_v3's multi-gate). It
-        # replaces correction_bias but is [num_tokens, num_experts] rather than
-        # [num_experts], so the Kunlun grouped-topk kernels below cannot take
-        # it as-is. No DeepSeek checkpoint uses it; fail loudly instead of
-        # silently routing with a broadcast-mismatched bias.
-        raise NotImplementedError(
-            "dynamic_expert_bias (per-token routing bias) is not supported by "
-            "the Kunlun select_experts replacement"
-        )
     top_k = topk_config.top_k
     use_grouped_topk = topk_config.use_grouped_topk
     topk_group = topk_config.topk_group

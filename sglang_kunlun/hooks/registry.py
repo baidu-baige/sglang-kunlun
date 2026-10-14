@@ -40,9 +40,6 @@ DEBUG_HOOK_MODULES = (
     "debug.dsv4_mtp_nextn_probes",
     "debug.mtp_alignment_plugin",
     "debug.ragged_draft_attention_probe",
-    # T002: CP × MoE 四个观测点探针。只在 DSV41_CP_PROBE_DIR 设置时才注册 hook，
-    # 未设置时模块本身不 import torch/sglang、完全空转。
-    "debug.dsv41_cp_moe_probe",
 )
 
 
