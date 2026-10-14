@@ -15,7 +15,6 @@ Registered symbols:
     (XSpeedGate `fused_engram_gate_v2`, torch fallback for the inputs it rejects)
   * sglang.kernels.ops.embeddings.engram_gather.engram_gather
   * sglang.kernels.ops.embeddings.engram_hash.engram_hash_ids
-    (XSpeedGate `engram_hash_ids`, torch fallback for the inputs it rejects)
   * sglang.kernels.ops.embeddings.engram_hash.engram_hash_ids_and_commit
   * sglang.kernels.ops.embeddings.engram_hash.engram_commit_history
 """
@@ -28,11 +27,7 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 
-from sglang_kunlun.kernels.kernel_ops import (
-    note_op_path,
-    register_jit_op,
-    register_triton_op,
-)
+from sglang_kunlun.kernels.kernel_ops import register_jit_op, register_triton_op
 
 
 @register_jit_op("sglang.kernels.ops.layernorm.rmsnorm_fp32", "rmsnorm_fp32")
@@ -67,95 +62,6 @@ def c2_decode_pool_kunlun(
     *,
     ring_size: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Ratio-2 decode pair pooling and state update on the XSpeedGate kernel.
-
-    Replaces the whole launcher (`dsv4/pair_pool_decode.py:111`): the op
-    allocates `pooled` / `group_pos` / `slots` itself and updates the two state
-    halves in place, so the upstream `empty_like` trio disappears. Semantics
-    match `_pair_pool_decode_kernel` including the `raw_out_loc == 0` reroute to
-    `pad_row` and the `out_loc < 0 -> 0` slot clamp; verified element-exact
-    against the torch reference for ring_size 0 and > 0.
-
-    `ring_size` becomes positional at the op boundary: its schema takes it as
-    the tenth argument, while upstream declares it keyword-only.
-
-    The torch path below stays for the inputs the op rejects -- it is also the
-    only path when several rows share one state row, which the op's one-program-
-    per-row writes cannot order (upstream has one decode row per request, so
-    production never hits it).
-    """
-    if not _pair_pool_decode_kernel_usable(
-        kv, score, pos, raw_out_loc, out_loc, req, state_kv, state_score
-    ):
-        return _pair_pool_decode_torch(
-            kv, score, pos, raw_out_loc, out_loc, req, state_kv, state_score,
-            pad_row, ring_size=ring_size,
-        )
-
-    note_op_path("pair_pool_decode", "xspeedgate")
-    return torch.ops.xspeedgate_ops.pair_pool_decode(
-        kv.contiguous(),
-        score.contiguous(),
-        pos.contiguous(),
-        raw_out_loc.contiguous(),
-        out_loc.contiguous(),
-        req.contiguous(),
-        state_kv,
-        state_score,
-        pad_row,
-        ring_size,
-    )
-
-
-def _pair_pool_decode_kernel_usable(
-    kv: torch.Tensor,
-    score: torch.Tensor,
-    pos: torch.Tensor,
-    raw_out_loc: torch.Tensor,
-    out_loc: torch.Tensor,
-    req: torch.Tensor,
-    state_kv: torch.Tensor,
-    state_score: torch.Tensor,
-) -> bool:
-    """Whether the XSpeedGate op accepts these inputs verbatim.
-
-    Every condition is a dtype/layout the op pins rather than a capacity limit,
-    so a False here means the call site handed us something upstream's triton
-    kernel tolerates and the op does not -- fall back instead of raising.
-    """
-    if not (kv.is_cuda and state_kv.is_cuda):
-        return False
-    if kv.dtype != torch.float32 or score.dtype != torch.float32:
-        return False
-    if state_kv.dtype != torch.float32 or state_score.dtype != torch.float32:
-        return False
-    if pos.dtype != torch.int64 or req.dtype != torch.int64:
-        return False
-    # One location dtype instantiates both vectors in the op.
-    if raw_out_loc.dtype != out_loc.dtype:
-        return False
-    if raw_out_loc.dtype not in (torch.int32, torch.int64):
-        return False
-    if state_kv.size(1) and state_kv.stride(1) != 1:
-        return False
-    if state_score.size(1) and state_score.stride(1) != 1:
-        return False
-    return True
-
-
-def _pair_pool_decode_torch(
-    kv: torch.Tensor,
-    score: torch.Tensor,
-    pos: torch.Tensor,
-    raw_out_loc: torch.Tensor,
-    out_loc: torch.Tensor,
-    req: torch.Tensor,
-    state_kv: torch.Tensor,
-    state_score: torch.Tensor,
-    pad_row: int,
-    *,
-    ring_size: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Ratio-2 decode pair pooling and state update in torch.
 
     Mirrors `_c2_decode_pool_kernel` step for step. All state reads happen
@@ -164,7 +70,6 @@ def _pair_pool_decode_torch(
     per-program ordering. Softmax runs in fp32 with the same pair-axis order as
     `DeepseekV41Compressor.pool_pairs`.
     """
-    note_op_path("pair_pool_decode", "torch")
     kv = kv.contiguous().float()
     score = score.contiguous().float()
     n, _ = kv.shape
@@ -347,15 +252,7 @@ def _engram_gate_v2_usable(
     `x.dtype == kv.dtype`, bf16/fp32 weights sharing one dtype, everything
     contiguous and on the same device, `eps > 0`. Anything else keeps the torch
     path instead of tripping a TORCH_CHECK deep inside a forward.
-
-    The `hasattr` comes first because the op is newer than the deployed wheel:
-    `xspeedgate_ops-1.3.0` exports `engram_hash_ids` / `engram_gather` but not
-    `fused_engram_gate_v2`, and without this check a bf16 run would die with
-    `AttributeError: '_OpNamespace' ... has no attribute 'fused_engram_gate_v2'`
-    instead of falling back. Same guard style as `_dsv4_native_rope_supported`.
     """
-    if not hasattr(torch.ops.xspeedgate_ops, "fused_engram_gate_v2"):
-        return False
     if x.dtype is not kv.dtype or x.dtype not in _ENGRAM_GATE_V2_DTYPES:
         return False
     if q_weight.dtype is not k_weight.dtype or q_weight.dtype not in _ENGRAM_GATE_V2_DTYPES:
@@ -389,11 +286,9 @@ def fused_engram_gate_kunlun(
     inputs), since `engram_gate`'s own CUDA guard does not cover every caller.
     """
     if _engram_gate_v2_usable(x, kv, q_weight, k_weight, eps):
-        note_op_path("fused_engram_gate", "xspeedgate:fused_engram_gate_v2")
         return torch.ops.xspeedgate_ops.fused_engram_gate_v2(
             x, kv, q_weight, k_weight, eps, clamp_value
         )
-    note_op_path("fused_engram_gate", "torch")
     return _fused_engram_gate_torch(x, kv, q_weight, k_weight, eps, clamp_value)
 
 
@@ -423,178 +318,10 @@ def _fused_engram_gate_torch(
     return (xf + gate * value.unsqueeze(1)).to(x.dtype)
 
 
-_ENGRAM_HASH_INT_DTYPES = (torch.int32, torch.int64)
-# 与 wrapper/src/embedding/engram_hash_ids.cpp:26-29 的编译期 LM 上限一致。
-_EHI_MAX_N, _EHI_MAX_LN, _EHI_MAX_PH, _EHI_MAX_COL = 16, 256, 2048, 512
-
-
-def _engram_hash_ids_op_args(
-    input_ids: torch.Tensor,
-    positions: torch.Tensor,
-    *,
-    mode: int,
-    history: torch.Tensor,
-    token_map: torch.Tensor,
-    multipliers: torch.Tensor,
-    primes: torch.Tensor,
-    offsets: torch.Tensor,
-    num_real: "int | None",
-    req_slots: "torch.Tensor | None",
-    block: int,
-    row: "torch.Tensor | None",
-    starts: "torch.Tensor | None",
-) -> "tuple | None":
-    """Normalized (input_ids, positions, history, req_slots, row, starts) for the op,
-    or None when `xspeedgate_ops::engram_hash_ids` cannot serve this call.
-
-    The op's contract is `check_engram_hash_ids_args`
-    (`XSpeedGate/wrapper/src/embedding/engram_hash_ids.cpp:51`). Two kinds of
-    mismatch with the upstream call site are just dtype conventions and get cast
-    here — these are [T] / [bs] index vectors, so the copy is negligible:
-      * `positions` arrives int64 (`ForwardBatch.positions`), the op wants int32;
-      * `req_slots` is `req_pool_indices` (int32), the op wants int64.
-    Everything else (the int64 hash buffers, the LM-bound shape limits, the
-    device) is a hard requirement: on a miss we return None and the torch path
-    runs, rather than letting a TORCH_CHECK fire mid-forward.
-    """
-    if not input_ids.is_cuda or input_ids.dim() != 1 or positions.dim() != 1:
-        return None
-    if positions.shape[0] != input_ids.shape[0]:
-        return None
-    if history.dim() != 2 or multipliers.dim() != 2 or primes.dim() != 3:
-        return None
-    if offsets.dim() != 2 or token_map.dim() != 1:
-        return None
-    if input_ids.dtype not in _ENGRAM_HASH_INT_DTYPES:
-        return None
-    if history.dtype not in _ENGRAM_HASH_INT_DTYPES:
-        return None
-    for buf in (token_map, multipliers, primes, offsets):
-        if buf.dtype is not torch.int64 or not buf.is_contiguous():
-            return None
-        if buf.device != input_ids.device:
-            return None
-    if history.device != input_ids.device or not history.is_contiguous():
-        return None
-
-    num_layers, n = multipliers.shape
-    n_heads = primes.shape[2]
-    if n < 2 or n > _EHI_MAX_N or num_layers * n > _EHI_MAX_LN:
-        return None
-    if (n - 1) * n_heads > _EHI_MAX_COL:
-        return None
-    if num_layers * (n - 1) * n_heads > _EHI_MAX_PH:
-        return None
-    if mode not in (0, 1, 2):
-        return None
-    if mode == 1 and block < 1:
-        return None
-    if mode == 2 and (row is None or starts is None):
-        return None
-    if num_real is not None and not 0 <= num_real <= input_ids.shape[0]:
-        return None
-
-    # input_ids 与 history 必须同 dtype：history 是 int32（`init_history`），token id
-    # 恒在 int32 内，所以按 history 的 dtype 归一化，不会截断。
-    ids = input_ids.contiguous()
-    if ids.dtype is not history.dtype:
-        ids = ids.to(history.dtype)
-    pos = positions.to(torch.int32).contiguous()
-    slots = None if req_slots is None else req_slots.to(torch.int64).contiguous()
-    row_i = None if row is None else row.to(torch.int64).contiguous()
-    starts_i = None if starts is None else starts.to(torch.int64).contiguous()
-    return ids, pos, slots, row_i, starts_i
-
-
 @register_jit_op(
     "sglang.kernels.ops.embeddings.engram_hash", "engram_hash_ids"
 )
 def engram_hash_ids_kunlun(
-    input_ids: torch.Tensor,
-    positions: torch.Tensor,
-    *,
-    mode: int,
-    history: torch.Tensor,
-    token_map: torch.Tensor,
-    multipliers: torch.Tensor,
-    primes: torch.Tensor,
-    offsets: torch.Tensor,
-    pad_id: int,
-    num_real: "int | None" = None,
-    req_slots: "torch.Tensor | None" = None,
-    block: int = 1,
-    row: "torch.Tensor | None" = None,
-    starts: "torch.Tensor | None" = None,
-    image_token_id: "int | None" = None,
-    mm_pad_shift: int = 0,
-    block_t: int = 32,
-):
-    """Hash ids [T, L, (n-1)*H] int64 + predecessor table [T, n] int32.
-
-    Runs on `xspeedgate_ops::engram_hash_ids` (the production path, semantics
-    aligned with the upstream Triton kernel); `_engram_hash_ids_torch` stays as
-    the fallback for the calls the op's contract rejects. `block_t` is a Triton
-    launch-shape knob with no meaning for the XPU kernel.
-    """
-    args = _engram_hash_ids_op_args(
-        input_ids,
-        positions,
-        mode=mode,
-        history=history,
-        token_map=token_map,
-        multipliers=multipliers,
-        primes=primes,
-        offsets=offsets,
-        num_real=num_real,
-        req_slots=req_slots,
-        block=block,
-        row=row,
-        starts=starts,
-    )
-    if args is None:
-        note_op_path("engram_hash_ids", "torch")
-        return _engram_hash_ids_torch(
-            input_ids,
-            positions,
-            mode=mode,
-            history=history,
-            token_map=token_map,
-            multipliers=multipliers,
-            primes=primes,
-            offsets=offsets,
-            pad_id=pad_id,
-            num_real=num_real,
-            req_slots=req_slots,
-            block=block,
-            row=row,
-            starts=starts,
-            image_token_id=image_token_id,
-            mm_pad_shift=mm_pad_shift,
-            block_t=block_t,
-        )
-    ids, pos, slots, row_i, starts_i = args
-    note_op_path("engram_hash_ids", "xspeedgate:engram_hash_ids")
-    return torch.ops.xspeedgate_ops.engram_hash_ids(
-        ids,
-        pos,
-        mode,
-        history,
-        token_map,
-        multipliers,
-        primes,
-        offsets,
-        pad_id,
-        num_real,
-        slots,
-        block,
-        row_i,
-        starts_i,
-        image_token_id,
-        mm_pad_shift,
-    )
-
-
-def _engram_hash_ids_torch(
     input_ids: torch.Tensor,
     positions: torch.Tensor,
     *,
@@ -804,7 +531,6 @@ def engram_gather_kunlun(
     # (int8 payload + bf16 per-row scale). Otherwise it is the fp8 layout with
     # e8m0 scales, one per `block_size` elements (DIM // BLK per row).
     int8_layout = block_size == dim
-    note_op_path("engram_gather", "ctypes:int8" if int8_layout else "ctypes:fp8")
     w_t = np.zeros((n, dim), dtype=np.float32)
     s_t = np.zeros((n, 1 if int8_layout else nblocks), dtype=np.float32)
     u8 = ctypes.c_ubyte
