@@ -230,12 +230,19 @@ def flash_mla_with_kvcache_kunlun(*args, **kwargs):
     return _flash_mla_with_kvcache_reference(**kwargs)
 
 
-# ``get_paged_mqa_logits_metadata`` used to be replaced here with an empty
-# placeholder: the upstream JIT kernel needs C++20 ``std::bit_cast`` (gcc-11+
-# libstdc++) which this build env cannot provide, and the Kunlun c4 logits path
-# does not read ``deep_gemm_metadata``. XSpeedGate now ships the op, so the real
-# schedule is built in ``kernel_ops.get_paged_mqa_logits_metadata_kunlun`` and
-# no placeholder is needed.
+@plugin_hook(
+    "sglang.kernels.ops.attention.dsv4.attn.get_paged_mqa_logits_metadata",
+    type=HookType.REPLACE,
+)
+def _get_paged_mqa_logits_metadata_kunlun(seq_lens, page_size, num_sm):
+    """Kunlun: bypass sglang JIT compile of paged_mqa_metadata.cuh.
+
+    The upstream JIT kernel requires C++20 ``std::bit_cast`` (needs gcc-11+
+    libstdc++), which the current build env (gcc-10) cannot provide. The
+    downstream Kunlun path (``_compute_c4_logits_kunlun`` via XSpeedGate ops)
+    does not consume ``deep_gemm_metadata``, so an empty placeholder is safe.
+    """
+    return torch.empty(0, dtype=torch.int32, device=seq_lens.device)
 
 
 class KunlunDSV4AttnMetadata(DSV4AttnMetadata):
