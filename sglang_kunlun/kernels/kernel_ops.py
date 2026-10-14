@@ -1499,25 +1499,11 @@ def dsv4_compress_norm_rope_store_v2_kunlun(
     # 4.1 给每个 paged KV 写入都带上布局标记；昆仑池是 plain fp16/bf16 半 cache，
     # 对应上游的 V4 布局。
     layout=None,
-    # main added the fp8 two-pool ("unified KV") store: the packed pair goes to
-    # a separate rope pool instead of the single half cache.
-    fp8_2buff: bool = False,
-    kvcache_rope: Optional[torch.Tensor] = None,
 ) -> None:
     """Apply v2 post-compression transforms and store into Kunlun cache pages."""
 
     if use_fp4:
         raise NotImplementedError("FP4 indexer is not enabled for the Torch reference")
-    if fp8_2buff or kvcache_rope is not None:
-        # Only reachable with SGLANG_DSV4_UNIFIED_KV_FP8=1, which also needs the
-        # Triton unified-KV kernels. The Kunlun operator writes one plain
-        # fp16/bf16 half cache and has nowhere to put the rope pool, so refuse
-        # rather than silently dropping the rope half of every stored pair.
-        raise NotImplementedError(
-            "fp8 two-pool unified_kv store (fp8_2buff/kvcache_rope) is not "
-            "supported by the Kunlun compress store; run with "
-            "SGLANG_DSV4_UNIFIED_KV_FP8=0"
-        )
     _assert_v4_kv_layout(layout, "compress_norm_rope_store")
     plan_raw = plan[1].contiguous()
     if plan_raw.shape[0] == 0:
@@ -3224,7 +3210,6 @@ def moe_fused_gate_dsv4_kunlun(
     num_token_non_padded: Optional[torch.Tensor] = None,
     renormalize_epsilon: float = 0.0,
     packed_out: Optional[torch.Tensor] = None,
-    sqrtsoftplus_log1p: bool = False,
 ):
     """Match the monkey-patched DeepSeek-V4 fused MoE gate.
 
@@ -3248,15 +3233,6 @@ def moe_fused_gate_dsv4_kunlun(
             "packed_out (FlashInfer routed-MoE form) is not supported by the "
             "Kunlun fused gate"
         )
-    # `sqrtsoftplus_log1p` (True for every deepseek_v41 checkpoint) only selects
-    # how upstream's Triton kernel evaluates softplus: `log1p(exp(x))` guarded at
-    # x > 20, instead of the open-coded `max(x, 0) + log1p(exp(-|x|))`. Both are
-    # the same function to float32 rounding, and the second effect -- ranking
-    # NaNs first rather than last -- can only matter on a row whose logits are
-    # already NaN. The Kunlun `moe_fused_gate_dsv4` op computes sqrtsoftplus in
-    # its own stable form, which is what the validated V4.1 baseline ran with,
-    # so the flag is accepted and deliberately not forwarded.
-    del sqrtsoftplus_log1p
 
     if scoring_func == "sigmoid" and apply_routed_scaling_factor_on_output:
         # MiniMax-M3 contract (its only caller is the MiniMax sigmoid branch in
@@ -5504,9 +5480,9 @@ def fused_dsa_draft_extend_metadata(
 
 @register_triton_op(
     "sglang.kernels.ops.attention.dsa.cp_split",
-    "dsa_cp_interleave_q_seqs_kernel",
+    "dsa_cp_round_robin_split_q_seqs_kernel",
 )
-def dsa_cp_interleave_q_seqs_kernel(
+def dsa_cp_round_robin_split_q_seqs_kernel(
     in_seqs: torch.Tensor,
     out_seqs: torch.Tensor,
     bs_idx: torch.Tensor,
@@ -5529,7 +5505,7 @@ def dsa_cp_interleave_q_seqs_kernel(
     selected = torch.nonzero(per_seq > 0, as_tuple=False).flatten()
     if selected.numel() != out_seqs.numel():
         raise RuntimeError(
-            "dsa_cp_interleave_q_seqs: selected rows do not match the "
+            "dsa_cp_round_robin_split_q_seqs: selected rows do not match the "
             f"preallocated output ({selected.numel()} vs {out_seqs.numel()}; "
             f"tokens={tokens}, cp_size={cp_size}, cp_rank={cp_rank})"
         )

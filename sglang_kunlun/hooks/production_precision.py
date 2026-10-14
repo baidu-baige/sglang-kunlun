@@ -85,10 +85,8 @@ def initialize_non_online_compress_state_kunlun(
     enable_memory_saver,
     ratio,
     online=False,
-    request_scoped=False,
     swa_page_size=0,
     online_mtp_max_draft_tokens=0,
-    state_cache_page_size=1,
 ):
     """Initialize every non-online KV row and score sentinel, not only the last."""
     if not online:

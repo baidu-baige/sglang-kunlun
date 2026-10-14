@@ -212,34 +212,13 @@ def initialize_mqa_rope_policy_kunlun(result, self, config, *args, **kwargs):
     type=HookType.REPLACE,
 )
 def compute_q_b_kunlun(self, q, positions, q_out=None):
-    """Write Q norm/RoPE into contiguous local storage before a TP-slice copy.
-
-    The per-head RMSNorm is V4-only: V4.1 sets ``config.q_head_norm = False``
-    and upstream ``MQALayer._compute_q_b`` skips the norm entirely, applying
-    RoPE alone. This used to call the fused norm+RoPE unconditionally, so under
-    CP (the one arm that reaches this hook) every V4.1 layer normalized Q a
-    second time. Keep the predicate, with the same spelling as the plugin's
-    other q implementation (``hooks/models/deepseek_v4.py``): a missing
-    attribute means the V4 contract, i.e. do the norm.
-    """
-    from sglang.srt.models.deepseek_v4 import fused_q_norm_rope, fused_rope_inplace
+    """Write Q norm/RoPE into contiguous local storage before a TP-slice copy."""
+    from sglang.srt.models.deepseek_v4 import fused_q_norm_rope
 
     _dsv4_dump(self, "self_attn.wq_b.input.q_norm", q)
     q, _ = self.wq_b(q)
     _dsv4_dump(self, "self_attn.wq_b.output", q)
     q = q.view(-1, self.n_local_heads, self.head_dim)
-    if not getattr(self, "q_head_norm", True):
-        # RoPE-only arm, upstream-equivalent: rope `q` in place in the buffer
-        # `wq_b` just produced, then move it to the caller's (possibly
-        # strided) destination with a plain copy.
-        fused_rope_inplace(
-            q[..., -self.qk_rope_head_dim :], None, self.freqs_cis, positions=positions
-        )
-        _dsv4_dump(self, "self_attn.q_local_after_norm_rope", q)
-        if q_out is None:
-            return q
-        q_out.copy_(q)
-        return q_out
     local_q_out = torch.empty_like(q)
     fused_q_norm_rope(q, local_q_out, self.eps, self.freqs_cis, positions)
     _dsv4_dump(self, "self_attn.q_local_after_norm_rope", local_q_out)
