@@ -1499,6 +1499,23 @@ class KernelOpsTest(unittest.TestCase):
         self.assertEqual(empty.call_args_list[0].args, (12, 257))
         self.assertEqual(result, (values, indices))
 
+    def test_weak_ref_tensor_is_bound_and_falls_back(self):
+        """sgl_kernel.weak_ref_tensor must be the real Kunlun stand-in, not the
+        auto-stub: breakable CUDA graph calls it to alias capture-pool tensors
+        without owning them. Non-CUDA input has no array interface, so the
+        fallback must hand the tensor back unchanged (address-correct)."""
+        from sglang_kunlun.bootstrap import sgl_kernel_stub
+
+        sgl_kernel_stub.install()
+        import sgl_kernel
+
+        self.assertTrue(callable(sgl_kernel.weak_ref_tensor))
+        self.assertNotIsInstance(sgl_kernel.weak_ref_tensor, sgl_kernel_stub._StubModule)
+
+        cpu_tensor = torch.ones(4)
+        self.assertIs(sgl_kernel.weak_ref_tensor(cpu_tensor), cpu_tensor)
+        self.assertIs(sgl_kernel.weak_ref_tensor("not a tensor"), "not a tensor")
+
     def test_register_all_installs_kernel_ops(self):
         registry = importlib.import_module("sglang_kunlun.hooks.registry")
         with mock.patch(
