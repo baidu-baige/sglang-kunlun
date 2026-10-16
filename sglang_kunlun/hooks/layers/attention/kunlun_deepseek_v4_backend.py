@@ -22,6 +22,9 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4MultiStepBackend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
@@ -407,6 +410,24 @@ def _dsa_prefill_cp_enabled() -> bool:
     return is_dsa_enable_prefill_cp()
 
 
+_cp_bcg_replay_logged = False
+
+
+def _log_cp_bcg_replay_once(parallel) -> None:
+    """Announce the first replay that trusts the captured CP geometry."""
+    global _cp_bcg_replay_logged
+    if _cp_bcg_replay_logged:
+        return
+    _cp_bcg_replay_logged = True
+    logger.warning(
+        "Kunlun DSA prefill CP: breakable-graph replay keeps the captured "
+        "CP-local geometry (attn_cp_rank=%s, attn_cp_size=%s) while the live "
+        "batch is smaller; using the pinned CP metadata.",
+        parallel.attn_cp_rank,
+        parallel.attn_cp_size,
+    )
+
+
 def _dsa_cp_prefill_ranks(forward_batch) -> Optional[tuple]:
     """Return ``(cp_rank, cp_size)`` when DSA prefill CP round-robin is active.
 
@@ -425,13 +446,26 @@ def _dsa_cp_prefill_ranks(forward_batch) -> Optional[tuple]:
         from sglang.srt.layers.attention.dsa.utils import (
             can_dsa_prefill_cp_round_robin_split as _can_cp_split,
         )
-
-    if not _can_cp_split(forward_batch):
+    # [fix] BCG & CP conflict
+    batch_active = _can_cp_split(forward_batch)
+    # ``can_dsa_prefill_cp_round_robin_split`` reads the *live* extend lengths,
+    # which undershoot under breakable-graph replay: the graph keeps the
+    # captured CP-local row geometry while the live batch carries only this
+    # step's tokens (a one-token extend sums below cp_size). The CP metadata
+    # that the BCG capture input pins at replay is authoritative then.
+    replay_active = is_in_breakable_cuda_graph() and (
+        getattr(forward_batch, "attn_cp_metadata", None) is not None
+    )
+    if not (batch_active or replay_active):
         return None
 
     from sglang.srt.runtime_context import get_parallel
 
     parallel = get_parallel()
+    if parallel.attn_cp_size <= 1:
+        return None
+    if replay_active and not batch_active:
+        _log_cp_bcg_replay_once(parallel)
     return parallel.attn_cp_rank, parallel.attn_cp_size
 
 
@@ -618,6 +652,36 @@ def _dsv4_page_table_span(max_seq_len: int, seq_lens_casual: torch.Tensor) -> in
             needed,
         )
     return needed
+
+
+def _forward_c4_indexer_impl(
+    original_fn,
+    self,
+    x,
+    q_lora,
+    c4_indexer,
+    forward_batch,
+    alt_streams,
+    enable_multi_stream,
+    q_lora_ready,
+    skip_compressor,
+):
+    # ``original_fn`` is the bound method, so ``self`` is already bound; it stays
+    # in the signature only so the break keeps a strong reference to the backend.
+    return original_fn(
+        x,
+        q_lora,
+        c4_indexer,
+        forward_batch,
+        alt_streams,
+        enable_multi_stream,
+        q_lora_ready,
+        skip_compressor,
+    )
+
+
+# Eager-break form of the C4 indexer call (see the wrapper method below).
+_eager_forward_c4_indexer = eager_on_graph(True)(_forward_c4_indexer_impl)
 
 
 class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
@@ -851,6 +915,42 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         q_lora_ready=None,
         skip_compressor=False,
     ):
+        """Run the C4 indexer between graph segments instead of inside one.
+
+        The C4 indexer is inherently data dependent: its prefill contract is
+        built from the live ``extend_seq_lens``/``c4_seq_lens`` and the page
+        selection follows the live page table.  Inside a breakable CUDA graph
+        segment the ops are *recorded* at capture, so replay re-reads the
+        capture-time buffers -- the indexer then picks the wrong pages and the
+        sparse attention attends to the wrong KV.  Running it as an eager break
+        (the same treatment ``cp/bcg.py`` gives the compressor) makes every
+        replay recompute it from live state.  Transparent when no capture is
+        active, so BCG=0 and tc_piecewise keep calling the body directly.
+        """
+        return _eager_forward_c4_indexer(
+            self._forward_c4_indexer_inner,
+            self,
+            x,
+            q_lora,
+            c4_indexer,
+            forward_batch,
+            alt_streams,
+            enable_multi_stream,
+            q_lora_ready,
+            skip_compressor,
+        )
+
+    def _forward_c4_indexer_inner(
+        self,
+        x,
+        q_lora,
+        c4_indexer,
+        forward_batch,
+        alt_streams=None,
+        enable_multi_stream=False,
+        q_lora_ready=None,
+        skip_compressor=False,
+    ):
         """Run the version-pinned C4 flow with explicit Kunlun request state."""
         import torch.nn.functional as F
 
@@ -974,7 +1074,16 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             c4_indexer=c4_indexer,
         )
 
-        assert indexer_metadata.page_table is core_metadata.page_table
+        # The identity only holds when the indexer runs inside the captured
+        # segment; under BCG replay the capture-time metadata objects are
+        # refreshed in place and the two sides can be distinct tensors holding
+        # the same values.
+        if indexer_metadata.page_table is not core_metadata.page_table:
+            logger.warning(
+                "[C4IDX] page_table identity differs under BCG replay: idx=%s core=%s",
+                tuple(indexer_metadata.page_table.shape),
+                tuple(core_metadata.page_table.shape),
+            )
         if self.debug_use_external_c4_sparse_indices:
             return
 
@@ -1872,6 +1981,32 @@ def _build_c4_prefill_contract(
         extend_lens = _dsa_cp_local_extend_lens(
             global_extend_lens, cp_rank, cp_size
         )
+        # [fix] The replay batch is padded to the capture bucket, so
+        # ``extend_seq_lens_cpu`` only carries the *padded* token count (e.g.
+        # 7168 for a 5603-token tail chunk) and the request's real local row
+        # count is not available from it.  ``c4_seq_lens`` is per row and CP
+        # padding rows sit at 1 (row 0 legitimately has 0), so it reveals the
+        # real row count -- which matches the eager shape exactly.  Without this
+        # the request's last row lands on a padding row, ``per_req_k_lens``
+        # collapses to 1, the logits buffer is sized 4 columns and the C4
+        # indexer selects almost no pages (nz=32 vs 4096).  The trailing padding
+        # rows are covered by the existing pad_rows logic.
+        if is_in_breakable_cuda_graph():
+            # The captured graph owns the row geometry, so ``extend_lens`` must
+            # span *all* captured rows -- including the CP padding rows a partial
+            # tail chunk leaves at the end of the bucket.  Upstream pins that
+            # geometry in ``attn_cp_metadata.per_rank_actual_token`` at replay
+            # (cp/bcg.py restores it to the captured local token count).  Do NOT
+            # shrink it to the "real" row count: the live ``c4_seq_lens`` is not
+            # monotonic in the row index, so any such heuristic drops real rows.
+            _md = getattr(forward_batch, "attn_cp_metadata", None)
+            _prat = (
+                getattr(_md, "per_rank_actual_token", None) if _md is not None else None
+            )
+            if _prat:
+                _pinned = int(_prat[min(cp_rank, len(_prat) - 1)])
+                if _pinned > 0 and len(extend_lens) == 1 and sum(extend_lens) != _pinned:
+                    extend_lens = [_pinned]
         extend_lens_tensor = torch.tensor(extend_lens, dtype=torch.int32)
         qlod_cpu = torch.zeros(len(extend_lens) + 1, dtype=torch.int32)
         if extend_lens:
@@ -1885,10 +2020,38 @@ def _build_c4_prefill_contract(
         )
         # The last LOCAL token is not the last GLOBAL token of the request, so
         # the compressed KV length must come from the full request context.
-        per_req_k_lens = (
-            _seq_lens_cpu_i32(forward_batch)[: len(extend_lens)] // 4
-        ).to(torch.int32)
-        per_req_k_lens = torch.clamp(per_req_k_lens, min=1)
+        # [fix] Take the compressed length from the *live* indexer metadata
+        # (``c4_seq_lens`` -- the same source the non-CP branch uses) instead of
+        # ``forward_batch.seq_lens_cpu``, which under BCG replay holds the
+        # capture/padded value.  ``c4_seq_lens`` grows along the rows, so the
+        # request's full compressed length is its last real row.
+        if not is_in_breakable_cuda_graph():
+            # Eager path is unchanged: the batch's own seq_lens are authoritative.
+            per_req_k_lens = (
+                _seq_lens_cpu_i32(forward_batch)[: len(extend_lens)] // 4
+            ).to(torch.int32)
+            per_req_k_lens = torch.clamp(per_req_k_lens, min=1)
+        else:
+            c4_flat = c4_seq_lens.reshape(-1).to("cpu", dtype=torch.int32)
+            if c4_flat.numel() == 0:
+                per_req_k_lens = torch.ones(len(extend_lens), dtype=torch.int32)
+            else:
+                per_req_k_lens = c4_flat.index_select(
+                    0, last_rows.long().clamp(max=c4_flat.numel() - 1)
+                )
+            per_req_k_lens = torch.clamp(per_req_k_lens, min=1)
+        # The logits width is ``per_req_k_lens.max()`` and the vendor topk scans
+        # ``c4_seq_lens[row]`` columns of it, so the contract must cover the live
+        # context maximum; ``c4_seq_lens`` is not strictly monotonic in the row
+        # index, so the last-row value alone can undershoot.
+        if is_in_breakable_cuda_graph() and len(extend_lens) == 1 and c4_flat.numel():
+            # Bound by what the page table can address: during capture
+            # ``c4_seq_lens`` is placeholder data and an unbounded floor would ask
+            # for a ~1e9-wide logits buffer.
+            _cap = max(1, int(page_table.shape[1]) * 64)  # c4 page size = 256 // 4
+            per_req_k_lens = torch.clamp(
+                per_req_k_lens, min=min(int(c4_flat.max().item()), _cap)
+            )
         use_causal = False
 
     klod_cpu = torch.zeros(len(extend_lens) + 1, dtype=torch.int32)

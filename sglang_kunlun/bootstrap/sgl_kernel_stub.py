@@ -242,5 +242,14 @@ def install() -> None:
         module.rmsnorm = _rmsnorm  # type: ignore[attr-defined]
         module.silu_and_mul = _silu_and_mul  # type: ignore[attr-defined]
 
+    # Bind the non-owning tensor alias used by breakable CUDA graph (and the
+    # piecewise backends) to keep capture-pool blocks recyclable.
+    from sglang_kunlun.kernels.sgl_kernel_kunlun.memory import (
+        weak_ref_tensor as _weak_ref_tensor,
+    )
+
+    for module in (root, sys.modules["sgl_kernel.memory"]):
+        module.weak_ref_tensor = _weak_ref_tensor  # type: ignore[attr-defined]
+
     # Register custom op schemas so @torch.library.register_fake succeeds.
     _define_custom_ops()
