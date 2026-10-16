@@ -8,11 +8,21 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 import torch
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph as is_in_piecewise_cuda_graph,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.dp_attention import (
+    get_is_extend_in_batch,
+    set_is_extend_in_batch,
+)
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
@@ -23,7 +33,14 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
     DeepEPNormalCombineInput,
 )
-from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputFormat
+
+from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
+    TopKOutput,
+    TopKOutputChecker,
+    TopKOutputFormat,
+)
+
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
@@ -439,12 +456,70 @@ class DeepEPMoE(FusedMoE):
         # limit as an argument (<= 0.0 disables it).
         self.swiglu_limit = 0.0 if _swiglu_limit is None else float(_swiglu_limit)
  
+    def _a2a_forward_with_output_impl(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        router_logits: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        # Eager run under breakable cuda graph. The dispatcher resolves its
+        # mode from the extend flag, and the graph runners force that flag
+        # False around capture, so pin it for this body.
+        saved_is_extend_in_batch = get_is_extend_in_batch()
+        set_is_extend_in_batch(True)
+        try:
+            output.copy_(
+                self.forward_impl(
+                    hidden_states,
+                    StandardTopKOutput(topk_weights, topk_ids, router_logits),
+                )
+            )
+        finally:
+            set_is_extend_in_batch(saved_is_extend_in_batch)
+
+    def _a2a_forward_capture_stub(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        router_logits: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        # Capture pass only: record the buffer address, skip the rank-coupled
+        # a2a. Warmup and replay run the real body.
+        output.zero_()
+
+    a2a_forward_with_output = eager_on_graph(
+        True, capture_stub=_a2a_forward_capture_stub
+    )(_a2a_forward_with_output_impl)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
         """forward"""
+        # DeepEP NORMAL mode is not capturable: its dispatch/combine is
+        # rank-coupled and reads host-side layout, so breakable capture runs
+        # the whole a2a + MoE as an eager node (mirrors upstream EPMoE).
+        if is_in_breakable_cuda_graph():
+            # Gate on the declared format rather than upstream's isinstance
+            # helper: Kunlun's select_experts hook returns its own
+            # standard-format carrier, which the checker does not know.
+            assert topk_output.format == TopKOutputFormat.STANDARD, (
+                "Only standard topk output is supported for breakable cuda graph"
+            )
+            output = torch.empty_like(hidden_states)
+            self.a2a_forward_with_output(
+                hidden_states,
+                topk_output.topk_weights,
+                topk_output.topk_ids,
+                topk_output.router_logits,
+                output,
+            )
+            return output
         if is_in_piecewise_cuda_graph():
             # Check the protocol property rather than isinstance against one
             # concrete class. Kunlun's select_experts returns its *own*

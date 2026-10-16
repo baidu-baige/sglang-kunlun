@@ -78,6 +78,19 @@ def mqa_forward_prepare_kunlun(
         from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 
         use_cp = dsa_use_prefill_cp(forward_batch)
+    else:
+        # The layer attribute is snapshotted at construction, before the
+        # Kunlun CP-v2 config is resolved; CP-v2 batches must go through the
+        # upstream gather-then-store path, otherwise only this rank's local KV
+        # rows are persisted while the reindexed attention metadata reads the
+        # full sequence's pages.
+        from sglang.srt.layers.cp.utils import is_cp_v2_active
+
+        if is_cp_v2_active(forward_batch):
+            self.dsa_enable_prefill_cp = True
+            from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+
+            use_cp = dsa_use_prefill_cp(forward_batch)
 
     if (
         not (

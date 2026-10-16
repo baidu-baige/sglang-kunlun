@@ -569,6 +569,22 @@ def dsv4_compressed_attention_torch(
             keys = torch.cat((keys, extra_keys), dim=1)
             valid = torch.cat((valid, extra_valid), dim=1)
 
+        # Masked lanes have to contribute exactly nothing.  ``gather_rows``
+        # clamps the -1 / out-of-range lanes onto cache slot 0, and slot 0 is
+        # the dummy target that breakable-prefill-cuda-graph padding writes to
+        # (``out_cache_loc`` pads with PaddingPolicy.ZERO), so it can hold NaN
+        # -- graph capture runs the compressor on an all-zero batch and leaves
+        # NaN in the C4 pool (measured: xknan=2068480, xkmax=nan).  The
+        # ``masked_fill`` below only sanitises ``scores``; the value einsum
+        # still consumes the raw gathered keys, where 0 * NaN = NaN poisons
+        # every query row that owns an invalid lane (measured: a whole 1024-row
+        # prefill chunk going NaN on all 8 CP ranks).  Zeroing the masked keys
+        # keeps both einsums exact and is a no-op for finite caches.
+        # Done in place with no mask: ``masked_fill_`` would broadcast the
+        # (q, k, 1) mask up to ``keys``' (q, k, head_dim) and materialise it as
+        # a full-size bool, which is ~1 GiB next to the ~4 GiB fp32 ``keys``
+        # transient and OOMs the decode graph-capture pool at mem-fraction 0.72.
+        torch.nan_to_num_(keys)
         scores = torch.einsum("qhd,qkd->qhk", query, keys) * softmax_scale
         scores = scores.masked_fill(~valid.unsqueeze(1), float("-inf"))
         if attn_sink is not None:
@@ -701,6 +717,14 @@ def dsv4_topk_transform_512_kunlun(
     # xspeedgate_ops::topk_transform(score, lengths, src_page_table,
     #     dst_page_table, topk, cu_seqlens_q=None, block_size=page_size,
     #     fast_path=True)
+    # The vendor kernel scans ``seq_lens[row]`` columns of ``scores``.  Under the
+    # breakable prefill CUDA graph the logits buffer is sized from the captured
+    # contract while ``c4_seq_lens`` is the live metadata, so the live value can
+    # exceed the buffer and the kernel reads out of bounds (observed
+    # score_stride=128 vs seq_len=304, and garbage 6.3e8 during capture) ->
+    # topk_transform_decode_kernel illegal access.  Bound it unconditionally so
+    # the recorded graph always carries the clamp.
+    seq_lens = seq_lens.clamp(max=int(scores.shape[1]))
     torch.ops.xspeedgate_ops.topk_transform(
         scores,
         seq_lens,
@@ -761,89 +785,37 @@ def dsv4_init_compression_metadata_kunlun(
     page_size: int = 0,
     compute_page_indices: bool = True,
 ):
-    # Prefill CP pads the metadata row count (seq_lens/positions) to a multiple
-    # of cp_size while raw_out_loc lists only the real tokens. The padding rows
-    # carry seq_len 1 / position 0, so the kernel does NOT skip them -- feeding
-    # them a padded raw_out_loc would write their compressed KV into a real
-    # cache slot. Upstream sizes the write buffers (*_out_loc) unpadded and masks
-    # rows >= num_write_tokens. Emulate that: run the Kunlun op over the real
-    # rows only, then restore the length/position/page outputs to the padded
-    # size with the padded rows' own seq_lens/positions.
-    bs = seq_lens.shape[0]
-    n = raw_out_loc.shape[0]
-    if n > bs:
-        raise RuntimeError(
-            "dsv4 init_compression_metadata: raw_out_loc longer than seq_lens "
-            f"({tuple(raw_out_loc.shape)} vs {tuple(seq_lens.shape)})"
-        )
-    if n == bs:
-        return torch.ops.xspeedgate_ops.init_compressed_attn_metadata_v2(
-            seq_lens,
-            positions,
-            raw_out_loc,
-            page_table,
-            page_size,
-            compute_page_indices,
-        )
+    """桥接 0.5.19 的 CP-v2 长度契约。
 
-    page_table_r = (
-        page_table[:n] if page_table is not None and page_table.shape[0] > n else page_table
-    )
-    (
-        c4_out,
-        c4_pos,
-        c4_raw,
-        c4_clamp,
-        c128_out,
-        c128_pos,
-        c128_raw,
-        c128_clamp,
-        c128_pages,
-    ) = torch.ops.xspeedgate_ops.init_compressed_attn_metadata_v2(
-        seq_lens[:n],
-        positions[:n],
+    0.5.19 起 ``raw_out_loc`` 是「每个逻辑 token 一行」的**未 pad** 数组
+    （``init_compression_metadata`` 的断言 ``raw_out_loc.shape[0] == num_tokens``），
+    而 ``seq_lens/positions/page_table`` 是按 per-rank 分区 pad 过的元数据长度；
+    vendor 算子要求两者等长。这里把 ``raw_out_loc`` 补到元数据长度再调算子——
+    补的行填 0（SWA 池保留的 dummy 槽，与 0.5.17 的 pad 行一致）——然后把两个
+    out_loc 输出裁回 ``raw_out_loc`` 原有的行数：``c4_out_loc``/``c128_out_loc``
+    属于 core 的 ``_CP_GLOBAL_FIELDS``（未 pad），其余 per-row 输出保持 pad 长度、
+    与 ``seq_lens_casual`` 对齐（``_CP_REINDEX_FIELDS``）。
+    """
+    meta_len = int(seq_lens.shape[0])
+    loc_len = int(raw_out_loc.shape[0])
+    if loc_len < meta_len:
+        raw_out_loc = torch.cat(
+            [raw_out_loc, raw_out_loc.new_zeros(meta_len - loc_len)]
+        )
+    outs = torch.ops.xspeedgate_ops.init_compressed_attn_metadata_v2(
+        seq_lens,
+        positions,
         raw_out_loc,
-        page_table_r,
+        page_table,
         page_size,
         compute_page_indices,
     )
-    pad_rows = bs - n
-    seq_lens_tail = seq_lens[n:].to(torch.int32)
-    positions_tail = positions[n:].to(torch.int32)
-    ones_tail = seq_lens_tail.clamp_min(1)
-
-    def _pad(x, tail):
-        return torch.cat([x, tail.to(x.dtype, copy=False)])
-
-    c4_pos = _pad(c4_pos, positions_tail)
-    c4_raw = _pad(c4_raw, seq_lens_tail)
-    c4_clamp = _pad(c4_clamp, ones_tail)
-    c128_pos = _pad(c128_pos, positions_tail)
-    c128_raw = _pad(c128_raw, seq_lens_tail)
-    c128_clamp = _pad(c128_clamp, ones_tail)
-    if c128_pages is not None:
-        c128_pages = torch.cat(
-            [
-                c128_pages,
-                torch.full(
-                    (pad_rows, c128_pages.shape[1]),
-                    -1,
-                    dtype=c128_pages.dtype,
-                    device=c128_pages.device,
-                ),
-            ]
-        )
-    return (
-        c4_out,
-        c4_pos,
-        c4_raw,
-        c4_clamp,
-        c128_out,
-        c128_pos,
-        c128_raw,
-        c128_clamp,
-        c128_pages,
-    )
+    if loc_len < meta_len:
+        outs = list(outs)
+        outs[0] = outs[0][:loc_len]   # c4_out_loc
+        outs[4] = outs[4][:loc_len]   # c128_out_loc
+        outs = tuple(outs)
+    return outs
     
 
 
@@ -1085,6 +1057,10 @@ def _dsv4_num_draft_tokens() -> int | None:
         return None
 
 
+#: 打印 compress plan 的行数/有效行数（诊断 BCG 下的定形 plan）。
+_DEBUG_COMPRESS_PLAN = os.environ.get("SGLANG_KUNLUN_DEBUG_COMPRESS_PLAN") == "1"
+
+
 def _dsv4_augment_prefill_plan_w(
     plan_w: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -1179,6 +1155,17 @@ def dsv4_compressor_prefill_plan_kunlun(
 ):
     """dsv4_compressor_prefill_plan_kunlun"""
     from sglang.kernels.ops.attention.dsv4.compress import CompressorPrefillPlan
+
+    try:
+        from sglang_kunlun.hooks.layers.cp.bcg import _compressor_runs_eager
+    except ImportError:
+        # The prefill-CP BCG hooks are only installed on nodes that run the
+        # breakable prefill graph; the decode node has no cp package, and
+        # without the eager compressor break the compact-plan fallback below
+        # must stay off.
+        def _compressor_runs_eager():
+            return False
+
     if compress_ratio not in (4, 128):
         raise ValueError(f"unsupported compression ratio: {compress_ratio}")
     if use_req_ring:
@@ -1187,6 +1174,12 @@ def dsv4_compressor_prefill_plan_kunlun(
         )
     if num_q_tokens < req_pool_indices.shape[0]:
         raise ValueError("num_q_tokens must be at least the batch size")
+    if use_cuda_graph and _compressor_runs_eager():
+        # 压缩器已经是 eager 断点（``cp/bcg.py`` 的 forward_core_compressor 钩子），
+        # 算子的工作量直接等于 plan 的行数：定形 plan 会补到 ``num_q_tokens`` 行，
+        # c128 下每行照样走一遍压缩 —— 实测 20 次调用 387ms/步（compact plan 5ms）。
+        # 断点之后没有被图捕获的东西读 plan，所以这里回退成紧凑 plan 是安全的。
+        use_cuda_graph = False
     pin_buffer = torch.empty(
             0,
             dtype=torch.uint8,
@@ -1205,6 +1198,19 @@ def dsv4_compressor_prefill_plan_kunlun(
         ring_size,
         use_cuda_graph,
     )
+    if _DEBUG_COMPRESS_PLAN:
+        raw = plan_c.view(torch.int32)
+        logger.info(
+            "compress plan(base): cr=%d use_cuda_graph=%s num_q=%d num_reqs=%d "
+            "plan_c=%s valid_rows=%d plan_w=%s",
+            compress_ratio,
+            use_cuda_graph,
+            num_q_tokens,
+            req_pool_indices.shape[0],
+            tuple(plan_c.shape),
+            int((raw[:, 0] != -1).sum().item()),
+            tuple(plan_w.shape),
+        )
     plan_w = _dsv4_augment_prefill_plan_w(
         plan_w,
         req_pool_indices,
@@ -1354,6 +1360,17 @@ def dsv4_compress_forward_v2_kunlun(
     if out is None:
         num_q_tokens = plan[1].shape[0]
         out = kv_score_input.new_empty((num_q_tokens, head_dim))
+    if _DEBUG_COMPRESS_PLAN:
+        raw = plan_c.view(torch.int32)
+        logger.info(
+            "compress op: cr=%d is_decode=%s plan_c=%s valid_rows=%d out=%s kv_in=%s",
+            compress_ratio,
+            plan.is_decode,
+            tuple(plan_c.shape),
+            int((raw[:, 0] != -1).sum().item()),
+            tuple(out.shape),
+            tuple(kv_score_input.shape),
+        )
     torch.ops.xspeedgate_ops.dsv4_compress_forward_v2(
         kv_score_buffer,
         kv_score_input,

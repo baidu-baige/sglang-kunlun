@@ -1,4 +1,5 @@
 """ model executor hooks """
+from . import breakable_cuda_graph  # noqa: F401
 from . import model_runner_kv_cache_mixin  # noqa: F401
 
 import torch
