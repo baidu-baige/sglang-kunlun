@@ -24,6 +24,7 @@ for _opt in (
     "dsv41_dspark_weights",
     "kimi_k3_gemm",
     "kimi_k3_text_only",
+    "kimi_k3_vision",
     "kimi_k3_w4a16_loader",
 ):
     try:
