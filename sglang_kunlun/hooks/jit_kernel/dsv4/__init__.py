@@ -21,8 +21,8 @@ Importing the submodules declares their ``HookRegistry`` registrations; the
 actual patching happens via ``HookRegistry.apply_hooks()``.
 """
 
-from . import compress  # noqa: F401
-from . import moe  # noqa: F401
-from . import gemm  # noqa: F401
-from . import attn  # noqa: F401
-from . import compress_old  # noqa: F401
+from sglang_kunlun.eb5_adapt.hooks.jit_kernel.dsv4 import compress  # noqa: F401
+from sglang_kunlun.eb5_adapt.hooks.jit_kernel.dsv4 import moe  # noqa: F401
+from sglang_kunlun.eb5_adapt.hooks.jit_kernel.dsv4 import gemm  # noqa: F401
+from sglang_kunlun.eb5_adapt.hooks.jit_kernel.dsv4 import attn  # noqa: F401
+from sglang_kunlun.eb5_adapt.hooks.jit_kernel.dsv4 import compress_old  # noqa: F401

@@ -26,7 +26,7 @@ import types
 
 import torch
 
-from sglang_kunlun.kernels.kernel_ops import register_jit_op
+from sglang_kunlun.eb5_adapt.kernels.kernel_ops import register_jit_op
 
 logger = logging.getLogger(__name__)
 _WARNED_PAGED_MQA_METADATA = False

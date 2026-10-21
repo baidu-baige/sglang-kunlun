@@ -17,5 +17,5 @@
 # limitations under the License.
 """distributed"""
 
-from . import parallel_state  # noqa: F401
+from sglang_kunlun.eb5_adapt.hooks.distributed import parallel_state  # noqa: F401
 from . import device_communicators  # noqa: F401

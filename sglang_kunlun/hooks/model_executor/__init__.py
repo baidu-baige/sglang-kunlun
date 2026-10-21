@@ -16,5 +16,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """ model executor hooks """
-from . import model_runner_kv_cache_mixin  # noqa: F401
-from . import model_runner  # noqa: F401
+from sglang_kunlun.eb5_adapt.hooks.model_executor import model_runner_kv_cache_mixin  # noqa: F401
+from sglang_kunlun.eb5_adapt.hooks.model_executor import model_runner  # noqa: F401

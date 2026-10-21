@@ -17,4 +17,4 @@
 # limitations under the License.
 """Wave 3 fused_moe_triton hooks."""
 
-from . import layer  # noqa: F401
+from sglang_kunlun.eb5_adapt.hooks.layers.moe.fused_moe_triton import layer  # noqa: F401

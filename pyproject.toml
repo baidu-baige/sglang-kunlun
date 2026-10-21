@@ -37,6 +37,9 @@ kunlun = "sglang_kunlun.platform:activate"
 
 [project.entry-points."sglang.srt.plugins"]
 kunlun_hooks = "sglang_kunlun.hooks.registry:register_all"
+# EB5 / EB-Lite 在昆仑上的适配入口。用 SGLANG_PLUGINS 白名单打开（kunlun 必须列进去）：
+#   export SGLANG_PLUGINS=kunlun,kunlun_hooks,eb5_internal_runtime_patch,eb5_kunlun_patch
+eb5_kunlun_patch = "sglang_kunlun.hooks.eb5_kunlun_patch:register_eb5_kunlun_patch"
 
 [project.scripts]
 sglang-kunlun-launch = "sglang_kunlun.launch:main"

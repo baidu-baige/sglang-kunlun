@@ -19,4 +19,4 @@
 
 from __future__ import annotations
 
-from . import http_server  # noqa: F401
+from sglang_kunlun.eb5_adapt.hooks.entrypoints import http_server  # noqa: F401

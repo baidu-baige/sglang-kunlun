@@ -65,7 +65,7 @@ def _create_backend_kunlun(original_fn, self, backend_name, backend_map, error_t
         backend_type = self.server_args.attention_backend
 
     if backend_type == "kunlun_dsv4":
-        from sglang_kunlun.hooks.layers.attention.deepseek_v4_backend import (
+        from sglang_kunlun.eb5_adapt.hooks.layers.attention.deepseek_v4_backend import (
             KunlunDeepseekV4AttnBackend,
             KunlunDeepseekV4MultiStepBackend,
         )

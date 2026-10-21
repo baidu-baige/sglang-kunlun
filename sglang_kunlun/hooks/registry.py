@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 HOOK_MODULES = (
     "sglang_kunlun.hooks.utils.common",
-    "sglang_kunlun.hooks.server_args",
+    "sglang_kunlun.eb5_adapt.hooks.server_args",
     "sglang_kunlun.hooks.arg_groups",
     "sglang_kunlun.hooks.layers",
     "sglang_kunlun.hooks.mem_cache",
@@ -51,7 +51,7 @@ HOOK_MODULES = (
 def register_all() -> None:
     """Import every hook module so decorators register with ``HookRegistry``."""
 
-    from sglang_kunlun.bootstrap.pre_shim import patch_grammar_backend_default
+    from sglang_kunlun.eb5_adapt.bootstrap.pre_shim import patch_grammar_backend_default
 
     try:
         patch_grammar_backend_default()
@@ -60,12 +60,12 @@ def register_all() -> None:
 
     from sglang_kunlun.kernels import deep_geem_hook as _deep_geem_hook  # noqa: F401
     from sglang_kunlun.kernels import flashinfer_hook as _flashinfer_hook  # noqa: F401
-    from sglang_kunlun.kernels import kernel_ops
+    from sglang_kunlun.eb5_adapt.kernels import kernel_ops
 
     kernel_ops.install()
 
     # try:
-    #     from sglang_kunlun.kernels.dsv4_torch_shim import patch_compress_old_prefill_plan
+    #     from sglang_kunlun.eb5_adapt.kernels.dsv4_torch_shim import patch_compress_old_prefill_plan
     #
     #     patch_compress_old_prefill_plan()
     # except Exception as exc:
@@ -85,14 +85,14 @@ def register_all() -> None:
     #     )
 
     # try:
-    #     from sglang_kunlun.kernels.dsv4_torch_shim import patch_compress_old_forward
+    #     from sglang_kunlun.eb5_adapt.kernels.dsv4_torch_shim import patch_compress_old_forward
     #
     #     patch_compress_old_forward()
     # except Exception as exc:
     #     logger.warning("sglang-kunlun: compress_old compress_forward patch failed: %s", exc)
 
     # try:
-    #     from sglang_kunlun.kernels.dsv4_torch_shim import patch_compress_old_norm_rope
+    #     from sglang_kunlun.eb5_adapt.kernels.dsv4_torch_shim import patch_compress_old_norm_rope
     #
     #     patch_compress_old_norm_rope()
     # except Exception as exc:

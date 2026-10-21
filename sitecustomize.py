@@ -39,7 +39,7 @@ def _install_http_routes(module) -> None:
     launch_server hook).
     """
     try:
-        from sglang_kunlun.hooks.entrypoints.http_server import install_routes
+        from sglang_kunlun.eb5_adapt.hooks.entrypoints.http_server import install_routes
 
         install_routes(module)
     except Exception as exc:  # noqa: BLE001 - never block server import
@@ -104,7 +104,7 @@ if _explicit_launch:
 
 if os.environ.get("SGLANG_PLATFORM") == "kunlun" or os.environ.get("SGLANG_USE_XPU") == "1":
     try:
-        from sglang_kunlun import _kunlun_pre_shim
+        from sglang_kunlun.eb5_adapt.bootstrap import _kunlun_pre_shim
 
         _kunlun_pre_shim()
         # server_args may already be imported; patch in place if so.

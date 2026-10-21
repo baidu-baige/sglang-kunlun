@@ -29,7 +29,7 @@ def main() -> None:
     os.environ["SGLANG_KUNLUN_EXPLICIT_LAUNCH"] = "1"
     os.environ.setdefault("SGLANG_PLATFORM", "kunlun")
 
-    from sglang_kunlun.bootstrap import _kunlun_pre_shim
+    from sglang_kunlun.eb5_adapt.bootstrap import _kunlun_pre_shim
 
     _kunlun_pre_shim()
     try:

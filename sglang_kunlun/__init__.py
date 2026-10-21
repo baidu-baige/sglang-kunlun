@@ -13,6 +13,15 @@
 # limitations under the License.
 """sglang-kunlun: OOT SGLang platform plugin for Kunlun (XPU) chips."""
 
-from sglang_kunlun.bootstrap import _kunlun_pre_shim
+# 以下兼容层随 c11d9c8 一起迁入 eb5_adapt；调用顺序与上游实现保持一致。
+from sglang_kunlun.eb5_adapt.bootstrap import compat_aliases as _compat_aliases
+
+_compat_aliases.install()
+
+from sglang_kunlun.eb5_adapt.bootstrap import optional_kernel_stubs as _optional_stubs
+
+_optional_stubs.install_all()
+
+from sglang_kunlun.eb5_adapt.bootstrap import _kunlun_pre_shim
 
 __all__ = ["_kunlun_pre_shim"]

@@ -184,7 +184,7 @@ def _prefill_plan_generate_torch(
 ):
     """Pure-torch ``CompressorPrefillPlan.generate`` (no tvm_ffi)."""
     from sglang.jit_kernel.dsv4.compress import CompressorPrefillPlan
-    from sglang_kunlun.kernels.dsv4_torch_shim import (
+    from sglang_kunlun.eb5_adapt.kernels.dsv4_torch_shim import (
         _make_prefill_plan_c4_torch,
         _make_prefill_plan_torch,
     )

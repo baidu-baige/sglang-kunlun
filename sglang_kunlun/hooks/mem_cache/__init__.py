@@ -16,6 +16,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """mem_cache hooks."""
-from . import common  # noqa: F401
+from sglang_kunlun.eb5_adapt.hooks.mem_cache import common  # noqa: F401
 from . import deepseek_v4_memory_pool  # noqa: F401
 from . import deepseek_v4_compress_state  # noqa: F401

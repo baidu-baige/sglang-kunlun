@@ -17,4 +17,4 @@
 # limitations under the License.
 """Kunlun hooks for expert-parallel MoE layers."""
 
-from . import layer  # noqa: F401
+from sglang_kunlun.eb5_adapt.hooks.layers.moe.ep_moe import layer  # noqa: F401

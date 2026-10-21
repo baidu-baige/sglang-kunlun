@@ -16,5 +16,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """speculative attention"""
-from . import draft_utils  # noqa: F401
+from sglang_kunlun.eb5_adapt.hooks.speculative import draft_utils  # noqa: F401
 from . import multi_layer_eagle_worker_v2  # noqa: F401

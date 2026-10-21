@@ -19,4 +19,4 @@
 
 from __future__ import annotations
 
-from . import deepseek_v4_hook  # noqa: F401
+from sglang_kunlun.eb5_adapt.hooks.arg_groups import deepseek_v4_hook  # noqa: F401

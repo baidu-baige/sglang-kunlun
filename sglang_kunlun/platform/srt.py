@@ -111,13 +111,13 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
 
     def get_draft_prefill_attention_backend_cls(self) -> type | None:
         """Return the Kunlun draft prefill attention backend class."""
-        from sglang_kunlun.hooks.layers.attention.kunlun_backend import KunlunAttentionBackend
+        from sglang_kunlun.eb5_adapt.hooks.layers.attention.kunlun_backend import KunlunAttentionBackend
 
         return KunlunAttentionBackend
 
     def get_draft_decode_attention_backend_cls(self) -> type | None:
         """Return the Kunlun draft decode attention backend class."""
-        from sglang_kunlun.hooks.layers.attention.kunlun_backend import (
+        from sglang_kunlun.eb5_adapt.hooks.layers.attention.kunlun_backend import (
             KunlunFlashAttentionMultiStepBackend,
         )
 
@@ -151,7 +151,7 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
 
     def get_paged_allocator_cls(self) -> type:
         """Return the Kunlun paged KV pool allocator class."""
-        from sglang_kunlun.hooks.mem_cache.kunlun_allocator import KunlunPagedTokenToKVPoolAllocator
+        from sglang_kunlun.eb5_adapt.hooks.mem_cache.kunlun_allocator import KunlunPagedTokenToKVPoolAllocator
 
         return KunlunPagedTokenToKVPoolAllocator
 

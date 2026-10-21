@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 import sys
 
-from sglang_kunlun import _kunlun_pre_shim
+from sglang_kunlun.eb5_adapt.bootstrap import _kunlun_pre_shim
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,7 @@ def _redirect_nsa_backend() -> None:
         )
         return
     try:
-        from . import _nsa_backend_impl  # noqa: F401
+        from sglang_kunlun.eb5_adapt.hooks.layers.attention import _nsa_backend_impl  # noqa: F401
 
         sys.modules[target] = _nsa_backend_impl
         logger.info("Redirected %s -> sglang_kunlun._nsa_backend_impl", target)
@@ -60,4 +60,4 @@ _redirect_nsa_backend()
 from . import attention_registry  # noqa: E402,F401
 from . import nsa  # noqa: E402,F401
 from . import fla  # noqa: E402,F401
-from . import deepseek_v4_backend  # noqa: E402,F401
+from sglang_kunlun.eb5_adapt.hooks.layers.attention import deepseek_v4_backend  # noqa: E402,F401

@@ -17,6 +17,6 @@
 # limitations under the License.
 """Kunlun overrides for ``sglang.srt.layers.attention.dsv4`` (v1 compressor)."""
 from . import compressor  # noqa: F401
-from . import index_buf_accessor  # noqa: F401
-from . import quant_k_cache  # noqa: F401
-from . import metadata_kernel  # noqa: F401
+from sglang_kunlun.eb5_adapt.hooks.layers.attention.dsv4 import index_buf_accessor  # noqa: F401
+from sglang_kunlun.eb5_adapt.hooks.layers.attention.dsv4 import quant_k_cache  # noqa: F401
+from sglang_kunlun.eb5_adapt.hooks.layers.attention.dsv4 import metadata_kernel  # noqa: F401

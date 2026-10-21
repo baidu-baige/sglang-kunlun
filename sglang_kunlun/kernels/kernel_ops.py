@@ -1750,7 +1750,7 @@ def _w8a8_block_int8_matmul(
 # kernel_ops.install() time.
 # ============================================================================
 
-from sglang_kunlun.kernels.dsv4_torch_shim import (  # noqa: E402
+from sglang_kunlun.eb5_adapt.kernels.dsv4_torch_shim import (  # noqa: E402
     _fused_q_norm_rope_torch,
     _fused_k_norm_rope_flashmla_torch,
     _fused_k_norm_rope_flashmla_kunlun,

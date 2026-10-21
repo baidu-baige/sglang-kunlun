@@ -13,6 +13,6 @@
 # limitations under the License.
 """Bootstrap helpers that must run before selected SGLang imports."""
 
-from .pre_shim import _kunlun_pre_shim
+from sglang_kunlun.eb5_adapt.bootstrap.pre_shim import _kunlun_pre_shim
 
 __all__ = ["_kunlun_pre_shim"]

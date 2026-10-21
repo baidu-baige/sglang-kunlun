@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import sys
 
-from sglang_kunlun.kernels.kernel_ops import register_jit_op
+from sglang_kunlun.eb5_adapt.kernels.kernel_ops import register_jit_op
 
 
 _FLASHINFER_MISSING_SYMBOL_MSG = (

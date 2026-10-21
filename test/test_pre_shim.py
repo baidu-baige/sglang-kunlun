@@ -52,7 +52,7 @@ class KunlunPreShimTest(unittest.TestCase):
     #     import argparse
     #     import types
 
-    #     from sglang_kunlun.bootstrap.pre_shim import patch_float16_kv_cache
+    #     from sglang_kunlun.eb5_adapt.bootstrap.pre_shim import patch_float16_kv_cache
 
     #     class FakeServerArgs:
     #         """Provide the ServerArgs methods patched by the plugin."""
