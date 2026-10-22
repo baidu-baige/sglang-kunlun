@@ -76,9 +76,27 @@ class VisionKunlunAttention(nn.Module):
         return out.to(dtype=q.dtype)
 
 
+def _replace_arg_meta(arg_meta, **changes):
+    """Copy a CLI ``Arg`` metadata object with fields replaced.
+
+    0.5.22 turned ``arg_groups.arg_utils.Arg`` from a frozen dataclass into a
+    frozen ``msgspec.Struct``, so ``dataclasses.replace`` raises
+    "replace() should be called on dataclass instances" -- which killed the
+    whole plugin registration at import time, not just this one declaration.
+    Try the msgspec API first and keep the dataclass path for older trees.
+    """
+    import dataclasses
+
+    try:
+        import msgspec.structs
+
+        return msgspec.structs.replace(arg_meta, **changes)
+    except (ImportError, TypeError):
+        return dataclasses.replace(arg_meta, **changes)
+
+
 def _extend_mm_attention_backend_choices() -> None:
     """Declare ``kunlun`` as a valid ``--mm-attention-backend`` value."""
-    import dataclasses
     import sys
     import typing
 
@@ -107,7 +125,7 @@ def _extend_mm_attention_backend_choices() -> None:
     ServerArgs.__annotations__["mm_attention_backend"] = typing.Annotated[
         (
             base_type,
-            dataclasses.replace(arg_meta, choices=[*arg_meta.choices, "kunlun"]),
+            _replace_arg_meta(arg_meta, choices=[*arg_meta.choices, "kunlun"]),
             *rest,
         )
     ]

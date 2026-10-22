@@ -10,6 +10,10 @@ the runtime takes when neither TileLang nor DeepGEMM mHC prenorm is enabled
           -> mhc.hc_split_sinkhorn   [already Kunlun]
           -> mhc.hc_combine          [Triton elementwise]    <-- here
 
+0.5.22 added one more on the same module: ``DeepseekV4Model.forward`` now builds
+the initial mHC residual with ``mhc.hc_broadcast`` instead of a plain
+``repeat``.
+
 The kernels exist upstream for batch invariance (a fixed K-split reduction
 order); the torch bodies below use the same arithmetic as the repo's own torch
 references (`_mhc_pre_torch`, `hc_combine`'s documented formula).
@@ -56,3 +60,17 @@ def hc_combine_kunlun(
     x = x_flat.reshape(m, hc, h).float()
     y = (pre.reshape(m, hc).float().unsqueeze(-1) * x).sum(dim=1)
     return y.to(out_dtype)
+
+
+@register_jit_op("sglang.kernels.ops.layernorm.mhc", "hc_broadcast")
+def hc_broadcast_kunlun(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
+    """``[T, H] -> [T, hc_mult, H]``, every copy equal to ``x``.
+
+    New in 0.5.22: ``DeepseekV4Model.forward`` builds the initial mHC residual
+    through this helper. It has an upstream non-CUDA fallback, but the gate is
+    ``if not x.is_cuda`` -- true nowhere on Kunlun, because the platform reuses
+    the CUDA device type -- so every prefill tried to compile
+    ``_hc_broadcast_kernel`` and died with "0 compatible backends for target
+    (cuda)". This is upstream's own fallback expression, verbatim.
+    """
+    return x.unsqueeze(1).repeat(1, hc_mult, 1)

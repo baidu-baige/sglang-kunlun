@@ -17,6 +17,9 @@ for _name in ("dspark_worker_v2", "dspark_draft_sampler"):
         _name,
         importlib.import_module(f"sglang.srt.speculative.dspark_components.{_name}"),
     )
+# 同理：kernels/kernel_ops.py 的 MarkovSampleStep.execute 钩子挂在 dspark 包下的
+# markov_sample 子模块上，而 dspark/__init__.py 不会把它导出。
+importlib.import_module("sglang.kernels.ops.speculative.dspark.markov_sample")
 # dflash_info_v2 同样要挂成 sglang.srt.speculative 的属性才能被解析。
 upstream_speculative.dflash_info_v2 = importlib.import_module(
     "sglang.srt.speculative.dflash_info_v2"
@@ -29,7 +32,6 @@ importlib.import_module("sglang.kernels.ops.speculative.dspark.dspark_accept")
 from . import dflash_info_v2  # noqa: E402,F401
 from . import draft_utils  # noqa: E402,F401
 from . import dspark_draft_backend  # noqa: E402,F401
-from . import dspark_draft_sampler  # noqa: E402,F401
 from . import dspark_precision  # noqa: E402,F401
 from . import eagle_worker_v2  # noqa: E402,F401
 from . import multi_layer_eagle_worker_v2  # noqa: E402,F401

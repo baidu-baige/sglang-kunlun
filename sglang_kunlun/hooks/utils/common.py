@@ -153,13 +153,20 @@ def _get_numa_cores(node: int) -> List[int]:
     "sglang.srt.utils.common.set_gpu_proc_affinity",
     type=HookType.REPLACE,
 )
-def set_gpu_proc_affinity_kunlun(
-    pp_size: int,
-    tp_size: int,
-    nnodes: int,
-    gpu_id: int,
-):
-    """Pin worker process to its XPU's NUMA-local core slice."""
+def set_gpu_proc_affinity_kunlun(gpu_id: int):
+    """Pin worker process to its XPU's NUMA-local core slice.
+
+    0.5.22 dropped ``(pp_size, tp_size, nnodes)`` from the upstream signature —
+    it now reads them from ``sglang.srt.runtime_context.get_parallel()`` inside
+    the body (``srt/utils/common.py:3091``), and both call sites pass only
+    ``gpu_id`` (``srt/managers/scheduler.py:6069``,
+    ``benchmark/one_batch.py:915``). Mirroring the new one-argument signature is
+    all this replacement needs: the Kunlun binding is derived from
+    ``xpu-smi topo -m`` / NUMA topology, so it never used the parallel layout.
+    If a future Kunlun policy needs it, read it the same way upstream does
+    (``get_parallel().pp_size`` / ``.tp_size`` / ``.nnodes``) rather than
+    re-adding parameters no caller passes.
+    """
     import psutil
 
     pid = os.getpid()

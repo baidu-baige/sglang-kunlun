@@ -123,7 +123,9 @@ def record(op: str, kwargs: Dict[str, Any], bs: int) -> None:
     if index != _layer_index():
         return
 
-    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_is_capture_mode,
+    )
 
     if get_is_capture_mode():
         # 只留引用，等 replay 写入真实值后再读
@@ -215,7 +217,8 @@ if msa_dump_enabled():
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
     HookRegistry.register(
-        "sglang.srt.model_executor.cuda_graph_runner.CudaGraphRunner.replay",
+        "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend."
+        "FullCudaGraphBackend.replay",
         _after_cuda_graph_replay,
         HookType.AFTER,
     )

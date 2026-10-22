@@ -67,66 +67,15 @@ def handle_cuda_graph_config_kunlun(original, server_args, *args, **kwargs):
                 config, Phase.PREFILL, backend=Backend.BREAKABLE
             ),
         )
-        config = resolving_view(server_args).cuda_graph_config
-    if config is not None and config.prefill.backend == Backend.BREAKABLE:
-        _enable_cp_v2_for_dsv4_interleave(server_args)
-    else:
-        # [fix] CP-v2 (and with it the DSA prefill CP row split) must not depend on
-        # the prefill CUDA graph being breakable. With --disable-prefill-cuda-graph
-        # the backend resolves to DISABLED, this branch was skipped, SGLANG_ENABLE_CP_V2
-        # stayed False, the row split was switched off and the C4 indexer read the full
-        # sequence's pages instead of the CP-local shard (~8x more device work;
-        # 8192-chunk 11.5k -> 1.5k tok/s).
-        _enable_cp_v2_for_dsv4_interleave(server_args)
     return result
 
 
-def _cp_prefill_requested(cfg, server_args) -> bool:
-    """Whether this run asks for prefill context parallelism.
-
-    0.5.19 keeps the deprecated ``--enable-dsa-prefill-context-parallel`` /
-    ``--enable-prefill-context-parallel`` aliases alive and resolves them into
-    ``enable_prefill_cp`` only as a *declaration*, so read all three names from
-    both the resolving view and the raw record.
-    """
-
-    for name in (
-        "enable_prefill_cp",
-        "enable_prefill_context_parallel",
-        "enable_dsa_prefill_context_parallel",
-    ):
-        if getattr(cfg, name, False) or getattr(server_args, name, False):
-            return True
-    return False
-
-
-def _enable_cp_v2_for_dsv4_interleave(server_args) -> None:
-    """Put a breakable-capture DSV4 prefill CP run on the CP-v2 rails."""
-    from sglang.srt.arg_groups.overrides import model_config_of, resolving_view
-    from sglang.srt.environ import envs
-
-    if envs.SGLANG_ENABLE_CP_V2.get():
-        return
-    cfg = resolving_view(server_args)
-    if not (
-        _cp_prefill_requested(cfg, server_args)
-        and getattr(cfg, "cp_strategy", None) == "interleave"
-    ):
-        return
-    # 0.5.19 dropped ServerArgs.get_model_config(); the pipeline's own helper is
-    # the resolver-safe way to read the model config.
-    architectures = model_config_of(server_args).hf_config.architectures or []
-    if not any(arch.startswith("DeepseekV4") for arch in architectures):
-        return
-
-    envs.SGLANG_ENABLE_CP_V2.set(True)
-    logger.warning(
-        "Enabling CP-v2 for %s prefill CP (cp_strategy=interleave) because a "
-        "breakable prefill CUDA graph was requested: the graph gate and the "
-        "CP-local capture inputs need it. The model keeps sharding its own "
-        "rows; the CP-v2 strategy shard/gather stay inert.",
-        "/".join(architectures),
-    )
+# NOTE: 0.5.22 removed ``SGLANG_ENABLE_CP_V2`` (strategy-based prefill context
+# parallelism is the only generic implementation now), so the 0.5.19-era
+# ``_enable_cp_v2_for_dsv4_interleave`` forcing is gone with it. The DSA CP row
+# split is kept authoritative by ``hooks/layers/cp/bcg.py``
+# (``is_dsa_enable_prefill_cp``), which reads the explicit
+# ``--enable-dsa-prefill-context-parallel`` flag instead of an env switch.
 
 
 @plugin_hook(

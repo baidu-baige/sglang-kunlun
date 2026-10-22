@@ -154,52 +154,91 @@ def _alloc_2m_aligned(total_bytes: int, dtype: torch.dtype, device: str):
     return flat[offset : offset + total_bytes].view(dtype)
 
 
+def _kunlun_half_cache_applies(cfg) -> bool:
+    """Whether this DSV4 pool is the Kunlun plain-fp16/bf16 "half cache"."""
+    if cfg.kv_cache_dtype_str not in ("fp16", "float16", "bf16", "bfloat16"):
+        return False
+    # unified_kv already prices a plain latent row, and trtllm uses its own
+    # uniform-FP8 pool; neither is the Kunlun half cache.
+    if getattr(cfg, "_unified", False):
+        return False
+    return True
+
+
+def _kunlun_paged_kv_bytes_per_token(cfg) -> int:
+    """One Kunlun KV slot in bytes: ``(qk_nope + qk_rope)`` fp16 elements."""
+    return (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim) * 2
+
+
+@plugin_hook(
+    "sglang.srt.model_executor.pool_configurator.DSV4PoolConfigurator."
+    "_get_paged_kv_bytes_per_token",
+    type=HookType.AROUND,
+)
+def dsv4_paged_kv_bytes_per_token_kunlun(original_fn, self, compress_ratio: int = 0):
+    """Price a paged DSV4 KV token at the Kunlun slot size.
+
+    0.5.22 moved the per-token KV byte count out of ``self.kv_bytes`` and into
+    this method, which derives it from the *reader's* page layout
+    (``select_dsv4_kv_layout()`` -> ``KVLayout.V4.page_bytes(page_size)``, i.e.
+    448 B fp8 nope + 128 B bf16 rope + 8 B ue8m0 scales = 584 B/token, padded to
+    the TMA row stride). That is the NVIDIA FlashMLA packing. The Kunlun pool
+    stores a plain fp16/bf16 latent instead -- ``(qk_nope + qk_rope)`` halves,
+    1024 B/token -- and ``kernel_ops._assert_v4_kv_layout`` refuses every packed
+    layout, so the slot width is the same at every compression ratio.
+
+    Under-counting by 1.75x is not a rounding error: the configurator hands out
+    1.72x more tokens than fit, which OOMs while building the pool (and made
+    ``full token usage`` read 0.00 when it did squeeze through). Correcting it
+    here instead of patching ``bytes_per_full_token`` afterwards means the SWA
+    term, the c4/c128 terms and the ratio-1/2 term all pick it up from upstream's
+    own formulas, so they keep tracking upstream drift.
+    """
+    if not _kunlun_half_cache_applies(self):
+        return original_fn(self, compress_ratio)
+    return _kunlun_paged_kv_bytes_per_token(self)
+
+
 @plugin_hook(
     "sglang.srt.model_executor.pool_configurator.DSV4PoolConfigurator.__init__",
     type=HookType.AFTER,
 )
 def dsv4_pool_configurator_kv_bytes_kunlun(result, self, kvc):
-    """按昆仑半 cache 的槽位大小定 DSV4 各池子的容量。
+    """Re-price the DSV4 pool coefficients at the Kunlun slot size.
 
-    `DSV4PoolConfigurator` 自己算 `kv_bytes = qk_nope + qk_rope*2 + 8`（448+128+8=584 B，
-    N 卡 FlashMLA 的 fp8 nope + bf16 rope + ue8m0 scale 打包），**从不问 pool 的
-    `get_bytes_per_token()`**，所以上面那个 `dsv4_get_bytes_per_token_kunlun` 影响不到容量。
-    昆仑一个槽位是 `(qk_nope + qk_rope)` 个 fp16 元素 = 1024 B，比它大 1.75 倍，于是
-    configurator 发的 token 额度是实际能装下的 1.72 倍（`bytes_per_full_token` 口径
-    3966 → 应为 6826，full_token 5804544 → 3372544）。表现是 `--mem-fraction-static 0.75`
-    在建池阶段 OOM（0.6 只是踩着卡的物理上限侥幸过关），以及 `full token usage` 恒为 0.00。
-
-    上游自己的 bf16 latent 池就是 `attn_head_dim * 2`（`self._unified` 分支），这里取同一个值。
-
-    0.5.19 已把容量计算收拢为 `bytes_per_full_token`，不再保存
-    `self.kv_bytes` / `_spec_infl` 等旧字段。因此这里在构造完成后只修正
-    `bytes_per_full_token` 中与 KV 槽位相关的那一项，保持 indexer/state
-    的上游计算不变。
+    ``_get_paged_kv_bytes_per_token`` above covers the SWA and c4/c128 terms, but
+    ``_compressed_bytes_per_full_token`` prices ratio 1 and 2 straight off
+    ``self.kv_bytes`` (the FlashMLA 584 B constant), and both coefficients were
+    already computed by the time this AFTER hook runs. Correct ``kv_bytes`` and
+    re-derive the two coefficients through upstream's own methods, re-applying
+    the speculative inflation it stored in ``_spec_infl`` -- rather than adding a
+    hand-rolled delta, which is what the 0.5.19 version of this hook did and
+    which stopped matching the formula in 0.5.22.
     """
-    if self.kv_cache_dtype_str not in ("fp16", "float16", "bf16", "bfloat16"):
-        return result
-    if getattr(self, "_unified", False):
-        return result  # unified KV 本来就按 bf16 latent 定容量
-
     del kvc
-    old_kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
-    new_kv_bytes = (self.qk_nope_head_dim + self.qk_rope_head_dim) * 2
-    kv_coeff = (
-        self.swa_ratio * self.num_layers_total
-        + (1 / (4 * self.c4_shrink_factor)) * self.num_layers_ca4
-        + (1 / 128) * self.num_layers_ca128
-    )
-    delta = (new_kv_bytes - old_kv_bytes) * kv_coeff
-    if self.is_speculative:
-        target_layers = self.num_layers_total
-        delta *= (target_layers + 1) / target_layers
-    self.bytes_per_full_token += delta
+    if not _kunlun_half_cache_applies(self):
+        return result
+
+    old_kv_bytes = self.kv_bytes
+    self.kv_bytes = _kunlun_paged_kv_bytes_per_token(self)
+    if getattr(self, "encoder_replay", False):
+        # request_window_bytes is a fixed-byte bias computed from kv_bytes before
+        # this hook runs; recomputing it would mean duplicating that formula.
+        logger.warning(
+            "Kunlun half-cache DSV4 sizing: --enable-encoder-swa-bounded-replay "
+            "prices its request window from kv_bytes before this hook runs, so "
+            "request_window_bytes still carries the %d B FlashMLA slot.",
+            old_kv_bytes,
+        )
+    self.bytes_per_swa_token = self._get_bytes_per_swa_token() * self._spec_infl
+    self.bytes_per_full_token = self._get_bytes_per_full_token() * self._spec_infl
 
     logger.info(
         "Kunlun half-cache DSV4 pool sizing: kv_bytes %d -> %d, "
-        "bytes_per_full_token %.2f",
+        "bytes_per_swa_token %.2f, bytes_per_full_token %.2f",
         old_kv_bytes,
-        new_kv_bytes,
+        self.kv_bytes,
+        self.bytes_per_swa_token,
         self.bytes_per_full_token,
     )
     return result

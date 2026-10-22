@@ -136,7 +136,6 @@ class EngramEmbeddingKunlun(EngramEmbedding):
             max(1, w_bytes + s_bytes),  # mmap needs storage even for an empty shard
             f"sglang_engram_{layer_id}",
             get_tp_group(),
-            pin=envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN.get(),
         )
         raw = self.host_table.bytes[: w_bytes + s_bytes]
         weight = raw[:w_bytes].view(torch.int8).view(n, dim)

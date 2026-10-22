@@ -388,7 +388,13 @@ class DeepEPMoE(FusedMoE):
             **kwargs,
         )
         self.should_fuse_routed_scaling_factor_in_topk = True
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and isinstance(
+        # 0.5.22 的 ``deep_gemm_wrapper/__init__.py`` 只 re-export
+        # ``entrypoint``，``ENABLE_JIT_DEEPGEMM`` 留在 ``configurer`` 里。
+        from sglang.srt.layers.deep_gemm_wrapper.configurer import (
+            ENABLE_JIT_DEEPGEMM,
+        )
+
+        if ENABLE_JIT_DEEPGEMM and isinstance(
             quant_config, Fp8Config
         ):
             self.deprecate_flag = True
@@ -499,8 +505,28 @@ class DeepEPMoE(FusedMoE):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
+        pre_quant_input: Optional[Tuple] = None,
     ):
         """forward"""
+        # `FusedMoE.forward` (our direct base) carries a trailing
+        # `pre_quant_input`: the MoE input quantized once per layer
+        # (`DeepseekV2MoE._maybe_quant_moe_input_once`) or the MXFP8
+        # `Mxfp8RoutedInputPreQuant`, passed *by keyword* from
+        # deepseek_v2.forward_normal / forward_normal_dual_stream. The parameter
+        # is not new in 0.5.22 (0.5.19 had it too) -- this override simply never
+        # mirrored it, so such a call would TypeError. Mirror the name and let
+        # `forward_impl` decide whether it can be honoured; the two graph
+        # branches below cannot: `a2a_forward_with_output` has a fixed tensor
+        # signature and the piecewise MoE op drops pre_quant_input (upstream
+        # says so in `DeepseekV2MoE._should_quant_routed_input_mxfp8`).
+        if pre_quant_input is not None and (
+            is_in_breakable_cuda_graph() or is_in_piecewise_cuda_graph()
+        ):
+            raise NotImplementedError(
+                "DeepEPMoE.forward: pre_quant_input cannot be threaded through "
+                "the cuda-graph MoE paths (the breakable eager a2a node and the "
+                "piecewise MoE op both take plain tensors)"
+            )
         # DeepEP NORMAL mode is not capturable: its dispatch/combine is
         # rank-coupled and reads host-side layout, so breakable capture runs
         # the whole a2a + MoE as an eager node (mirrors upstream EPMoE).
@@ -540,19 +566,38 @@ class DeepEPMoE(FusedMoE):
                 self.layer_id,
             )
         else:
-            return self.forward_impl(hidden_states, topk_output)
+            return self.forward_impl(hidden_states, topk_output, pre_quant_input)
 
     def forward_impl(
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
+        pre_quant_input: Optional[Tuple] = None,
     ):
         """forward_impl"""
 
         if self.deprecate_flag:
+            # The deprecated path is plain `FusedMoE.forward_impl`, which knows
+            # how to splice `pre_quant_input` into the standard dispatch output
+            # (`_dispatch_with_pre_quant`), so hand it over untouched.
             return super().forward_impl(
                 hidden_states,
                 topk_output,
+                pre_quant_input=pre_quant_input,
+            )
+
+        # The DeepEP dispatcher has no pre-quantized-input seam -- it quantizes
+        # inside dispatch and its DispatchOutput is not the standard format
+        # `FusedMoE._dispatch_with_pre_quant` requires. Upstream's own
+        # DeepEPMoE does not even accept the argument, so a non-None value here
+        # would be silently dropped (and, for `Mxfp8RoutedInputPreQuant`, would
+        # leave its side stream unjoined under graph capture). Fail loudly
+        # instead; None keeps the previous behaviour exactly.
+        if pre_quant_input is not None:
+            raise NotImplementedError(
+                "DeepEPMoE.forward_impl: pre_quant_input is not supported on the "
+                "DeepEP path (the dispatcher quantizes internally and produces a "
+                "non-standard DispatchOutput)"
             )
 
         # TODO: can we call super().forward here?

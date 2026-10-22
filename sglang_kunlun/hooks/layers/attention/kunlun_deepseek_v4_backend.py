@@ -129,13 +129,15 @@ def _clamp_c128_prefill_topk(
     "sglang.srt.layers.attention.deepseek_v4_backend._create_flashmla_metadata",
     type=HookType.REPLACE,
 )
-@plugin_hook(
-    "sglang.srt.layers.attention.deepseek_v4_backend_hip_radix."
-    "_create_flashmla_metadata",
-    type=HookType.REPLACE,
-)
 def _create_flashmla_metadata_kunlun():
-    """Disable CUDA FlashMLA metadata on Kunlun."""
+    """Disable CUDA FlashMLA metadata on Kunlun.
+
+    The companion registration on
+    ``deepseek_v4_backend_hip_radix._create_flashmla_metadata`` is gone: that
+    module is ROCm-only and does not import on this box (``No module named
+    'triton.experimental'``), so the hook could never resolve and every boot
+    logged "Failed to apply hooks". Kunlun never selects the HIP radix backend.
+    """
 
     return None
 
@@ -251,7 +253,9 @@ def _get_paged_mqa_logits_metadata_kunlun(seq_lens, page_size, num_sm):
 class KunlunDSV4AttnMetadata(DSV4AttnMetadata):
     """DSV4 metadata without CUDA FlashMLA scheduler objects."""
 
-    def init_flashmla_related(self, is_prefill: bool = False) -> None:
+    def init_flashmla_related(
+        self, is_prefill: bool = False, low_ratio_buffers=None
+    ) -> None:
         """Initialize Kunlun sparse metadata without FlashMLA schedulers.
 
         Mirrors the upstream ratio split. V4-Flash stages carry ratio 4 (and
@@ -259,6 +263,14 @@ class KunlunDSV4AttnMetadata(DSV4AttnMetadata):
         buffers must stay unset there and the c1/c2 buffers must be allocated --
         otherwise the low-ratio path silently degrades to window-only attention
         (and an absent c4 pool crashes this method outright).
+
+        ``low_ratio_buffers`` (0.5.22): the V4.1 decode path pre-builds the
+        capture-shaped c1/c2 top-k buffers once
+        (``build_low_ratio_metadata``) and hands the tuple in by keyword, so
+        this method must adopt them instead of allocating fresh ones -- a fresh
+        allocation on a graph replay writes into a tensor nothing captured
+        reads. Upstream slices ``[2:4]`` for c1 and ``[6:8]`` for c2 under
+        ``not is_prefill and low_ratios == (1, 2)``; mirror exactly that.
         """
         # 4.1 renamed the DSV4 metadata field (and the backend attribute) from
         # c4_sparse_topk/c4_topk to index_topk; the value is the same
@@ -287,6 +299,27 @@ class KunlunDSV4AttnMetadata(DSV4AttnMetadata):
         self.c4_sparse_raw_indices = None
         # V4.1 low-ratio (1/2) sparse top-k buffers. The indexer fills them in
         # place; the attention op reads them as (slot, -1-padded) extra indices.
+        if low_ratio_buffers is not None:
+            assert not is_prefill and tuple(self.low_ratios) == (1, 2), (
+                "low_ratio_buffers is the V4.1 decode contract: "
+                f"is_prefill={is_prefill} low_ratios={tuple(self.low_ratios)}"
+            )
+            (
+                self.c1_sparse_topk_lengths,
+                self.c1_sparse_page_indices,
+            ) = low_ratio_buffers[2:4]
+            (
+                self.c2_sparse_topk_lengths,
+                self.c2_sparse_page_indices,
+            ) = low_ratio_buffers[6:8]
+            self.c1_sparse_raw_indices = None
+            self.c2_sparse_raw_indices = None
+            self.c0_flashmla_metadata = None
+            self.c1_flashmla_metadata = None
+            self.c2_flashmla_metadata = None
+            self.c4_flashmla_metadata = None
+            self.c128_flashmla_metadata = None
+            return
         for ratio in self.low_ratios:
             # 0.5.19's upstream metadata has only c4/c128 fields.  The
             # c1/c2 fields exist only on the V4.1 low-ratio metadata layout,
@@ -326,6 +359,53 @@ def _copy_host_lengths_(destination, source, fill_value: int) -> None:
     destination[:count].copy_(source[:count])
     if count < destination.numel():
         destination[count:].fill_(fill_value)
+
+
+_PACKED_WARNED: set = set()
+
+
+def _as_packed(tensor: torch.Tensor, what: str) -> torch.Tensor:
+    """Pack a tensor before handing it to a vendor op, warning once if it copied.
+
+    The XSpeedGate / kunlun_ops kernels take raw ``data_ptr()`` and recompute the
+    row stride from the declared shape; a strided view silently makes every row
+    but the first read the wrong memory. Column slices of page tables are the
+    usual source, so warn the first time each site actually needs the copy -- a
+    silent ``.contiguous()`` would hide a real metadata-layout change.
+    """
+    if tensor.is_contiguous():
+        return tensor
+    if what not in _PACKED_WARNED:
+        _PACKED_WARNED.add(what)
+        logger.warning(
+            "[KUNLUN-PACK] %s was not contiguous (shape=%s stride=%s); "
+            "copying before the vendor op",
+            what,
+            tuple(tensor.shape),
+            tensor.stride(),
+        )
+    return tensor.contiguous()
+
+
+def _as_packed_out(tensor: torch.Tensor, what: str):
+    """Return ``(kernel_target, writeback)`` for a vendor-op *output* tensor.
+
+    ``out.contiguous()`` on a strided output is a silent data loss: the kernel
+    fills the temporary copy and the caller keeps reading zeros. Hand back the
+    packed buffer plus the original so the caller can copy the result home.
+    """
+    if tensor.is_contiguous():
+        return tensor, None
+    if what not in _PACKED_WARNED:
+        _PACKED_WARNED.add(what)
+        logger.warning(
+            "[KUNLUN-PACK] output %s was not contiguous (shape=%s stride=%s); "
+            "the vendor op writes a copy that must be written back",
+            what,
+            tuple(tensor.shape),
+            tensor.stride(),
+        )
+    return tensor.contiguous(), tensor
 
 
 def _is_graph_extend_mode(forward_mode) -> bool:
@@ -690,10 +770,15 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # The Kunlun metadata builder was written against the 4.1 field names.
-        # 0.5.19's upstream backend still exposes the same values as
-        # ``c4_topk`` and does not publish ratio tuples on the backend object.
-        # Normalize the compatibility fields once at construction time.
-        self.index_topk = getattr(self, "index_topk", self.c4_topk)
+        # 0.5.22's upstream backend publishes ``index_topk`` itself
+        # (``deepseek_v4_backend.py:1179``) and no longer has the older
+        # ``c4_topk`` spelling anywhere, so the former compatibility fallback
+        # ``getattr(self, "index_topk", self.c4_topk)`` is both dead and an
+        # AttributeError (the default is evaluated eagerly). Assert instead:
+        # losing this field silently would mean an unbounded top-k.
+        assert hasattr(self, "index_topk"), (
+            "upstream DSV4 backend no longer publishes index_topk"
+        )
         ratios = tuple(
             getattr(self.model_runner.model_config, "compress_ratios", ())
         )
@@ -1044,7 +1129,11 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             )
             return F.pad(tensor, pad, value=value)
 
-        c4_seq_lens = match_num_queries(indexer_metadata.c4_seq_lens, value=1)
+        # 0.5.22 把 ``PagedIndexerMetadata.c4_seq_lens`` 改名成
+        # ``compressed_seq_lens``（同时新增 compress_ratio/row_chunk 等字段）。
+        c4_seq_lens = match_num_queries(
+            indexer_metadata.compressed_seq_lens, value=1
+        )
         c4_seq_lens_for_logits = c4_seq_lens
         page_table = match_num_queries(indexer_metadata.page_table, value=0)
         c4_sparse_page_indices = match_num_queries(
@@ -1112,25 +1201,25 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             topk_transform = getattr(
                 upstream_indexer,
                 "topk_transform_pytorch_vectorized",
-                upstream_indexer.topk_transform_512_pytorch_vectorized,
+                upstream_indexer.topk_transform_pytorch_vectorized,
             )
             topk_transform(
                 logits,
                 c4_seq_lens,
                 page_table,
                 c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
+                indexer_metadata.compressed_page_size,
                 raw_indices,
             )
         elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
             topk_transform = getattr(upstream_indexer, "topk_transform_paged_v2", None)
             if topk_transform is None:
-                upstream_indexer.topk_transform_512_pytorch_vectorized(
+                upstream_indexer.topk_transform_pytorch_vectorized(
                     logits,
                     c4_seq_lens,
                     page_table,
                     c4_sparse_page_indices,
-                    indexer_metadata.c4_page_size,
+                    indexer_metadata.compressed_page_size,
                     raw_indices,
                 )
             else:
@@ -1139,21 +1228,21 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                     c4_seq_lens,
                     page_table,
                     c4_sparse_page_indices,
-                    indexer_metadata.c4_page_size,
+                    indexer_metadata.compressed_page_size,
                     indexer_metadata.topk_metadata,
                 )
         else:
             topk_transform = getattr(
                 upstream_indexer,
                 "topk_transform_paged",
-                upstream_indexer.topk_transform_512_pytorch_vectorized,
+                upstream_indexer.topk_transform_pytorch_vectorized,
             )
             topk_transform(
                 logits,
                 c4_seq_lens,
                 page_table,
                 c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
+                indexer_metadata.compressed_page_size,
                 raw_indices,
             )
 
@@ -1166,7 +1255,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 # query row per draft token; expand the request-indexed inputs
                 # to one entry per row so every row swaps in its own top-k.
                 swap_req_indices = forward_batch.req_pool_indices
-                swap_seq_lens = indexer_metadata.c4_seq_lens
+                swap_seq_lens = indexer_metadata.compressed_seq_lens
                 rows = raw_indices.size(0)
                 n_reqs = swap_req_indices.size(0)
                 real_rows = n_reqs
@@ -1224,7 +1313,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             weight=weights,
             seq_lens=c4_seq_lens,
             page_table=page_table,
-            max_seq_len=indexer_metadata.max_c4_seq_len,
+            max_seq_len=indexer_metadata.max_compressed_seq_len,
             forward_batch=forward_batch,
             c4_indexer=c4_indexer,
         )
@@ -1283,7 +1372,13 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             "4.1 request-window (encoder SWA bounded replay) is not supported by "
             "the Kunlun DSV4 backend"
         )
-        assert self.swa_page_size == upstream.SWA_WINDOW
+        # 0.5.19 的 backend 上有个 ``self.swa_page_size = 128`` 常量，和
+        # ``SWA_WINDOW`` 恒等，所以这里原来的断言是恒真的；0.5.22 把这个冗余
+        # 字段删掉了。池子上的 ``swa_page_size`` 是**另一个量**（= 服务的
+        # ``page_size``，本部署是 256），上游自己断言的是
+        # ``token_to_kv_pool.swa_page_size % SWA_WINDOW == 0``
+        # （``deepseek_v4_backend.py:1154``），本方法进来前就已经查过了。
+        assert self.token_to_kv_pool.swa_page_size % upstream.SWA_WINDOW == 0
         seq_lens_casual = seq_lens_casual.to(torch.int32)
         swa_page_indices = self.get_swa_page_indices(
             seq_lens_casual=seq_lens_casual,
@@ -1329,14 +1424,14 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             page_table=(page_table // self.page_size).to(torch.int32),
             swa_page_indices=swa_page_indices,
             swa_topk_lengths=torch.clamp(seq_lens_casual, max=upstream.SWA_WINDOW),
-            c4_sparse_topk=self.index_topk,
+            # 0.5.22 renamed the dataclass field ``c4_sparse_topk`` to
+            # ``index_topk`` and promoted ``present_ratios`` / ``low_ratios``
+            # into the constructor (``present_ratios`` has no default), so they
+            # are passed here instead of being patched on afterwards.
+            index_topk=self.index_topk,
+            present_ratios=self.present_ratios,
+            low_ratios=self.low_ratios,
         )
-        # 0.5.19 keeps the upstream dataclass constructor contract
-        # (``c4_sparse_topk``); the 4.1 compatibility fields are consumed by
-        # KunlunDSV4AttnMetadata.init_flashmla_related().
-        metadata.index_topk = self.index_topk
-        metadata.present_ratios = self.present_ratios
-        metadata.low_ratios = self.low_ratios
         # Apply the effective-length contract after construction as well;
         # this keeps the value correct if upstream metadata initialization resets it.
         metadata.swa_topk_lengths = swa_topk_lengths
@@ -1388,7 +1483,13 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         窗口索引（相关 kernel 有昆仑替换实现），昆仑侧唯一要改的是无效 lane 的约定：
         填 page 0 而不是 -1，尾部由 ``swa_topk_lengths`` 掩掉。
         """
-        assert self.swa_page_size == upstream.SWA_WINDOW
+        # 0.5.19 的 backend 上有个 ``self.swa_page_size = 128`` 常量，和
+        # ``SWA_WINDOW`` 恒等，所以这里原来的断言是恒真的；0.5.22 把这个冗余
+        # 字段删掉了。池子上的 ``swa_page_size`` 是**另一个量**（= 服务的
+        # ``page_size``，本部署是 256），上游自己断言的是
+        # ``token_to_kv_pool.swa_page_size % SWA_WINDOW == 0``
+        # （``deepseek_v4_backend.py:1154``），本方法进来前就已经查过了。
+        assert self.token_to_kv_pool.swa_page_size % upstream.SWA_WINDOW == 0
         seq_lens_casual = seq_lens_casual.to(torch.int32)
         if dspark_swa_buffers is not None:
             swa_page_indices, swa_topk_lengths = dspark_swa_buffers
@@ -1412,12 +1513,11 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             page_table=(page_table // self.page_size).to(torch.int32),
             swa_page_indices=swa_page_indices,
             swa_topk_lengths=swa_topk_lengths,
-            c4_sparse_topk=self.index_topk,
+            # See the prefill builder above: 0.5.22 constructor field names.
+            index_topk=self.index_topk,
+            present_ratios=self.present_ratios,
+            low_ratios=self.low_ratios,
         )
-        metadata.index_topk = self.index_topk
-        metadata.present_ratios = self.present_ratios
-        metadata.low_ratios = self.low_ratios
-        metadata.swa_topk_lengths = swa_topk_lengths
         metadata.c4_sparse_topk_lengths = None
         metadata.c4_sparse_page_indices = None
         metadata.c4_sparse_raw_indices = None
@@ -1813,19 +1913,29 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             device=q_3d.device,
         )
         lse = torch.zeros_like(max_logits)
-        q_op = q_3d.contiguous()
-        win_cache_op = win_cache.contiguous()
-        win_indices_op = win_indices.contiguous()
-        extra_cache_op = extra_cache.contiguous()
-        extra_indices_op = extra_indices.contiguous()
-        out_op = out.contiguous()
-        max_logits_op = max_logits.contiguous()
-        lse_op = lse.contiguous()
-        q_lod_cpu_op = q_lod_cpu.contiguous()
-        q_lod_op = q_lod.contiguous()
-        kv_lens_cpu_op = kv_lens_cpu.contiguous()
-        kv_lens_op = kv_lens.contiguous()
-        attn_sink_op = local_sink.contiguous() if local_sink is not None else None
+        q_op = _as_packed(q_3d, "compressed_attention.q")
+        win_cache_op = _as_packed(win_cache, "compressed_attention.win_cache")
+        win_indices_op = _as_packed(win_indices, "compressed_attention.win_indices")
+        extra_cache_op = _as_packed(extra_cache, "compressed_attention.extra_cache")
+        extra_indices_op = _as_packed(
+            extra_indices, "compressed_attention.extra_indices"
+        )
+        # Outputs: a plain ``.contiguous()`` here would send the kernel into a
+        # throwaway copy and leave `out` at zeros.
+        out_op, out_writeback = _as_packed_out(out, "compressed_attention.out")
+        max_logits_op, max_logits_writeback = _as_packed_out(
+            max_logits, "compressed_attention.max_logits"
+        )
+        lse_op, lse_writeback = _as_packed_out(lse, "compressed_attention.lse")
+        q_lod_cpu_op = _as_packed(q_lod_cpu, "compressed_attention.q_lod_cpu")
+        q_lod_op = _as_packed(q_lod, "compressed_attention.q_lod")
+        kv_lens_cpu_op = _as_packed(kv_lens_cpu, "compressed_attention.kv_lens_cpu")
+        kv_lens_op = _as_packed(kv_lens, "compressed_attention.kv_lens")
+        attn_sink_op = (
+            _as_packed(local_sink, "compressed_attention.attn_sink")
+            if local_sink is not None
+            else None
+        )
         # Mirror the Golden 0.5.14 device probe: local heads only, the
         # index-selected cache rows actually consumed, and post-clamp indices.
         local_q_heads = getattr(layer, "tp_q_head_num", q_op.shape[1])
@@ -1925,6 +2035,12 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             # # lifetime of the contiguous temporary inputs.
             # side_stream=torch.cuda.current_stream().cuda_stream,
         )
+        if out_writeback is not None:
+            out_writeback.copy_(out_op)
+        if max_logits_writeback is not None:
+            max_logits_writeback.copy_(max_logits_op)
+        if lse_writeback is not None:
+            lse_writeback.copy_(lse_op)
         for name, value in () if not _dsv4_dump_enabled() else (
             ("compressed_attention.output.out_pre_rope", out_op[:, :local_q_heads]),
             (
@@ -2262,6 +2378,31 @@ def _select_c4_target_verify_rows(
     return q_fp8, weight, seq_lens, page_table, num_queries_per_request
 
 
+def _has_xspeedgate_op(name: str) -> bool:
+    """Whether the installed XSpeedGate build exposes ``name``.
+
+    The paged c4 logits fast path below is optional: ``mqa_logits_paged`` is
+    present only in newer vendor builds, and a missing op raises
+    ``AttributeError: '_OpNamespace' 'xspeedgate_ops' object has no attribute
+    ...`` on the first prefill rather than at import. Probe once and fall back to
+    the gather + ``c4a_mqa_logits`` path, which computes the same logits.
+    """
+    cached = _XSPEEDGATE_OP_CACHE.get(name)
+    if cached is None:
+        cached = hasattr(torch.ops.xspeedgate_ops, name)
+        _XSPEEDGATE_OP_CACHE[name] = cached
+        if not cached:
+            logger.warning(
+                "xspeedgate_ops.%s is unavailable in this build; using the "
+                "non-paged Kunlun fallback for the same computation",
+                name,
+            )
+    return cached
+
+
+_XSPEEDGATE_OP_CACHE: dict = {}
+
+
 def _compute_c4_logits_kunlun(
     *,
     backend,
@@ -2328,6 +2469,7 @@ def _compute_c4_logits_kunlun(
             and q.shape[1:] == (64, 128)
             and weights.shape[1] == 64
             and kvcache_fp8.shape[1:] == (64, 1, 132)
+            and _has_xspeedgate_op("mqa_logits_paged")
         ):
             pt_rows = (
                 contract["last_rows"]
@@ -2430,7 +2572,10 @@ def _compute_c4_logits_kunlun(
     block_size = kvcache_fp8.shape[1]
     seq_lens = seq_lens.view(-1)[:batch_size]
     q = q_fp8.view(torch.int8) if q_fp8.dtype == torch.uint8 else q_fp8
-    weights = weight.unsqueeze(1)
+    q = _as_packed(q, "c4a_paged_mqa_logits.q")
+    weights = _as_packed(
+        weight.unsqueeze(1), "c4a_paged_mqa_logits.weight"
+    )
 
     cache_flat = kvcache_fp8.view(
         kvcache_fp8.shape[0], block_size * (head_dim + 4)
@@ -2446,7 +2591,15 @@ def _compute_c4_logits_kunlun(
         (max_seq_len + block_size - 1) // block_size,
         page_table.shape[1],
     )
-    block_table = page_table[:, :num_pages].to(torch.int32)
+    # ``page_table`` is already int32, so ``.to(torch.int32)`` is a no-op and the
+    # column slice keeps ``stride(0) == page_table.shape[1]``.  The vendor kernel
+    # derives the row stride from ``size(1)``, not ``stride(0)`` (verified with
+    # probe_block_table_stride.py: rows 1..N read another request's pages), so the
+    # table has to be packed before the call.  At page_size=256 the slice is a
+    # no-op and this costs nothing; it only bites at other page sizes.
+    block_table = _as_packed(
+        page_table[:, :num_pages].to(torch.int32), "c4a_paged_mqa_logits.block_table"
+    )
     scale_pages = (
         cache_flat[:, scale_offset:]
         .contiguous()

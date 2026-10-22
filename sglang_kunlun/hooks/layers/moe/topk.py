@@ -30,6 +30,7 @@ from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     TopKConfig,
     biased_grouped_topk,
+    biased_grouped_topk_impl,
     biased_topk_impl,
     _use_aiter,
     _post_process_topk_ids,
@@ -120,6 +121,23 @@ def select_experts_kunlun(
     layer_id: Optional[int] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    # 0.5.22 added these two keyword-only parameters, and ``TopK.forward_cuda``
+    # passes BOTH unconditionally on every MoE forward
+    # (``srt/layers/moe/topk.py:789``-791; ``forward_native`` passes
+    # ``dynamic_expert_bias`` too). Omitting them is a TypeError on the active
+    # MoE path, so they are mirrored here.
+    #  * ``dynamic_expert_bias``: a per-token [num_tokens, num_experts] routing
+    #    bias produced by the multi-gate (``srt/layers/multi_gate.py:190``,
+    #    used by bailing_moe / bailing_moe_v3). Upstream overrides
+    #    ``topk_config.correction_bias`` with it and routes through
+    #    ``biased_grouped_topk_impl`` (sigmoid only) — see below.
+    #  * ``router_logits_partials``: fp32 split-K partials from the ROCm decode
+    #    router gate (``srt/models/deepseek_v2.py:1090``), whose fixed-order sum
+    #    IS the logits. Only the aiter sqrtsoftplus gate consumes them; every
+    #    other route first reduces them with ``rocm_router_reduce_partials``, a
+    #    HIP Triton kernel. Rejected explicitly below.
+    dynamic_expert_bias: Optional[torch.Tensor] = None,
+    router_logits_partials: Optional[torch.Tensor] = None,
 ) -> StandardTopKOutput:
     """select_experts"""
     top_k = topk_config.top_k
@@ -129,7 +147,13 @@ def select_experts_kunlun(
     renormalize = topk_config.renormalize
     num_fused_shared_experts = topk_config.num_fused_shared_experts
     custom_routing_function = topk_config.custom_routing_function
-    correction_bias = topk_config.correction_bias
+    # 0.5.22: a per-token ``dynamic_expert_bias`` supersedes the static
+    # per-expert ``topk_config.correction_bias`` (upstream topk.py:2563).
+    correction_bias = (
+        topk_config.correction_bias
+        if dynamic_expert_bias is None
+        else dynamic_expert_bias
+    )
     torch_native = topk_config.torch_native
     routed_scaling_factor = topk_config.routed_scaling_factor
     apply_routed_scaling_factor_on_output = (
@@ -137,6 +161,16 @@ def select_experts_kunlun(
     )
 
     scoring_func = topk_config.scoring_func
+
+    if router_logits_partials is not None:
+        # Kunlun has no ROCm split-K router gate and cannot run the HIP Triton
+        # reducer (``rocm_router_reduce_partials``) that upstream falls back to,
+        # so unreduced partials would silently leave ``router_logits`` as an
+        # unfilled buffer. Fail loudly instead.
+        raise NotImplementedError(
+            "Kunlun select_experts does not support router_logits_partials "
+            "(ROCm split-K router gate); pass pre-reduced router_logits"
+        )
 
     router_logits, correction_bias = (
         expert_location_dispatch.transform_select_experts_inputs(
@@ -159,7 +193,31 @@ def select_experts_kunlun(
         and top_k == 16
         and router_logits.shape[-1] == 896
     )
-    if use_k3_router:
+    if dynamic_expert_bias is not None:
+        # 0.5.22 branch (upstream topk.py:2644): a per-token bias cannot go
+        # through the fused per-expert-bias gates, so upstream takes the pure
+        # torch ``biased_grouped_topk_impl`` and requires sigmoid scoring.
+        # That reference impl is plain torch, so it runs as-is on Kunlun —
+        # mirror it exactly rather than approximating it with
+        # ``kunlun_ops.moe_sigmoid_group_topk_norm`` (whose ``bias`` is
+        # per-expert [num_experts], not per-token).
+        if scoring_func != "sigmoid":
+            raise ValueError(
+                "Per-token expert bias is only supported with sigmoid routing"
+            )
+        topk_weights, topk_ids = biased_grouped_topk_impl(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            correction_bias=correction_bias,
+            topk=top_k,
+            renormalize=renormalize,
+            num_expert_group=num_expert_group or 1,
+            topk_group=topk_group or 1,
+            num_fused_shared_experts=num_fused_shared_experts,
+            routed_scaling_factor=routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+        )
+    elif use_k3_router:
         topk_weights, topk_ids = route_k3_torch(
             router_logits, correction_bias, top_k
         )

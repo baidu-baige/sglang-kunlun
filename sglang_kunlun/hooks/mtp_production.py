@@ -84,6 +84,9 @@ def prepare_for_draft_extend_kunlun(
     num_draft_tokens,
     draft_model_runner,
     cuda_graph_runner,
+    *,
+    kv_loc_plan=None,
+    write_cols=None,
 ):
     """Build fixed-width graph metadata or correct ragged eager metadata."""
     from sglang.srt.model_executor.forward_batch_info import (
@@ -160,11 +163,23 @@ def prepare_for_draft_extend_kunlun(
         else CaptureHiddenMode.FULL
     )
 
+    # 0.5.22 made the iteration's KV write window explicit: the draft builds a
+    # ``KVLocPlan`` and verify / draft extend bind the *same* plan through
+    # ``ForwardBatch.init_new(kv_loc_plan=..., write_cols=...)`` instead of each
+    # forward re-deriving its slots. Honour it when the caller has a plan;
+    # ``write_cols`` names the columns of that window this forward writes (the
+    # accepted-only flat index on the compacted path). With no plan the call is
+    # byte-for-byte the 0.5.19 one and ``init_new`` builds its own plan.
+    plan_kwargs = {}
+    if kv_loc_plan is not None:
+        plan_kwargs["kv_loc_plan"] = kv_loc_plan
+        plan_kwargs["write_cols"] = write_cols
     forward_batch = ForwardBatch.init_new(
         batch,
         draft_model_runner,
         capture_hidden_mode=batch.capture_hidden_mode,
         return_hidden_states_before_norm=False,
+        **plan_kwargs,
     )
     increment = (
         accept_lens.to(forward_batch.seq_lens.dtype)
@@ -356,8 +371,13 @@ def capture_cuda_graphs_kunlun(self):
     "sglang.srt.speculative.eagle_worker_v2.EAGLEWorkerV2.verify",
     type=HookType.AFTER,
 )
-def publish_verify_stride_kunlun(result, self, batch, grammar_barrier=None):
+def publish_verify_stride_kunlun(
+    result, self, batch, pp_proxy_tensors=None, grammar_barrier=None
+):
     """Carry the verify-time fixed row width to scheduler result processing."""
+    # 0.5.22 inserted ``pp_proxy_tensors`` between ``batch`` and
+    # ``grammar_barrier`` in ``EAGLEWorkerV2.verify``; an AFTER hook receives
+    # the target's own arguments, so mirror it or the call raises TypeError.
     result.speculative_num_draft_tokens = self.speculative_num_draft_tokens
     return result
 
@@ -431,7 +451,7 @@ def correct_draft_input_hidden(worker, batch_result):
     "sglang.srt.speculative.eagle_worker_v2.EagleDraftWorker._draft_extend_for_decode",
     type=HookType.REPLACE,
 )
-def draft_extend_for_decode_kunlun(self, batch, batch_result):
+def draft_extend_for_decode_kunlun(self, batch, batch_result, *, kv_loc_plan=None):
     """Compact accepted request prefixes for synchronous DSV4 draft extend."""
     import sglang.srt.speculative.eagle_worker_v2 as upstream
 
@@ -459,6 +479,11 @@ def draft_extend_for_decode_kunlun(self, batch, batch_result):
         next_token_ids = batch_result.next_token_ids.index_select(0, accepted).to(
             torch.int64
         )
+        # 0.5.22's ``kv_loc_plan`` owns the whole verify window; this path packs
+        # only the accepted prefix rows, which is exactly what ``write_cols``
+        # expresses (a flat index into the ``[bs, num_draft_tokens]`` window),
+        # so the plan is bound with the same index the compaction uses.
+        write_cols = accepted
     else:
         hidden_states = batch_result.logits_output.hidden_states
         out_cache_loc = batch.out_cache_loc
@@ -469,6 +494,22 @@ def draft_extend_for_decode_kunlun(self, batch, batch_result):
             - 1
         )
         next_token_ids = batch_result.next_token_ids.to(torch.int64)
+        # Full-width path: this forward writes the plan's whole window.
+        write_cols = None
+
+    if kv_loc_plan is not None:
+        # The cols index above addresses the window as [bs, num_draft_tokens];
+        # a plan whose window is shaped differently would silently bind the
+        # wrong slots, so refuse it here instead of corrupting the draft KV.
+        window = kv_loc_plan.write_virtual
+        expected = len(batch.seq_lens) * self.speculative_num_draft_tokens
+        if window is not None and window.numel() != expected:
+            raise RuntimeError(
+                "kunlun draft-extend: kv_loc_plan window does not match the "
+                f"verify window (plan={window.numel()}, expected={expected}, "
+                f"batch_size={len(batch.seq_lens)}, "
+                f"num_draft_tokens={self.speculative_num_draft_tokens})"
+            )
 
     draft_extend_input = upstream.EagleDraftExtendInput(
         hidden_states=hidden_states,
@@ -487,6 +528,8 @@ def draft_extend_for_decode_kunlun(self, batch, batch_result):
             self.speculative_num_draft_tokens,
             self.draft_runner,
             self.cuda_graph_runner_for_draft_extend,
+            kv_loc_plan=kv_loc_plan,
+            write_cols=write_cols,
         )
     if self.plan_stream:
         torch.get_device_module(self.device).current_stream().wait_stream(

@@ -35,8 +35,20 @@ def compute_kv_to_cache_kunlun(
     forward_batch: ForwardBatch,
     attn_backend,
     qkv_a: Optional[torch.Tensor] = None,
+    q_rope: Optional[torch.Tensor] = None,
 ) -> None:
-    """Normalize and rotate KV, then use the dirty 0.5.14 direct writer."""
+    """Normalize and rotate KV, then use the dirty 0.5.14 direct writer.
+
+    0.5.22 新增 `q_rope`（[T, H, head_dim]）：上游让同一次 fused norm+rope+store
+    launch 顺带把 query heads 也 rope 掉。唯一的调用点是 `_forward_prepare` 的
+    `q_rope=q if fuse_q_rope else None`，而 `fuse_q_rope` 只可能由
+    `_hip.compute_q_b` 置真（非 HIP 分支写死 `fuse_q_rope = False`），
+    `fused_k_norm_rope_flashmla` 里也是 `assert _is_hip, "only the ROCm K launch
+    ropes q"`、XPU 分支直接 `assert q is None`。所以 Kunlun 上它恒为 None；
+    融进同一个 launch 做不到，但"返回时 query heads 已 rope"这个契约能照样满足：
+    把它挂到下面那次 `fused_rope_inplace` 的 q 位上（XPU 后端本来就是 q、k 两次
+    triton rope），而不是悄悄丢掉一个 Q 没转的张量。
+    """
     if qkv_a is not None:
         kv = qkv_a[..., self.q_lora_rank :]
     else:
@@ -45,12 +57,17 @@ def compute_kv_to_cache_kunlun(
 
     from sglang.srt.models.deepseek_v4 import fused_rope_inplace
 
-    fused_rope_inplace(
-        kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
-        None,
-        self.freqs_cis,
-        positions,
-    )
+    kv_rope = kv[..., -self.qk_rope_head_dim :].unsqueeze(1)
+    if q_rope is None:
+        fused_rope_inplace(kv_rope, None, self.freqs_cis, positions)
+    else:
+        # 0.5.22 的 q_rope：Q 和 KV 一起转（上游一个 launch，这里 q/k 两个参数）。
+        fused_rope_inplace(
+            q_rope[..., -self.qk_rope_head_dim :],
+            kv_rope,
+            self.freqs_cis,
+            positions,
+        )
     _store_kv_to_swa_cache_direct(self, kv, forward_batch, attn_backend)
 
 
@@ -67,30 +84,33 @@ def mqa_forward_prepare_kunlun(
     attn_backend,
     q_out: Optional[torch.Tensor] = None,
     x_quant=None,
+    q_rope_out: Optional[torch.Tensor] = None,
+    k_nope_out: Optional[torch.Tensor] = None,
+    k_rope_out: Optional[torch.Tensor] = None,
 ):
-    """Use the single-call Q/KV RoPE order for prefill and decode."""
+    """Use the single-call Q/KV RoPE order for prefill and decode.
+
+    0.5.22 新增 `q_rope_out` / `k_nope_out` / `k_rope_out`：unified_kv 的 fp8
+    双池（nope + rope 两个 buffer）布局下，上游让 `fused_qk_norm_rope_swa_store`
+    把打包后的 Q 和 K 直接写进调用方预分配的这三块 buffer（`MQALayer.forward`
+    只在 `unified_fp8_decode or unified_fp8_prefill` 分支里才 new_empty 它们，
+    且全部按关键字传入）。这条路径必须走上游实现，所以三者原样转发给
+    `original_fn`；Kunlun 快路径本身被 `is_unified_kv_triton()` 排除在外，
+    拿到非 None 只能说明上游的门条件变了，宁可炸也不要把 Q/K 的打包输出静默丢掉。
+    """
     from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
         is_unified_kv_triton,
     )
 
-    use_cp = False
-    if self.dsa_enable_prefill_cp:
-        from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+    # 0.5.22 吸收了这段逻辑：``MQALayer`` 不再在构造期快照
+    # ``dsa_enable_prefill_cp``（这个字段现在只留在
+    # ``DeepseekV4DecoderLayer`` 上），上游 ``_forward_prepare`` 自己就是
+    # 一行 ``use_cp = is_cp_active(forward_batch)``
+    # （``deepseek_v4.py:1846``）。沿用同一个判定，否则读 MQALayer 上已不存在
+    # 的属性会在第一个 prefill batch 上 AttributeError。
+    from sglang.srt.layers.cp.utils import is_cp_active
 
-        use_cp = dsa_use_prefill_cp(forward_batch)
-    else:
-        # The layer attribute is snapshotted at construction, before the
-        # Kunlun CP-v2 config is resolved; CP-v2 batches must go through the
-        # upstream gather-then-store path, otherwise only this rank's local KV
-        # rows are persisted while the reindexed attention metadata reads the
-        # full sequence's pages.
-        from sglang.srt.layers.cp.utils import is_cp_v2_active
-
-        if is_cp_v2_active(forward_batch):
-            self.dsa_enable_prefill_cp = True
-            from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
-
-            use_cp = dsa_use_prefill_cp(forward_batch)
+    use_cp = is_cp_active(forward_batch)
 
     if (
         not (
@@ -108,6 +128,20 @@ def mqa_forward_prepare_kunlun(
             attn_backend,
             q_out,
             x_quant=x_quant,
+            q_rope_out=q_rope_out,
+            k_nope_out=k_nope_out,
+            k_rope_out=k_rope_out,
+        )
+
+    # 0.5.22 的 unified_kv fp8 双池输出 buffer 只在上面那条 original_fn 分支上
+    # 有意义（`is_unified_kv_triton()` 为真时已经转走了）。真走到这里还非 None，
+    # 说明上游的门条件变了，静默忽略会让调用方拿着一块没人写过的 buffer 去做
+    # attention / ring store。
+    if q_rope_out is not None or k_nope_out is not None or k_rope_out is not None:
+        raise NotImplementedError(
+            "Kunlun 的 _forward_prepare 快路径不产出 unified_kv fp8 的打包 Q/K "
+            "(q_rope_out/k_nope_out/k_rope_out)；请用 SGLANG_DSV4_UNIFIED_KV_FP8=0，"
+            "或让这些 batch 走上游实现。"
         )
 
     x_linear = x_quant if x_quant is not None else x

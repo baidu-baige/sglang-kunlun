@@ -120,8 +120,19 @@ class KunlunPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
         extend_num_tokens: int,
+        num_new_pages: int = None,
     ):
-        """Allocate pages for extend tokens using the selected backend kernel."""
+        """Allocate pages for extend tokens using the selected backend kernel.
+
+        ``num_new_pages`` (0.5.22): ``SWATokenToKVPoolAllocator.alloc_extend``
+        now computes the exact page count once on the CPU tensors and passes it
+        to both leaf allocators, so the parameter has to exist here -- without it
+        every extend batch dies with "unexpected keyword argument". It is used
+        the way upstream uses it: as the pre-launch depth check, because both the
+        Triton and the native allocator read past ``free_pages`` when the pool is
+        too shallow. The kernel's own packed count stays the authority for how
+        many pages are actually consumed below.
+        """
         if self.debug_mode:
             assert torch.all(
                 (last_loc + 1) % self.page_size == prefix_lens % self.page_size
@@ -135,6 +146,9 @@ class KunlunPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             self.free_pages
         ):
             self.merge_and_sort_free()
+
+        if num_new_pages is not None and num_new_pages > len(self.free_pages):
+            return None
 
         alloc_fn = _select_alloc_extend_func()
         out_indices, origin_num_new_pages = alloc_fn(
@@ -188,6 +202,14 @@ class KunlunPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             out_indices.copy_(last_loc + 1)
             return out_indices
 
+        # The vendor kernel asserts ``last_loc_ptr must be int32``. The DSPARK
+        # decode path happens to hand it int32, but 0.5.22's
+        # ``SWATokenToKVPoolAllocator.alloc_decode`` passes the int64 full-layer
+        # ``last_loc`` (and its int64 ``swa_last_loc`` translation), so a
+        # non-speculative run died on the first decode step. Normalize here, the
+        # same way the alloc_extend helpers above normalize their inputs.
+        if last_loc.dtype != torch.int32:
+            last_loc = last_loc.to(torch.int32)
         torch.ops.xspeedgate_ops.alloc_decode_kernel(
             seq_lens,
             last_loc,

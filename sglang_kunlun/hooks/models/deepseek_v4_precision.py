@@ -251,12 +251,19 @@ def compute_kv_bf16_kunlun(self, x, positions, qkv_a=None):
     return kv
 
 
+def _dsa_use_prefill_cp(forward_batch) -> bool:
+    """0.5.22 不再从 ``models.deepseek_v4`` re-export 这个判定。"""
+    from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+
+    return dsa_use_prefill_cp(forward_batch)
+
+
 @plugin_hook(
     "sglang.srt.models.deepseek_v4.MQALayer.forward",
     type=HookType.REPLACE,
 )
 def mqa_forward_global_head_layout_kunlun(
-    self, x, positions, forward_batch, x_quant=None
+    self, x, positions, forward_batch, x_quant=None, defer_all_reduce=False
 ):
     """Version-pinned MQA forward with deterministic TP-global Q head slots.
 
@@ -264,6 +271,16 @@ def mqa_forward_global_head_layout_kunlun(
     the attention backend through a module global, so wrapping it would require
     request-hot-path global rebinding. All non-local Q and sink slots are zeroed,
     and only this rank's local output slice is returned.
+
+    0.5.22 added `defer_all_reduce`: when set, upstream skips wo_b's TP
+    all-reduce and returns `mhc.AttnOutput(partial)` so the reduction rides the
+    fused `all_reduce_mhc_post_combine_norm` launch inside the MHC post. That
+    kernel is Blackwell-only (`deepseek_v4_mhc.can_fuse_post` requires
+    `get_platform().is_blackwell`; the other caller is the ROCm
+    `deepseek_v4_fused_mhc` path), so on Kunlun the flag can only arrive as
+    False -- this hook mirrors the parameter and refuses loudly if it is ever
+    truthy instead of returning a reduced plain tensor the caller did not ask
+    for.
     """
     import sglang.srt.models.deepseek_v4 as upstream
     from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
@@ -274,15 +291,25 @@ def mqa_forward_global_head_layout_kunlun(
     if not upstream.get_attn_tp_context().input_scattered and x.shape[0] == 0:
         return x
 
+    # 放在空 batch 短路之后，和上游 forward 的顺序一致（上游那条短路同样直接
+    # 返回 x、不产出 AttnOutput）。
+    if defer_all_reduce:
+        raise NotImplementedError(
+            "Kunlun MQA forward 无法把 wo_b 的 TP all-reduce 交给 MHC post 融合"
+            "（all_reduce_mhc_post_combine_norm 是 Blackwell/ROCm 专有 kernel），"
+            "defer_all_reduce=True 不支持。"
+        )
+
     attn_backend = get_attn_backend()
     enable_multi_stream = (
         upstream.envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
         and self.alt_streams is not None
         and upstream.get_is_capture_mode()
         and x.shape[0] <= self._multi_stream_bs_limit
-        and not (
-            self.dsa_enable_prefill_cp and upstream.dsa_use_prefill_cp(forward_batch)
-        )
+        # 0.5.22 删掉了 MQALayer 上的 ``dsa_enable_prefill_cp`` 快照；
+        # ``dsa_use_prefill_cp`` 的第二个参数留空时自己调
+        # ``is_dsa_enable_prefill_cp()``，所以这里直接问它。
+        and not _dsa_use_prefill_cp(forward_batch)
         and not (upstream._is_hip and self.compressor is None)
     )
 
@@ -332,6 +359,9 @@ def mqa_forward_global_head_layout_kunlun(
             )
         kv = None
     else:
+        # 0.5.22 给 _forward_prepare 加了 q_rope_out/k_nope_out/k_rope_out（unified_kv
+        # fp8 双池的打包 Q/K 输出）。这条 Q head 布局只分配 bf16 的 q_global/q_out，
+        # 不走双池布局，所以三者保持默认 None，等价于上游的非 unified-fp8 分支。
         q, kv = self._forward_prepare(
             x,
             positions,
@@ -393,7 +423,10 @@ def mqa_forward_global_head_layout_kunlun(
             o = o[:, tp_slice, :]
 
     if upstream._is_npu:
-        upstream.v4_rope_inplace_npu(
+        # 0.5.22 的 rope in-place helper 叫 ``fused_rope_inplace``
+        # （``deepseek_v4.py:1404`` 就是这么调的）；NPU 分支在昆仑上不可达，
+        # 但名字要指向真实存在的符号。
+        upstream.fused_rope_inplace(
             o[..., -self.qk_rope_head_dim :],
             None,
             self.freqs_cis,

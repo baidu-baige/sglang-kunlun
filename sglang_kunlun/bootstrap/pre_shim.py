@@ -337,6 +337,55 @@ def _patch_flashinfer_optional_symbols() -> None:
             setattr(module, symbol_name, _unsupported)
 
 
+def _stub_small_copy_fast_path() -> None:
+    """Keep the new 0.5.22 small-copy Triton fast path out of the CUDA-graph fill.
+
+    ``cuda_graph_buffer_registry._grouped_foreach_copy_`` gained a fast path in
+    0.5.22::
+
+        if dsts and dsts[0].is_cuda:
+            from sglang.kernels.ops.memory.small_copy import try_small_copy
+            if try_small_copy(dsts, srcs):
+                return
+
+    Two separate problems on Kunlun, and they bite in sequence:
+
+    1. ``small_copy`` declares its kernel with
+       ``@triton.jit(do_not_specialize_on_alignment=...)``, a keyword Triton
+       3.2+ added. The installed Triton is 3.0.0, so merely *importing* the
+       module raises ``TypeError: jit() got an unexpected keyword argument``
+       -- on every eager extend batch, which killed the first real forward.
+    2. Even with the import fixed, ``try_small_copy``'s only platform gate is
+       ``device.type != "cuda"``, which is False here because the Kunlun
+       platform reuses the CUDA device type. It would claim the copy and then
+       fail at launch ("0 compatible backends for target (cuda)").
+
+    So filtering the Triton kwarg would just move the failure later. Install a
+    stub whose ``try_small_copy`` declines instead: declining is the documented
+    contract of that call, and the caller falls back to
+    ``torch._foreach_copy_`` / ``dst.copy_()``, which is what 0.5.19 always did.
+    """
+    import sys
+    import types
+
+    name = "sglang.kernels.ops.memory.small_copy"
+    if name in sys.modules:
+        return
+
+    module = types.ModuleType(name)
+    module.__doc__ = (
+        "Kunlun stub: the upstream small-copy Triton kernel needs Triton 3.2+ "
+        "to import and has no Kunlun backend to launch on."
+    )
+
+    def try_small_copy(dsts, srcs):  # noqa: ARG001 - contract is "decline"
+        return False
+
+    module.try_small_copy = try_small_copy
+    module._sglang_kunlun_stub = True
+    sys.modules[name] = module
+
+
 def _kunlun_pre_shim() -> None:
     """Force triton's active driver to advertise ``backend == "cuda"``."""
     import os
@@ -402,6 +451,11 @@ def _kunlun_pre_shim() -> None:
         _patch_transformers_optional_model_modules()
     except Exception:
         pass
+
+    try:
+        _stub_small_copy_fast_path()
+    except Exception:
+        logger.warning("Kunlun: small_copy stub installation failed", exc_info=True)
 
     try:
         from sglang_kunlun.bootstrap import sgl_kernel_stub

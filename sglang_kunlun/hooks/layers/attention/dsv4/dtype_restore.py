@@ -16,9 +16,13 @@ _FP16_DTYPE_NAMES = frozenset(("fp16", "float16", "half"))
 def restore_requested_fp16_parameter_dtype(*linears):
     """把未量化 Linear 恢复到服务请求的 fp16 dtype（非 fp16 请求时不动）。"""
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-    from sglang.srt.server_args import get_global_server_args
 
-    if get_global_server_args().dtype not in _FP16_DTYPE_NAMES:
+    from sglang_kunlun.compat import server_arg
+
+    # 0.5.22 把 ``get_global_server_args()`` 彻底退休成一个只会抛
+    # RuntimeError 的迁移提示，所以这里改走插件自己的 ``compat.server_arg``
+    # （resolution_result 投影，和 namespace bag 同一套规则）。
+    if server_arg("dtype", None) not in _FP16_DTYPE_NAMES:
         return
 
     for linear in linears:

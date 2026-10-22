@@ -10,8 +10,8 @@ already strategy-agnostic and available here:
   interleave``, and that strategy implements ``can_apply`` /
   ``shard_hidden_states`` / ``shard_position_ids`` / ``gather_hidden_states``
   for token ``i -> rank i % cp_size``.
-* ``SGLANG_ENABLE_CP_V2`` is already auto-enabled for DSA + interleave in
-  ``ServerArgs._handle_context_parallelism``, so ``is_cp_v2_active`` and the
+* Strategy-based prefill CP is the only implementation in 0.5.22 -- the
+  ``SGLANG_ENABLE_CP_V2`` switch was removed -- so ``is_cp_active`` and the
   CP-local BCG input (``PrefillCPBCGInput``) work without further plumbing.
 * ``DeepEPMoE.forward`` (Kunlun plugin) carries the BCG eager-break contract
   that keeps the rank-coupled DeepEP NORMAL a2a out of the captured graph.
@@ -41,45 +41,24 @@ _KUNLUN_PREFILL_ATTENTION_BACKEND = "kunlun_compressed"
 # 0.5.19 的 core 已经原生实现了 0.5.17 时代由本插件承担的 CP-v2 + BCG 几何
 # （init_forward_metadata_prefill 自己 pad + reindex、PrefillCPBCGInput.prepare 自己
 # 分片、模型侧有自己的 CP-v2 分支），所以 0.5.17 的那组「padded-global 元数据 +
-# 手动 reindex」钩子已整体删除，这里只保留 Kunlun 特有的部分：
+# 手动 reindex」钩子已整体删除；0.5.22 又把 CP-v2 变成唯一实现（SGLANG_ENABLE_CP_V2
+# 下线），所以插件侧的 CP-v2 强制也一并删除。这里只保留 Kunlun 特有的部分：
 #   * supports_prefill_cp_bcg 放宽到 interleave + kunlun_compressed，
-#   * CP-v2 强制（server_args 钩子，见 hooks/server_args.py），
 #   * 压缩器 eager 断点 + 紧凑 plan 重建（build/replay 两个钩子），
 #   * 回放尾部的 DSV4 元组契约、interleave 回放桶选择，
-#   * ragged draft 保持 pre-CP-v2 布局。
+#   * ragged draft / 投机批次不走 CP 分片。
 
 
-@plugin_hook(
-    "sglang.srt.layers.attention.dsa.utils.is_dsa_enable_prefill_cp",
-    type=HookType.REPLACE,
-)
-def is_dsa_enable_prefill_cp_kunlun():
-    """Keep an explicit DSA prefill CP request authoritative under CP-v2.
-
-    Upstream's CP-v2 branch answers this from ``is_deepseek_dsa(config)``, whose
-    architecture allowlist predates ``DeepseekV4ForCausalLM``. With CP-v2
-    enabled for DSV4 that would silently switch off the DSA CP row split, the
-    communicator's CP moves, the compressor's CP layout and the Kunlun
-    attention's CP branch -- while CP-v2 itself shards the embeddings, leaving
-    the two layouts inconsistent. The explicit flag (set by the DSV4 CP
-    validation at argument-resolution time) wins; everything else keeps the
-    upstream verdict.
-    """
-    from sglang.srt.runtime_context import get_parallel
-
-    parallel = get_parallel()
-    if parallel.enable_dsa_prefill_context_parallel:
-        return True
-    if not envs.SGLANG_ENABLE_CP_V2.get() or parallel.attn_cp_size <= 1:
-        return False
-
-    from sglang.srt.configs.model_config import is_deepseek_dsa
-    from sglang.srt.arg_groups.overrides import model_config_of
-    from sglang.srt.runtime_context import get_server_args
-
-    # 0.5.19 dropped ServerArgs.get_model_config(); the pipeline's resolver-safe
-    # helper is the way in.
-    return is_deepseek_dsa(model_config_of(get_server_args()).hf_config)
+# NOTE: 0.5.17/0.5.19 的 ``is_dsa_enable_prefill_cp`` REPLACE 钩子在 0.5.22 下线。
+# 那个钩子存在的唯一理由是上游的架构白名单只认 ``is_deepseek_dsa``、漏掉
+# ``DeepseekV4ForCausalLM``，于是 DSV4 的 DSA CP 行切分会被静默关掉。0.5.22 的
+# ``dsa/utils.py:is_dsa_enable_prefill_cp`` 已经显式返回
+# ``is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)``，而
+# ``is_deepseek_v4`` 覆盖 ``DeepseekV4ForCausalLM``/``...NextN``/``...DSpark``，
+# 上游已经吸收了这个修复。保留旧钩子还会报错：它读的
+# ``get_parallel().enable_dsa_prefill_context_parallel`` 在 0.5.22 的
+# ``ParallelContext`` 上已不存在（字段改名为 ``enable_prefill_cp``），
+# 每个 TP rank 的 scheduler 都会以 AttributeError 退出。
 
 
 # NOTE: 0.5.17 的 ``cp_split_and_rebuild_data/position`` REPLACE 钩子在 0.5.19 下线：
@@ -266,29 +245,30 @@ def refresh_for_breakable_cuda_graph_replay_kunlun(
 
 
 # NOTE: 0.5.17 的 ``cp_round_robin_input_ids`` REPLACE 钩子在 0.5.19 下线：core 的
-# CP-v2 行分片已按 ``max_rank_len`` pad，MoE gating 的形状断言由原生路径满足。
+# CP 行分片已按 ``max_rank_len`` pad，MoE gating 的形状断言由原生路径满足。
 
 
 @plugin_hook(
-    "sglang.srt.layers.cp.utils.is_cp_v2_active",
-    type=HookType.REPLACE,
+    "sglang.srt.layers.cp.utils.is_cp_active",
+    type=HookType.AROUND,
 )
-def is_cp_v2_active_kunlun(forward_batch) -> bool:
-    """Keep the ragged draft extend on its pre-CP-v2 layout.
+def is_cp_active_kunlun(original, forward_batch) -> bool:
+    """Keep the ragged draft extend and speculative batches off the CP shard.
 
     The DSPARK ragged draft extend builds its own row layout
-    (``_kunlun_ragged_draft_extend``): sharding only one of its sides through
-    CP-v2 leaves the attention with query rows that do not match its position
-    rows. Those batches keep the model-side DSA split instead, exactly as
-    before CP-v2 was enabled.
+    (``_kunlun_ragged_draft_extend``), and target-verify / draft-extend batches
+    are special-cased by the plugin's LoD paths. Upstream's eager CP shard only
+    mirrors plain prefill extends, so sharding one side leaves the attention
+    with query rows that do not match its position rows. Those batches keep the
+    model-side DSA split.
+
+    0.5.22 renamed ``is_cp_v2_active`` to ``is_cp_active`` (strategy-based CP is
+    now the only implementation), and the upstream body is exactly the tail this
+    hook used to copy -- so this is an AROUND that only adds the Kunlun
+    early-outs and delegates the verdict.
     """
     if getattr(forward_batch, "_kunlun_ragged_draft_extend", False):
         return False
-    # Speculative batches (target verify / draft extend) build their own row
-    # layout: the plugin's LoD paths special-case them, and CP-v2's eager shard
-    # only mirrors plain prefill extends -- sharding one side leaves the
-    # attention with 5 query rows against 8 position rows. Keep them on the
-    # model-side DSA split, as before CP-v2 was enabled.
     if getattr(forward_batch, "spec_info", None) is not None:
         return False
     forward_mode = getattr(forward_batch, "forward_mode", None)
@@ -296,21 +276,7 @@ def is_cp_v2_active_kunlun(forward_batch) -> bool:
         forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
     ):
         return False
-
-    from sglang.srt.layers.cp.utils import enable_cp_v2, get_cp_strategy
-
-    if not enable_cp_v2():
-        return False
-    forward_mode = getattr(forward_batch, "forward_mode", None)
-    if forward_mode is None or not forward_mode.is_context_parallel_extend():
-        return False
-    strategy = get_cp_strategy()
-    if strategy is None:
-        return False
-    input_ids = getattr(forward_batch, "input_ids", None)
-    if input_ids is None:
-        return False
-    return strategy.can_apply(len(input_ids), forward_batch)
+    return original(forward_batch)
 
 
 @plugin_hook(

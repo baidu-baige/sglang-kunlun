@@ -272,9 +272,23 @@ def dsv4_paged_backup_kunlun(
     type=HookType.AROUND,
 )
 def dsv4_paged_load_kunlun(
-    original_fn, self, device_pool, host_indices, device_indices, layer_id, io_backend
+    original_fn,
+    self,
+    device_pool,
+    host_indices,
+    device_indices,
+    layer_id,
+    io_backend,
+    *,
+    is_draft: bool = False,
 ):
-    """Load one layer of the DSV4 paged host pool with the Kunlun kernel."""
+    """Load one layer of the DSV4 paged host pool with the Kunlun kernel.
+
+    ``is_draft`` selects the draft worker's device pool upstream; the Kunlun
+    transfer reads the pool off ``self``, so it is accepted (no caller passes it
+    today, but omitting the name makes any future one a TypeError) and ignored.
+    """
+    del is_draft
     _transfer_per_layer(self, host_indices, device_indices, layer_id, io_backend)
 
 
@@ -301,7 +315,19 @@ def dsv4_state_backup_kunlun(
     type=HookType.AROUND,
 )
 def dsv4_state_load_kunlun(
-    original_fn, self, device_pool, host_indices, device_indices, layer_id, io_backend
+    original_fn,
+    self,
+    device_pool,
+    host_indices,
+    device_indices,
+    layer_id,
+    io_backend,
+    *,
+    is_draft: bool = False,
 ):
-    """Load one layer of the DSV4 state host pool with the Kunlun kernel."""
+    """Load one layer of the DSV4 state host pool with the Kunlun kernel.
+
+    See ``dsv4_paged_load_kunlun`` for ``is_draft``.
+    """
+    del is_draft
     _transfer_per_layer(self, host_indices, device_indices, layer_id, io_backend)

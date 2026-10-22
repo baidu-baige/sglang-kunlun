@@ -47,7 +47,11 @@ except ImportError:  # dsv4.1 删掉了 DSA prefill-CP 的 in-seq-split 模式
     def is_dsa_prefill_cp_in_seq_split() -> bool:
         """上游只保留 interleave / round-robin 模式，这个符号守着的分支永远不会激活。"""
         return False
-from sglang.srt.layers.cp.utils import get_cp_strategy, is_cp_v2_active
+from sglang.srt.layers.attention.dsa.utils import (
+    dsa_use_prefill_cp,
+    is_dsa_enable_prefill_cp,
+)
+from sglang.srt.layers.cp.utils import get_cp_strategy, is_cp_active
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.layers.attention.dsa.dsa_indexer import (
     _broadcast_indexer_topk_from_rank0,
@@ -99,7 +103,8 @@ REQUIRED_INDEXER_ATTRS = (
     "index_topk",
     "k_norm",
     "n_heads",
-    "dsa_enable_prefill_cp",
+    # 0.5.22 不再在 C4Indexer 上快照 ``dsa_enable_prefill_cp``；下面改成直接问
+    # ``dsa/utils`` 的自由函数。
     "rope_head_dim",
     "rotary_emb",
     "softmax_scale",
@@ -899,8 +904,8 @@ def _get_q_k_bf16(
         key = rotate_activation(key)
 
     # allgather+rerrange
-    if is_cp_v2_active(forward_batch):
-        # CP-v2 (``--cp-strategy interleave``): the strategy owns the gather, so
+    if is_cp_active(forward_batch):
+        # Strategy CP (``--cp-strategy interleave``): the strategy owns the gather, so
         # it restores the original token order and drops the per-rank padding.
         # ``cp_all_gather_rerange_output`` cannot do that here: for round-robin
         # it returns ``local_rows * cp_size`` rows, and the local rows are padded
@@ -909,7 +914,7 @@ def _get_q_k_bf16(
         # so the extra padded rows make the Kunlun store abort with
         # "set_k_and_s_triton: k_num != loc_num".
         key = get_cp_strategy().materialize_full_indexer_k_cache(key, forward_batch)
-    elif forward_batch.attn_cp_metadata is not None and indexer.dsa_enable_prefill_cp:
+    elif dsa_use_prefill_cp(forward_batch):
         key = cp_all_gather_rerange_output(
             key.contiguous(),
             indexer.cp_size,
@@ -1043,7 +1048,7 @@ def forward_cuda(
             skip_logits_computation = max_kv_len <= indexer.index_topk
 
     # Optimization: fast path when skipping topk computation
-    if skip_logits_computation and (not indexer.dsa_enable_prefill_cp):
+    if skip_logits_computation and (not is_dsa_enable_prefill_cp()):
         topk_result = _forward_cuda_k_only(indexer,
             x,
             positions,

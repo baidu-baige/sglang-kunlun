@@ -39,11 +39,14 @@ def configure_dsv4_hicache(original_fn, *args, **kwargs):
 
 
 @plugin_hook(
-    "sglang.srt.mem_cache.hiradix_cache.HiRadixCache.__init__",
+    "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.__init__",
     type=HookType.AROUND,
 )
 def configure_dsv4_hiradix(original_fn, self, *args, **kwargs):
-    """Configure shared DSV4 host KV lazily when HiRadixCache is constructed."""
+    """Configure shared DSV4 host KV lazily when the radix cache is constructed.
+
+    0.5.22 merged ``HiRadixCache`` into ``UnifiedRadixCache``.
+    """
     params = kwargs.get("params", args[0] if args else None)
     if shared_host_kv.is_enabled() and not shared_host_kv.active():
         if params is None:
@@ -90,12 +93,16 @@ def alloc_with_shared_host_kv(
 
 
 @plugin_hook(
-    "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller."
-    "HybridCacheController.start_writing",
+    "sglang.srt.managers.cache_controller.HiCacheController.start_writing",
     type=HookType.AROUND,
 )
 def verify_shared_indices(original_fn, self, *args, **kwargs):
-    """Verify queued host indices agree across TP ranks before writing."""
+    """Verify queued host indices agree across TP ranks before writing.
+
+    0.5.22 keeps ``start_writing`` only on ``HiCacheController``;
+    ``HybridCacheController`` inherits it (as ``BaseHiCacheController``), so the
+    base class is the hook point.
+    """
     if shared_host_kv.active() and shared_host_kv.VERIFY:
         for operation in self.write_queue:
             shared_host_kv.verify_indices(operation.host_indices)

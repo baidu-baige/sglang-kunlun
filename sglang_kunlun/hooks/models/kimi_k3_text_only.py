@@ -52,11 +52,13 @@ def handle_kunlun_multimodal_feature_transport(original_fn, server_args):
     """Resolve multimodal features to host transport before args are published."""
     from sglang.srt.arg_groups.overrides import declare_resolution
 
+    # 0.5.22 removed ``keep_mm_feature_on_device``: the transport choice alone
+    # now decides whether features stay on the device, so declaring the old
+    # field raises "are not ServerArgs fields" during argument resolution.
     declare_resolution(
         server_args,
         "kunlun_multimodal_feature_transport",
         mm_feature_transport="cpu",
-        keep_mm_feature_on_device=False,
     )
     return original_fn(server_args)
 

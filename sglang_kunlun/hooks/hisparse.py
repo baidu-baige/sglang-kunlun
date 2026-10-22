@@ -478,7 +478,9 @@ def _hisparse_mark_only_real_resident_slots(original_fn, self, req, *args, **kwa
     try:
         if not getattr(self, "is_dsv4_hisparse", False):
             return out
-        allocated_len = int(req.extend_range.end)
+        # 0.5.22 把 ``Req.extend_range`` 换成了标量 ``Req.extend_end``
+        # （``schedule_batch.py:1076``：本轮填充 [prefix_len, extend_end)）。
+        allocated_len = int(req.extend_end)
         if allocated_len <= 0:
             return out
         compressed = self.mem_pool_device.translate_loc_from_full_to_compressed(

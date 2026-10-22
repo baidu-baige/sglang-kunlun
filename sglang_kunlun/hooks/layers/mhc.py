@@ -46,10 +46,10 @@ def hc_split_sinkhorn_kunlun(
 
 
 @plugin_hook(
-    "sglang.srt.models.deepseek_v4._get_mhc_ops",
+    "sglang.srt.models.deepseek_v4.get_mhc_ops",
     type=HookType.REPLACE,
 )
-def _get_mhc_ops_kunlun():
+def get_mhc_ops_kunlun():
     """Resolve the MHC ops through the hooked module instead of ``sgl_kernel``.
 
     Upstream short-circuits to ``sgl_kernel.hc_split_sinkhorn`` on XPU, which

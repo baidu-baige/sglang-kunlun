@@ -40,8 +40,17 @@ class KunlunMHATokenToKOnlyPool(MHATokenToKOnlyPool):
         # Not set by upstream MHATokenToKOnlyPool; the offload path reads it.
         self.cpu_offloading_chunk_size = 8192
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
-        """Gather K-only slot rows at ``indices`` to CPU tensors, chunked."""
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        """Gather K-only slot rows at ``indices`` to CPU tensors, chunked.
+
+        0.5.22 added a third ``req_pool_index`` parameter to
+        ``KVCache.get_cpu_copy``, and the allocators forward it **by keyword**,
+        so it has to appear here or the first retraction raises TypeError. It
+        selects a per-request row in the DSA compress-tail buffers
+        (``MLATokenToKVPool._get_compress_tail_cpu_copy``); this K-only pool has
+        no such per-request state, so it is accepted and unused, exactly as in
+        upstream's own MHA/MLA pools.
+        """
         current_platform.synchronize()
         k_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -56,14 +65,23 @@ class KunlunMHATokenToKOnlyPool(MHATokenToKOnlyPool):
         current_platform.synchronize()
         return k_cache_cpu
 
-    def load_cpu_copy(self, k_cache_cpu, indices, mamba_indices=None):
-        """Scatter CPU K-only chunks back into slot rows at ``indices``."""
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        """Scatter CPU K-only chunks back into slot rows at ``indices``.
+
+        The first parameter is renamed ``k_cache_cpu`` -> ``kv_cache_cpu`` to
+        match ``KVCache.load_cpu_copy``: upstream composites pass the payload
+        positionally today, but the name is part of the contract and a keyword
+        call would have failed. ``req_pool_index`` is new in 0.5.22 and unused
+        here, see :meth:`get_cpu_copy`.
+        """
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
-                k_cpu = k_cache_cpu[layer_id][i // chunk_size]
+                k_cpu = kv_cache_cpu[layer_id][i // chunk_size]
                 assert k_cpu.shape[0] == len(chunk_indices)
                 k_chunk = k_cpu.to(self.k_buffer[layer_id].device, non_blocking=True)
                 self.k_buffer[layer_id][chunk_indices] = k_chunk
@@ -166,7 +184,7 @@ class KunlunMiniMaxSparseKVPool(MiniMaxSparseKVPool):
             **kwargs,
         )
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         """Offload KV of the given token slots to host memory.
 
         Used by PD-decode retraction (``Req.offload_kv_cache``). Fans out to
@@ -176,25 +194,45 @@ class KunlunMiniMaxSparseKVPool(MiniMaxSparseKVPool):
         immediately reuse them, so anything left behind would be restored as
         foreign data on resume, corrupting the context. MiniMax sparse
         attention has no mamba state, so ``mamba_indices`` is unused.
+
+        0.5.22 added ``req_pool_index`` to ``KVCache.get_cpu_copy`` and
+        ``schedule_batch.offload_kv_cache`` passes it by keyword. It is
+        forwarded to the sub-pools the way upstream's own composite pools do
+        (``SWATokenToKVPool`` / ``HybridLinearKVPool`` forward only this one),
+        so a sub-pool that ever starts using it keeps working.
         """
         return {
-            "main": self.main_pool.get_cpu_copy(indices),
+            "main": self.main_pool.get_cpu_copy(
+                indices, req_pool_index=req_pool_index
+            ),
             "index_kv": (
-                self.index_kv_pool.get_cpu_copy(indices)
+                self.index_kv_pool.get_cpu_copy(
+                    indices, req_pool_index=req_pool_index
+                )
                 if self.index_kv_pool is not None
                 else None
             ),
             "index_k": (
-                self.index_k_pool.get_cpu_copy(indices)
+                self.index_k_pool.get_cpu_copy(
+                    indices, req_pool_index=req_pool_index
+                )
                 if self.index_k_pool is not None
                 else None
             ),
         }
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         """Reload KV previously produced by ``get_cpu_copy`` back onto device."""
-        self.main_pool.load_cpu_copy(kv_cache_cpu["main"], indices)
+        self.main_pool.load_cpu_copy(
+            kv_cache_cpu["main"], indices, req_pool_index=req_pool_index
+        )
         if self.index_kv_pool is not None:
-            self.index_kv_pool.load_cpu_copy(kv_cache_cpu["index_kv"], indices)
+            self.index_kv_pool.load_cpu_copy(
+                kv_cache_cpu["index_kv"], indices, req_pool_index=req_pool_index
+            )
         if self.index_k_pool is not None:
-            self.index_k_pool.load_cpu_copy(kv_cache_cpu["index_k"], indices)
+            self.index_k_pool.load_cpu_copy(
+                kv_cache_cpu["index_k"], indices, req_pool_index=req_pool_index
+            )

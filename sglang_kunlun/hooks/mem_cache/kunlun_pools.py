@@ -196,8 +196,19 @@ class KunlunMHATokenToKVPool(MHATokenToKVPool):
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
-    def get_cpu_copy(self, indices):
-        """Copy KV cache pages from GPU to CPU in chunks."""
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        """Copy KV cache pages from GPU to CPU in chunks.
+
+        Signature alignment: 0.5.22's ``KVCache.get_cpu_copy`` takes
+        ``(indices, mamba_indices, req_pool_index)`` and every allocator
+        (``allocator/token.py``, ``allocator/paged.py``) forwards both extras
+        **by keyword**, so an override missing them raises TypeError on the
+        first retraction. Neither is this pool's business, exactly as in
+        upstream ``MHATokenToKVPool.get_cpu_copy``: ``mamba_indices`` addresses
+        the separate mamba state pool (no mamba state here) and
+        ``req_pool_index`` is only read by the DSA compress-tail pool
+        (``_get_compress_tail_cpu_copy``), which this pool does not have.
+        """
         torch.cuda.synchronize()
         is_4d = self.head_dim != self.v_head_dim
         kv_cache_cpu = []
@@ -220,8 +231,14 @@ class KunlunMHATokenToKVPool(MHATokenToKVPool):
         torch.cuda.synchronize()
         return kv_cache_cpu
 
-    def load_cpu_copy(self, kv_cache_cpu, indices):
-        """Load KV cache pages from CPU back to GPU in chunks."""
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        """Load KV cache pages from CPU back to GPU in chunks.
+
+        Same 0.5.22 signature alignment as :meth:`get_cpu_copy`; both extras are
+        keyword-forwarded by the allocators and are inert for this pool.
+        """
         torch.cuda.synchronize()
         is_4d = self.head_dim != self.v_head_dim
         chunk_size = self.cpu_offloading_chunk_size
@@ -251,11 +268,37 @@ class KunlunMHATokenToKVPool(MHATokenToKVPool):
 class KunlunMLATokenToKVPool(MLATokenToKVPool):
     """Kunlun MLA KV pool with custom KV buffer set/get operations."""
 
-    def set_mla_kv_buffer(self, layer, loc, cache_k_nope, cache_k_rope):
-        """Set MLA KV buffer using the kunlun_ops triton kernel."""
+    def set_mla_kv_buffer(
+        self,
+        layer,
+        loc_info,
+        cache_k_nope,
+        cache_k_rope,
+        layer_id_override: Optional[int] = None,
+    ):
+        """Set MLA KV buffer using the kunlun_ops triton kernel.
+
+        0.5.22 renamed the write target ``loc`` -> ``loc_info`` and changed its
+        type: the backends now build a ``KVWriteLoc`` dataclass
+        (``KVWriteLoc.for_batch`` / ``for_layer`` in flashattention_backend,
+        flashinfer_mla_backend, trtllm_mla_backend, ...), so unwrap it before
+        touching the kernel. Inert for the callers that still hand over a plain
+        tensor (``dsa_backend`` and our own NSA backend pass ``cache_loc``).
+
+        ``layer_id_override`` is mirrored too. It is not new in 0.5.22 (0.5.19
+        already had it) -- this override simply never carried it: SWA's hybrid
+        pool calls the sub-pool with ``layer=None`` and
+        ``layer_id_override=<pool-local layer id>``, so ``layer.layer_id`` may
+        only be read when no override was given.
+        """
         from kunlun_ops import set_mla_kv_buffer_triton
 
-        layer_id = layer.layer_id
+        from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
+
+        loc, _, _ = unwrap_write_loc(loc_info)
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         if cache_k_nope.dtype != self.dtype:
             cache_k_nope = cache_k_nope.to(self.dtype)
             cache_k_rope = cache_k_rope.to(self.dtype)

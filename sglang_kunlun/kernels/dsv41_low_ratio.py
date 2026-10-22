@@ -29,9 +29,7 @@ import torch
 from sglang_kunlun.kernels.kernel_ops import register_jit_op
 
 
-@register_jit_op(
-    "sglang.kernels.ops.attention.dsv4.rmsnorm_fp32", "rmsnorm_fp32"
-)
+@register_jit_op("sglang.kernels.ops.layernorm.rmsnorm_fp32", "rmsnorm_fp32")
 def rmsnorm_fp32_kunlun(
     x: torch.Tensor, weight: torch.Tensor, eps: float
 ) -> torch.Tensor:
@@ -47,80 +45,9 @@ def rmsnorm_fp32_kunlun(
     return ((xf * inv_rms) * weight.float()).to(dtype)
 
 
-@register_jit_op(
-    "sglang.kernels.ops.attention.dsv4.pair_pool_decode", "pair_pool_decode"
-)
-def pair_pool_decode_kunlun(
-    kv: torch.Tensor,
-    score: torch.Tensor,
-    pos: torch.Tensor,
-    raw_out_loc: torch.Tensor,
-    out_loc: torch.Tensor,
-    req: torch.Tensor,
-    state_kv: torch.Tensor,
-    state_score: torch.Tensor,
-    pad_row: int,
-    *,
-    ring_size: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Ratio-2 decode pair pooling and state update in torch.
-
-    Mirrors `_pair_pool_decode_kernel` step for step. All state reads happen
-    before any write (the kernel never has two rows sharing a slot in one
-    launch), so plain gather-then-scatter reproduces it without the racy
-    per-program ordering. Softmax runs in fp32 with the same pair-axis order as
-    `DeepseekV41Compressor.pool_pairs`.
-    """
-    kv = kv.contiguous().float()
-    score = score.contiguous().float()
-    n, _ = kv.shape
-    req = req.to(torch.int64).reshape(-1)
-    pos = pos.to(torch.int64).reshape(-1)
-    raw_loc = raw_out_loc.to(torch.int64).reshape(-1)
-    out_loc_ = out_loc.to(torch.int64).reshape(-1)
-
-    odd = (pos % 2) == 1
-
-    if ring_size:
-        read_row = torch.where(
-            (raw_loc == 0) | (pos == 0),
-            torch.full_like(req, pad_row),
-            req * ring_size + (pos - 1) % ring_size,
-        )
-    else:
-        read_row = torch.where(raw_loc == 0, torch.full_like(req, pad_row), req)
-
-    # Read the partner state before writing anything.
-    p_kv = state_kv.index_select(0, read_row).clone()
-    p_score = state_score.index_select(0, read_row).clone()
-
-    if ring_size:
-        write_row = req * ring_size + pos % ring_size
-        live = (raw_loc != 0).unsqueeze(-1)
-        # A pad row is never written. Index-copy handles the write_row being a
-        # permutation (one decode row per live request).
-        kv_out = torch.where(live, kv, state_kv.index_select(0, write_row))
-        score_out = torch.where(live, score, state_score.index_select(0, write_row))
-        state_kv.index_copy_(0, write_row, kv_out)
-        state_score.index_copy_(0, write_row, score_out)
-    else:
-        odd_c = odd.unsqueeze(-1)
-        state_kv.index_copy_(
-            0, read_row, torch.where(odd_c, p_kv, kv)
-        )
-        state_score.index_copy_(
-            0, read_row, torch.where(odd_c, p_score, score)
-        )
-
-    m = torch.maximum(p_score, score)
-    e0 = torch.exp(p_score - m)
-    e1 = torch.exp(score - m)
-    denom = e0 + e1
-    pooled = p_kv * (e0 / denom) + kv * (e1 / denom)
-
-    group_pos = torch.where(odd, pos - 1, pos)
-    slots = torch.where(out_loc_ >= 0, out_loc_, torch.zeros_like(out_loc_))
-    return pooled, group_pos, slots
+# NOTE: the ratio-2 ``pair_pool_decode`` replacement was dropped: upstream has no
+# ``sglang.kernels.ops.attention.dsv4.pair_pool_decode`` module in 0.5.19 or 0.5.22,
+# so the registration only ever logged "kernel_ops: ... not found".
 
 
 def _fp32_pow2(exp: torch.Tensor) -> torch.Tensor:
@@ -173,7 +100,7 @@ def _fake_quant_compressed_kv_torch(x: torch.Tensor) -> torch.Tensor:
 
 
 @register_jit_op(
-    "sglang.srt.layers.attention.dsv4.torch_quant", "fake_quant_compressed_kv"
+    "sglang.kernels.ops.attention.dsv4.torch_quant", "fake_quant_compressed_kv"
 )
 def fake_quant_compressed_kv_kunlun(x: torch.Tensor) -> torch.Tensor:
     """XPU-safe replacement for the E4M3-scaled FP4 round-trip."""
@@ -181,7 +108,7 @@ def fake_quant_compressed_kv_kunlun(x: torch.Tensor) -> torch.Tensor:
 
 
 @register_jit_op(
-    "sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4",
+    "sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant",
     "rope_tail_fake_quant_fp4",
 )
 def rope_tail_fake_quant_fp4_kunlun(
@@ -192,16 +119,29 @@ def rope_tail_fake_quant_fp4_kunlun(
     block_size: int = 32,
     *,
     compressed_kv: bool = False,
+    positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Rotate the last `rope_dim` features, then FP4 round-trip.
 
     Delegates to the repo's torch oracle for the RoPE and the per-32 UE8M0 FP4
     step; the compressed-KV (per-16 E4M3) step uses the XPU-safe E4M3 rounding
     above because the oracle's fp8 dtype cast is unimplemented on P800.
+
+    ``positions`` (0.5.22): when given, ``freqs`` is the whole table and row ``t``
+    reads ``freqs[positions[t]]`` -- the fused kernel gathers it itself. The
+    torch path has to do the gather, exactly as ``dsv41_sparse._rope_fq4`` does
+    on its own non-fused branch; dropping it would rope every row with the
+    table's leading entries.
     """
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import rope_tail
-    from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
+    from sglang.kernels.ops.attention.dsv4.torch_quant import fake_quant_fp4
 
+    if positions is not None:
+        assert positions.dim() == 1 and positions.shape[0] == x.shape[0], (
+            positions.shape,
+            x.shape,
+        )
+        freqs = freqs[positions]
     rotated = rope_tail(x, freqs, rope_dim, inverse)
     if compressed_kv:
         return _fake_quant_compressed_kv_torch(rotated)

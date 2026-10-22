@@ -435,8 +435,20 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Prefill / verify / draft-extend through the Kunlun sparse kernel."""
+        # 0.5.22 appended `attn_sink` to DeepseekSparseAttnBackend.forward_extend
+        # (learnable per-head attention sinks, produced by the DSV4 models and
+        # forwarded as a kwarg by RadixAttention only when non-None). The Kunlun
+        # sparse kernel has no sink input, and upstream itself rejects sinks on
+        # every dsa_impl except flashmla_sparse, so refuse explicitly instead of
+        # dropping them and silently computing a different softmax.
+        if attn_sink is not None:
+            raise NotImplementedError(
+                "KunlunDSAAttnBackend.forward_extend: learnable attention sinks "
+                "(attn_sink) are not supported by the Kunlun sparse kernel"
+            )
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -620,8 +632,16 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Decode through the Kunlun sparse kernel."""
+        # Same 0.5.22 `attn_sink` tail as forward_extend; the Kunlun sparse
+        # decode kernel has no sink input either.
+        if attn_sink is not None:
+            raise NotImplementedError(
+                "KunlunDSAAttnBackend.forward_decode: learnable attention sinks "
+                "(attn_sink) are not supported by the Kunlun sparse kernel"
+            )
         if k is not None:
             assert v is not None
             if save_kv_cache:

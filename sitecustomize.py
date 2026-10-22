@@ -57,6 +57,22 @@ def _enable_transformers_compatibility() -> None:
             configuration_utils.PreTrainedConfig = config_type
         if not hasattr(transformers, "PreTrainedConfig"):
             transformers.PreTrainedConfig = config_type
+        if not hasattr(config_type, "__class_validators__"):
+            # ``__class_validators__`` is installed by huggingface_hub's
+            # ``@strict`` decorator, which transformers only applies to
+            # ``PretrainedConfig`` from 5.4 on. 0.5.22's
+            # ``hf_transformers_patches._patch_layer_types_validation`` reads it
+            # unguarded, so on this transformers build ``import sglang`` dies
+            # with "type object 'PreTrainedConfig' has no attribute
+            # '__class_validators__'" before any Kunlun code runs.
+            #
+            # An empty list is the honest value here: without the strict
+            # decoration there is no ``validate_layer_type`` validator to wrap,
+            # so upstream's patch loop should find nothing and do nothing. It is
+            # also inert for huggingface_hub, which only iterates this list from
+            # the ``__post_init__`` that the skipped decoration would have
+            # installed.
+            config_type.__class_validators__ = []
 
     original_strict = hub_dataclasses.strict
     if getattr(original_strict, "_sglang_kunlun_compatible", False):
@@ -67,6 +83,19 @@ def _enable_transformers_compatibility() -> None:
             try:
                 return original_strict(target, **kwargs)
             except StrictDataclassDefinitionError:
+                # The decoration is skipped, so ``@strict`` never installs
+                # ``__class_validators__``. 0.5.22's
+                # ``hf_transformers_patches._patch_layer_types_validation``
+                # reads that attribute unguarded (it is a transformers 5.4+
+                # mechanism) and ``import sglang`` dies with
+                # "type object 'PreTrainedConfig' has no attribute
+                # '__class_validators__'". Install the empty list the skipped
+                # decoration would have produced: with no validators there is
+                # no ``validate_layer_type`` to wrap, which is the right answer
+                # for this transformers build, and the patch loop becomes the
+                # no-op it should be.
+                if not hasattr(target, "__class_validators__"):
+                    target.__class_validators__ = []
                 return target
 
         return decorate(cls) if cls is not None else decorate

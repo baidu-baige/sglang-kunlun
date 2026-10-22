@@ -56,7 +56,16 @@ def kunlun_init_model_parallel_group(
     use_custom_allreduce: Optional[bool] = None,
     use_message_queue_broadcaster: bool = False,
     group_name: Optional[str] = None,
-    use_mscclpp_allreduce: Optional[bool] = None,
+    # 0.5.22 renamed this parameter: ``use_mscclpp_allreduce`` -> ``use_mscclpp``.
+    # The rename goes all the way down: the module default is now
+    # ``_ENABLE_MSCCLPP`` (was ``_ENABLE_MSCCLPP_ALL_REDUCE``) and
+    # ``GroupCoordinator.__init__`` takes ``use_mscclpp`` (was ``use_pymscclpp``).
+    # No in-tree caller passes it by keyword (every ``init_model_parallel_group``
+    # call site omits it, see parallel_state.py:2681/2697/2721), so the rename
+    # only matters for this body — but the old name would have made both the
+    # ``from ... import _ENABLE_MSCCLPP_ALL_REDUCE`` and the
+    # ``use_pymscclpp=`` kwarg fail.
+    use_mscclpp: Optional[bool] = None,
     use_torch_symm_mem_allreduce: Optional[bool] = None,
     recovered_rank: bool = False,
     rank_offset: int = 0,
@@ -65,15 +74,15 @@ def kunlun_init_model_parallel_group(
     """Kunlun: init GroupCoordinator with XPU/NPU/HPU communicators."""
     from sglang.srt.distributed.parallel_state import (
         _ENABLE_CUSTOM_ALL_REDUCE,
-        _ENABLE_MSCCLPP_ALL_REDUCE,
+        _ENABLE_MSCCLPP,
         _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE,
         GroupCoordinator,
     )
 
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
-    if use_mscclpp_allreduce is None:
-        use_mscclpp_allreduce = _ENABLE_MSCCLPP_ALL_REDUCE
+    if use_mscclpp is None:
+        use_mscclpp = _ENABLE_MSCCLPP
     if use_torch_symm_mem_allreduce is None:
         use_torch_symm_mem_allreduce = _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
 
@@ -82,7 +91,7 @@ def kunlun_init_model_parallel_group(
         local_rank=local_rank,
         torch_distributed_backend=backend,
         use_pynccl=False,
-        use_pymscclpp=use_mscclpp_allreduce,
+        use_mscclpp=use_mscclpp,
         use_custom_allreduce=use_custom_allreduce,
         use_torch_symm_mem_all_reduce=use_torch_symm_mem_allreduce,
         use_hpu_communicator=True,

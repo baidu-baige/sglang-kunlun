@@ -21,13 +21,39 @@ from __future__ import annotations
 
 import logging
 
-from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
 
 from .device import KunlunDeviceMixin
 
 
 class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
     supported_quantization = ["int8", "w8a8_int8", "compressed-tensors"]
+
+    # 0.5.22 新增的平台能力声明（0.5.19 完全没有这个结构），**每个字段默认 False**，
+    # 而 core 在构造之前就读它来选代码路径。不声明的后果是静默降级，没有任何日志：
+    #
+    #   * ``graph_capture``：``cuda_graph_setup.capture_cuda_graphs`` 在
+    #     ``if current_platform.capabilities.graph_capture:`` 下才调
+    #     ``capture_decode_graph``。默认 False ⇒ decode / target_verify /
+    #     draft_decode 三个图**一个都不抓**，启动日志里
+    #     ``cuda_graph={...}`` 全是 0.00、每个 batch 都是 ``cuda graph: False``，
+    #     整个服务退化成 eager。0.5.19 的归档基线是 target_verify=44.94s、
+    #     draft_decode=151.95s、371 个 decode batch 全部 ``cuda graph: True``，
+    #     所以这是必须打开的一项——否则精度/性能都不是验收口径。
+    #   * ``supports_triton``：保持 False。昆仑起不了 triton（整个
+    #     ``kernels/kernel_ops.py`` 替换层就是为这件事存在的），
+    #     ``allocator/paged.py`` 据此改用 torch-native 分配器，正是我们要的。
+    #   * ``piecewise_graph``：保持 False，昆仑没有 torch.compile 捕获路径
+    #     （见 hooks/server_args.py 把 tc_piecewise 降级成 breakable）。
+    #   * ``hicache_device_kernels``：保持 False。插件自己用
+    #     ``hooks/mem_cache/kunlun_hicache.py`` 接管传输，host pool 跳过上游的
+    #     staging buffer 是正确的；本部署也没开 hicache。
+    capabilities = PlatformCapabilities(
+        supports_triton=False,
+        graph_capture=True,
+        piecewise_graph=False,
+        hicache_device_kernels=False,
+    )
 
     def __init__(self) -> None:
         super().__init__()

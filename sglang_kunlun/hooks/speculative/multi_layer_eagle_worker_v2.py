@@ -18,7 +18,16 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
     "sglang.srt.speculative.multi_layer_eagle_worker_v2.MultiLayerEagleDraftWorker._draft_extend_for_decode",
     type=HookType.AROUND,
 )
-def _draft_extend_for_decode_kunlun(original_fn, self, batch, batch_result):
+def _draft_extend_for_decode_kunlun(
+    original_fn, self, batch, batch_result, *, staged=False, kv_loc_plan=None
+):
+    # 0.5.22 added two keyword-only parameters: ``staged`` (whether
+    # ``_draft_extend_plan_for_decode`` already staged this batch's shared
+    # reads into the draft-extend graph runner, read back as the boundary-KV
+    # window and passed to ``cgr.prepare(..., staged=staged)``) and
+    # ``kv_loc_plan`` (the iteration's KVLocPlan from ``verify_input``). This
+    # wrapper only forces attention-backend init, so both are mirrored and
+    # forwarded unchanged.
     original_runner_forward = {
         idx: runner.forward for idx, runner in enumerate(self.draft_runner_list)
     }
@@ -46,7 +55,9 @@ def _draft_extend_for_decode_kunlun(original_fn, self, batch, batch_result):
         runner.forward = make_patched_forward(runner.forward)
 
     try:
-        return original_fn(self, batch, batch_result)
+        return original_fn(
+            self, batch, batch_result, staged=staged, kv_loc_plan=kv_loc_plan
+        )
     finally:
         for idx, runner in enumerate(self.draft_runner_list):
             runner.forward = original_runner_forward[idx]

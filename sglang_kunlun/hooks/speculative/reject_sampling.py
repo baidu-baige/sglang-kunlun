@@ -86,23 +86,29 @@ def chain_speculative_sampling_kunlun(
     threshold_single,
     threshold_acc,
     deterministic,
+    *,
+    block_verification: bool = False,
 ):
     """转调 XSpeedGate 的 XPU 算子，结果原地写回三个输出张量。
 
     ``threshold_single`` / ``threshold_acc`` / ``deterministic`` 以及
     ``retrive_next_token`` / ``retrive_next_sibling``（tree 接口的遗留入参）
     算子侧不使用，但仍按上游签名传下去，避免以后算子启用它们时又要改调用点。
+
+    0.5.22 给上游 wrapper 新增了 keyword-only 的 ``block_verification``
+    （``kernels/ops/speculative/reject_sampling.py:258``），由
+    ``--speculative-use-block-verification`` 打开，两个调用点都用
+    ``partial(sampling_fn, block_verification=True)`` 以**关键字**传进来
+    （``srt/speculative/eagle_utils.py:950``、
+    ``kernels/ops/speculative/dspark/dspark_accept.py:143``）。
+    它不是一个旋钮而是换算法：kernel 里 ``BLOCK_VERIFICATION`` 走的是
+    Algorithm 2（arXiv:2403.10444），按整段 prefix 概率
+    ``prod(p_i/q_i)`` 判接受、bonus 从带残差质量的分布里采，和 classic
+    chain rejection sampling 的逐步 ``u*q < p`` 判据不是一回事。
+    XSpeedGate 的 XPU 算子只实现 classic 那一套，拿它顶替会**静默**算出
+    错误的接受长度，所以 ``block_verification=True`` 时一律不走算子。
     """
-    op = _resolve_op()
-    global _LOGGED
-    if op is None:
-        if not _LOGGED:
-            _LOGGED = True
-            logger.warning(
-                "[KUNLUN_SPEC_SAMPLING] xspeedgate_ops 缺少 %s，回落到 kernel_ops "
-                "注册的 torch 实现",
-                _OP_NAME,
-            )
+    def _call_original(**extra):
         return original_fn(
             predicts,
             accept_index,
@@ -118,7 +124,38 @@ def chain_speculative_sampling_kunlun(
             threshold_single,
             threshold_acc,
             deterministic,
+            **extra,
         )
+
+    if block_verification:
+        # 交回 original_fn（kernel_ops 用 register_jit_op 注册的那份 torch 实现），
+        # 并把开关原样带下去：那份实现还不支持时直接报错，绝不悄悄退化成 classic。
+        try:
+            return _call_original(block_verification=True)
+        except TypeError as exc:
+            if "block_verification" in str(exc):
+                raise NotImplementedError(
+                    "昆仑尚未实现 block verification（Algorithm 2，"
+                    "arXiv:2403.10444）：XSpeedGate 的 "
+                    f"{_OP_NAME} 只做 classic chain rejection sampling，"
+                    "kernel_ops 里的 torch 兜底也还没接这个开关。"
+                    "请去掉 --speculative-use-block-verification。"
+                ) from exc
+            raise
+
+    op = _resolve_op()
+    global _LOGGED
+    if op is None:
+        if not _LOGGED:
+            _LOGGED = True
+            logger.warning(
+                "[KUNLUN_SPEC_SAMPLING] xspeedgate_ops 缺少 %s，回落到 kernel_ops "
+                "注册的 torch 实现",
+                _OP_NAME,
+            )
+        # block_verification 为默认值 False，等价于不传——保持与上游默认一致，
+        # 同时不依赖兜底实现是否已经有这个形参。
+        return _call_original()
     if not _LOGGED:
         _LOGGED = True
         logger.info("[KUNLUN_SPEC_SAMPLING] 使用 xspeedgate_ops.%s", _OP_NAME)
