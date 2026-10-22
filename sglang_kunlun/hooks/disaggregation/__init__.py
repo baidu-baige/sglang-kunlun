@@ -39,7 +39,13 @@ def _wrap_buf_infos(orig):
 
 
 def _patch_pool(pool):
-    if pool is None or getattr(pool, "_kunlun_2m_aligned", False):
+    if pool is None:
+        return
+    # Hybrid pools also need their PD ``end_layer`` set here; do it before the
+    # 2MiB-alignment early-return so it is never skipped for an already-aligned
+    # pool. Idempotent + no-op on non-hybrid pools.
+    _ensure_hybrid_pd_layer_range(pool)
+    if getattr(pool, "_kunlun_2m_aligned", False):
         return
     if hasattr(pool, "get_contiguous_buf_infos"):
         pool.get_contiguous_buf_infos = _wrap_buf_infos(pool.get_contiguous_buf_infos)
@@ -55,6 +61,42 @@ def _patch_pool(pool):
             pool.get_index_k_state_buf_infos
         )
     pool._kunlun_2m_aligned = True
+
+
+def _ensure_hybrid_pd_layer_range(pool):
+    """PD fix: give HybridLinearKVPool the ``end_layer`` the prefill
+    KVManager expects.
+
+    Upstream ``disaggregation/prefill.py`` builds the KVArgs with
+    ``prefill_start_layer`` via ``_transfer_start_layer`` (a *full-attention-
+    relative* index for hybrid pools) but reads ``prefill_end_layer`` straight
+    off ``pool.end_layer``. HybridLinearKVPool (Kimi-Linear: only the full-attn
+    / MLA layers keep KV, the KDA/linear layers use recurrent state) never
+    defines ``end_layer`` -> AttributeError at init.
+
+    To stay consistent with ``_transfer_start_layer`` we set ``end_layer`` in the
+    same full-attention-relative space:
+        (# full-attn layers with id < start_layer) + full_layer_nums
+    which brackets exactly the full-attn KV layer groups this rank transfers.
+    """
+    if pool is None:
+        return
+    try:
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+    except Exception:
+        return
+    if isinstance(pool, HybridLinearKVPool) and not hasattr(pool, "end_layer"):
+        start = getattr(pool, "start_layer", 0) or 0
+        mapping = getattr(pool, "full_attention_layer_id_mapping", {})
+        n_before = sum(1 for lid in mapping if lid < start)
+        pool.end_layer = n_before + pool.full_layer_nums
+        logger.info(
+            "sglang-kunlun: set HybridLinearKVPool.end_layer=%d "
+            "(start_layer=%d, full_layer_nums=%d) for PD prefill KVManager",
+            pool.end_layer,
+            start,
+            pool.full_layer_nums,
+        )
 
 
 def _kunlun_init_kv_manager_around(original_fn, self):
