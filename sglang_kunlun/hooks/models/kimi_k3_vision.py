@@ -7,17 +7,17 @@
    _normalize_and_patchify_torch。
 
 ViT 注意力：**不再需要 --mm-attention-backend**。按 sglang 源码同款 shape-aware 逻辑分流：
-大图（max_seqlen>1536 或 max_seqlen*total_tokens>=3e6）-> kunlun_mm，小图 -> sdpa。
-kunlun_mm 是昆仑大图注意力后端的命名占位（对标 B300 的 fa4），**当前用分段 SDPA 实现**，
-待昆仑 fa4 等价算子就位后，只需改 VisionKunlunMMAttention.forward 内部即可替换。
+大图（max_seqlen>1536 或 max_seqlen*total_tokens>=3e6）-> kunlun，小图 -> sdpa。
+大图复用插件已有的公共后端 ``kunlun``（``hooks/layers/attention/vision.py`` 的
+``VisionKunlunAttention``，基于 kunlun_ops.flash_attn_varlen_func）；本文件只负责 K3 侧的
+分流与建模块。小图仍走上游分段 SDPA。
 """
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
-import torch.nn as nn
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
@@ -81,37 +81,7 @@ def kunlun_normalize_and_patchify(
     )
 
 
-# ========================= ViT 注意力：大图 kunlun_mm / 小图 sdpa =========================
-class VisionKunlunMMAttention(nn.Module):
-    """昆仑大图 ViT 注意力后端（命名占位，对标 B300 的 fa4）。
-
-    当前用上游分段 SDPA（sdpa_varlen_attention）实现，数值与小图 sdpa 一致；
-    待昆仑 fa4 等价变长注意力算子就位后，仅替换本 forward 内部即可。
-    """
-
-    def __init__(self, **kwargs) -> None:  # 接收 use_data_parallel / workspace_buffer 等
-        super().__init__()
-
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        cu_seqlens=None,
-        bsz: int = 1,
-        seq_len: Optional[int] = None,
-        forward_metadata=None,
-        **kwargs,
-    ) -> torch.Tensor:
-        """变长 ViT 注意力：返回 [tot, H, D]。"""
-        from sglang.srt.models.kimi_k3_vl import sdpa_varlen_attention
-
-        cu = cu_seqlens
-        if cu is None and forward_metadata is not None:
-            cu = forward_metadata.cu_seqlens
-        out = sdpa_varlen_attention(q, k, v, cu)  # [tot, H*D]
-        return out.view(q.shape[0], q.shape[1], q.shape[2])  # [tot, H, D]
-
+# ========================= ViT 注意力：大图 kunlun / 小图 sdpa =========================
 
 @plugin_hook(
     "sglang.srt.models.kimi_k3_vl._resolve_mm_attention_backend",
@@ -120,7 +90,7 @@ class VisionKunlunMMAttention(nn.Module):
 def kunlun_resolve_mm_attention_backend(
     configured_backend, *, max_seqlen, total_tokens, device, fa4_available=None
 ):
-    """昆仑同款 shape-aware 选择：auto 时大图 kunlun_mm、小图 sdpa；显式后端则透传。"""
+    """昆仑同款 shape-aware 选择：auto 时大图 kunlun、小图 sdpa；显式后端则透传。"""
     if configured_backend != "auto":
         return configured_backend
     from sglang.srt.models.kimi_k3_vl import (
@@ -129,7 +99,7 @@ def kunlun_resolve_mm_attention_backend(
     )
 
     is_big = max_seqlen > _MAXLEN or max_seqlen * total_tokens >= _WORK
-    return "kunlun_mm" if is_big else "sdpa"
+    return "kunlun" if is_big else "sdpa"
 
 
 @plugin_hook(
@@ -137,14 +107,12 @@ def kunlun_resolve_mm_attention_backend(
     type=HookType.AROUND,
 )
 def kunlun_moonvit_layer_init(original_fn, self, *args, **kwargs):
-    """让 ViT block 构造出 kunlun_mm 后端模块（auto/sdpa 时都建它，供大图路径使用）。
+    """让 ViT block 构造出 kunlun 后端模块（auto/sdpa 时都建它，供大图路径使用）。
 
-    注意：仅改本层的 attention_backend（影响 ModuleDict 构造）；按图大小的 per-forward
-    选择仍由 encoder 的 attention_backend='auto' 驱动 _resolve_mm_attention_backend。
+    kunlun 后端已在 hooks/layers/attention/vision.py import 时注册进 QKV_BACKEND_IMPL
+    （早于本 hook）。这里仅改本层的 attention_backend（影响 ModuleDict 构造）；按图大小的
+    per-forward 选择仍由 encoder 的 'auto' 驱动 _resolve_mm_attention_backend。
     """
-    from sglang.srt.layers.attention.vision import QKV_BACKEND_IMPL
-
-    QKV_BACKEND_IMPL.setdefault("kunlun_mm", VisionKunlunMMAttention)
     if kwargs.get("attention_backend") in (None, "auto", "sdpa"):
-        kwargs["attention_backend"] = "kunlun_mm"
+        kwargs["attention_backend"] = "kunlun"
     return original_fn(self, *args, **kwargs)
