@@ -764,6 +764,104 @@ def _forward_c4_indexer_impl(
 _eager_forward_c4_indexer = eager_on_graph(True)(_forward_c4_indexer_impl)
 
 
+
+_GRAPH_INPUT_CHECK_LOGGED: set = set()
+
+
+def _graph_check_limit(pool):
+    """Paged pool limit: number of pages the pool can address, else None."""
+    if pool is None:
+        return None
+    size = getattr(pool, "size", None)
+    if size is None:
+        return None
+    page = getattr(pool, "page_size", None) or getattr(pool, "global_page_size", None)
+    try:
+        return int(size) // int(page) if page else int(size)
+    except (TypeError, ValueError):
+        return None
+
+
+def _graph_tensor_span(tensor):
+    if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+        return None
+    try:
+        return int(tensor.min()), int(tensor.max())
+    except Exception:
+        return None
+
+
+def _serialize_graph_replay() -> None:
+    """Wait for the previous replay before building the next one's metadata.
+
+    The target decode graph replays the compressor store, C4/C128 indexer and
+    attention without a device-wide fence at the end. The out-of-graph Python
+    that builds the next iteration's metadata (and the next replay itself) can
+    therefore start while the previous iteration's async work is still in
+    flight. At long context this race corrupts the compress state and faults
+    the device (``kl3ChannelCheckErrors status=719`` / ``invalid program
+    counter``); a single stream sync is not enough because the compressor uses
+    a different stream. Serializing the replay is the verified fix. Set
+    ``DSV4_KUNLUN_GRAPH_SYNC=0`` to trade correctness for overlap.
+    """
+    if os.environ.get("DSV4_KUNLUN_GRAPH_SYNC", "1") != "1":
+        return
+    torch.cuda.synchronize()
+
+
+def _check_graph_replay_inputs(backend, forward_batch):
+    """Log the first out-of-range index fed to a captured decode graph.
+
+    A device-side fault inside a graph replay has no Python frame. The replay
+    inputs are built out of graph, so an illegal page/slot can be reported
+    here before the launch. Enabled only via DSV4_KUNLUN_GRAPH_INPUT_CHECK=1.
+    """
+    if os.environ.get("DSV4_KUNLUN_GRAPH_INPUT_CHECK", "0") != "1":
+        return
+    pool = getattr(backend, "token_to_kv_pool", None)
+    if pool is None:
+        return
+    limits = {
+        "out_cache_loc": getattr(pool, "size", None),
+        "swa_page_indices": _graph_check_limit(getattr(pool, "swa_kv_pool", None)),
+        "c4_sparse_page_indices": _graph_check_limit(getattr(pool, "c4_kv_pool", None)),
+        "c128_page_indices": _graph_check_limit(getattr(pool, "c128_kv_pool", None)),
+    }
+    checks = [("out_cache_loc", getattr(forward_batch, "out_cache_loc", None))]
+    core = getattr(getattr(backend, "forward_metadata", None), "core_metadata", None)
+    if core is not None:
+        checks.extend(
+            [
+                ("swa_page_indices", getattr(core, "swa_page_indices", None)),
+                ("c4_sparse_page_indices", getattr(core, "c4_sparse_page_indices", None)),
+                ("c128_page_indices", getattr(core, "c128_page_indices", None)),
+            ]
+        )
+    seq_span = _graph_tensor_span(getattr(forward_batch, "seq_lens", None))
+    for name, tensor in checks:
+        span = _graph_tensor_span(tensor)
+        if span is None:
+            continue
+        low, high = span
+        limit = limits.get(name)
+        if low >= -1 and (limit is None or high < int(limit)):
+            continue
+        if name in _GRAPH_INPUT_CHECK_LOGGED:
+            continue
+        _GRAPH_INPUT_CHECK_LOGGED.add(name)
+        logger.warning(
+            "[GRAPH_INPUT_CHECK] %s out of range: min=%s max=%s limit=%s "
+            "mode=%s bs=%s seq_lens=%s",
+            name,
+            low,
+            high,
+            limit,
+            getattr(forward_batch, "forward_mode", None),
+            getattr(forward_batch, "batch_size", None),
+            seq_span,
+        )
+
+
 class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
     """0.5.14 DSV4 control flow with the Kunlun attention boundary."""
 
@@ -988,6 +1086,8 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             self._c4_decode_aux,
             self._attention_graph_extend_aux,
         )
+        _serialize_graph_replay()
+        _check_graph_replay_inputs(self, forward_batch)
 
     def forward_c4_indexer(
         self,
