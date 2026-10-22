@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 
 import torch
@@ -467,3 +468,30 @@ def dspark_forward_batch_generation_kunlun(original_fn, *args, **kwargs):
     """
     kwargs.pop("pp_proxy_tensors", None)
     return original_fn(*args, **kwargs)
+
+
+@plugin_hook(
+    "sglang.srt.speculative.dspark_components.dspark_worker_v2."
+    "DSparkWorkerV2.init_cuda_graphs",
+    type=HookType.AROUND,
+)
+def disable_dspark_draft_cuda_graph_kunlun(original_fn, self, *args, **kwargs):
+    """Keep the DSpark draft eager on Kunlun.
+
+    A long-context think batch (8 identical requests, ~45k prompt) replays the
+    captured draft graph and trips a device-side failure -- the scheduler
+    reports ``CUDA error: invalid program counter`` right after
+    ``DecodeCudaGraphRunner._publish_read_done`` and every TP scheduler exits.
+    The same batch completes with the draft eager, while the target-verify
+    graph stays captured, so the crash is isolated to the draft graph.
+
+    This does not make the output deterministic: identical requests can still
+    take different greedy paths because of page-layout-dependent numerics in
+    the compression path. It only removes the crash. Set
+    ``SGLANG_KUNLUN_DSPARK_DRAFT_CUDA_GRAPH=1`` to restore upstream capture for
+    performance experiments.
+    """
+    if os.environ.get("SGLANG_KUNLUN_DSPARK_DRAFT_CUDA_GRAPH", "0") != "1":
+        self._decode_graph_allowed = False
+    return original_fn(self, *args, **kwargs)
+
