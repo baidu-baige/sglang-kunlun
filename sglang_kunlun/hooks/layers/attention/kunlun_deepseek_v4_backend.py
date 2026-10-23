@@ -75,6 +75,26 @@ def dsv4_stable_dsa_enabled() -> bool:
     makes repeated runs bit-identical at a modest throughput cost.  Everything
     else keeps using the vendor operators.
 
+    Measured 2026-10-23 (P800, TP8, greedy, same request repeated):
+
+      prompt tokens   default            + STABLE_DSA        + STABLE_DSA and
+                                                              BKCL_STABLE_NCORES
+      899             top-3 logit jitter  exact               exact
+      7911            jitter ~0.05-0.18   jitter ~0.05         jitter ~0.005
+      45138           jitter ~0.10,       jitter ~0.10         jitter ~0.10
+                      argmax flips
+
+    So two independent noise sources exist.  The short-context one is the XCCL
+    ring all-reduce: ``bkcl.h`` only promises an identical accumulation order
+    across devices for ``bkcl_all_reduce_stable``, and ``BKCL_STABLE_NCORES=16``
+    switches ``ring_all_reduce`` to that kernel (``device_wrapper_kl3.cpp``).
+    The long-context one lives in vendor kernels that have no reference
+    implementation (compressor store and the main paged attention): it survives
+    ``DSV4_KUNLUN_REFERENCE_ONLY=1``, ``--disable-cuda-graph``, non-speculative
+    decoding, ``SGLANG_OPT_USE_COMPRESSOR_V2=0``, ``--boundary-reduction ar`` and
+    ``--chunked-prefill-size 262144``, so it needs layout-invariant vendor
+    kernels.
+
     NOTE: the compressor operators (``dsv4_compress_forward_v2`` /
     ``dsv4_compress_norm_rope_store_v2``) have no Torch reference hook yet, so a
     small residual run-to-run variation can still remain; a fully deterministic
