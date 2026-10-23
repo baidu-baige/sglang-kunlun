@@ -767,6 +767,77 @@ _eager_forward_c4_indexer = eager_on_graph(True)(_forward_c4_indexer_impl)
 
 _GRAPH_INPUT_CHECK_LOGGED: set = set()
 
+# Per-rank replay trace (DSV4_KUNLUN_STEP_TRACE=1). A graph replay that hangs
+# inside a collective parks every rank in cudaGraphLaunch, so the only way to
+# tell a device-side stall from a cross-rank step mismatch is to compare what
+# each rank fed to its last replay.
+_STEP_TRACE_STATE = {"step": 0, "fd": None}
+
+
+def _step_trace_rank() -> int:
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank()
+    except Exception:
+        pass
+    return -1
+
+
+def _step_trace(backend, forward_batch) -> None:
+    """Append one line per replay input to <dir>/rank<r>.log.
+
+    Records the scheduler-visible shape of the replay (mode, request count,
+    request slots, sequence lengths) so a hang can be classified afterwards:
+    identical last lines on every rank mean the ranks stayed in lockstep and
+    the graph itself stalled; differing lines mean a scheduler desync.
+    Diagnostic only, enabled via DSV4_KUNLUN_STEP_TRACE=1.
+    """
+    if os.environ.get("DSV4_KUNLUN_STEP_TRACE", "0") != "1":
+        return
+    state = _STEP_TRACE_STATE
+    rank = _step_trace_rank()
+    if state["fd"] is None:
+        trace_dir = os.environ.get("DSV4_KUNLUN_STEP_TRACE_DIR", "/tmp/dsv4_step_trace")
+        try:
+            os.makedirs(trace_dir, exist_ok=True)
+            state["fd"] = open(
+                os.path.join(trace_dir, f"rank{rank}.log"), "a", buffering=1
+            )
+        except Exception:
+            return
+    state["step"] += 1
+
+    def _span(name):
+        tensor = getattr(forward_batch, name, None)
+        if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+            return "-"
+        flat = tensor.reshape(-1)
+        try:
+            if flat.numel() <= 8:
+                return ",".join(str(int(v)) for v in flat.tolist())
+            return f"{int(flat.min())}..{int(flat.max())}/n={flat.numel()}"
+        except Exception:
+            return "?"
+
+    spec_info = getattr(forward_batch, "spec_info", None)
+    line = (
+        f"step={state['step']} pid={os.getpid()} rank={rank} "
+        f"mode={getattr(forward_batch, 'forward_mode', None)} "
+        f"bs={getattr(forward_batch, 'batch_size', None)} "
+        f"req={_span('req_pool_indices')} "
+        f"seq={_span('seq_lens')} "
+        f"seq_casual={_span('seq_lens_casual')} "
+        f"out_loc={_span('out_cache_loc')} "
+        f"pos={_span('positions')} "
+        f"rows={getattr(spec_info, 'num_tokens_per_req', '-')}"
+    )
+    try:
+        state["fd"].write(line + "\n")
+    except Exception:
+        pass
+
 
 def _graph_check_limit(pool):
     """Paged pool limit: number of pages the pool can address, else None."""
@@ -1088,6 +1159,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         )
         _serialize_graph_replay()
         _check_graph_replay_inputs(self, forward_batch)
+        _step_trace(self, forward_batch)
 
     def forward_c4_indexer(
         self,
