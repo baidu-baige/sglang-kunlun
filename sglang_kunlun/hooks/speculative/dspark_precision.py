@@ -476,22 +476,24 @@ def dspark_forward_batch_generation_kunlun(original_fn, *args, **kwargs):
     type=HookType.AROUND,
 )
 def disable_dspark_draft_cuda_graph_kunlun(original_fn, self, *args, **kwargs):
-    """Keep the DSpark draft eager on Kunlun.
+    """Keep the DSpark draft captured unless it is explicitly turned off.
 
-    A long-context think batch (8 identical requests, ~45k prompt) replays the
-    captured draft graph and trips a device-side failure -- the scheduler
-    reports ``CUDA error: invalid program counter`` right after
-    ``DecodeCudaGraphRunner._publish_read_done`` and every TP scheduler exits.
-    The same batch completes with the draft eager, while the target-verify
-    graph stays captured, so the crash is isolated to the draft graph.
+    The draft graph used to fault (``CUDA error: invalid program counter`` right
+    after ``DecodeCudaGraphRunner._publish_read_done``) on a long-context think
+    batch. That fault was a cross-replay race, and
+    ``_serialize_graph_replay`` (``kunlun_deepseek_v4_backend``) now fences the
+    device before every replay, so the capture is kept: it is 1.4-2x faster
+    (8x45k concurrent decode 296s -> 208s, bs=1 48 -> 105 tok/s) and it removes
+    the eager-vs-captured collective mixing that makes the XCCL all-reduce
+    deadlock easier to hit (see ``AICapX-841`` notes on
+    ``kl3_all_reduce_Entry`` task timeouts).
 
-    This does not make the output deterministic: identical requests can still
+    This still does not make the output deterministic: identical requests can
     take different greedy paths because of page-layout-dependent numerics in
-    the compression path. It only removes the crash. Set
-    ``SGLANG_KUNLUN_DSPARK_DRAFT_CUDA_GRAPH=1`` to restore upstream capture for
-    performance experiments.
+    the compression path. Set ``SGLANG_KUNLUN_DSPARK_DRAFT_CUDA_GRAPH=0`` to
+    fall back to the eager draft.
     """
-    if os.environ.get("SGLANG_KUNLUN_DSPARK_DRAFT_CUDA_GRAPH", "0") != "1":
+    if os.environ.get("SGLANG_KUNLUN_DSPARK_DRAFT_CUDA_GRAPH", "1") == "0":
         self._decode_graph_allowed = False
     return original_fn(self, *args, **kwargs)
 
