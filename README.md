@@ -77,6 +77,33 @@ YOUR_PATH=/path/to/your/workspace
 pip install -e "${YOUR_PATH}/sglang-kunlun"
 ```
 
+## Container Image
+
+For a ready-to-run deployment, build the Kunlun inference image from
+[`dockerfile/Dockerfile`](dockerfile/Dockerfile). It is a single self-contained
+build file: the Kunlun runtime (`xre`, `xccl`), the Kunlun PyTorch backend
+(`xpytorch`/`torch_xmlir`), the operator libraries (`kunlun_ops`,
+`xspeedgate_ops`, `deep_ep`, `xmooncake`, `xtriton`, `flash_mla`) and this
+plugin are all installed from `ARG`-driven download addresses.
+
+The build context is the parent directory of this repository and must also
+contain a SGLang source tree, which the image uses through `PYTHONPATH` rather
+than installing it:
+
+```bash
+# <ctx>/sglang-kunlun/   this repository
+# <ctx>/sglang/          SGLang source tree
+docker build -f sglang-kunlun/dockerfile/Dockerfile \
+  -t iregistry.baidu-int.com/aicapx/sglang-kunlun:dev .
+```
+
+Always flatten the result before publishing it, otherwise the clean-up steps
+only become whiteout entries and the image does not shrink. See
+[`dockerfile/README.md`](dockerfile/README.md) for the flatten command, the
+offline/restricted-network build mode (`REUSE_BASE_PY_ENV`), and — most
+importantly — the "why it is written this way" notes that list what must **not**
+be removed from the image.
+
 ## Quick Start
 
 ### Configure the Runtime
@@ -238,12 +265,13 @@ sglang-kunlun/
 │   ├── kernels/                # Kunlun kernel shims and operator replacements
 │   ├── models/                 # External model package registration
 │   └── launch.py               # Explicit Kunlun launcher
+├── debug/                      # Debug and alignment helpers
+├── dockerfile/                 # Inference image: a single Dockerfile plus notes
 ├── test/                       # Unit and contract tests
-├── build/                      # Repository packaging scripts
+├── third_party/                # SGLang submodule used for reference
+├── sitecustomize.py            # Kunlun bootstrap hook loaded from PYTHONPATH
 ├── pyproject.toml              # Package metadata and SGLang entry points
-├── requirements.txt            # Build and test dependencies
-├── LICENSE                     # Apache License 2.0
-└── NOTICE                      # Copyright and third-party notices
+└── requirements.txt            # Build and test dependencies
 ```
 
 ## Development and Validation
@@ -255,16 +283,18 @@ dependencies installed:
 python3 -m pytest -q
 ```
 
-The CI packaging script creates `output/sglang_kunlun.tar.gz`:
+The CI profile in [`ci.yml`](ci.yml) builds the wheel with:
 
 ```bash
-sh build/build.sh
+pip3 install -r requirements.txt && python3 -m build
 ```
 
 For changes affecting runtime behavior, validate on the target Kunlun
 environment with the relevant model, quantization mode, parallelism, and
 graph/disaggregation settings. A passing unit-test run alone does not establish
-end-to-end inference or performance correctness.
+end-to-end inference or performance correctness. Changes under `dockerfile/`
+should additionally be validated by building the image, flattening it, and
+starting a real service with it.
 
 ## Contributing
 
