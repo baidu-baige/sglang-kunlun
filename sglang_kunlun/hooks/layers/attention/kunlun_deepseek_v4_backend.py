@@ -882,6 +882,39 @@ def _graph_tensor_span(tensor):
         return None
 
 
+_STEP_BARRIER_GROUP = None
+
+
+def _cross_rank_step_barrier() -> None:
+    """Rendezvous every TP rank before the next replay is launched.
+
+    ``_serialize_graph_replay`` only fences *this* device, so a fast rank can
+    enter replay N+1 while a peer is still finishing replay N and its
+    collectives. That skew is the remaining suspect for the XCCL all_reduce
+    deadlock (``kl3_all_reduce_Entry ... task timeout`` on every rank while all
+    of them sit in ``cudaGraphLaunch``), so DSV4_KUNLUN_STEP_BARRIER=1 adds a
+    global step boundary. The rendezvous uses the group's CPU (gloo) group, so
+    the barrier itself never touches XCCL. Diagnostic; costs one host round
+    trip per step.
+    """
+    global _STEP_BARRIER_GROUP
+    if os.environ.get("DSV4_KUNLUN_STEP_BARRIER", "0") != "1":
+        return
+    if _STEP_BARRIER_GROUP is None:
+        try:
+            import torch.distributed as dist
+
+            from sglang.srt.distributed.parallel_state import get_tp_group
+
+            group = get_tp_group().cpu_group
+            _STEP_BARRIER_GROUP = group if group is not None else "none"
+        except Exception:
+            _STEP_BARRIER_GROUP = "none"
+    if _STEP_BARRIER_GROUP == "none":
+        return
+    torch.distributed.barrier(group=_STEP_BARRIER_GROUP)
+
+
 def _serialize_graph_replay() -> None:
     """Wait for the previous replay before building the next one's metadata.
 
@@ -896,8 +929,10 @@ def _serialize_graph_replay() -> None:
     ``DSV4_KUNLUN_GRAPH_SYNC=0`` to trade correctness for overlap.
     """
     if os.environ.get("DSV4_KUNLUN_GRAPH_SYNC", "1") != "1":
+        _cross_rank_step_barrier()
         return
     torch.cuda.synchronize()
+    _cross_rank_step_barrier()
 
 
 def _check_graph_replay_inputs(backend, forward_batch):
