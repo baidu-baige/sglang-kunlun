@@ -21,7 +21,6 @@ from sglang_kunlun.hooks.models.mtp_input_correction import (
 logger = logging.getLogger(__name__)
 
 # One-shot state for the MTP input-correction diagnostics.
-_MTP_CORRECTION_LOGGED = False
 _MTP_CORRECTION_LOADED = False
 
 def draft_forward_context(draft_model_runner):
@@ -435,15 +434,6 @@ def correct_draft_input_hidden(worker, batch_result):
     corrected = corrected_hidden(model, hidden)
     if corrected is hidden:
         return None
-    global _MTP_CORRECTION_LOGGED
-    if not _MTP_CORRECTION_LOGGED:
-        _MTP_CORRECTION_LOGGED = True
-        logger.info(
-            "sglang-kunlun: MTP input correction applied to the draft hidden "
-            "(%s %s)",
-            tuple(corrected.shape),
-            corrected.dtype,
-        )
     return corrected
 
 

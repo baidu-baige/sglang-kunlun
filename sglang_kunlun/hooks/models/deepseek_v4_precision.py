@@ -147,26 +147,6 @@ def _restore_requested_fp16_parameter_dtype(*linears):
 
 
 @plugin_hook(
-    "sglang.srt.layers.attention.dsv4.indexer.C4Indexer.__init__",
-    type=HookType.AFTER,
-)
-def initialize_c4_indexer_parameter_dtype_kunlun(result, self, *args, **kwargs):
-    """Restore the requested dtype for C4 indexer projections."""
-    _restore_requested_fp16_parameter_dtype(self.wq_b, self.weights_proj)
-    return result
-
-
-@plugin_hook(
-    "sglang.srt.layers.attention.dsv4.compressor.Compressor.__init__",
-    type=HookType.AFTER,
-)
-def initialize_compressor_parameter_dtype_kunlun(result, self, *args, **kwargs):
-    """Restore the requested dtype for the compressor gate projection."""
-    _restore_requested_fp16_parameter_dtype(self.wkv_gate)
-    return result
-
-
-@plugin_hook(
     "sglang.srt.models.deepseek_v4.MqaAttentionBase.__init__",
     type=HookType.AFTER,
 )

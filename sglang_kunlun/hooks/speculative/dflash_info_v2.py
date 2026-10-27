@@ -35,9 +35,6 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 logger = logging.getLogger(__name__)
 
-_LOGGED = {"once": False}
-
-
 @plugin_hook(
     "sglang.srt.speculative.dflash_info_v2.DFlashDraftInputV2.prepare_for_decode",
     type=HookType.BEFORE,
@@ -55,11 +52,4 @@ def evict_swa_before_dflash_decode(self, batch, *args, **kwargs):
     for req in batch.reqs:
         req.decode_batch_idx += 1
 
-    if not _LOGGED["once"]:
-        _LOGGED["once"] = True
-        logger.info(
-            "[kunlun] dflash SWA eviction hook active (sliding_window=%s, page_size=%s)",
-            getattr(batch.tree_cache, "sliding_window_size", None),
-            getattr(batch.tree_cache, "page_size", None),
-        )
     return None

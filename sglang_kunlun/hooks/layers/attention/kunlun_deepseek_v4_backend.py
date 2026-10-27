@@ -30,6 +30,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 )
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 from sglang_kunlun.kernels.kernel_ops import (
+    _dsv4_topk_torch_fallback,
     dsv4_c4_paged_mqa_logits_torch,
     dsv4_compressed_attention_torch,
     dsv4_quant_k_cache_kunlun,
@@ -381,9 +382,6 @@ def _copy_host_lengths_(destination, source, fill_value: int) -> None:
         destination[count:].fill_(fill_value)
 
 
-_PACKED_WARNED: set = set()
-
-
 def _as_packed(tensor: torch.Tensor, what: str) -> torch.Tensor:
     """Pack a tensor before handing it to a vendor op, warning once if it copied.
 
@@ -395,15 +393,6 @@ def _as_packed(tensor: torch.Tensor, what: str) -> torch.Tensor:
     """
     if tensor.is_contiguous():
         return tensor
-    if what not in _PACKED_WARNED:
-        _PACKED_WARNED.add(what)
-        logger.warning(
-            "[KUNLUN-PACK] %s was not contiguous (shape=%s stride=%s); "
-            "copying before the vendor op",
-            what,
-            tuple(tensor.shape),
-            tensor.stride(),
-        )
     return tensor.contiguous()
 
 
@@ -416,15 +405,6 @@ def _as_packed_out(tensor: torch.Tensor, what: str):
     """
     if tensor.is_contiguous():
         return tensor, None
-    if what not in _PACKED_WARNED:
-        _PACKED_WARNED.add(what)
-        logger.warning(
-            "[KUNLUN-PACK] output %s was not contiguous (shape=%s stride=%s); "
-            "the vendor op writes a copy that must be written back",
-            what,
-            tuple(tensor.shape),
-            tensor.stride(),
-        )
     return tensor.contiguous(), tensor
 
 
@@ -695,9 +675,6 @@ def _refresh_graph_host_lengths(
         _copy_host_lengths_(kv_lens_cpu, seq_lens, fill_value=1)
         kv_lens.copy_(kv_lens_cpu)
         torch.maximum(kv_lens, query_lens, out=kv_lens)
-_DSV4_PAGE_TABLE_SPAN_LOGGED = False
-
-
 def _page_slack() -> int:
     """One page of slack for the page-table span (see _dsv4_page_table_span)."""
     return upstream.PAGE_INDEX_ALIGNED_SIZE if hasattr(upstream, "PAGE_INDEX_ALIGNED_SIZE") else 64
@@ -743,14 +720,6 @@ def _dsv4_page_table_span(max_seq_len: int, seq_lens_casual: torch.Tensor) -> in
     needed = int(seq_lens_casual.max().item())
     if needed <= max_seq_len:
         return max_seq_len
-    global _DSV4_PAGE_TABLE_SPAN_LOGGED
-    if not _DSV4_PAGE_TABLE_SPAN_LOGGED:
-        _DSV4_PAGE_TABLE_SPAN_LOGGED = True
-        logger.warning(
-            "[DSV4_PAGE_TABLE] widening span: max_seq_len=%s needed=%s",
-            max_seq_len,
-            needed,
-        )
     return needed
 
 
@@ -783,103 +752,6 @@ def _forward_c4_indexer_impl(
 # Eager-break form of the C4 indexer call (see the wrapper method below).
 _eager_forward_c4_indexer = eager_on_graph(True)(_forward_c4_indexer_impl)
 
-
-
-_GRAPH_INPUT_CHECK_LOGGED: set = set()
-
-# Per-rank replay trace (DSV4_KUNLUN_STEP_TRACE=1). A graph replay that hangs
-# inside a collective parks every rank in cudaGraphLaunch, so the only way to
-# tell a device-side stall from a cross-rank step mismatch is to compare what
-# each rank fed to its last replay.
-_STEP_TRACE_STATE = {"step": 0, "fd": None}
-
-
-def _step_trace_rank() -> int:
-    try:
-        import torch.distributed as dist
-
-        if dist.is_available() and dist.is_initialized():
-            return dist.get_rank()
-    except Exception:
-        pass
-    return -1
-
-
-def _step_trace(backend, forward_batch) -> None:
-    """Append one line per replay input to <dir>/rank<r>.log.
-
-    Records the scheduler-visible shape of the replay (mode, request count,
-    request slots, sequence lengths) so a hang can be classified afterwards:
-    identical last lines on every rank mean the ranks stayed in lockstep and
-    the graph itself stalled; differing lines mean a scheduler desync.
-    Diagnostic only, enabled via DSV4_KUNLUN_STEP_TRACE=1.
-    """
-    if os.environ.get("DSV4_KUNLUN_STEP_TRACE", "0") != "1":
-        return
-    state = _STEP_TRACE_STATE
-    rank = _step_trace_rank()
-    if state["fd"] is None:
-        trace_dir = os.environ.get("DSV4_KUNLUN_STEP_TRACE_DIR", "/tmp/dsv4_step_trace")
-        try:
-            os.makedirs(trace_dir, exist_ok=True)
-            state["fd"] = open(
-                os.path.join(trace_dir, f"rank{rank}.log"), "a", buffering=1
-            )
-        except Exception:
-            return
-    state["step"] += 1
-
-    def _span(name):
-        tensor = getattr(forward_batch, name, None)
-        if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
-            return "-"
-        flat = tensor.reshape(-1)
-        try:
-            if flat.numel() <= 8:
-                return ",".join(str(int(v)) for v in flat.tolist())
-            return f"{int(flat.min())}..{int(flat.max())}/n={flat.numel()}"
-        except Exception:
-            return "?"
-
-    spec_info = getattr(forward_batch, "spec_info", None)
-    line = (
-        f"step={state['step']} pid={os.getpid()} rank={rank} "
-        f"mode={getattr(forward_batch, 'forward_mode', None)} "
-        f"bs={getattr(forward_batch, 'batch_size', None)} "
-        f"req={_span('req_pool_indices')} "
-        f"seq={_span('seq_lens')} "
-        f"seq_casual={_span('seq_lens_casual')} "
-        f"out_loc={_span('out_cache_loc')} "
-        f"pos={_span('positions')} "
-        f"rows={getattr(spec_info, 'num_tokens_per_req', '-')}"
-    )
-    try:
-        state["fd"].write(line + "\n")
-    except Exception:
-        pass
-
-
-def _graph_check_limit(pool):
-    """Paged pool limit: number of pages the pool can address, else None."""
-    if pool is None:
-        return None
-    size = getattr(pool, "size", None)
-    if size is None:
-        return None
-    page = getattr(pool, "page_size", None) or getattr(pool, "global_page_size", None)
-    try:
-        return int(size) // int(page) if page else int(size)
-    except (TypeError, ValueError):
-        return None
-
-
-def _graph_tensor_span(tensor):
-    if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
-        return None
-    try:
-        return int(tensor.min()), int(tensor.max())
-    except Exception:
-        return None
 
 
 _STEP_BARRIER_GROUP = None
@@ -933,59 +805,6 @@ def _serialize_graph_replay() -> None:
         return
     torch.cuda.synchronize()
     _cross_rank_step_barrier()
-
-
-def _check_graph_replay_inputs(backend, forward_batch):
-    """Log the first out-of-range index fed to a captured decode graph.
-
-    A device-side fault inside a graph replay has no Python frame. The replay
-    inputs are built out of graph, so an illegal page/slot can be reported
-    here before the launch. Enabled only via DSV4_KUNLUN_GRAPH_INPUT_CHECK=1.
-    """
-    if os.environ.get("DSV4_KUNLUN_GRAPH_INPUT_CHECK", "0") != "1":
-        return
-    pool = getattr(backend, "token_to_kv_pool", None)
-    if pool is None:
-        return
-    limits = {
-        "out_cache_loc": getattr(pool, "size", None),
-        "swa_page_indices": _graph_check_limit(getattr(pool, "swa_kv_pool", None)),
-        "c4_sparse_page_indices": _graph_check_limit(getattr(pool, "c4_kv_pool", None)),
-        "c128_page_indices": _graph_check_limit(getattr(pool, "c128_kv_pool", None)),
-    }
-    checks = [("out_cache_loc", getattr(forward_batch, "out_cache_loc", None))]
-    core = getattr(getattr(backend, "forward_metadata", None), "core_metadata", None)
-    if core is not None:
-        checks.extend(
-            [
-                ("swa_page_indices", getattr(core, "swa_page_indices", None)),
-                ("c4_sparse_page_indices", getattr(core, "c4_sparse_page_indices", None)),
-                ("c128_page_indices", getattr(core, "c128_page_indices", None)),
-            ]
-        )
-    seq_span = _graph_tensor_span(getattr(forward_batch, "seq_lens", None))
-    for name, tensor in checks:
-        span = _graph_tensor_span(tensor)
-        if span is None:
-            continue
-        low, high = span
-        limit = limits.get(name)
-        if low >= -1 and (limit is None or high < int(limit)):
-            continue
-        if name in _GRAPH_INPUT_CHECK_LOGGED:
-            continue
-        _GRAPH_INPUT_CHECK_LOGGED.add(name)
-        logger.warning(
-            "[GRAPH_INPUT_CHECK] %s out of range: min=%s max=%s limit=%s "
-            "mode=%s bs=%s seq_lens=%s",
-            name,
-            low,
-            high,
-            limit,
-            getattr(forward_batch, "forward_mode", None),
-            getattr(forward_batch, "batch_size", None),
-            seq_span,
-        )
 
 
 class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
@@ -1213,8 +1032,6 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             self._attention_graph_extend_aux,
         )
         _serialize_graph_replay()
-        _check_graph_replay_inputs(self, forward_batch)
-        _step_trace(self, forward_batch)
 
     def forward_c4_indexer(
         self,
@@ -1345,6 +1162,26 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             q_indexer[0].shape[0] if use_fp4_indexer else q_indexer.shape[0]
         )
 
+        # BCG replay pads the query rows to the captured bucket; run the indexer on
+        # the live rows only (eager shape) and leave the pad rows at -1.  CP keeps
+        # its own padded-row contract.
+        if (
+            is_in_breakable_cuda_graph()
+            and not torch.cuda.is_current_stream_capturing()
+            and _dsa_cp_prefill_ranks(forward_batch) is None
+        ):
+            # Live rows are a prefix; pad rows end with compressed length 0.
+            _lens_all = indexer_metadata.compressed_seq_lens.reshape(-1)
+            _nz = torch.nonzero(_lens_all > 0)
+            live_rows = int(_nz[-1].item()) + 1 if _nz.numel() else 0
+            if 0 < live_rows < query_rows:
+                query_rows = live_rows
+                if use_fp4_indexer:
+                    q = (q[0][:live_rows], q[1][:live_rows])
+                else:
+                    q = q[:live_rows]
+                weights = weights[:live_rows]
+
         def match_num_queries(tensor, value):
             if tensor.shape[0] == query_rows:
                 return tensor
@@ -1388,6 +1225,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             core_metadata=core_metadata,
             forward_batch=forward_batch,
             c4_indexer=c4_indexer,
+            positions=positions,
         )
 
         # The identity only holds when the indexer runs inside the captured
@@ -1425,12 +1263,10 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             raw_indices = core_metadata.c4_sparse_raw_indices
 
         if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
-            topk_transform = getattr(
-                upstream_indexer,
-                "topk_transform_pytorch_vectorized",
-                upstream_indexer.topk_transform_pytorch_vectorized,
-            )
-            topk_transform(
+            # Routed through the plugin's row-chunked wrapper: the upstream helper
+            # clones the whole (rows, seq_len) FP32 tile, which is an 8 GiB
+            # allocation under a breakable prefill graph captured at 8192 rows.
+            _dsv4_topk_torch_fallback(
                 logits,
                 c4_seq_lens,
                 page_table,
@@ -1531,8 +1367,18 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         core_metadata,
         forward_batch,
         c4_indexer,
+        positions=None,
     ):
         del fn, core_metadata
+        # Under BCG the indexer metadata carries the capture-time graph width; the
+        # vendor kernel needs the live compressed length (eager already passes it).
+        live_max_seq_len = indexer_metadata.max_compressed_seq_len
+        if (
+            forward_batch is not None
+            and forward_batch.forward_mode.is_extend()
+            and c4_seq_lens.numel() > 0
+        ):
+            live_max_seq_len = max(int(c4_seq_lens.max()), 1)
         return _compute_c4_logits_kunlun(
             backend=self,
             q_fp8=q,
@@ -1540,9 +1386,10 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             weight=weights,
             seq_lens=c4_seq_lens,
             page_table=page_table,
-            max_seq_len=indexer_metadata.max_compressed_seq_len,
+            max_seq_len=live_max_seq_len,
             forward_batch=forward_batch,
             c4_indexer=c4_indexer,
+            positions=positions,
         )
 
     def on_after_cuda_graph_warmup(self):
@@ -2293,7 +2140,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
 
 
 def _build_c4_prefill_contract(
-    forward_batch, c4_seq_lens, page_table, device, num_queries
+    forward_batch, c4_seq_lens, page_table, device, num_queries, positions=None
 ):
     """Build the request-level LoD contract used by the extend path."""
     global_extend_lens = [int(value) for value in forward_batch.extend_seq_lens_cpu]
@@ -2302,7 +2149,16 @@ def _build_c4_prefill_contract(
     if cp_ranks is None:
         # c4_flat is only used here; keeping it off the CP path avoids a dead per-layer D2H sync.
         c4_flat = c4_seq_lens.reshape(-1).to("cpu", dtype=torch.int32)
-        extend_lens = global_extend_lens
+        extend_lens = list(global_extend_lens)
+        # BCG replay reports the bucket-padded extend length; trim it so
+        # ``last_rows`` addresses the request's real last row (k_lens != 0).
+        _pad_excess = sum(extend_lens) - int(num_queries)
+        while _pad_excess > 0 and extend_lens:
+            _cut = min(_pad_excess, max(extend_lens[-1] - 1, 0))
+            if _cut <= 0:
+                break
+            extend_lens[-1] -= _cut
+            _pad_excess -= _cut
         qlod_cpu = torch.zeros(len(extend_lens) + 1, dtype=torch.int32)
         if extend_lens:
             qlod_cpu[1:] = torch.cumsum(
@@ -2316,6 +2172,12 @@ def _build_c4_prefill_contract(
         use_causal = prefix_lens is not None and all(
             int(value) < 3 for value in prefix_lens
         )
+        # ``extend_prefix_lens_cpu`` is a capture-time placeholder under replay;
+        # take the prefix from the first query row's position instead.
+        if positions is not None and positions.numel() > 0:
+            _starts = qlod_cpu[:-1].long()
+            _starts = _starts.clamp(max=max(positions.numel() - 1, 0))
+            use_causal = all(int(positions[int(_i)]) < 3 for _i in _starts)
     else:
         # CP round-robin: c4_seq_lens/page_table are per local token while
         # extend_seq_lens_cpu stays global, so rebuild the per-request query
@@ -2486,9 +2348,6 @@ def _gather_c4_prefill_kv(cache, page_table, contract, device):
     return k_contiguous, k_scale_contiguous
 
 
-_C4_VERIFY_CHUNK_LOGGED = False
-
-
 def _c4_target_verify_logits_chunked(
     *, q_fp8, kvcache_fp8, weight, seq_lens, page_table, max_seq_len, num_requests
 ):
@@ -2500,16 +2359,6 @@ def _c4_target_verify_logits_chunked(
     r * nd + j, hence the strided column slices.
     """
     num_queries = q_fp8.shape[0]
-    global _C4_VERIFY_CHUNK_LOGGED
-    if not _C4_VERIFY_CHUNK_LOGGED:
-        _C4_VERIFY_CHUNK_LOGGED = True
-        logger.warning(
-            "[DSV4_C4_VERIFY] per-row path active: num_queries=%s num_requests=%s "
-            "page_rows=%s",
-            num_queries,
-            num_requests,
-            page_table.shape[0],
-        )
     if num_requests <= 0 or num_queries % num_requests:
         raise ValueError(
             "Kunlun C4 TARGET_VERIFY requires uniform queries per request: "
@@ -2641,6 +2490,7 @@ def _compute_c4_logits_kunlun(
     max_seq_len,
     forward_batch,
     c4_indexer,
+    positions=None,
 ):
     """Compute C4 logits with explicit Kunlun request ownership."""
 
@@ -2689,7 +2539,12 @@ def _compute_c4_logits_kunlun(
             q = q.view(torch.int8)
         weights = weight.float().contiguous()
         contract = _build_c4_prefill_contract(
-            forward_batch, seq_lens, page_table, q.device, q.shape[0]
+            forward_batch,
+            seq_lens,
+            page_table,
+            q.device,
+            q.shape[0],
+            positions=positions,
         )
         if (
             contract["cp_ranks"] is None

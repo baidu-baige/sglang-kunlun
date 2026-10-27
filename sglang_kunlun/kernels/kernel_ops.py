@@ -16,45 +16,9 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 logger = logging.getLogger(__name__)
 _ENABLE_DSV4_ACCURACY_DUMPS = False
-_DSV4_PROBE_COUNTERS: Dict[str, int] = {}
 
 import xspeedgate_ops
 
-
-def _dsv4_probe(group: str, tensors: Mapping[str, object], **meta) -> None:
-    """Persist opt-in DSV4 intermediate tensors without affecting the hot path."""
-    output_dir = os.environ.get("DSV4_ACCURACY_DUMP_DIR")
-    tensor_values = [value for value in tensors.values() if isinstance(value, torch.Tensor)]
-    if not output_dir or not tensor_values:
-        return
-    expected_tokens = int(os.environ.get("DSV4_ACCURACY_DUMP_TOKENS", "0"))
-    if expected_tokens and tensor_values[0].shape[0] != expected_tokens:
-        return
-    rank = 0
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        rank = torch.distributed.get_rank()
-    if rank != int(os.environ.get("DSV4_ACCURACY_DUMP_RANK", "0")):
-        return
-    sample_tokens = int(os.environ.get("DSV4_ACCURACY_DUMP_SAMPLE_TOKENS", "8"))
-    tensors = {
-        name: value[:sample_tokens] if isinstance(value, torch.Tensor) and value.ndim else value
-        for name, value in tensors.items()
-    }
-    key = f"{rank}:{group}"
-    index = _DSV4_PROBE_COUNTERS.get(key, 0)
-    _DSV4_PROBE_COUNTERS[key] = index + 1
-    if index >= int(os.environ.get("DSV4_ACCURACY_DUMP_LIMIT", "16")):
-        return
-    payload = {
-        "meta": {"rank": rank, "group": group, "call": index, **meta},
-        "tensors": {
-            name: value.detach().cpu()
-            for name, value in tensors.items()
-            if isinstance(value, torch.Tensor)
-        },
-    }
-    os.makedirs(output_dir, exist_ok=True)
-    torch.save(payload, os.path.join(output_dir, f"rank{rank}_{group}_{index:04d}.pt"))
 
 def _debug_tensor_meta(name: str, value: object) -> str:
     if isinstance(value, torch.Tensor):
@@ -374,12 +338,59 @@ def dsv4_create_paged_compress_data_kunlun(
     )
 
 
-def _dsv4_topk_torch_fallback(*args, **kwargs) -> None:
+# Peak device bytes for one row tile of the reference top-k transform. The
+# upstream helper clones the whole (rows, seq_len) FP32 score tile before the
+# selection, so an unbounded call costs rows * seq_len * 4 * 2 bytes: under a
+# breakable prefill graph captured at 8192 rows x 262144 columns that is an
+# 8 GiB allocation and the scheduler dies with CUDA OOM. Row slices are
+# independent, so the tile is bounded here the same way the C4 logits path
+# bounds its own score tile.
+_DEFAULT_TOPK_TILE_BYTES = 512 * 1024 * 1024
+
+
+def _dsv4_topk_torch_fallback(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """Row-chunked wrapper around ``topk_transform_pytorch_vectorized``.
+
+    Writes land in ``out_*`` views, so a chunked call produces exactly the same
+    result as one call over every row.
+    """
     from sglang.srt.layers.attention.dsv4.indexer import (
         topk_transform_pytorch_vectorized,
     )
 
-    topk_transform_pytorch_vectorized(*args, **kwargs)
+    rows = int(scores.shape[0])
+    if rows == 0:
+        return
+    width = int(scores.shape[1])
+    row_bytes = max(1, width * 4) * 2
+    chunk = max(1, min(rows, _DEFAULT_TOPK_TILE_BYTES // row_bytes))
+    if chunk >= rows:
+        topk_transform_pytorch_vectorized(
+            scores,
+            seq_lens,
+            page_tables,
+            out_page_indices,
+            page_size,
+            out_raw_indices,
+        )
+        return
+    for lo in range(0, rows, chunk):
+        hi = min(lo + chunk, rows)
+        topk_transform_pytorch_vectorized(
+            scores[lo:hi],
+            seq_lens[lo:hi],
+            page_tables[lo:hi],
+            out_page_indices[lo:hi],
+            page_size,
+            None if out_raw_indices is None else out_raw_indices[lo:hi],
+        )
 
 
 _C4_LOGITS_CHUNK_BYTES_ENV = "SGLANG_KUNLUN_C4_LOGITS_CHUNK_BYTES"
@@ -388,6 +399,11 @@ _C4_LOGITS_CHUNK_BYTES_ENV = "SGLANG_KUNLUN_C4_LOGITS_CHUNK_BYTES"
 # count OOMs on long context; 512 MiB keeps the tile small while still giving
 # the BMM enough rows to stay efficient.
 _DEFAULT_C4_LOGITS_CHUNK_BYTES = 512 * 1024 * 1024
+
+
+def _trunc_div(value: torch.Tensor, divisor: int) -> torch.Tensor:
+    """Integer division that truncates toward zero, like Triton's ``//``."""
+    return torch.div(value, divisor, rounding_mode="trunc")
 
 
 def dsv4_c4_paged_mqa_logits_torch(
@@ -687,11 +703,6 @@ def dsv4_topk_transform_512_kunlun(
             page_size,
             out_raw_indices,
         )
-        _dsv4_probe(
-            "topk",
-            {"scores": scores, "raw_indices": out_raw_indices, "page_indices": out_page_indices},
-            page_size=page_size,
-        )
         return
     if os.environ.get("DSV4_KUNLUN_REFERENCE_ONLY") == "1":
         _dsv4_topk_transform_graph_safe(
@@ -700,11 +711,6 @@ def dsv4_topk_transform_512_kunlun(
             page_tables,
             out_page_indices,
             page_size,
-        )
-        _dsv4_probe(
-            "topk",
-            {"scores": scores, "page_indices": out_page_indices},
-            page_size=page_size,
         )
         return
 
@@ -736,11 +742,6 @@ def dsv4_topk_transform_512_kunlun(
         True,
     )
     out_page_indices.copy_(dst_page_table)
-    _dsv4_probe(
-        "topk",
-        {"scores": scores, "page_indices": out_page_indices},
-        page_size=page_size,
-    )
 
 
 @register_jit_op("sglang.kernels.ops.attention.dsv4.topk", "topk_transform_paged_v2")
@@ -896,42 +897,6 @@ import logging as _dsv4_logging
 
 _KERNEL_OPS_LOGGER = _dsv4_logging.getLogger(__name__)
 
-_DSV4_STATE_LOC_TRACE = {"lines": 0}
-
-
-def _dsv4_trace_state_loc(pos, raw_loc, swa_loc, ring_size):
-    """Count C4 state reads whose SWA translation is the invalid slot 0."""
-
-    import os
-
-    if os.environ.get("DSV4_C4_STATE_LOC_TRACE") != "1":
-        return
-    if _DSV4_STATE_LOC_TRACE["lines"] >= 200:
-        return
-    positive = pos > 0
-    if not bool(positive.any()):
-        return
-    if int(pos.max()) < 1000:
-        return
-    bad = positive & (swa_loc == 0)
-    num_bad = int(bad.sum())
-    _DSV4_STATE_LOC_TRACE["lines"] += 1
-    bad_pos = pos[bad][:8].tolist() if num_bad else []
-    swa_min = int(swa_loc.min())
-    _KERNEL_OPS_LOGGER.warning(
-        "[DSV4_C4_STATE_LOC] rows=%s pos_max=%s zero_mapped=%s sample_pos=%s "
-        "swa_min=%s swa_max=%s swa_min_mod_ring=%s raw_min=%s",
-        int(pos.numel()),
-        int(pos.max()),
-        num_bad,
-        bad_pos,
-        swa_min,
-        int(swa_loc.max()),
-        swa_min % ring_size,
-        int(raw_loc.min()),
-    )
-
-
 def _dsv4_state_loc_torch(
     compress_ratio: int,
     req_pool_indices: torch.Tensor,
@@ -952,7 +917,6 @@ def _dsv4_state_loc_torch(
     safe_pos = pos.clamp(min=0, max=req_to_token.shape[1] - 1)
     raw_loc = req_to_token[rid, safe_pos].to(torch.int64)
     swa_loc = full_to_state[raw_loc].to(torch.int64)
-    _dsv4_trace_state_loc(pos, raw_loc, swa_loc, ring_size)
     return (
         torch.div(swa_loc, swa_page_size, rounding_mode="floor") * ring_size
         + swa_loc.remainder(ring_size)
@@ -1016,9 +980,6 @@ def dsv4_compressor_decode_plan_kunlun(
 #: draft token 数一调大就会重新踩坑。
 _DSV4_MTP_PAD_OVERRIDE = int(os.environ.get("DSV4_MTP_PAD", "0"))
 
-_DSV4_MTP_PAD_LOGGED: set[tuple[int, int]] = set()
-
-
 def _dsv4_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
     """state ring 能服务的最大 draft token 数，即 plan 的 ``mtp_pad``。
 
@@ -1036,28 +997,6 @@ def _dsv4_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
     pad = ring_size - window_size + 2 if ring_size > window_size else 0
     if _DSV4_MTP_PAD_OVERRIDE:
         pad = _DSV4_MTP_PAD_OVERRIDE
-    key = (compress_ratio, ring_size)
-    if key not in _DSV4_MTP_PAD_LOGGED:
-        _DSV4_MTP_PAD_LOGGED.add(key)
-        num_draft = _dsv4_num_draft_tokens()
-        logger.info(
-            "dsv4 compress state ring: ratio=%d ring_size=%d window=%d mtp_pad=%d "
-            "(vendor kernel uses %d, num_draft_tokens=%s)",
-            compress_ratio,
-            ring_size,
-            window_size,
-            pad,
-            min(ring_size - compress_ratio, 4),
-            num_draft,
-        )
-        if num_draft is not None and pad < num_draft:
-            raise AssertionError(
-                f"compress state ring cannot serve the verify window: mtp_pad={pad} < "
-                f"num_draft_tokens={num_draft} (ratio={compress_ratio}, "
-                f"ring_size={ring_size}). Rejected draft state would be read back from "
-                f"whatever the ring held before, which shows up as non-reproducible "
-                f"output rather than an error. Raise ring_size or lower the window."
-            )
     return pad
 
 
@@ -1691,31 +1630,6 @@ def write_req_to_token_pool_triton(
 ) -> None:
     """Write request token mappings into the request-to-token pool."""
 
-    _dsv4_probe(
-        "write_req_to_token_input",
-        {
-            "req_pool_indices": req_pool_indices,
-            "prefix_tensors": prefix_tensors,
-            "pre_lens": pre_lens,
-            "seq_lens": seq_lens,
-            "extend_lens": extend_lens,
-            "out_cache_loc": out_cache_loc,
-        },
-        req_to_token_stride=tuple(req_to_token_ptr.stride()),
-        req_to_token_is_contiguous=req_to_token_ptr.is_contiguous(),
-        req_pool_indices_stride=tuple(req_pool_indices.stride()),
-        req_pool_indices_is_contiguous=req_pool_indices.is_contiguous(),
-        prefix_tensors_stride=tuple(prefix_tensors.stride()),
-        prefix_tensors_is_contiguous=prefix_tensors.is_contiguous(),
-        pre_lens_stride=tuple(pre_lens.stride()),
-        pre_lens_is_contiguous=pre_lens.is_contiguous(),
-        seq_lens_stride=tuple(seq_lens.stride()),
-        seq_lens_is_contiguous=seq_lens.is_contiguous(),
-        extend_lens_stride=tuple(extend_lens.stride()),
-        extend_lens_is_contiguous=extend_lens.is_contiguous(),
-        out_cache_loc_stride=tuple(out_cache_loc.stride()),
-        out_cache_loc_is_contiguous=out_cache_loc.is_contiguous(),
-    )
     torch.ops.xspeedgate_ops.write_req_to_token_pool(
         req_to_token_ptr,
         req_pool_indices.to(torch.int32),
@@ -1729,10 +1643,6 @@ def write_req_to_token_pool_triton(
         written_rows = req_to_token_ptr.index_select(
             0, req_pool_indices.to(torch.long)
         )[:, :35328]
-        _dsv4_probe(
-            "write_req_to_token_output",
-            {"written_rows": written_rows},
-        )
 
 
 @register_triton_op("sglang.kernels.ops.memory.common", "get_last_loc_kernel")
@@ -1924,23 +1834,6 @@ def _dspark_require(condition: bool, op: str, message: str) -> None:
 
     if not condition:
         raise AssertionError(f"xspeedgate_ops.{op}: {message}")
-
-
-_DSPARK_FALLBACK_WARNED: set = set()
-
-
-def _dspark_warn_fallback(op: str, reason: str) -> None:
-    """Log the first time an op degrades to torch so it is never silent."""
-
-    if op in _DSPARK_FALLBACK_WARNED:
-        return
-    _DSPARK_FALLBACK_WARNED.add(op)
-    _KERNEL_OPS_LOGGER.warning(
-        "sglang-kunlun: %s runs the torch path instead of the XSpeedGate "
-        "kernel (%s)",
-        op,
-        reason,
-    )
 
 
 @register_triton_op(
@@ -2287,7 +2180,6 @@ def mixed_accept_select_kernel(
 
     # vendor 算子把 bs 行整表缓存到 SM，硬性 bs <= 64；running bs 可以超过它。
     if bs > 64:
-        _dspark_warn_fallback(op, f"bs={bs} exceeds the vendor limit of 64")
         is_greedy = greedy_mask_ptr[:bs].to(torch.bool)
         correct_len_ptr[:bs].copy_(
             torch.where(
@@ -2611,7 +2503,6 @@ def compact_verify_ids_triton(
             str(tokens.device),
         )
 
-    _dspark_warn_fallback(op, f"bs={bs} exceeds the vendor limit of 1024")
     from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
         compact_verify_ids,
     )
@@ -2952,10 +2843,6 @@ def dsv4_moe_fused_gate_kunlun(
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
-_DSV4_HASH_TOPK_GUARD_COUNTERS: dict = {}
-_DSV4_HASH_TOPK_GUARD_REPORTED: dict = {}
-
-
 def _dsv4_guard_hash_topk_input_ids(
     input_ids: torch.Tensor, tid2eid: torch.Tensor
 ) -> torch.Tensor:
@@ -2968,32 +2855,7 @@ def _dsv4_guard_hash_topk_input_ids(
     ids = input_ids.to(torch.int64)
     table_size = tid2eid.shape[0]
     invalid = (ids < 0) | (ids >= table_size)
-    counter = _DSV4_HASH_TOPK_GUARD_COUNTERS.get(ids.device)
-    if counter is None:
-        counter = torch.zeros((), dtype=torch.int32, device=ids.device)
-        _DSV4_HASH_TOPK_GUARD_COUNTERS[ids.device] = counter
-    # Captured into the graph so replay accumulates too; never read here, that
-    # would sync the host on the hot path.
-    counter.add_(invalid.sum().to(torch.int32))
     return ids.masked_fill(invalid, 0)
-
-
-def _dsv4_report_hash_topk_guard(device) -> None:
-    """Log the clamp counter when it grows; env-gated because reading it syncs."""
-    import os
-
-    if os.getenv("DSV4_HASH_TOPK_GUARD_DEBUG", "0") != "1":
-        return
-    counter = _DSV4_HASH_TOPK_GUARD_COUNTERS.get(device)
-    if counter is None:
-        return
-    total = int(counter)
-    if total <= _DSV4_HASH_TOPK_GUARD_REPORTED.get(device, 0):
-        return
-    _DSV4_HASH_TOPK_GUARD_REPORTED[device] = total
-    logger.warning(
-        "[DSV4_HASH_TOPK_GUARD] device=%s clamped_token_ids_total=%s", device, total
-    )
 
 
 @register_jit_op("sglang.kernels.ops.moe.dsv4", "hash_topk")
@@ -3012,7 +2874,6 @@ def dsv4_hash_topk_kunlun(
 
     # compared with v0.5.8, _dsv4_guard_hash_topk_input_ids can be moved.
     safe_input_ids = input_ids.to(torch.int64)
-    _dsv4_report_hash_topk_guard(safe_input_ids.device)
     topk_ids, topk_weights = torch.ops.xspeedgate_ops.moe_hash_topk_fused(
         router_logits,
         safe_input_ids,
@@ -3475,24 +3336,6 @@ def alloc_extend_kernel(
 ) -> None:
     """Allocate KV cache pages for extend batches."""
 
-    _dsv4_probe(
-        "alloc_extend_input",
-        {
-            "prefix_lens": prefix_lens,
-            "seq_lens": seq_lens,
-            "last_loc": last_loc,
-            "free_pages": free_pages,
-        },
-        bs_upper=bs_upper,
-        page_size=page_size,
-        prefix_lens_dtype=str(prefix_lens.dtype),
-        seq_lens_dtype=str(seq_lens.dtype),
-        last_loc_dtype=str(last_loc.dtype),
-        prefix_lens_stride=tuple(prefix_lens.stride()),
-        seq_lens_stride=tuple(seq_lens.stride()),
-        last_loc_stride=tuple(last_loc.stride()),
-        last_loc_is_contiguous=last_loc.is_contiguous(),
-    )
     if prefix_lens.dtype != torch.int64:
         prefix_lens = prefix_lens.to(torch.int64)
     if seq_lens.dtype != torch.int64:
@@ -3544,15 +3387,6 @@ def alloc_extend_kernel(
         out_indices.shape[0],
         out_indices,
         ret_value,
-    )
-    _dsv4_probe(
-        "alloc_extend_output",
-        {
-            "out_indices": out_indices,
-            "ret_value": ret_value,
-        },
-        bs_upper=bs_upper,
-        page_size=page_size,
     )
 
 
@@ -4987,11 +4821,6 @@ def dsv4_fused_q_indexer_rope_hadamard_quant_kunlun(
     kunlun_ops.matmul(
         q_rope_2d, hadamard_matrix, q_hadamard_2d, False, True, 1.0, 0.0
     )
-    _dsv4_probe(
-        "q_fused",
-        {"q_wq_b": q_wq_b, "q_rope": q_rope, "q_hadamard": q_hadamard},
-        positions_shape=tuple(positions.shape),
-    )
     q = q_hadamard
     q_shape = q.shape
     q_2d = q.contiguous().view(-1, q_shape[-1])
@@ -5003,16 +4832,6 @@ def dsv4_fused_q_indexer_rope_hadamard_quant_kunlun(
     q_int8 = q_int8.view(q_shape)
     q_scale = q_scale.view(q_shape[0], -1)
     weights = dsv4_fused_scale_kunlun(weight, weight_scale, q_scale)
-    _dsv4_probe(
-        "q_fused_quant",
-        {
-            "q_int8": q_int8,
-            "q_scale": q_scale,
-            "weights_raw": weight,
-            "weights_scaled": weights,
-        },
-        weight_scale=float(weight_scale),
-    )
     return q_int8, weights
 
 
@@ -5833,19 +5652,6 @@ from sglang_kunlun.kernels.sgl_kernel_kunlun.dsv4_hisparse import (
     copy_items as _hisparse_copy_items,
 )
 
-_HISPARSE_TRACE_CALLS = 0
-
-
-def _hisparse_trace(msg: str) -> None:
-    """Opt-in one-shot tracing of the hisparse hot path (bring-up only)."""
-    global _HISPARSE_TRACE_CALLS
-    if os.environ.get("SGLANG_KUNLUN_HISPARSE_TRACE") != "1":
-        return
-    if _HISPARSE_TRACE_CALLS < 5:
-        logger.info("sglang-kunlun hisparse: %s", msg)
-    _HISPARSE_TRACE_CALLS += 1
-
-
 def _hisparse_load_cache_to_device_buffer(
     *,
     is_dsv4_layout: bool,
@@ -5898,10 +5704,6 @@ def _hisparse_load_cache_to_device_buffer(
     # whole table through int32 for the gather/scatter.
     lru_all = lru_slots.to(torch.int32)
 
-    _hisparse_trace(
-        f"swap_in bs={batch_size} top_k={top_k} hot={hot} "
-        f"dsv4={is_dsv4_layout} record_plan={miss_src is not None}"
-    )
 
     # DSV4 TARGET_VERIFY has multiple rows for the same request.  Their
     # newest tokens and top-k sets are different, so the request-level
@@ -6446,17 +6248,21 @@ def get_and_clear_swa_pages_kernel_kunlun(
     full_reps = reps[:num_pages].to(torch.int64)
 
     swa_reps = mapping[full_reps]
-    swa_pages[:num_pages].copy_(swa_reps // page_size)
+    # Triton's ``//`` on integers truncates toward zero; torch's ``//`` floors.
+    # ``full_to_swa_index_mapping`` can hold ``-1`` sentinels, where the two
+    # differ (``-1 // 4`` is 0 in the kernel and -1 in torch), so the division
+    # has to match the kernel exactly rather than "look right" for non-negatives.
+    swa_pages[:num_pages].copy_(_trunc_div(swa_reps, page_size))
     peers_mapped[:num_pages].copy_(swa_reps > 0)
 
-    page_starts = full_reps // page_size * page_size
+    page_starts = _trunc_div(full_reps, page_size) * page_size
     offsets = torch.arange(page_size, device=mapping.device, dtype=torch.int64)
     mapping_offsets = page_starts[:, None] + offsets[None, :]
 
     if CHECK_PAGE_MAPPINGS:
         page_mapping = mapping[mapping_offsets]
-        same_swa_page = (
-            page_mapping // page_size == (swa_reps[:, None] // page_size)
+        same_swa_page = _trunc_div(page_mapping, page_size) == _trunc_div(
+            swa_reps[:, None], page_size
         )
         valid = (swa_reps > 0) & (
             ((page_mapping > 0) & ~same_swa_page).sum(dim=1) == 0

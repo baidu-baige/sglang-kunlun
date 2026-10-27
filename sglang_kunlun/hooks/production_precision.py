@@ -130,9 +130,6 @@ def initialize_non_online_compress_state_kunlun(
     return result
 
 
-_DSV4_VERIFY_MASK_DISABLED_LOGGED = False
-
-
 @plugin_hook(
     "sglang.srt.layers.attention.verify_mask.maybe_create_verify_mask",
     type=HookType.AROUND,
@@ -159,12 +156,4 @@ def _dsv4_disable_verify_mask(original_fn, *args, **kwargs):
 
     if os.environ.get("DSV4_KUNLUN_VERIFY_MASK") == "1":
         return original_fn(*args, **kwargs)
-    global _DSV4_VERIFY_MASK_DISABLED_LOGGED
-    if not _DSV4_VERIFY_MASK_DISABLED_LOGGED:
-        _DSV4_VERIFY_MASK_DISABLED_LOGGED = True
-        logger.warning(
-            "[DSV4_VERIFY_MASK] backend-owned verify mask disabled on Kunlun; "
-            "the caller fills a FULL_MASK tree mask each iteration "
-            "(set DSV4_KUNLUN_VERIFY_MASK=1 to restore upstream behaviour)"
-        )
     return None

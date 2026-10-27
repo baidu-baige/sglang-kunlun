@@ -54,7 +54,6 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 logger = logging.getLogger(__name__)
 
 _OP_NAME = "speculative_sampling_classic_kernel"
-_LOGGED = False
 
 
 def _resolve_op():
@@ -144,21 +143,10 @@ def chain_speculative_sampling_kunlun(
             raise
 
     op = _resolve_op()
-    global _LOGGED
     if op is None:
-        if not _LOGGED:
-            _LOGGED = True
-            logger.warning(
-                "[KUNLUN_SPEC_SAMPLING] xspeedgate_ops 缺少 %s，回落到 kernel_ops "
-                "注册的 torch 实现",
-                _OP_NAME,
-            )
         # block_verification 为默认值 False，等价于不传——保持与上游默认一致，
         # 同时不依赖兜底实现是否已经有这个形参。
         return _call_original()
-    if not _LOGGED:
-        _LOGGED = True
-        logger.info("[KUNLUN_SPEC_SAMPLING] 使用 xspeedgate_ops.%s", _OP_NAME)
     op(
         predicts,
         accept_index,
@@ -177,7 +165,6 @@ def chain_speculative_sampling_kunlun(
     )
 
 
-_SOFTMAX_LOGGED = False
 _SOFTMAX_OP_NAME = "softmax_temp"
 _SOFTMAX_TEMP_BLOCK_V = 4096
 
@@ -202,14 +189,8 @@ def softmax_temp_execute_kunlun(cls, *args, **kwargs) -> torch.Tensor:
     `logits_row_stride` / `BLOCK_V`），一个 kernel 直接写进 out。
     算子不存在时（旧版 xspeedgate_ops）回落到 torch，不影响启动。
     """
-    global _SOFTMAX_LOGGED
     op = _resolve_softmax_temp_op()
     if op is None:
-        if not _SOFTMAX_LOGGED:
-            _SOFTMAX_LOGGED = True
-            logger.info(
-                "[KUNLUN_SPEC_SAMPLING] SoftmaxTemp 走 torch 实现（绕开 flashinfer）"
-            )
         return cls.torch(*args, **kwargs)
     logits = kwargs["logits"]
     temperatures = kwargs["temperatures"]
@@ -219,12 +200,6 @@ def softmax_temp_execute_kunlun(cls, *args, **kwargs) -> torch.Tensor:
     assert (
         bs * rows_per_request == num_rows
     ), f"num_rows {num_rows} not divisible by rows_per_request {rows_per_request}"
-    if not _SOFTMAX_LOGGED:
-        _SOFTMAX_LOGGED = True
-        logger.info(
-            "[KUNLUN_SPEC_SAMPLING] SoftmaxTemp 使用 xspeedgate_ops.%s",
-            _SOFTMAX_OP_NAME,
-        )
     out = torch.empty((num_rows, vocab), dtype=torch.float32, device=logits.device)
     op(
         logits,

@@ -248,6 +248,29 @@ def _metadata_shapes(attn_metadata) -> str:
     return "md(" + ", ".join(parts) + ")"
 
 
+def _require_continuous_index_k(pool, where: str) -> None:
+    """Fail loudly on the 0.5.22 index-K API change.
+
+    0.5.22 removed the per-request ``get_index_k_continuous`` /
+    ``get_index_k_scale_continuous`` gather. The replacement is the batched
+    ``get_index_k_scale_buffer(layer_id)`` buffer view (or
+    ``IndexKeyCache.get_k_and_scale(layer_id, seq_len_tensor, page_indices,
+    seq_len_sum, max_seq_len)``), which materialises every request's K in one
+    call. Porting these two ragged/CP paths onto it is not a rename -- the
+    per-request loop and the ``torch.cat`` packing change shape -- and no Kunlun
+    run exercises them (DSV4 uses ``kunlun_deepseek_v4_backend``), so leave them
+    unimplemented with a readable message instead of an AttributeError.
+    """
+    if hasattr(pool, "get_index_k_continuous"):
+        return
+    raise NotImplementedError(
+        f"{where}: the 0.5.22 index-K pool dropped "
+        "get_index_k_continuous/get_index_k_scale_continuous. Port this path "
+        "onto get_index_k_scale_buffer()/IndexKeyCache.get_k_and_scale() "
+        "before using DSA ragged prefill or CP prefill on this build."
+    )
+
+
 def _align_rows_to_q(tensor, extend_lens: List[int], q_offset: int):
     """Reduce a per-request-padded metadata tensor to the live q rows."""
     if tensor is None or tensor.shape[0] == q_offset:
@@ -445,6 +468,7 @@ def _get_topk_ragged(
     metadata: "BaseIndexerMetadata",
     topk_result: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    _require_continuous_index_k(get_token_to_kv_pool(), "_get_topk_ragged")
     """Kunlun ragged indexer.
 
     ``enable_dual_stream`` / ``topk_result`` exist for upstream 0.5.14 signature
@@ -687,6 +711,9 @@ def _get_topk_ragged_with_cp(
     actual_seq_q: int,
     cp_index: List[Tuple[int, int, int]] = None,
 ) -> torch.Tensor:
+    _require_continuous_index_k(
+        get_token_to_kv_pool(), "_get_topk_ragged_with_cp"
+    )
     if TYPE_CHECKING:
         assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 

@@ -131,9 +131,6 @@ def kunlun_init_model_parallel_group(
 #
 # `SGLANG_KUNLUN_REDUCE_SCATTERV_FALLBACK=0` 可关掉，回到上游行为（会在 DP 下报错）。
 
-_KUNLUN_RSV_WARNED: set = set()
-
-
 @plugin_hook(
     "sglang.srt.distributed.parallel_state.GroupCoordinator.reduce_scatterv",
     type=HookType.AROUND,
@@ -149,14 +146,4 @@ def reduce_scatterv_without_pynccl(original_fn, self, input_, output=None, sizes
     if getattr(self, "pynccl_comm", None) is not None:
         return original_fn(self, input_, output, sizes)
 
-    key = getattr(self, "unique_name", id(self))
-    if key not in _KUNLUN_RSV_WARNED:
-        _KUNLUN_RSV_WARNED.add(key)
-        logging.getLogger(__name__).info(
-            "reduce_scatterv: 该组 pynccl_comm 为 None（昆仑关闭 pynccl），"
-            "改用 _deterministic_reduce_scatterv（all_reduce + narrow）。"
-            "group=%s world_size=%s",
-            getattr(self, "unique_name", "?"),
-            getattr(self, "world_size", "?"),
-        )
     return self._deterministic_reduce_scatterv(input_, output, sizes)

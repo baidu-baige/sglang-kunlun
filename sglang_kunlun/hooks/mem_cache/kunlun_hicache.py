@@ -19,8 +19,6 @@ import torch
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 logger = logging.getLogger(__name__)
-_DIAG = {"copy_full_page": False}
-
 from sglang_kunlun.kernels.sgl_kernel_kunlun.dsv4_hicache import (
     transfer_kv_all_layer_mla,
     transfer_kv_per_layer_mla,
@@ -126,8 +124,7 @@ def _copy_full_page(pool, src_buffers, dst_buffers, src_indices, dst_indices) ->
         s_max = int(src_rows.max()) if src_rows.numel() else -1
         d_max = int(dst_rows.max()) if dst_rows.numel() else -1
         oob = s_max >= src_buffer.shape[0] or d_max >= dst_buffer.shape[0]
-        if oob or not _DIAG["copy_full_page"]:
-            _DIAG["copy_full_page"] = True
+        if oob:
             logger.error(
                 "HISPARSE_DIAG copy_full_page pool=%s page_size=%d n_layers=%d "
                 "src_idx[min=%d max=%d n=%d] dst_idx[min=%d max=%d n=%d] "

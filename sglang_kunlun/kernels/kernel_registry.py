@@ -184,14 +184,9 @@ def resolution_report(ops: Tuple[str, ...] = KIMI_K3_TRACKED_OPS) -> List[str]:
     return lines
 
 
-_REPORTED = False
 
 
 def log_resolution_report_once() -> None:
     """Log the Kimi-K3 kernel resolution table once per process."""
-    global _REPORTED
-    if _REPORTED:
-        return
-    _REPORTED = True
     for line in resolution_report():
         logger.info("kernel_registry: %s", line)

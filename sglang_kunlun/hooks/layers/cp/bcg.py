@@ -249,6 +249,32 @@ def refresh_for_breakable_cuda_graph_replay_kunlun(
 
 
 @plugin_hook(
+    "sglang.srt.model_executor.runner.prefill_cuda_graph_runner"
+    ".PrefillCudaGraphRunner.can_replay_locally",
+    type=HookType.AROUND,
+)
+def can_replay_locally_single_request_kunlun(original, self, *args, **kwargs):
+    """Veto BCG prefill replay for merged multi-request batches.
+
+    A merged batch (e.g. one request's tail chunk plus another's first chunk)
+    rebuilds its replay metadata as a single request -- bs/extend drop to one
+    aggregate 8192-token extend while the rows still hold both requests'
+    positions -- so the C4 indexer addresses the wrong rows and the sparse
+    attention reads another request's pages.  Set DSV4_BCG_ALLOW_MULTI_REQ=1 to
+    restore the old behavior.
+    """
+    import os as _os
+
+    if _os.environ.get("DSV4_BCG_ALLOW_MULTI_REQ") != "1":
+        batch_size = kwargs.get("batch_size")
+        if batch_size is None and args:
+            batch_size = args[0]
+        if batch_size is not None and int(batch_size) > 1:
+            return False
+    return original(self, *args, **kwargs)
+
+
+@plugin_hook(
     "sglang.srt.layers.cp.utils.is_cp_active",
     type=HookType.AROUND,
 )
