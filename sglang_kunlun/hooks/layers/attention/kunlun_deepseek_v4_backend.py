@@ -682,7 +682,7 @@ def _refresh_graph_host_lengths(
 
         c4_context_lens = (seq_lens // 4) * 4
         for key, aux in c4_decode_aux.items():
-            cached_bs, _, _, rows_per_req = key
+            cached_bs, _, _, _rows_per_req = key
             if cached_bs < batch_size:
                 continue
             _copy_host_lengths_(aux[2], c4_context_lens, fill_value=4)
@@ -748,24 +748,19 @@ def _dsv4_page_table_span(max_seq_len: int, seq_lens_casual: torch.Tensor) -> in
     """
     if os.environ.get("DSV4_PAGE_TABLE_COVER_CASUAL", "1") != "1":
         return max_seq_len
+    bound = max_seq_len + _draft_token_count() + _page_slack()
     if torch.cuda.is_current_stream_capturing():
-        # The span is a Python slice bound, so the real maximum needs a host
-        # sync.  That cannot run inside capture -- and during capture the tensor
-        # holds uninitialised memory, so the sync sized the page table from
-        # garbage (spans around 8e8 were observed) and the attention then read
-        # past it: "load/store operation exceed memory size".  Take the static
-        # upper bound instead: verify rows reach committed + num_draft_tokens.
-        # ``scores`` is the full compressed logits width and the page table is
-        # gathered with ``raw_indices >> page_bits``, so the span has to cover
-        # the logits width, not just the causal length.  One page of slack keeps
-        # the last page fully described.
-        return max_seq_len + _draft_token_count() + _page_slack()
+        # During capture the lens hold placeholder data; take the static upper bound.
+        return bound
     if seq_lens_casual.numel() == 0:
         return max_seq_len
     needed = int(seq_lens_casual.max().item())
     if needed <= max_seq_len:
         return max_seq_len
-    return needed
+    # Clamp: capture on a non-current stream (DSPARK verify graphs) reports
+    # capturing=False while the lens are still uninitialised, which sized the
+    # table from garbage and OOMed with a 2 TB allocation.
+    return min(needed, bound)
 
 
 def _forward_c4_indexer_impl(
@@ -2778,6 +2773,10 @@ def _compute_c4_logits_kunlun(
         (max_seq_len + block_size - 1) // block_size,
         page_table.shape[1],
     )
+    # k_scale is built from ``num_pages`` pages, so the context bound has to
+    # match it: the paged kernel asserts max_context_len / compress_ratio ==
+    # k_scale.size(1), and the capture-time width can exceed it by a page.
+    max_seq_len = min(int(max_seq_len), num_pages * block_size)
     # ``page_table`` is already int32, so ``.to(torch.int32)`` is a no-op and the
     # column slice keeps ``stride(0) == page_table.shape[1]``.  The vendor kernel
     # derives the row stride from ``size(1)``, not ``stride(0)`` (verified with
@@ -2815,6 +2814,12 @@ def _compute_c4_logits_kunlun(
             _needed_width = (_host_max + 3) // 4
             if _needed_width > int(max_seq_len):
                 max_seq_len = min(_needed_width, num_pages * block_size)
+    # Capture-time page ids are placeholder garbage; an out-of-range gather (or a
+    # kernel reading them) stalls the device queue instead of raising.  Replay
+    # refreshes the table in place, so clamping only affects warmup/capture.
+    block_table = block_table.clamp_(
+        min=0, max=max(int(scale_pages.shape[0]) - 1, 0)
+    )
     page_indices = block_table.to(torch.long)
     k_scale = scale_pages[page_indices].reshape(batch_size, -1)[
         :, :max_seq_len
@@ -2837,7 +2842,13 @@ def _compute_c4_logits_kunlun(
         aux = qlod_cpu, qlod_xpu, context_lens_cpu, context_lens_xpu
         backend._c4_decode_aux[key] = aux
     qlod_cpu, qlod_xpu, context_lens_cpu, context_lens_xpu = aux
-    raw_seq_lens_cpu = _seq_lens_cpu_i32(forward_batch)
+    # Capture-time placeholder lens can be garbage (~1.5e9); feeding them to the
+    # kernel as context_lens overflows int32 and leaves the device queue stuck.
+    # Replay refreshes these tensors in place, so clamping here only affects the
+    # warmup/capture pass that would otherwise hang.
+    _lens_cap = int(max_seq_len)
+    seq_lens = seq_lens.clamp(min=1, max=_lens_cap)
+    raw_seq_lens_cpu = _seq_lens_cpu_i32(forward_batch).clamp(max=_lens_cap * 4)
     if per_row_verify:
         # batch_size is now bs*num_draft; the host lengths must line up row-wise
         # with the expanded page table.
