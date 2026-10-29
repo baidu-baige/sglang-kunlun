@@ -4718,15 +4718,20 @@ def _dsv4_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
         # counter, which PyTorch refuses for *inference* tensors -- and the DSPARK
         # draft runs under inference_mode. Copy into a fresh tensor instead: the
         # destination is ours, so only its counter moves.
+        # ``empty_like`` inherits the *inference* flag from its source, and any
+        # in-place write into an inference tensor raises "Cannot set version
+        # counter". Allocate a plain tensor instead.
         if freqs_cis.is_complex():
             real = torch.view_as_real(freqs_cis)  # view only
-            target = torch.empty_like(real, memory_format=torch.contiguous_format)
+            target = torch.empty(
+                real.shape, dtype=real.dtype, device=real.device
+            )
             target.copy_(real)
             cached = target.flatten(-2, -1)
         else:
             # Already real-valued: the real/imag split is an identity.
-            target = torch.empty_like(
-                freqs_cis, memory_format=torch.contiguous_format
+            target = torch.empty(
+                freqs_cis.shape, dtype=freqs_cis.dtype, device=freqs_cis.device
             )
             target.copy_(freqs_cis)
             cached = target
