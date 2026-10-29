@@ -1053,6 +1053,28 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             self._c4_decode_aux,
             self._attention_graph_extend_aux,
         )
+        # The draft writes its block KV through ``core.swa_out_cache_loc``, a
+        # pointer-stable buffer cached at metadata build. Only the *device* copy is
+        # refreshed in-graph, so a replayed DSPARK step kept writing the capture-time
+        # slots -- in PD that corrupts the target's history and the model degenerates
+        # into a repetition loop (accept length 1.1 vs 1.8 on 0.5.19). Refresh it
+        # from the live out_cache_loc, device-to-device, on every replay.
+        try:
+            core = getattr(self.forward_metadata, "core_attn_metadata", None)
+            cached_loc = getattr(core, "swa_out_cache_loc", None)
+            live_loc = getattr(forward_batch, "out_cache_loc", None)
+            if (
+                cached_loc is not None
+                and live_loc is not None
+                and cached_loc.shape[0] == live_loc.shape[0]
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                mapped = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    live_loc
+                ).to(torch.int32)
+                cached_loc.copy_(mapped)
+        except Exception:  # noqa: BLE001 - keep the metadata path alive
+            pass
         # A device-wide wait is not legal inside capture on XPU: it surfaces as
         # ``error code=299, wait for noc idle timeout`` from capture_decode_graph
         # (seen while capturing the DSPARK verify graphs). The fence only orders
