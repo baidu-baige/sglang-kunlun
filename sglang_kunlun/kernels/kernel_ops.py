@@ -4745,17 +4745,29 @@ def _dsv4_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
     )
     cached = _DSV4_FREQS_REAL_CACHE.get(key)
     if cached is None:
-        # ``torch.cat`` on the real/imag views tries to bump the version counter of
-        # an *inference* tensor (the DSPARK draft runs under inference_mode) and
-        # raises "Cannot set version_counter for inference tensor". ``view_as_real``
-        # is a pure view, and the contiguous copy below materialises it.
-        # Any op that materialises a copy (cat/contiguous) bumps a version
-        # counter, which PyTorch refuses for *inference* tensors -- and the DSPARK
-        # draft runs under inference_mode. Copy into a fresh tensor instead: the
-        # destination is ours, so only its counter moves.
+        # The op reads this as ``cat((real, imag), dim=-1)``: the real parts of
+        # every frequency first, then the imaginary parts. Build exactly that.
+        #
+        # ``torch.cat`` on ``torch.real``/``torch.imag`` views bumps the version
+        # counter of an *inference* tensor (the DSPARK draft runs under
+        # inference_mode) and raises "Cannot set version_counter for inference
+        # tensor", so write into a fresh tensor we own instead -- only its counter
+        # moves. Do NOT use ``view_as_real(...).flatten(-2, -1)``: that is the
+        # *interleaved* layout (r0, i0, r1, i1, ...), not the concatenated halves
+        # (r0, r1, ..., i0, i1, ...). Feeding the interleaved form to the op pairs
+        # every rotation with the wrong cos/sin, which left greedy decoding
+        # fluent for the first few high-confidence tokens and then collapsed into
+        # repeated punctuation.
         if freqs_cis.is_complex():
-            cached = torch.view_as_real(_plain_copy(freqs_cis)).flatten(-2, -1)
-            cached = _plain_copy(cached)
+            parts = torch.view_as_real(_plain_copy(freqs_cis))
+            half = parts.shape[-2]
+            cached = torch.empty(
+                parts.shape[:-2] + (half * 2,),
+                dtype=parts.dtype,
+                device=parts.device,
+            )
+            cached[..., :half].copy_(parts[..., 0])
+            cached[..., half:].copy_(parts[..., 1])
         else:
             # Already real-valued: the real/imag split is an identity.
             cached = _plain_copy(freqs_cis)
