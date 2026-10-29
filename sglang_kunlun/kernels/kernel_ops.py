@@ -4718,10 +4718,10 @@ def _dsv4_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
             cached = torch.view_as_real(freqs_cis).contiguous()
             cached = cached.flatten(-2, -1)
         else:
-            half = freqs_cis.shape[-1] // 2
-            cached = torch.cat(
-                (freqs_cis[..., :half], freqs_cis[..., half:]), dim=-1
-            ).contiguous()
+            # Already real-valued: the real/imag split is an identity, so a plain
+            # contiguous copy is both correct and inference-mode safe (``cat`` on
+            # an inference tensor raises "Cannot set version_counter").
+            cached = freqs_cis.contiguous()
         _DSV4_FREQS_REAL_CACHE[key] = cached
     return cached
 
