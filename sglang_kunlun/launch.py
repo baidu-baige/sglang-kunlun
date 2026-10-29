@@ -32,6 +32,9 @@ def main() -> None:
 
     KunlunSRTPlatform._extend_attention_backend_choices()
     import sglang_kunlun.hooks.layers.attention.attention_registry  # noqa: F401
+    # Any Triton kernel that slips past the plugin's replacements hangs the
+    # XPU queue (kl3_wait_for_noc_idle) instead of raising; fail loudly.
+    import sglang_kunlun.hooks.triton_tripwire  # noqa: F401
 
     runpy.run_module("sglang.launch_server", run_name="__main__")
 

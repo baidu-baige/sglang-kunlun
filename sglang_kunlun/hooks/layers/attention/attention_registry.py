@@ -95,8 +95,15 @@ def install_kunlun_mla_forward_dispatch() -> None:
             _dispatch_mla_subtype,
             is_in_breakable_cuda_graph,
             is_in_tc_piecewise_cuda_graph,
-            mla_use_prefill_cp,
         )
+        try:
+            from sglang.srt.models.deepseek_common.attention_backend_handler import (
+                mla_use_prefill_cp,
+            )
+        except ImportError:
+            # 0.5.22 dropped the helper from the handler; the handler itself now
+            # asks ``cp.utils.is_cp_active`` for the same question.
+            from sglang.srt.layers.cp.utils import is_cp_active as mla_use_prefill_cp
     except Exception as exc:  # pragma: no cover - upstream layout drift
         logger.warning("Could not install Kunlun MLA forward dispatch: %s", exc)
         return
