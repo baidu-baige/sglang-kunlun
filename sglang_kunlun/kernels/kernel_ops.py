@@ -4699,6 +4699,21 @@ _DSV4_FREQS_REAL_CACHE: dict[tuple[object, ...], torch.Tensor] = {}
 _DSV4_IDENTITY_MAPPING_CACHE: dict[tuple[object, ...], torch.Tensor] = {}
 
 
+def _plain_copy(t: torch.Tensor) -> torch.Tensor:
+    """Materialise ``t`` as a plain contiguous tensor.
+
+    Inference tensors (the DSPARK draft runs under ``inference_mode``) reject
+    ``contiguous()`` / ``to()`` / ``view_as_real`` with "Cannot set version counter
+    for inference tensor". Allocating a fresh tensor with ``torch.empty`` and
+    ``copy_`` into it only touches the new tensor's counter, which PyTorch allows.
+    """
+    if not t.is_inference():
+        return t if t.is_contiguous() else t.contiguous()
+    out = torch.empty(t.shape, dtype=t.dtype, device=t.device)
+    out.copy_(t)
+    return out
+
+
 def _dsv4_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
     """Return the pointer-stable GPT-J cache expected by the Kunlun RoPE op."""
 
@@ -4718,23 +4733,12 @@ def _dsv4_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
         # counter, which PyTorch refuses for *inference* tensors -- and the DSPARK
         # draft runs under inference_mode. Copy into a fresh tensor instead: the
         # destination is ours, so only its counter moves.
-        # ``empty_like`` inherits the *inference* flag from its source, and any
-        # in-place write into an inference tensor raises "Cannot set version
-        # counter". Allocate a plain tensor instead.
         if freqs_cis.is_complex():
-            real = torch.view_as_real(freqs_cis)  # view only
-            target = torch.empty(
-                real.shape, dtype=real.dtype, device=real.device
-            )
-            target.copy_(real)
-            cached = target.flatten(-2, -1)
+            cached = torch.view_as_real(_plain_copy(freqs_cis)).flatten(-2, -1)
+            cached = _plain_copy(cached)
         else:
             # Already real-valued: the real/imag split is an identity.
-            target = torch.empty(
-                freqs_cis.shape, dtype=freqs_cis.dtype, device=freqs_cis.device
-            )
-            target.copy_(freqs_cis)
-            cached = target
+            cached = _plain_copy(freqs_cis)
         _DSV4_FREQS_REAL_CACHE[key] = cached
     return cached
 
@@ -4744,10 +4748,13 @@ def _dsv4_rotate_gptj_tail(
     positions: torch.Tensor,
 ) -> torch.Tensor:
     if value.ndim == 3 and value.shape[1:] == (64, 128):
+        pos_i32 = _plain_copy(
+            positions.flatten().to(torch.int64).to(torch.int32)
+        )
         return torch.ops.xspeedgate_ops.dsv4_rotate_gptj_tail(
-            value=value.contiguous(),
-            freqs_cis=freqs_cis.contiguous(),
-            positions=positions.flatten().to(dtype=torch.int32).contiguous(),
+            value=_plain_copy(value),
+            freqs_cis=_plain_copy(freqs_cis),
+            positions=pos_i32,
             inverse=False,
         )
 
