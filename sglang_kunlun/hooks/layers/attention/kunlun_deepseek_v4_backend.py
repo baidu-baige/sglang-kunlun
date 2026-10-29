@@ -653,15 +653,30 @@ def _refresh_graph_host_lengths(
         c4_context_lens = (seq_lens // 4) * 4
         for key, aux in c4_decode_aux.items():
             cached_bs, _, _, rows_per_req = key
-            if rows_per_req != 1:
-                # TARGET_VERIFY per-row entry: its rows are draft rows, not
-                # requests, and _compute_c4_logits_kunlun refreshes it inline.
-                # Overwriting it here feeds request-shaped lengths to a
-                # row-shaped buffer on the next replay.
-                continue
             if cached_bs < batch_size:
                 continue
             _copy_host_lengths_(aux[2], c4_context_lens, fill_value=4)
+            aux[3].copy_(aux[2])
+        return
+
+    if forward_batch.forward_mode.is_target_verify():
+        # DSPARK verify replays a graph captured for `bs * num_draft` rows, but
+        # the host `context_lens_cpu` buffer is pointer-stable and was only ever
+        # filled at capture time, so every replay fed the kernel the placeholder
+        # length. The device tensor is refreshed inside the graph, the host one
+        # cannot be -- which is exactly why eager verify was right and the
+        # captured verify path silently diverged. Expand each request's length to
+        # its draft rows to match the row-shaped page table.
+        c4_context_lens = (seq_lens // 4) * 4
+        for key, aux in c4_decode_aux.items():
+            cached_bs, _, _, rows_per_req = key
+            rows = batch_size * max(rows_per_req, 1)
+            if cached_bs < rows:
+                continue
+            lens = c4_context_lens
+            if rows_per_req > 1:
+                lens = c4_context_lens.repeat_interleave(rows_per_req)
+            _copy_host_lengths_(aux[2], lens, fill_value=4)
             aux[3].copy_(aux[2])
         return
 
@@ -812,6 +827,13 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Always let the scheduler publish ``seq_lens_cpu``. Upstream clears the
+        # flag under DSPARK (``deepseek_v4_backend.py:1241``), and the Kunlun
+        # metadata builder then falls back to a *blocking* D2H
+        # (``kv_lens.to("cpu", non_blocking=False)`` in `_make_lod`). Under
+        # DSPARK that copy lands between collectives and deadlocks: py-spy showed
+        # 7 ranks in the embedding all_reduce while rank 4 sat in `_make_lod`.
+        self.needs_cpu_seq_lens = True
         # The Kunlun metadata builder was written against the 4.1 field names.
         # 0.5.22's upstream backend publishes ``index_topk`` itself
         # (``deepseek_v4_backend.py:1179``) and no longer has the older
@@ -1031,7 +1053,12 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             self._c4_decode_aux,
             self._attention_graph_extend_aux,
         )
-        _serialize_graph_replay()
+        # A device-wide wait is not legal inside capture on XPU: it surfaces as
+        # ``error code=299, wait for noc idle timeout`` from capture_decode_graph
+        # (seen while capturing the DSPARK verify graphs). The fence only orders
+        # replay against the next metadata build, so skip it while capturing.
+        if not in_capture and not torch.cuda.is_current_stream_capturing():
+            _serialize_graph_replay()
 
     def forward_c4_indexer(
         self,
@@ -1378,7 +1405,15 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             and forward_batch.forward_mode.is_extend()
             and c4_seq_lens.numel() > 0
         ):
-            live_max_seq_len = max(int(c4_seq_lens.max()), 1)
+            # At capture the compressed lens are placeholders (1..4), and taking
+            # them dimensioned the whole vendor call for a one-column context:
+            # width=1, num_pages=1, k_scale=(rows, 1). Replay then indexes far
+            # past that row -- dmesg kl3_wait_for_noc_idle / kernel exception 721
+            # on fa_xpu::c4a_mqa_logits. Keep the metadata width unless the lens
+            # look like real data.
+            _live = int(c4_seq_lens.max())
+            if _live > 4:
+                live_max_seq_len = _live
         return _compute_c4_logits_kunlun(
             backend=self,
             q_fp8=q,
@@ -1750,7 +1785,13 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                     torch.ones(pad_rows, dtype=torch.int32, device=kv_lens.device),
                 ]
             )
-        q_lod = q_lod_cpu.to(device, non_blocking=False)
+        # Upload through pinned memory without waiting: a blocking H2D drains the
+        # device queue, and under DSPARK that queue still holds an unmatched
+        # collective, so the copy never returns (py-spy: rank 7 in _make_lod while
+        # the other ranks sit in the embedding all_reduce). Stream order already
+        # guarantees the LoD is visible to the kernels that consume it.
+        host_lod = q_lod_cpu if q_lod_cpu.is_pinned() else q_lod_cpu.pin_memory()
+        q_lod = host_lod.to(device, non_blocking=True)
         return q_lod_cpu, q_lod, kv_lens_cpu, kv_lens
 
     def store_cache(
@@ -2494,6 +2535,15 @@ def _compute_c4_logits_kunlun(
 ):
     """Compute C4 logits with explicit Kunlun request ownership."""
 
+    # Capture-time indexer metadata can carry an uninitialised
+    # ``max_compressed_seq_len`` (placeholder lens), and DSPARK verify-graph
+    # capture then asks for a 2134 GiB logits buffer. Bound the width by the
+    # model context (c4 compresses 4:1); this only ever shrinks placeholder
+    # capture-time widths, never a real one.
+    _ctx_cap = int(getattr(backend, "MAX_SEQ_LEN_FOR_CAPTURE", 0) or 0)
+    if _ctx_cap > 0:
+        max_seq_len = min(int(max_seq_len), _ctx_cap // 4 + _page_slack())
+
     is_target_verify = (
         forward_batch is not None
         and forward_batch.forward_mode.is_target_verify()
@@ -2688,6 +2738,28 @@ def _compute_c4_logits_kunlun(
         .view(torch.float32)
         .view(-1, block_size)
     )
+    # ``k_scale`` is materialised from ``num_pages`` pages, so the kernel's
+    # ``max_context_len / compress_ratio`` must equal ``k_scale.size(1)``. The
+    # capture-time width (context bound) can exceed the page table's coverage at
+    # this mem-fraction, which fails the vendor assert -> clamp to what the table
+    # actually describes.
+    max_seq_len = min(int(max_seq_len), num_pages * block_size)
+    # ``context_lens`` must never exceed ``max_context_len`` (= max_seq_len * 4):
+    # the vendor kernel (fa_xpu::c4a_mqa_logits) indexes the logits row with it, and
+    # a longer length walks off the row -- dmesg kl3_wait_for_noc_idle, kernel
+    # exception 721, then the TP collective behind it hangs. Widening the row to
+    # the real length is safe (clipping the length is not: it would silently drop
+    # context). The bound comes from the host mirror, so no device sync, and
+    # capture-time placeholders are ignored by the ``<= MAX_SEQ_LEN_FOR_CAPTURE``
+    # sanity check.
+    _host_lens = _seq_lens_cpu_i32(forward_batch)
+    _ctx_tokens = int(getattr(backend, "MAX_SEQ_LEN_FOR_CAPTURE", 0) or 0)
+    if _host_lens.numel():
+        _host_max = int(_host_lens.max())
+        if _host_max > 0 and (_ctx_tokens <= 0 or _host_max <= _ctx_tokens):
+            _needed_width = (_host_max + 3) // 4
+            if _needed_width > int(max_seq_len):
+                max_seq_len = min(_needed_width, num_pages * block_size)
     page_indices = block_table.to(torch.long)
     k_scale = scale_pages[page_indices].reshape(batch_size, -1)[
         :, :max_seq_len
@@ -2726,6 +2798,51 @@ def _compute_c4_logits_kunlun(
     )
     context_lens_xpu.copy_(seq_lens.to(torch.int32) * 4)
 
+    # The vendor dispatch is `fa_xpu::c4a_mqa_logits<...>`; a shape mismatch there
+    # does not raise, it wedges the device (dmesg: kl3_wait_for_noc_idle) and the
+    # following TP collective hangs. Assert the contract first so a bad shape is
+    # a Python error instead of a node reboot.
+    _rows = (
+        int(q.shape[0]),
+        int(batch_size),
+        int(seq_lens.numel()),
+        int(block_table.shape[0]),
+        int(k_scale.shape[0]),
+        int(context_lens_cpu.numel()),
+        int(context_lens_xpu.numel()),
+        int(qlod_cpu.numel()) - 1,
+    )
+    if len(set(_rows)) != 1:
+        raise RuntimeError(
+            "Kunlun c4a_paged_mqa_logits row mismatch "
+            "(q, batch_size, seq_lens, block_table, k_scale, ctx_cpu, ctx_xpu, qlod): "
+            f"{_rows} max_seq_len={max_seq_len} per_row_verify={per_row_verify} "
+            f"verify={is_target_verify}"
+        )
+    if int(logits_width := max_seq_len) <= 0:
+        raise RuntimeError(f"Kunlun c4a_paged_mqa_logits bad width {logits_width}")
+    if os.environ.get("DSV4_C4_SHAPE_LOG") == "1" and not getattr(
+        backend, "_c4_shape_logged", False
+    ):
+        backend._c4_shape_logged = True
+        logger.warning(
+            "[C4SHAPE] q=%s bs=%s seq_lens.max=%s ctx_cpu.max=%s width=%s "
+            "num_pages=%s block_size=%s page_table=%s k_scale=%s k_cache=%s "
+            "verify=%s per_row=%s rows_per_req=%s",
+            tuple(q.shape),
+            batch_size,
+            int(seq_lens.max()) if seq_lens.numel() else -1,
+            int(context_lens_cpu.max()) if context_lens_cpu.numel() else -1,
+            max_seq_len,
+            num_pages,
+            block_size,
+            tuple(page_table.shape),
+            tuple(k_scale.shape),
+            tuple(kvcache_fp8.shape),
+            is_target_verify,
+            per_row_verify,
+            rows_per_req,
+        )
     logits = torch.empty(
         (batch_size, 1, max_seq_len),
         dtype=torch.float32,
