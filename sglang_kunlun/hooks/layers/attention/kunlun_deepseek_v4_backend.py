@@ -2570,6 +2570,39 @@ def _compute_c4_logits_kunlun(
         forward_batch is not None
         and forward_batch.forward_mode.is_target_verify()
     )
+
+    # PD decode does not publish ``seq_lens_cpu`` for a DSPARK batch, and the
+    # compressed-lens buffer it hands us still holds uninitialised memory:
+    # the probe logged ``seq_lens.max=570687470`` with ``ctx_cpu.max=0`` on a 25K
+    # prompt (the real compressed length is ~6250). The C4 indexer then selects
+    # sparse pages from garbage, the target attends to the wrong pages, and the
+    # output degenerates into a repetition loop while every draft token is
+    # rejected (accept length 1.1 vs 1.8 on 0.5.19). ``forward_batch.seq_lens``
+    # is correct in PD, so rebuild both views from it when the ones we were given
+    # cannot be true. Healthy batches skip this entirely.
+    if forward_batch is not None and getattr(forward_batch, "seq_lens", None) is not None:
+        _ctx_tokens = int(getattr(backend, "MAX_SEQ_LEN_FOR_CAPTURE", 0) or 0)
+        _host_lens = _seq_lens_cpu_i32(forward_batch)
+        _host_bad = _host_lens.numel() == 0 or int(_host_lens.max()) <= 0
+        _dev_bad = seq_lens.numel() > 0 and _ctx_tokens > 0 and (
+            int(seq_lens.max()) > _ctx_tokens
+        )
+        if _host_bad or _dev_bad:
+            _dev_tokens = forward_batch.seq_lens.to(torch.int32)
+            if _dev_tokens.numel() and seq_lens.numel() % max(_dev_tokens.numel(), 1) == 0:
+                _repeat = seq_lens.numel() // _dev_tokens.numel()
+                if _repeat > 1:
+                    _dev_tokens = _dev_tokens.repeat_interleave(_repeat)
+                seq_lens = torch.div(
+                    _dev_tokens, 4, rounding_mode="floor"
+                ).to(torch.int32)
+                _rebuilt_host_tokens = _dev_tokens.to("cpu", non_blocking=False)
+            else:
+                _rebuilt_host_tokens = None
+        else:
+            _rebuilt_host_tokens = None
+    else:
+        _rebuilt_host_tokens = None
     if (
         os.environ.get("DSV4_KUNLUN_REFERENCE_ONLY") == "1"
         or os.environ.get("DSV4_KUNLUN_REFERENCE_C4") == "1"
@@ -2804,7 +2837,11 @@ def _compute_c4_logits_kunlun(
         aux = qlod_cpu, qlod_xpu, context_lens_cpu, context_lens_xpu
         backend._c4_decode_aux[key] = aux
     qlod_cpu, qlod_xpu, context_lens_cpu, context_lens_xpu = aux
-    raw_seq_lens_cpu = _seq_lens_cpu_i32(forward_batch)
+    raw_seq_lens_cpu = (
+        _rebuilt_host_tokens
+        if _rebuilt_host_tokens is not None
+        else _seq_lens_cpu_i32(forward_batch)
+    )
     if per_row_verify:
         # batch_size is now bs*num_draft; the host lengths must line up row-wise
         # with the expanded page table.
