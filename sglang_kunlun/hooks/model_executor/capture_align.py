@@ -42,12 +42,17 @@ def capture_prepare_aligned_kunlun(original, self, *args, **kwargs):
     try:
         import torch.distributed as dist
 
-        from sglang.srt.distributed.parallel_state import get_tp_group
+        from sglang.srt.distributed.parallel_state import get_world_group
 
-        torch.cuda.synchronize()
-        group = get_tp_group().cpu_group
+        # Barrier FIRST on the whole-world CPU group (every rank takes part, so it
+        # cannot be matched against a device collective), then drain this rank's
+        # queue. Synchronizing first deadlocks when a peer is parked in a device
+        # barrier: py-spy showed one rank in torch.cuda.synchronize() while the
+        # other seven waited in the gloo barrier of the previous bucket.
+        group = get_world_group().cpu_group
         if group is not None and dist.is_initialized():
             dist.barrier(group=group)
+        torch.cuda.synchronize()
     except Exception as exc:  # noqa: BLE001 - alignment is best effort
         logger.debug("capture_prepare alignment skipped: %s", exc)
     return original(self, *args, **kwargs)
