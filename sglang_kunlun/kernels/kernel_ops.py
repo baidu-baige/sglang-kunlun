@@ -4714,14 +4714,22 @@ def _dsv4_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
         # an *inference* tensor (the DSPARK draft runs under inference_mode) and
         # raises "Cannot set version_counter for inference tensor". ``view_as_real``
         # is a pure view, and the contiguous copy below materialises it.
+        # Any op that materialises a copy (cat/contiguous) bumps a version
+        # counter, which PyTorch refuses for *inference* tensors -- and the DSPARK
+        # draft runs under inference_mode. Copy into a fresh tensor instead: the
+        # destination is ours, so only its counter moves.
         if freqs_cis.is_complex():
-            cached = torch.view_as_real(freqs_cis).contiguous()
-            cached = cached.flatten(-2, -1)
+            real = torch.view_as_real(freqs_cis)  # view only
+            target = torch.empty_like(real, memory_format=torch.contiguous_format)
+            target.copy_(real)
+            cached = target.flatten(-2, -1)
         else:
-            # Already real-valued: the real/imag split is an identity, so a plain
-            # contiguous copy is both correct and inference-mode safe (``cat`` on
-            # an inference tensor raises "Cannot set version_counter").
-            cached = freqs_cis.contiguous()
+            # Already real-valued: the real/imag split is an identity.
+            target = torch.empty_like(
+                freqs_cis, memory_format=torch.contiguous_format
+            )
+            target.copy_(freqs_cis)
+            cached = target
         _DSV4_FREQS_REAL_CACHE[key] = cached
     return cached
 
