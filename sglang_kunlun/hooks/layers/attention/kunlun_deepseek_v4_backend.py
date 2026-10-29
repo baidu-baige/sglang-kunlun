@@ -476,6 +476,36 @@ def _seq_lens_cpu_i32(forward_batch) -> torch.Tensor:
     seq_lens_cpu = forward_batch.seq_lens_cpu
     if seq_lens_cpu is None:
         seq_lens_cpu = forward_batch.seq_lens.to("cpu", non_blocking=False)
+        return seq_lens_cpu[: forward_batch.batch_size].to(torch.int32)
+
+    # The pinned ``seq_lens_cpu`` mirror is not refreshed per CUDA-graph replay:
+    # ``DecodeCudaGraphRunner`` fills its buffer once with ``seq_len_fill_value``
+    # and only the eagle draft runners copy the live lengths in. Under DSPARK the
+    # replay therefore reported length 1 per row, so ``context_lens_cpu`` for the
+    # C4 operator came out as 0 and the target attended to nothing of its real
+    # history (accept length 1.0 vs 1.8 on 0.5.19). The device tensor *is*
+    # refreshed before replay, so read it instead -- once per forward, cached on
+    # the batch object, because the C4 path asks per layer. Capture must not sync,
+    # and the extend/prefill runners do refresh their mirror, so both are left on
+    # the original path.
+    mode = forward_batch.forward_mode
+    if (
+        (mode.is_decode_or_idle() or mode.is_target_verify())
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        cached = getattr(forward_batch, "_dsv4_host_seq_lens", None)
+        if cached is not None and cached.numel() == forward_batch.batch_size:
+            return cached
+        live = (
+            forward_batch.seq_lens[: forward_batch.batch_size]
+            .to("cpu", non_blocking=False)
+            .to(torch.int32)
+        )
+        try:
+            forward_batch._dsv4_host_seq_lens = live
+        except Exception:  # noqa: BLE001 - slotted batch objects
+            pass
+        return live
     return seq_lens_cpu[: forward_batch.batch_size].to(torch.int32)
 
 
