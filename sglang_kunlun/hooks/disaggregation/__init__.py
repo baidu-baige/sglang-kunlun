@@ -34,13 +34,13 @@ def _wrap_buf_infos(orig):
     def _wrapped(*args, **kwargs):
         ptrs, lens, items = orig(*args, **kwargs)
         aligned = _align(lens)
-        if _os.environ.get("DSV4_PD_STATE_LOG") == "1" and not getattr(
-            _wrap_buf_infos, "_logged", False
-        ):
-            _wrap_buf_infos._logged = True
+        _name = getattr(orig, "__qualname__", "?")
+        _seen = _wrap_buf_infos.__dict__.setdefault("_seen", set())
+        if _os.environ.get("DSV4_PD_STATE_LOG") == "1" and _name not in _seen:
+            _seen.add(_name)
             logger.warning(
                 "[PDSTATE] name=%s buffers=%d data_lens=%s aligned=%s item_lens=%s",
-                getattr(orig, "__qualname__", "?"),
+                _name,
                 len(ptrs),
                 list(lens)[:6],
                 aligned[:6],
