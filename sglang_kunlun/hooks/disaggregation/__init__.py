@@ -33,7 +33,20 @@ def _align(values):
 def _wrap_buf_infos(orig):
     def _wrapped(*args, **kwargs):
         ptrs, lens, items = orig(*args, **kwargs)
-        return ptrs, _align(lens), items
+        aligned = _align(lens)
+        if _os.environ.get("DSV4_PD_STATE_LOG") == "1" and not getattr(
+            _wrap_buf_infos, "_logged", False
+        ):
+            _wrap_buf_infos._logged = True
+            logger.warning(
+                "[PDSTATE] name=%s buffers=%d data_lens=%s aligned=%s item_lens=%s",
+                getattr(orig, "__qualname__", "?"),
+                len(ptrs),
+                list(lens)[:6],
+                aligned[:6],
+                list(items)[:6],
+            )
+        return ptrs, aligned, items
 
     return _wrapped
 
