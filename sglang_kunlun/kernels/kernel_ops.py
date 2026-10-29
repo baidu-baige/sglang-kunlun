@@ -860,11 +860,31 @@ def dsv4_expand_prefill_causally_kunlun(
         ExpandPrefillCausallyResult,
     )
 
-    if seq_lens_cpu is None:
-        seq_lens_cpu = seq_lens.cpu().tolist()
+    # ``seq_lens_cpu`` cannot be trusted under CUDA-graph replay: the decode graph
+    # runner fills ``buffers.seq_lens_cpu`` once with ``seq_len_fill_value`` and only
+    # the *eagle* draft runners copy the live lengths into it per replay, so a DSPARK
+    # TARGET_VERIFY replay hands us the capture-time placeholder. The vendor op reads
+    # the host list, so ``seq_lens_casual`` -- and therefore ``c4_topk_lengths_raw``
+    # and every sparse page selection downstream -- came out of uninitialised memory
+    # (the C4 probe logged compressed lens of 570687470 on a 25K prompt). The device
+    # tensor *is* refreshed before replay, so always derive the host view from it.
+    if seq_lens_cpu is None or len(seq_lens_cpu) == seq_lens.shape[0]:
+        _live_lens = seq_lens.to("cpu", non_blocking=False).tolist()
+        if (
+            seq_lens_cpu is not None
+            and list(seq_lens_cpu) != _live_lens
+            and not getattr(dsv4_expand_prefill_causally_kunlun, "_stale_logged", False)
+        ):
+            dsv4_expand_prefill_causally_kunlun._stale_logged = True
+            _KERNEL_OPS_LOGGER.warning(
+                "[DSV4] stale seq_lens_cpu mirror replaced: host=%s device=%s",
+                list(seq_lens_cpu)[:8],
+                _live_lens[:8],
+            )
+        seq_lens_cpu = _live_lens
 
-    if extend_seq_lens_cpu is None:
-        extend_seq_lens_cpu = extend_seq_lens.cpu().tolist()
+    if extend_seq_lens_cpu is None or len(extend_seq_lens_cpu) == extend_seq_lens.shape[0]:
+        extend_seq_lens_cpu = extend_seq_lens.to("cpu", non_blocking=False).tolist()
 
     if req_pool_indices.dtype != torch.int32:
         req_pool_indices_i32 = req_pool_indices.to(torch.int32)
