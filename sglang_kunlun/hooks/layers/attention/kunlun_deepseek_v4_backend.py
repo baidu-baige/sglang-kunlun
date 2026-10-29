@@ -2843,10 +2843,20 @@ def _compute_c4_logits_kunlun(
         )
     if int(logits_width := max_seq_len) <= 0:
         raise RuntimeError(f"Kunlun c4a_paged_mqa_logits bad width {logits_width}")
-    if os.environ.get("DSV4_C4_SHAPE_LOG") == "1" and not getattr(
-        backend, "_c4_shape_logged", False
+    _live_max = int(seq_lens.max()) if seq_lens.numel() else 0
+    _want_log = os.environ.get("DSV4_C4_SHAPE_LOG")
+    if (
+        (_want_log == "1" and not getattr(backend, "_c4_shape_logged", False))
+        or (
+            _want_log == "live"
+            and _live_max > 4
+            and not getattr(backend, "_c4_shape_logged_live", False)
+        )
     ):
-        backend._c4_shape_logged = True
+        if _want_log == "live":
+            backend._c4_shape_logged_live = True
+        else:
+            backend._c4_shape_logged = True
         logger.warning(
             "[C4SHAPE] q=%s bs=%s seq_lens.max=%s ctx_cpu.max=%s width=%s "
             "num_pages=%s block_size=%s page_table=%s k_scale=%s k_cache=%s "
