@@ -1667,6 +1667,26 @@ def dsv4_set_k_and_s_with_mapping_kunlun(
     raw_loc = raw_loc.to(dtype=torch.int32).contiguous()
     if full_to_swa_index_mapping.device != raw_loc.device:
         full_to_swa_index_mapping = full_to_swa_index_mapping.to(raw_loc.device)
+    # The vendor kernel indexes the mapping with ``raw_loc`` directly, so an
+    # out-of-range location is an out-of-bounds device read, not an error return:
+    # on 2026-10-31 all eight 144 devices took
+    # ``KL_XID_KERNEL_EXCEPTION`` inside
+    # ``set_k_and_s_v4_with_mapping_kernel<int, long>`` (the ``<int, long>``
+    # instantiation is this call site -- the other one passes an int32 identity
+    # mapping) and the schedulers died with ``cudaErrorLaunchTimeout``.
+    #
+    # DSpark's verify commit passes -1 for the rejected tail (routinely 5 of 6
+    # rows) and a CUDA-graph replay can leave capture-time sentinels in the
+    # padded rows, so clamp into the mapping's index range exactly as
+    # ``dsv4_set_k_and_s_kunlun`` already does for the non-mapping variant.
+    # Location 0 is the paged allocator's reserved dummy page (free pages start
+    # at 1), so the neutralised rows land somewhere no request ever reads; there
+    # is no need to also zero the payload. Pure device ops, fixed shape, no host
+    # sync -- safe inside a graph capture.
+    if raw_loc.numel() and full_to_swa_index_mapping.numel():
+        raw_loc = raw_loc.clamp(
+            min=0, max=int(full_to_swa_index_mapping.shape[0]) - 1
+        )
     torch.ops.xspeedgate_ops.set_k_and_s_v4_with_mapping(
         buf,
         raw_loc,
