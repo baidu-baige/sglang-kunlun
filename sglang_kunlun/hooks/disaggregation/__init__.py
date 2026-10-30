@@ -194,3 +194,8 @@ async def _skip_hisparse_pd_warmup(original_fn, *args, **kwargs):
         )
         return [200] * dp_size
     return await original_fn(*args, **kwargs)
+
+
+# The DSPARK draft seed across the PD boundary lives in its own module; importing
+# it here registers its hooks with the rest of the disaggregation package.
+from sglang_kunlun.hooks.disaggregation import dspark_hidden_states  # noqa: E402,F401
