@@ -42,6 +42,7 @@ HOOK_MODULES = (
     "sglang_kunlun.hooks.function_call",
     "sglang_kunlun.hooks.parser",
     "sglang_kunlun.hooks.jit_kernel",
+    "sglang_kunlun.hooks.kernels",
     "sglang_kunlun.hooks.models",
     "sglang_kunlun.models",
     "sglang_kunlun.hooks.speculative",
@@ -105,7 +106,9 @@ def register_all() -> None:
 
         patch_compressor_forward_cuda_alias()
     except Exception as exc:
-        logger.warning("sglang-kunlun: Compressor forward_cuda alias patch failed: %s", exc)
+        logger.warning(
+            "sglang-kunlun: Compressor forward_cuda alias patch failed: %s", exc
+        )
 
     for module_name in HOOK_MODULES:
         importlib.import_module(module_name)
