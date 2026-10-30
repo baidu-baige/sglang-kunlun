@@ -561,3 +561,48 @@ def _hisparse_prealloc_capacity_device_bound(original_fn, self, req, *args, **kw
         return original_fn(self, req, *args, **kwargs)
 
     return original_fn(self, req, *args, **kwargs)
+
+
+@plugin_hook(
+    "sglang.srt.managers.hisparse_coordinator.HiSparseSpecSwapManager.__init__",
+    type=HookType.AROUND,
+)
+def _disable_spec_swap_for_dsv4_hisparse(
+    original_fn, self, coordinator, *, num_draft_tokens: int, **kwargs
+):
+    """Keep 0.5.19's behaviour for DSV4 HiSparse: no spec swap, and no raise.
+
+    ``HiSparseSpecSwapManager`` is new in 0.5.22 -- 0.5.19 had no equivalent, so
+    DSV4 HiSparse ran with DSPARK and simply never had a spec-swap stage. 0.5.22's
+    coordinator builds the manager whenever ``num_draft_tokens > 0`` and the
+    manager then rejects this exact configuration::
+
+        ValueError: HiSparse spec swap currently supports DSA caches only.
+
+    which kills the scheduler inside ``maybe_init_hisparse_coordinator``, before a
+    single token is served.
+
+    The manager is not needed on this path. The two stages that assume it is live
+    -- ``swap_in`` and ``output_locs`` -- are reached from
+    ``swap_in_selected_pages`` only under ``top_k_result.ndim == 3``, and the
+    Kunlun backend never produces a 3-D top-k: it flattens the verify batch's
+    draft rows into the request dimension with ``repeat_interleave`` before
+    calling the coordinator (``kunlun_deepseek_v4_backend.py``: "the coordinator
+    is per-request, but a verify batch has one query row per draft token"), so
+    what arrives is always 2-D.
+
+    Passing ``num_draft_tokens=0`` lets upstream's own prologue run and stop at
+    its ``if not self.enabled: return``, which is less brittle than
+    reimplementing that prologue here. It also restores 0.5.19's miss-plan width
+    exactly: ``miss_plan_capacity`` is ``top_k * max(1, num_draft_tokens)``, so 0
+    yields ``top_k`` -- the width 0.5.19 sized ``_miss_src``/``_miss_dst`` with.
+    """
+    if getattr(coordinator, "is_dsv4_hisparse", False) and num_draft_tokens > 0:
+        logger.info(
+            "sglang-kunlun: DSV4 HiSparse keeps the 0.5.19 no-spec-swap path "
+            "(requested num_draft_tokens=%d); the backend flattens draft rows "
+            "into the request dimension, so the 3-D swap stages are unreachable",
+            num_draft_tokens,
+        )
+        return original_fn(self, coordinator, num_draft_tokens=0, **kwargs)
+    return original_fn(self, coordinator, num_draft_tokens=num_draft_tokens, **kwargs)
