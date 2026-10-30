@@ -868,20 +868,59 @@ def dsv4_expand_prefill_causally_kunlun(
     # and every sparse page selection downstream -- came out of uninitialised memory
     # (the C4 probe logged compressed lens of 570687470 on a 25K prompt). The device
     # tensor *is* refreshed before replay, so always derive the host view from it.
+    #
+    # The device buffer is only refreshed for the *live* rows, though. On the DSPARK
+    # draft-block path the graph's ``seq_lens`` tail keeps whatever the capture left
+    # there, and those entries can exceed int32 -- the vendor op then raises
+    # "expand_prefill_casually: seq_lens values must be in int32 range" and takes all
+    # eight schedulers down (observed 2026-10-31 03:34:53 on 144). Sanitise per row:
+    # keep a plausible device length, otherwise fall back to the host mirror entry,
+    # which is exactly the value this path used before deriving from the device.
     if seq_lens_cpu is None or len(seq_lens_cpu) == seq_lens.shape[0]:
         _live_lens = seq_lens.to("cpu", non_blocking=False).tolist()
+        _host_lens = list(seq_lens_cpu) if seq_lens_cpu is not None else None
+        _int32_max = 2**31 - 1
+
+        def _plausible(value) -> bool:
+            return isinstance(value, int) and 0 <= value <= _int32_max
+
+        _clean_lens = []
+        _repaired = []
+        for _row, _value in enumerate(_live_lens):
+            if _plausible(_value):
+                _clean_lens.append(_value)
+                continue
+            _fallback = (
+                _host_lens[_row]
+                if _host_lens is not None and _plausible(_host_lens[_row])
+                else 0
+            )
+            _clean_lens.append(_fallback)
+            _repaired.append((_row, _value, _fallback))
+        if _repaired and not getattr(
+            dsv4_expand_prefill_causally_kunlun, "_oob_logged", False
+        ):
+            dsv4_expand_prefill_causally_kunlun._oob_logged = True
+            _KERNEL_OPS_LOGGER.warning(
+                "[DSV4] out-of-int32 seq_lens rows repaired: rows=%s "
+                "(row, device, used) device_len=%s host=%s extend=%s",
+                _repaired[:8],
+                len(_live_lens),
+                None if _host_lens is None else _host_lens[:8],
+                extend_seq_lens.shape[0],
+            )
         if (
-            seq_lens_cpu is not None
-            and list(seq_lens_cpu) != _live_lens
+            _host_lens is not None
+            and _host_lens != _clean_lens
             and not getattr(dsv4_expand_prefill_causally_kunlun, "_stale_logged", False)
         ):
             dsv4_expand_prefill_causally_kunlun._stale_logged = True
             _KERNEL_OPS_LOGGER.warning(
                 "[DSV4] stale seq_lens_cpu mirror replaced: host=%s device=%s",
-                list(seq_lens_cpu)[:8],
-                _live_lens[:8],
+                _host_lens[:8],
+                _clean_lens[:8],
             )
-        seq_lens_cpu = _live_lens
+        seq_lens_cpu = _clean_lens
 
     if extend_seq_lens_cpu is None or len(extend_seq_lens_cpu) == extend_seq_lens.shape[0]:
         extend_seq_lens_cpu = extend_seq_lens.to("cpu", non_blocking=False).tolist()
