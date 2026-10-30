@@ -361,14 +361,13 @@ def _get_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
     _FREQS_REAL_CACHE[key] = freqs_real
     return freqs_real
 
-
 def _apply_rope_xspeedgate(
-    q: torch.Tensor,           # [B, rope_dim] or [B, H, rope_dim]
+    q: torch.Tensor,
     k: Optional[torch.Tensor],
-    freqs_cis: torch.Tensor,   # [max_pos, rope_dim//2] complex64
-    positions: torch.Tensor,   # [B] int32/int64
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
     inverse: bool = False,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+) -> None:
     """Apply GPT-J RoPE via ``xspeedgate_ops.flashinfer_rotary_embedding``.
 
     Returns ``(q_out, k_out)`` as new tensors (non-in-place).
@@ -376,46 +375,22 @@ def _apply_rope_xspeedgate(
     """
     freqs_real = _get_cos_sin_cache(freqs_cis)
     rotary_dim = q.shape[-1]
+    # KUNLUN FIX: XPU flashinfer_rotary_embedding kernel requires
+    # contiguous inputs. q/k may be non-contiguous slices (e.g.
+    # q[..., -rope_dim:] from the MQA layer).
     q_input = q.contiguous() if not q.is_contiguous() else q
     k_input = k.contiguous() if (k is not None and not k.is_contiguous()) else k
-    # The Kunlun rotary kernel misbehaves (reads out-of-range positions) when a
-    # single launch carries many tokens, which happens on the NSA prefill
-    # context-parallel path for long prompts. RoPE is per-token independent, so
-    # chunking the launch is numerically identical.
-    chunk = int(os.environ.get("KL_ROPE_CHUNK", "256"))
-    n_tok = q_input.shape[0]
-    if chunk <= 0 or n_tok <= chunk:
-        return torch.ops.xspeedgate_ops.flashinfer_rotary_embedding(
-            positions=positions,
-            rotary_dim=rotary_dim,
-            head_size=rotary_dim,
-            cos_sin_cache=freqs_real,
-            is_neox_style=False,
-            query=q_input,
-            key=k_input,
-            offsets=None,
-            inverse=inverse,
-        )
-    q_parts, k_parts = [], []
-    for beg in range(0, n_tok, chunk):
-        end = min(beg + chunk, n_tok)
-        q_p, k_p = torch.ops.xspeedgate_ops.flashinfer_rotary_embedding(
-            positions=positions[beg:end].contiguous(),
-            rotary_dim=rotary_dim,
-            head_size=rotary_dim,
-            cos_sin_cache=freqs_real,
-            is_neox_style=False,
-            query=q_input[beg:end].contiguous(),
-            key=k_input[beg:end].contiguous() if k_input is not None else None,
-            offsets=None,
-            inverse=inverse,
-        )
-        q_parts.append(q_p)
-        if k_p is not None:
-            k_parts.append(k_p)
-    q_out = torch.cat(q_parts, dim=0)
-    k_out = torch.cat(k_parts, dim=0) if k_parts else None
-    return q_out, k_out
+    return torch.ops.xspeedgate_ops.flashinfer_rotary_embedding(
+        positions=positions,
+        rotary_dim=rotary_dim,
+        head_size=rotary_dim,
+        cos_sin_cache=freqs_real,
+        is_neox_style=False,
+        query=q_input,
+        key=k_input,
+        offsets=None,
+        inverse=inverse,
+    )
 
 
 def _fused_rope_inplace_kunlun(

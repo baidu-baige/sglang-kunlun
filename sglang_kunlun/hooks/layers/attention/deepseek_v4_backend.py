@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 from typing import Literal, Optional, Tuple, List
@@ -75,11 +76,367 @@ def _flatten_cache(cache: torch.Tensor) -> torch.Tensor:
     return cache.reshape(-1, cache.shape[-1]).contiguous()
 
 
+_C4A_COMPRESS_RATIO = 4
+_C4A_BAIL_SEEN = set()
+
+
+def _c4a_bail(reason: str, cp_rank, detail: str = ""):
+    """Log once per distinct reason why the ragged Kunlun op cannot be used.
+
+    Falling back to ``_c4a_cp_extend_logits_torch`` costs orders of magnitude
+    and is wrong for multi-request batches, yet raises nothing -- and because
+    ranks then diverge in speed the cost surfaces as skew in the next collective
+    (DeepEP dispatch) rather than as indexer time. Make it visible.
+
+    ``reason`` must be a fixed string -- it is the dedup key, so interpolating
+    shapes into it would make the seen-set grow without bound. Put those in
+    ``detail``.
+    """
+    if reason not in _C4A_BAIL_SEEN:
+        _C4A_BAIL_SEEN.add(reason)
+        logger.warning(
+            "sglang-kunlun: C4 indexer extend falls back to torch on "
+            "cp_rank=%s: %s%s",
+            cp_rank,
+            reason,
+            f" ({detail})" if detail else "",
+        )
+    return None
+
+
+def _c4a_detect_cp_round_robin(forward_batch):
+    """Return ``(cp_rank, cp_size)`` when this extend call is a CP shard.
+
+    Round-robin split is the only DSA prefill CP mode describable as a ragged
+    q-lod; in-seq-split would need a different k range per local row.
+    """
+    try:
+        from sglang.srt.layers.attention.dsa.utils import (
+            is_dsa_prefill_cp_round_robin_split,
+        )
+
+        if not is_dsa_prefill_cp_round_robin_split():
+            return None
+        if not forward_batch.forward_mode.is_context_parallel_extend():
+            return None
+        from sglang.srt.runtime_context import get_parallel
+
+        parallel = get_parallel()
+        if parallel.attn_cp_size <= 1:
+            return None
+        # Same rank/size source as DSV4AttnMetadata.apply_cp_reindex, so the
+        # local q rows line up with the already-reindexed index tables.
+        return parallel.attn_cp_rank, parallel.attn_cp_size
+    except Exception as exc:
+        return _c4a_bail("cp detection failed", None, repr(exc))
+
+
+def _c4a_local_extend_lens(global_extend_lens, cp_rank, cp_size):
+    """Per-request local q length under round-robin CP, with carry-over.
+
+    Byte-for-byte the same recurrence as upstream
+    ``dsa.utils.dsa_cp_round_robin_split_q_seqs_cpu``: request ``i`` starts its
+    round-robin window wherever the previous request left off, so the local
+    length is *not* ``ceil(len / cp_size)``.
+    """
+    local = []
+    extra = 0
+    for cur in global_extend_lens:
+        cur = int(cur) + extra
+        keep = cur // cp_size + int(cur % cp_size > cp_rank)
+        local.append(keep)
+        extra = cur - keep * cp_size
+    return local
+
+
+def _c4a_extend_desc(
+    *,
+    extend_seq_lens_cpu,
+    seq_lens_cpu,
+    c4_seq_lens,
+    cp,
+    num_local_rows,
+    page_table_rows,
+    max_k,
+):
+    """Ragged extend descriptor for ``kunlun_ops.c4a_mqa_logits``, or ``None``.
+
+    Returns ``(per_req_k_lens, qlod_cpu, pt_rows, max_seq_q, is_causal)``.
+    """
+    if cp is not None:
+        cp_rank, cp_size = cp
+        if seq_lens_cpu is None:
+            return _c4a_bail("cp extend without seq_lens_cpu", cp_rank)
+        num_requests = len(extend_seq_lens_cpu)
+        if len(seq_lens_cpu) < num_requests:
+            return _c4a_bail(
+                "cp extend shape mismatch",
+                cp_rank,
+                f"{num_requests=} {len(seq_lens_cpu)=}",
+            )
+        q_lens = _c4a_local_extend_lens(extend_seq_lens_cpu, cp_rank, cp_size)
+        # The request's *full* compressed KV length. Reading c4_seq_lens at the
+        # last local token would undercount by up to (cp_size - 1) // 4 entries
+        # -- under round-robin that token is not the request's last global one --
+        # which silently truncates attention.
+        k_lens = [
+            min(max(int(seq_lens_cpu[i]) // _C4A_COMPRESS_RATIO, 1), max_k)
+            for i in range(num_requests)
+        ]
+        # Causality is applied per local row by the downstream topk mask; the
+        # kernel cannot express it because a local row's position within its
+        # request is not its row index.
+        is_causal = False
+    else:
+        cp_rank = None
+        num_requests = len(extend_seq_lens_cpu)
+        q_lens = [int(v) for v in extend_seq_lens_cpu]
+        last = [
+            min(max(i - 1, 0), c4_seq_lens.shape[0] - 1)
+            for i in itertools.accumulate(q_lens)
+        ]
+        k_lens = (
+            c4_seq_lens[torch.tensor(last, dtype=torch.long, device=c4_seq_lens.device)]
+            .to(torch.int32)
+            .clamp(max=max_k)
+            .tolist()
+        )
+        is_causal = True
+
+    real_rows = sum(q_lens)
+    if real_rows > num_local_rows:
+        return _c4a_bail(
+            "q rows overflow", cp_rank, f"{real_rows=} > {num_local_rows=} {cp=}"
+        )
+
+    pt_rows = [
+        min(max(end - 1, 0), page_table_rows - 1) if q_lens[i] > 0 else 0
+        for i, end in enumerate(itertools.accumulate(q_lens))
+    ]
+
+    # ``dsa.utils.cal_padded_tokens`` aligns the global token dim (mlp-sync + cp
+    # align) and only then divides by cp_size, so every rank gets the same
+    # ``ceil_div`` row count while only the ranks holding the remainder actually
+    # fill it. Describe the pad rows as 1-token requests instead of bailing out;
+    # bailing would leave cp_rank 0 alone on the fast path and every other rank
+    # on the fp32 torch fallback.
+    pad_rows = num_local_rows - real_rows
+    if pad_rows > 0:
+        q_lens += [1] * pad_rows
+        k_lens += [1] * pad_rows
+        pt_rows += [0] * pad_rows
+
+    qlod_cpu = torch.zeros(len(q_lens) + 1, dtype=torch.int32)
+    qlod_cpu[1:] = torch.cumsum(torch.tensor(q_lens, dtype=torch.int32), dim=0)
+    per_req_k_lens = torch.tensor(k_lens, dtype=torch.int32)
+    return per_req_k_lens, qlod_cpu, pt_rows, max(q_lens), is_causal
+
+
 class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
     """KunlunDeepseekV4AttnBackend
     """
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+
+    # Class-level defaults rather than __init__ assignments:
+    # KunlunDeepseekV4MultiStepBackend builds itself by calling
+    # ``DeepseekV4AttnBackend.__init__`` directly, so an __init__ here would be
+    # skipped for that instance and every memo access would raise AttributeError.
+    _kunlun_length_desc_memo = None
+    _kunlun_c4a_state = None
+    _kunlun_c4a_qlod = None
+    _kunlun_c4a_ctxlen = None
+
+    def _kunlun_length_desc(self, core_attn_metadata: DSV4AttnMetadata, n_q, device):
+        """Per-iteration memo of the qlod / kvseqlen descriptors.
+
+        ``_kunlun_compressed_attention`` runs once per layer per compress_ratio
+        (~180 calls per step on a 60-layer model), but these tensors depend only
+        on the forward batch. Rebuilding them per call cost two H2D copies plus a
+        *blocking* D2H every time, and a ``.max()`` sync on the eager path.
+
+        ``seq_lens_casual`` is the iteration token: ``make_core_attn_metadata``
+        allocates a fresh one every eager iteration (and ``apply_cp_reindex``
+        replaces it), while CUDA-graph replay refills the same buffer in place
+        with ``copy_``, which bumps ``_version``; comparing identity *and*
+        version catches both. ``n_q`` is part of the key because the q rows can
+        differ within one metadata (breakable CUDA graph slices q down to
+        ``num_token_non_padded``). Holding a strong reference to the token keeps
+        its identity from being recycled by a later allocation.
+
+        The 5th slot caches ``kvseqlen_cpu.max()`` lazily: some layers are
+        SWA-only and never ask for it, so it must not be part of the key.
+        """
+        token = core_attn_metadata.seq_lens_casual
+        key = (n_q, device)
+        cached = self._kunlun_length_desc_memo
+        if (
+            cached is not None
+            and cached[0] is token
+            and cached[1] == token._version
+            and cached[2] == key
+        ):
+            return cached[3]
+
+        seq_lens = token[:n_q]
+        qlod_cpu = torch.arange(seq_lens.shape[0] + 1, dtype=torch.int32)
+        qlod_xpu = qlod_cpu.to(device, non_blocking=False)
+        kvseqlen_xpu = seq_lens.to(dtype=torch.int32, device=device).contiguous()
+        kvseqlen_cpu = kvseqlen_xpu.to("cpu", non_blocking=False)
+        desc = [qlod_cpu, qlod_xpu, kvseqlen_cpu, kvseqlen_xpu, None]
+        self._kunlun_length_desc_memo = (token, token._version, key, desc)
+        return desc
+
+    def _c4a_iter_state(self, seq_lens, num_rows, max_seq_len, device):
+        """Per-iteration scratch dict for the C4 indexer descriptors.
+
+        ``forward_c4_indexer`` runs once per layer (60x per step) but every
+        descriptor it derives -- q-lod, per-request k lengths, page rows, the
+        CP split -- depends only on the forward batch. Rebuilding them per layer
+        cost a *blocking* D2H each time (``.tolist()`` / ``.cpu()`` on device
+        length tensors), and a blocking D2H drains the whole XPU queue, so the
+        host could never run ahead of the device: per-run_batch latency became
+        host + device instead of max(host, device), with a stall whose size
+        depends on how much work happened to be queued.
+
+        ``indexer_metadata.c4_seq_lens`` is the iteration token: it is a stable
+        object across layers, replaced per eager iteration and refilled in place
+        (bumping ``_version``) on CUDA-graph replay, so identity + version
+        catches both. Callers populate keys lazily; a miss just rebuilds.
+        """
+        token = seq_lens
+        forward_metadata = getattr(self, "forward_metadata", None)
+        indexer_metadata = getattr(forward_metadata, "indexer_metadata", None)
+        if indexer_metadata is not None:
+            token = indexer_metadata.c4_seq_lens
+        key = (num_rows, max_seq_len, device)
+        state = self._kunlun_c4a_state
+        if (
+            state is not None
+            and state["token"] is token
+            and state["version"] == token._version
+            and state["key"] == key
+        ):
+            return state
+        state = {"token": token, "version": token._version, "key": key}
+        self._kunlun_c4a_state = state
+        return state
+
+    def _c4a_decode_qlod(self, num_rows, device):
+        """Pointer-stable ``qlod`` descriptors, built once per (rows, device).
+
+        ``qlod`` is just ``arange(num_rows + 1)`` -- it depends only on the row
+        count, never on any sequence-length value, so caching it can never go
+        stale (unlike the context lengths, whose reuse caused the precision
+        regression). Building it fresh every call cost an H2D copy (or a device
+        ``arange`` launch) per layer; here the device tensor is materialised once
+        per distinct batch size and reused. Being pointer-stable is also correct
+        for graph replay since the content is invariant for a given row count.
+        """
+        # Per-instance cache keyed on (rows, device); lazily created on first use.
+        cache = self._kunlun_c4a_qlod
+        if cache is None:
+            cache = self._kunlun_c4a_qlod = {}
+        entry = cache.get((num_rows, device))
+        if entry is None:
+            # Build the CPU descriptor once, then a pointer-stable device copy.
+            # Blocking H2D so the device tensor is fully populated before any
+            # graph capture records its address.
+            qlod_cpu = torch.arange(num_rows + 1, dtype=torch.int32)
+            qlod_xpu = qlod_cpu.to(device, non_blocking=False)
+            # Cache both halves; content is invariant for this row count, so the
+            # same tensors are safe to reuse across eager calls and graph replay.
+            entry = (qlod_cpu, qlod_xpu)
+            cache[(num_rows, device)] = entry
+        return entry
+
+    def _c4a_decode_context_lens(self, num_rows, device):
+        """Pointer-stable context-length buffers, built once per (rows, device).
+
+        Mirrors 0.5.8's ``C4DecodeMeta``. The paged decode kernel reads
+        ``context_lens_cpu`` at launch time, so under CUDA-graph replay the host
+        tensor must have a stable, kept-alive address -- a throwaway
+        ``.to("cpu")`` tensor can be freed after the capture call and leave the
+        replayed kernel pointing at reused memory. Here a pinned CPU buffer + a
+        device buffer are pre-allocated once per batch size and held by the
+        instance.
+
+        Only the *storage* is reused: the caller refills both buffers in place on
+        every call. The values themselves are never cached -- they depend on
+        seq_len and change every step; caching them caused the stale-block_id
+        precision regression.
+        """
+        cache = self._kunlun_c4a_ctxlen
+        if cache is None:
+            cache = self._kunlun_c4a_ctxlen = {}
+        entry = cache.get((num_rows, device))
+        if entry is None:
+            context_lens_cpu_buf = torch.empty(
+                num_rows, dtype=torch.int32
+            ).pin_memory()
+            context_lens_xpu_buf = torch.empty(
+                num_rows, dtype=torch.int32, device=device
+            )
+            entry = (context_lens_cpu_buf, context_lens_xpu_buf)
+            cache[(num_rows, device)] = entry
+        return entry
+
+    def _c4a_extend_bundle(
+        self,
+        *,
+        forward_batch,
+        extend_seq_lens_cpu,
+        c4_seq_lens,
+        num_local_rows,
+        page_table_rows,
+        max_seq_len,
+        device,
+    ):
+        """Every host-side extend descriptor at once, or ``False`` to bail.
+
+        Built once per iteration and reused by all layers: the lengths depend on
+        the forward batch, not on the layer. Everything that used to touch the
+        device from the host lives here, so the per-layer path is pure enqueue.
+        """
+        if extend_seq_lens_cpu is not None and len(extend_seq_lens_cpu) > 0:
+            desc = _c4a_extend_desc(
+                extend_seq_lens_cpu=extend_seq_lens_cpu,
+                seq_lens_cpu=getattr(forward_batch, "seq_lens_cpu", None),
+                c4_seq_lens=c4_seq_lens,
+                cp=_c4a_detect_cp_round_robin(forward_batch),
+                num_local_rows=num_local_rows,
+                page_table_rows=page_table_rows,
+                max_k=max_seq_len,
+            )
+            if desc is None:
+                return False
+            per_req_k_lens, qlod_cpu, pt_rows, max_seq_q, is_causal = desc
+        else:
+            per_req_k_lens = c4_seq_lens.to(torch.int32).cpu()
+            num_requests = num_local_rows
+            qlod_cpu = torch.arange(num_requests + 1, dtype=torch.int32)
+            pt_rows = list(range(min(num_requests, page_table_rows)))
+            pt_rows += [page_table_rows - 1] * (num_requests - len(pt_rows))
+            max_seq_q = 1
+            is_causal = True
+
+        num_requests = per_req_k_lens.shape[0]
+        klod_cpu = torch.zeros(num_requests + 1, dtype=torch.int32)
+        klod_cpu[1:] = torch.cumsum(per_req_k_lens * _C4A_COMPRESS_RATIO, dim=0)
+        com_k_start_cpu = torch.zeros(num_requests, dtype=torch.int32)
+        k_lens = per_req_k_lens.tolist()
+        return (
+            k_lens,
+            pt_rows,
+            sum(k_lens),
+            max(k_lens) if k_lens else 0,
+            max_seq_q,
+            is_causal,
+            qlod_cpu,
+            qlod_cpu.to(device),
+            klod_cpu,
+            klod_cpu.to(device),
+            com_k_start_cpu,
+            com_k_start_cpu.to(device),
+        )
 
     def forward_c4_indexer(
         self,
@@ -387,29 +744,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         assert D == 128 and kvcache_fp8.shape[1] == _BLOCK_SIZE and _sq == 1
 
         total_dim = _BLOCK_SIZE * (D + 4)
-
-        # NSA prefill context parallelism hands this rank a strided subset of the
-        # sequence's queries, so the request's extend length is not the number of
-        # local query rows and the ragged (q-lod based) logits kernel cannot describe
-        # it: it would address rows outside the logits buffer, leaving most queries
-        # with all-zero scores so topk keeps only the oldest ``topk`` compressed
-        # states. Compute the scores for the local rows directly instead
-        # (see _c4a_cp_extend_logits_torch).
-        _cp_local = False
-        if not is_decode and extend_seq_lens_cpu is not None:
-            if len(extend_seq_lens_cpu) > 0:
-                _cp_local = int(sum(int(v) for v in extend_seq_lens_cpu)) != B
-
-        if _cp_local:
-            return self._c4a_cp_extend_logits_torch(
-                q_fp8,
-                kvcache_fp8,
-                weight,
-                _seq_lens,
-                page_table,
-                max_seq_len,
-                block_size=_BLOCK_SIZE,
-            )
+        state = self._c4a_iter_state(_seq_lens, B, max_seq_len, q_fp8.device)
 
         if is_decode:
             # ── Decode / Target-Verify: paged op with mixed cache layout ──
@@ -418,11 +753,17 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             # interleaved per page); no host-side gather needed.
             kv_cache_flat = kvcache_fp8.reshape(-1, total_dim)
 
-            c4_seq_lens = _seq_lens.to(torch.int32).clamp(0, max_seq_len)
-            context_lens_xpu = c4_seq_lens * _COMPRESS_RATIO
-            context_lens_cpu = context_lens_xpu.to("cpu", non_blocking=False)
-            qlod_cpu = torch.arange(B + 1, dtype=torch.int32)
-            qlod_xpu = qlod_cpu.to(q_fp8.device, non_blocking=False)
+            context_lens_cpu, context_lens_xpu = self._c4a_decode_context_lens(
+                B, q_fp8.device
+            )
+            context_lens_pre = (
+                _seq_lens.to(torch.int32).clamp(0, max_seq_len) * _COMPRESS_RATIO
+            )
+            context_lens_xpu.copy_(context_lens_pre)
+            context_lens_cpu.copy_(context_lens_xpu, non_blocking=False)
+
+            qlod_cpu, qlod_xpu = self._c4a_decode_qlod(B, q_fp8.device)
+
             block_table_i32 = (
                 page_table.to(torch.int32)
                 if page_table.dtype != torch.int32
@@ -451,39 +792,49 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             return logits.squeeze(1)
 
         # ── Extend / Prefill: gather KV contiguous, then c4a_mqa_logits ─
-        if extend_seq_lens_cpu is not None and len(extend_seq_lens_cpu) > 0:
-            extend_lens = torch.as_tensor(extend_seq_lens_cpu, dtype=torch.int32)
-            cum = torch.zeros(len(extend_seq_lens_cpu) + 1, dtype=torch.int64)
-            cum[1:] = torch.cumsum(extend_lens.long(), dim=0)
-            last_idx = (cum[1:] - 1).clamp(0, _seq_lens.shape[0] - 1)
-            per_req_k_lens = _seq_lens[last_idx].to(torch.int32).cpu()
-            num_requests = len(extend_seq_lens_cpu)
-            qlod_cpu = torch.zeros(num_requests + 1, dtype=torch.int32)
-            qlod_cpu[1:] = torch.cumsum(extend_lens, dim=0)
-            max_seq_q = int(extend_lens.max().item())
-            if int(qlod_cpu[-1].item()) != B:
-                # NSA prefill context parallelism gives this rank only a strided
-                # subset of the sequence's queries, so the request's extend length is
-                # not the number of local query rows. Feeding the full length as the
-                # q-lod makes the logits kernel address rows that do not exist: it
-                # writes inf into part of the buffer and leaves the tail untouched, so
-                # every query past ~topk compressed states keeps all-zero scores and
-                # topk degenerates to "the oldest 512 states". Describe the local rows
-                # instead and let the per-query mask in the topk transform apply
-                # causality (which it does anyway), so drop the kernel-side mask.
-                per_req_k_lens = _seq_lens.to(torch.int32).cpu().max().reshape(1)
-                num_requests = 1
-                qlod_cpu = torch.tensor([0, B], dtype=torch.int32)
-                max_seq_q = B
-                is_causal_logits = False
-            else:
-                is_causal_logits = True
-        else:
-            per_req_k_lens = _seq_lens.to(torch.int32).cpu()
-            num_requests = B
-            qlod_cpu = torch.arange(num_requests + 1, dtype=torch.int32)
-            max_seq_q = 1
-            is_causal_logits = True
+        bundle = state.get("extend")
+        if bundle is None:
+            bundle = self._c4a_extend_bundle(
+                forward_batch=forward_batch,
+                extend_seq_lens_cpu=extend_seq_lens_cpu,
+                c4_seq_lens=_seq_lens,
+                num_local_rows=B,
+                page_table_rows=page_table.shape[0],
+                max_seq_len=max_seq_len,
+                device=q_fp8.device,
+            )
+            state["extend"] = bundle
+        if bundle is False:
+            # Orders of magnitude slower and wrong for multi-request batches,
+            # but it is the only path that does not need a ragged q-lod.
+            return self._c4a_cp_extend_logits_torch(
+                q_fp8,
+                kvcache_fp8,
+                weight,
+                _seq_lens,
+                page_table,
+                max_seq_len,
+                block_size=_BLOCK_SIZE,
+            )
+        (
+            k_lens,
+            pt_rows,
+            total_k,
+            max_seq_k_compressed,
+            max_seq_q,
+            is_causal_logits,
+            qlod_cpu,
+            qlod_xpu,
+            klod_cpu,
+            klod_xpu,
+            com_k_start_cpu,
+            com_k_start_xpu,
+        ) = bundle
+
+        if total_k == 0:
+            return torch.zeros(
+                (B, max_seq_len), dtype=torch.float32, device=q_fp8.device
+            )
 
         kv_cache_flat = kvcache_fp8.reshape(-1, total_dim)
         SCALE_OFFSET = _BLOCK_SIZE * D
@@ -495,24 +846,14 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             .reshape(-1, _BLOCK_SIZE)
         )
 
-        total_k = int(per_req_k_lens.sum().item())
-        if total_k == 0:
-            return torch.zeros(
-                (B, max_seq_len), dtype=torch.float32, device=q_fp8.device
-            )
-
         k_contiguous = torch.empty((total_k, D), dtype=torch.int8, device=q_fp8.device)
         k_scale_contiguous = torch.empty(
             total_k, dtype=torch.float32, device=q_fp8.device
         )
-        max_seq_k_compressed = 0
         offset = 0
-        pt_rows = (qlod_cpu[1:] - 1).clamp(0, page_table.shape[0] - 1).tolist()
-        for i in range(num_requests):
-            seq_len_i = int(per_req_k_lens[i].item())
+        for i, seq_len_i in enumerate(k_lens):
             if seq_len_i == 0:
                 continue
-            max_seq_k_compressed = max(max_seq_k_compressed, seq_len_i)
             num_blocks = (seq_len_i + _BLOCK_SIZE - 1) // _BLOCK_SIZE
             pt_row = min(int(pt_rows[i]), page_table.shape[0] - 1)
             pages = page_table[pt_row, :num_blocks].long()
@@ -522,14 +863,6 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 -1
             )[:seq_len_i]
             offset += seq_len_i
-
-        pre_k_lens = per_req_k_lens * _COMPRESS_RATIO
-        klod_cpu = torch.zeros(num_requests + 1, dtype=torch.int32)
-        klod_cpu[1:] = torch.cumsum(pre_k_lens, dim=0)
-        klod_xpu = klod_cpu.to(q_fp8.device, non_blocking=False)
-        qlod_xpu = qlod_cpu.to(q_fp8.device, non_blocking=False)
-        com_k_start_cpu = torch.zeros(num_requests, dtype=torch.int32)
-        com_k_start_xpu = com_k_start_cpu.to(q_fp8.device, non_blocking=False)
 
         logits = torch.zeros(
             (B, max_seq_k_compressed), dtype=torch.float32, device=q_fp8.device
@@ -745,11 +1078,8 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         # derived from buffer contents here would freeze at capture time.
         is_cuda_graph_mode = logical_mode.is_decode() or logical_mode.is_target_verify()
 
-        seq_lens = core_attn_metadata.seq_lens_casual[: q.shape[0]]
-        qlod_cpu = torch.arange(seq_lens.shape[0] + 1, dtype=torch.int32)
-        qlod_xpu = qlod_cpu.to(q.device, non_blocking=False)
-        kvseqlen_xpu = seq_lens.to(dtype=torch.int32, device=q.device)
-        kvseqlen_cpu = kvseqlen_xpu.to("cpu", non_blocking=False)
+        desc = self._kunlun_length_desc(core_attn_metadata, q.shape[0], q.device)
+        qlod_cpu, qlod_xpu, kvseqlen_cpu, kvseqlen_xpu, _ = desc
 
         q_dtype = q.dtype
         win_cache = _flatten_cache(swa_k_cache)
@@ -772,27 +1102,30 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             if is_cuda_graph_mode:
                 max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
             else:
-                max_seq_len = int(kvseqlen_cpu.max().item())
+                if desc[4] is None:
+                    desc[4] = int(kvseqlen_cpu.max().item())
+                max_seq_len = desc[4]
             com_topk = max(max_seq_len // com_ratio, 1)
             com_topk = min(com_topk, com_indices.shape[1])
             com_indices = com_indices[:, :com_topk].contiguous()
 
-        # NSA prefill context parallelism leaves garbage (e.g. -8388608) in the
-        # index rows of padded / out-of-window tokens. The Kunlun op only
-        # understands -1 as "no key"; anything else out of range makes it read
-        # unrelated cache slots, so the result would depend on the KV placement
-        # of the request. Normalise out-of-range entries to -1.
-        win_indices = torch.where(
-            (win_indices >= 0) & (win_indices < win_cache.shape[0]),
-            win_indices,
-            torch.full_like(win_indices, -1),
-        ).contiguous()
+        # ``swa_page_indices`` (-> win_indices) is built by ``get_swa_page_indices``
+        # with an explicit ``masked_fill_(..., -1)`` for every out-of-window
+        # column, so it never carries uninitialised memory -- no clamp needed
+        # here, the Kunlun op already treats -1 as "no key".
+        #
+        # ``extra_indices`` (-> com_indices, the c4/c128 compressed index table)
+        # is different: under NSA prefill context parallelism, padded query
+        # rows are never written by the upstream Triton kernel and keep
+        # whatever the allocator handed out (e.g. -8388608, stale float -inf
+        # bits read as int32). Those rows are always whole padding rows (the
+        # kernel does write valid -1 sentinels for real, partially-windowed
+        # rows), so clamping into range is safe here -- the padding row's
+        # output is never consumed downstream. clamp_ is a single fused
+        # in-place op vs. two comparisons + an or + an index_put_.
         if com_indices.numel() and com_cache.shape[0] > 0:
-            com_indices = torch.where(
-                (com_indices >= 0) & (com_indices < com_cache.shape[0]),
-                com_indices,
-                torch.full_like(com_indices, -1),
-            ).contiguous()
+            com_indices.clamp_(min=0, max=com_cache.shape[0] - 1)
+        com_indices = com_indices.contiguous()
 
         out = torch.empty(
             (q_3d.shape[0], q_3d.shape[1], self.head_dim_v),
@@ -801,7 +1134,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         )
         max_logits = torch.empty(q_3d.shape[:2], dtype=torch.float32, device=q.device)
         lse = torch.empty_like(max_logits)
-        if q_3d.shape[1] == 64:
+        if q_3d.shape[1] in [64, 128]:  # 64 for dsv4 flash, 128 for dsv4 pro
             torch.ops.xspeedgate_ops.compressed_attention(
                 q_3d,
                 win_cache,
@@ -811,10 +1144,10 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 out,
                 max_logits,
                 lse,
-                qlod_cpu.contiguous(),
-                qlod_xpu.contiguous(),
-                kvseqlen_cpu.contiguous(),
-                kvseqlen_xpu.contiguous(),
+                qlod_cpu,
+                qlod_xpu,
+                kvseqlen_cpu,
+                kvseqlen_xpu,
                 self.softmax_scale,
                 is_causal,
                 win_size,

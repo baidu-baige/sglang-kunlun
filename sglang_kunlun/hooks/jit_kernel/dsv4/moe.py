@@ -23,7 +23,7 @@ unavailable on the Kunlun XPU. Three symbols are REPLACE'd here:
 - ``silu_and_mul_clamp`` -> native fused op
   ``silu(clamp(g, max=lim)) * clamp(u, -lim, lim)``, where ``g, u`` is the gate_up split.
 - ``hash_topk`` -> fused Kunlun hash MoE routing, with a pure-torch fallback.
-- ``mask_topk_ids`` -> static-shape ``where`` + in-place ``copy_`` (graph-capturable).
+- ``mask_topk_ids`` -> default sglang pure-torch boolean-mask (graph-capturable).
   The JIT build of this one fails earlier than the others: tvm_ffi ``load_inline``
   compiles ``#include <concepts>``, unavailable on gcc-9 ("fatal error: concepts: No
   such file or directory"). ``srt.layers.moe.topk._mask_topk_ids_padded_region``
@@ -42,6 +42,7 @@ versions.
 from __future__ import annotations
 
 import torch
+import xspeedgate_ops  # noqa: F401  (registers torch.ops.xspeedgate_ops.*)
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
@@ -144,8 +145,15 @@ def _mask_topk_ids_torch(
     topk_ids: torch.Tensor,
     num_token_non_padded: torch.Tensor,
 ) -> None:
-    """Set rows >= ``num_token_non_padded`` to -1, in-place and graph-capturable."""
-    idx = torch.arange(topk_ids.shape[0], device=topk_ids.device).unsqueeze(-1)
-    new = torch.where(idx < num_token_non_padded, topk_ids,
-                      torch.full_like(topk_ids, -1))
-    topk_ids.copy_(new)
+    """Set rows >= ``num_token_non_padded`` to -1, in-place and graph-capturable.
+
+    Reproduces the default (``else``) branch of 5.14's
+    ``srt.layers.moe.topk._mask_topk_ids_padded_region``: a plain boolean-mask
+    assignment. On Kunlun (``_is_cuda`` True, int32 topk_ids, fill_value -1)
+    5.14 would call the JIT ``mask_topk_ids`` kernel, which fails to build here,
+    so this REPLACE stands in with the default pure-torch path.
+    """
+    if num_token_non_padded is None:
+        return
+    indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
+    topk_ids[indices >= num_token_non_padded, :] = -1

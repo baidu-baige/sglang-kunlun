@@ -73,13 +73,20 @@ def _get_s_triton(
     type=HookType.REPLACE,
 )
 def set_k_and_s_triton(cls, pool, buf, loc, index_k, index_k_scale) -> None:
-    """Set NSA K and S index buffers with Kunlun kernels."""
-    import kunlun_ops
+    """ set_k_and_s_triton """
+    num_pages = buf.shape[0]
+    page_size = pool.page_size
+    max_valid_loc = num_pages * page_size - 1
 
-    kunlun_ops.set_k_and_s_triton(
+    loc_i64 = loc.to(torch.int64).contiguous()
+    # Always clamp without sync (.item() hangs if prior kernel failed async)
+    if loc_i64.numel() > 0:
+        loc_i64 = loc_i64.clamp(min=0, max=max_valid_loc)
+
+    torch.ops.xspeedgate_ops.set_k_and_s_paged(
         buf=buf.contiguous(),
-        loc=loc.to(torch.int64).contiguous(),
+        loc=loc_i64,
         index_k=index_k.contiguous(),
         index_k_scale=index_k_scale.contiguous(),
-        page_size=pool.page_size,
+        page_size=page_size,
     )

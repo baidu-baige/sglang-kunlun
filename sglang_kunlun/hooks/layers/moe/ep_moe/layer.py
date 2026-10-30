@@ -99,11 +99,8 @@ class _DSV4ClampedSiluAndMul(torch.nn.Module):
         self.limit = float(limit)
 
     def forward(self, x):
-        """Clamp the SwiGLU gate/up to swiglu_limit, then SiLU-multiply."""
-        gate, up = x.chunk(2, dim=-1)
-        gate = gate.clamp(max=self.limit)
-        up = up.clamp(min=-self.limit, max=self.limit)
-        return (torch.nn.functional.silu(gate.float()) * up.float()).to(x.dtype)
+        """Fused clamp + SiLU-multiply, instead of chunk/clamp/silu in torch."""
+        return torch.ops.xspeedgate_ops.silu_and_mul_with_swiglu_limit(x, self.limit)
 
 
 class ReusedBuffer:
@@ -290,10 +287,10 @@ class W8A8NormalMoeBuffer:
         buffer1_size = max(self.M * 2 * self.F * 2, self.M * self.H * 2)
         # Zero-initialised for the same reason as Bfp16orFp16NormalMoeBuffer.
         self.buffer0 = ReusedBuffer(
-            torch.zeros(buffer0_size, dtype=torch.uint8, device=self.device)
+            torch.empty(buffer0_size, dtype=torch.uint8, device=self.device)
         )
         self.buffer1 = ReusedBuffer(
-            torch.zeros(buffer1_size, dtype=torch.uint8, device=self.device)
+            torch.empty(buffer1_size, dtype=torch.uint8, device=self.device)
         )
 
     @property
@@ -631,13 +628,13 @@ class DeepEPMoE(FusedMoE):
             # rows carry uninitialised bytes, which read back as NaN scales /
             # weights / group ids on the first forward after start-up and poison
             # the grouped GEMM output for the real tokens as well.
-            input_scale = torch.zeros(
+            input_scale = torch.empty(
                 num_all_tokens, 1, device=device, dtype=torch.float32
             )
-            m_indices = torch.zeros(num_all_tokens, dtype=torch.int32, device=device)
-            token_counts = torch.zeros(num_tokens, dtype=torch.int32, device=device)
-            token_to_m = torch.zeros(num_tokens, topk, dtype=torch.int32, device=device)
-            token_weights = torch.zeros(
+            m_indices = torch.empty(num_all_tokens, dtype=torch.int32, device=device)
+            token_counts = torch.empty(num_tokens, dtype=torch.int32, device=device)
+            token_to_m = torch.empty(num_tokens, topk, dtype=torch.int32, device=device)
+            token_weights = torch.empty(
                 num_all_tokens, dtype=torch.bfloat16, device=device
             )
             torch.ops.custom_ops.dispatch_convert(
