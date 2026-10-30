@@ -45,11 +45,14 @@ def is_kunlun() -> bool:
 
 
 def empty_cache():
-    """Release cached device memory back to the allocator (XPU/CUDA)."""
+    """Release cached device memory back to the allocator.
+
+    Kunlun is presented to this stack as CUDA, so the CUDA allocator is the
+    right one to ask. ``torch.xpu`` is not usable here -- see
+    ``test/test_cuda_only_contract.py``.
+    """
     try:
-        if hasattr(torch, "xpu") and torch.xpu.is_available():
-            torch.xpu.empty_cache()
-        elif torch.cuda.is_available():
+        if torch.cuda.is_available():
             torch.cuda.empty_cache()
     except Exception:
         pass
