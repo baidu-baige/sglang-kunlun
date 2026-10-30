@@ -25,16 +25,16 @@ mem_cache/deepseekv4_memory_pool.py.
 Approach: let ORIGINAL create/_alloc run (correct shape/dtype for every pool
 variant), then swap each freshly-zeroed buffer for a 2MB-aligned buffer of the
 SAME shape/dtype/device. CRITICAL: free the original buffer BEFORE allocating its
-aligned replacement (and empty the XPU cache) so peak memory stays at +1 buffer,
+aligned replacement (and empty the device cache) so peak memory stays at +1 buffer,
 not 2x the whole pool (that OOMs at mem-fraction 0.8+).
 """
+
 from __future__ import annotations
 
 import logging
 import os
 
 import torch
-
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 logger = logging.getLogger(__name__)
@@ -51,11 +51,14 @@ def _is_kunlun() -> bool:
 
 
 def _empty_cache():
-    """Release cached device memory back to the allocator (XPU/CUDA)."""
+    """Release cached device memory back to the allocator.
+
+    Kunlun is presented to this stack as CUDA, so the CUDA allocator is the
+    right one to ask. ``torch.xpu`` is not usable here -- see
+    ``test/test_cuda_only_contract.py``.
+    """
     try:
-        if hasattr(torch, "xpu") and torch.xpu.is_available():
-            torch.xpu.empty_cache()
-        elif torch.cuda.is_available():
+        if torch.cuda.is_available():
             torch.cuda.empty_cache()
     except Exception:
         pass
@@ -132,7 +135,6 @@ def compress_state_alloc_kunlun(original_fn, self, **kwargs):
     self.kv_score_buffer = KVAndScore(_alloc_2m_aligned(shape, dtype, device))
 
 
-
 @plugin_hook(
     "sglang.srt.mem_cache.deepseek_v4_memory_pool.DeepSeekV4UnifiedKVPool.__init__",
     type=HookType.AROUND,
@@ -152,6 +154,7 @@ def unified_kv_init_kunlun(original_fn, self, *args, **kwargs):
         del b
         _empty_cache()
         bufs[i] = _alloc_2m_aligned(shape, dtype, device)
+
 
 logger.info(
     "sglang-kunlun: 2MB-aligned KV/indexer/compress-state realloc hooks registered"
