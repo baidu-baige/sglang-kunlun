@@ -1524,6 +1524,66 @@ class KernelOpsTest(unittest.TestCase):
             registry.register_all()
         install.assert_called_once_with()
 
+    def test_hisparse_all_layer_backup_matches_per_layer_copy(self):
+        """The batched all-layer backup must address tokens exactly as copy_items does.
+
+        It exists only to cut 86 blocking device->host copies per decode step down
+        to one, so any difference in the value/scale addressing would be a silent
+        KV corruption rather than a slowdown.
+        """
+        from sglang_kunlun.kernels.sgl_kernel_kunlun import dsv4_hisparse as dh
+
+        torch.manual_seed(0)
+        n_layers = 3
+        item = dh.DSV4_VALUE_BYTES + dh.DSV4_SCALE_BYTES
+        src = [
+            torch.randint(0, 255, (4, dh.DSV4_ROW_BYTES), dtype=torch.uint8)
+            for _ in range(n_layers)
+        ]
+        ref = [
+            torch.zeros((3, dh.DSV4_ROW_BYTES), dtype=torch.uint8)
+            for _ in range(n_layers)
+        ]
+        new = [t.clone() for t in ref]
+        # Spread the locations across page boundaries: loc >> 6 is the page and
+        # loc & 63 the slot, so these cover pages 0/1/2 at offsets 5/6/2.
+        src_locs = torch.tensor([5, 70, 130], dtype=torch.int64)
+        dst_locs = torch.tensor([1, 65, 130], dtype=torch.int64)
+
+        for layer in range(n_layers):
+            dh.copy_items(
+                src[layer],
+                ref[layer],
+                src_locs,
+                dst_locs,
+                item,
+                is_dsv4_layout=True,
+                page_size=dh.DSV4_PAGE_SIZE,
+            )
+        dh._copy_all_layer_staged(src, new, src_locs, dst_locs)
+
+        for layer in range(n_layers):
+            self.assertTrue(
+                torch.equal(ref[layer], new[layer]),
+                f"layer {layer} differs from the per-layer copy",
+            )
+        # Confirm something was actually written -- an all-zero pair would pass
+        # vacuously.
+        self.assertGreater(int(ref[0].sum()), 0)
+
+    def test_hisparse_all_layer_backup_declines_wrong_layout_and_direction(self):
+        """The gate must hand back anything that is not a padded-C4 D2H pair."""
+        from sglang_kunlun.kernels.sgl_kernel_kunlun import dsv4_hisparse as dh
+
+        item = dh.DSV4_VALUE_BYTES + dh.DSV4_SCALE_BYTES
+        locs = torch.tensor([0], dtype=torch.int64)
+        # Both ends on the host: nothing to batch, the per-layer path is fine.
+        padded = [torch.zeros((2, dh.DSV4_ROW_BYTES), dtype=torch.uint8)]
+        self.assertFalse(dh.copy_items_all_layer_d2h(padded, padded, locs, locs, item))
+        # Flat Kunlun half-cache row: the split value/scale addressing does not apply.
+        flat = [torch.zeros((2, dh.DSV4_PAGE_SIZE * item), dtype=torch.uint8)]
+        self.assertFalse(dh.copy_items_all_layer_d2h(flat, flat, locs, locs, item))
+
 
 if __name__ == "__main__":
     unittest.main()

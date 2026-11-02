@@ -28,6 +28,7 @@ from sglang_kunlun.kernels.sgl_kernel_kunlun.dsv4_hisparse import (
     DSV4_SCALE_BYTES,
     DSV4_VALUE_BYTES,
     copy_items,
+    copy_items_all_layer_d2h,
 )
 
 from . import shared_host_kv
@@ -83,10 +84,21 @@ def _pool_token_bytes(pool) -> int:
 
 
 def _copy_token_granular(pool, src_buffers, dst_buffers, src_indices, dst_indices) -> None:
-    """Move C4 tokens one by one through the torch-native item mover."""
+    """Move C4 tokens one by one through the torch-native item mover.
+
+    The all-layer device->host backup takes a batched route: one gather per layer
+    into a shared device buffer, then a single crossing, instead of two blocking
+    copies per layer.  See ``copy_items_all_layer_d2h`` for the measurement that
+    motivated it.  Any other shape or direction keeps the per-layer path.
+    """
     src_indices = src_indices.to(torch.int64)
     dst_indices = dst_indices.to(torch.int64)
     item_size_bytes = _pool_token_bytes(pool)
+    page_size = _pool_page_size(pool)
+    if len(src_buffers) > 1 and copy_items_all_layer_d2h(
+        src_buffers, dst_buffers, src_indices, dst_indices, item_size_bytes, page_size
+    ):
+        return
     for layer_id in range(len(src_buffers)):
         copy_items(
             src_buffers[layer_id],
@@ -95,7 +107,7 @@ def _copy_token_granular(pool, src_buffers, dst_buffers, src_indices, dst_indice
             dst_indices,
             item_size_bytes,
             is_dsv4_layout=True,
-            page_size=_pool_page_size(pool),
+            page_size=page_size,
         )
 
 

@@ -28,27 +28,157 @@ DSV4_SCALE_BYTE_OFFSET = DSV4_VALUE_BYTES * DSV4_PAGE_SIZE
 # Padded page row: ceil((576 + 8) * 64 / 576) * 576.
 DSV4_ROW_BYTES = 37440
 
-# One pinned staging buffer per (rows, item_bytes, dtype), grown in place and reused.
-# The swap-in runs once per layer per decode step — 43 x N allocations of a fresh
-# non-contiguous temp was a measurable part of the 10x throughput gap, and pinning is
-# what turns the H2D from a synchronous staged copy into a DMA.
+# Staging buffers keyed by (kind, layers, item_bytes, dtype, device), grown in place and
+# reused.  The transfers run once per layer per decode step — 43 x N allocations of a
+# fresh non-contiguous temp was a measurable part of the throughput gap, and pinning the
+# host end is what turns a crossing into a DMA instead of a staged synchronous copy.
 _STAGE: dict = {}
 
 
-def _pinned_stage(rows: int, item_bytes: int, dtype: torch.dtype) -> torch.Tensor:
-    key = (item_bytes, dtype)
+def _stage(
+    kind: str,
+    layers: int,
+    rows: int,
+    item_bytes: int,
+    dtype: torch.dtype,
+    device,
+) -> torch.Tensor:
+    """A reusable ``(layers, rows, item_bytes)`` staging buffer.
+
+    ``device=None`` asks for pinned host memory.  Rows are over-allocated so a
+    batch that grows by one request does not reallocate every step; the returned
+    view is always exactly ``rows`` long.
+    """
+    key = (kind, layers, item_bytes, dtype, str(device))
     buf = _STAGE.get(key)
-    if buf is None or buf.shape[0] < rows:
-        # Over-allocate so a slightly larger batch does not reallocate every step.
-        want = max(rows, (buf.shape[0] * 2 if buf is not None else 1024))
-        try:
-            buf = torch.empty((want, item_bytes), dtype=dtype, pin_memory=True)
-        except Exception:
-            # No pinned memory available (some containers cap it): a plain tensor is
-            # still better than a per-call temp, it just loses the DMA path.
-            buf = torch.empty((want, item_bytes), dtype=dtype)
+    if buf is None or buf.shape[1] < rows:
+        want = max(rows, (buf.shape[1] * 2 if buf is not None else 64))
+        if device is None:
+            try:
+                buf = torch.empty(
+                    (layers, want, item_bytes), dtype=dtype, pin_memory=True
+                )
+            except Exception:
+                # No pinned memory available (some containers cap it): a plain tensor
+                # is still better than a per-call temp, it just loses the DMA path.
+                buf = torch.empty((layers, want, item_bytes), dtype=dtype)
+        else:
+            buf = torch.empty((layers, want, item_bytes), dtype=dtype, device=device)
         _STAGE[key] = buf
-    return buf[:rows]
+    return buf[:, :rows]
+
+
+def _as_bytes(t: torch.Tensor) -> torch.Tensor:
+    """Byte view of a KV buffer.
+
+    Both ends are addressed in bytes: the paged host pool is uint8 while the
+    device half-cache is bf16, so a token spans a different number of elements
+    on each side.  ``view`` is metadata-only for these contiguous rows.
+    """
+    return t if t.dtype == torch.uint8 else t.view(torch.uint8)
+
+
+def _padded_runs(t: torch.Tensor):
+    """The value and scale runs of a padded C4 page row, as strided views.
+
+    A page row is 64 x 576B of values followed by 64 x 8B of scales, so the two
+    are separate runs and need separate addressing.  ``as_strided`` exposes them
+    without materialising a page-sized index tensor.
+    """
+    return (
+        t.as_strided(
+            (t.shape[0], DSV4_PAGE_SIZE, DSV4_VALUE_BYTES),
+            (t.stride(0), DSV4_VALUE_BYTES, 1),
+            0,
+        ),
+        t.as_strided(
+            (t.shape[0], DSV4_PAGE_SIZE, DSV4_SCALE_BYTES),
+            (t.stride(0), DSV4_SCALE_BYTES, 1),
+            DSV4_SCALE_BYTE_OFFSET,
+        ),
+    )
+
+
+def copy_items_all_layer_d2h(
+    src_buffers,
+    dst_buffers,
+    src_locs: torch.Tensor,
+    dst_locs: torch.Tensor,
+    item_size_bytes: int,
+    page_size: int = DSV4_PAGE_SIZE,
+) -> bool:
+    """Back up the same token slice of every layer across ONE device->host crossing.
+
+    Returns ``True`` when it handled the transfer and ``False`` when the layout
+    is not the padded-C4 device->host case, in which case the caller must fall
+    back to the per-layer path.
+
+    Why this exists: ``_copy_token_granular`` called ``copy_items`` once per
+    layer, and every call crossed the bus twice (values, then scales) into
+    pageable or strided host memory -- a *blocking* copy each time.  With 43
+    layers that is 86 host stalls per decode step to move ~200KB, and all of it
+    sits inside what upstream deliberately made asynchronous:
+    ``HiSparseCoordinator._eager_backup_previous_token`` issues the backup on
+    ``decode_backup_stream`` and only waits on ``_backup_done_event`` at the
+    next step.  py-spy on the live server put 30% of scheduler CPU samples on
+    that one assignment, second only to the forward's own sync.
+
+    So gather every layer into one contiguous device buffer first (43 x 2 kernel
+    launches, no host sync at all), cross once into pinned host memory, then
+    scatter host-side with plain CPU indexing.  86 synchronisations per step
+    become one, and the gathers stay on the backup stream where they belong.
+    """
+    n_layers = len(src_buffers)
+    if n_layers == 0:
+        return True
+    src0 = _as_bytes(src_buffers[0])
+    dst0 = _as_bytes(dst_buffers[0])
+    # Only the padded C4 row needs the split value/scale addressing, and only a
+    # real device->host pair benefits -- same-device copies are already async.
+    if src0.shape[1] == page_size * item_size_bytes:
+        return False
+    if not src0.is_cuda or dst0.is_cuda:
+        return False
+    _copy_all_layer_staged(src_buffers, dst_buffers, src_locs, dst_locs)
+    return True
+
+
+def _copy_all_layer_staged(src_buffers, dst_buffers, src_locs, dst_locs) -> None:
+    """The staged all-layer padded-C4 copy, with no device gate.
+
+    Split out from ``copy_items_all_layer_d2h`` so the addressing can be checked
+    against the per-layer path on CPU tensors, where neither end is a device.
+    """
+    n_layers = len(src_buffers)
+    src0 = _as_bytes(src_buffers[0])
+    src_locs = src_locs.reshape(-1).to(torch.int64)
+    dst_locs = dst_locs.reshape(-1).to(torch.int64)
+    n = src_locs.numel()
+    if n == 0:
+        return
+
+    item = DSV4_VALUE_BYTES + DSV4_SCALE_BYTES
+    s_locs = src_locs.to(src0.device)
+    s_page = s_locs >> DSV4_PAGE_BITS
+    s_off = s_locs & DSV4_PAGE_MASK
+
+    stage_dev = _stage("d2h", n_layers, n, item, torch.uint8, src0.device)
+    for i in range(n_layers):
+        s_value, s_scale = _padded_runs(_as_bytes(src_buffers[i]))
+        stage_dev[i, :, :DSV4_VALUE_BYTES] = s_value[s_page, s_off]
+        stage_dev[i, :, DSV4_VALUE_BYTES:] = s_scale[s_page, s_off]
+
+    # The one crossing.  Blocking on purpose: the host scatter below reads it,
+    # and this is the single synchronisation the whole backup now costs.
+    stage_host = _stage("d2h", n_layers, n, item, torch.uint8, None)
+    stage_host.copy_(stage_dev)
+
+    d_page = dst_locs >> DSV4_PAGE_BITS
+    d_off = dst_locs & DSV4_PAGE_MASK
+    for i in range(n_layers):
+        d_value, d_scale = _padded_runs(_as_bytes(dst_buffers[i]))
+        d_value[d_page, d_off] = stage_host[i, :, :DSV4_VALUE_BYTES]
+        d_scale[d_page, d_off] = stage_host[i, :, DSV4_VALUE_BYTES:]
 
 
 def copy_items(
@@ -122,27 +252,40 @@ def copy_items(
             dst_scale[dst_page, dst_off] = src_scale[src_page, src_off]
             return
 
-        # Cross-device (the HiSparse swap-in: host pool -> device buffer) used to be
-        # two independent `gather().to(device)` round trips, one for the values and one
-        # for the scales. Both landed in pageable memory, so each was a synchronous
-        # staged copy, and the gather allocated a fresh non-contiguous temp per layer
-        # per step. Measured on longbench think-high at maxrun 8: 11.9 tok/s against
-        # 171.6 for the same config without HiSparse — ~720ms per decode step for
-        # ~103MB of KV (8 req x 512 top-k x 584B x 43 layers), i.e. ~143MB/s, an order
-        # of magnitude under what one H2D of that size should reach. The link was never
-        # the bottleneck; the pageable staging and the per-call allocations were.
+        # Cross-device.  Two directions reach this point and they want opposite
+        # treatment, which the first attempt at this got wrong:
+        #
+        # * host -> device (the HiSparse swap-in) used to be two independent
+        #   `gather().to(device)` round trips, one for values and one for scales, both
+        #   landing in pageable memory, so each was a synchronous staged copy, and the
+        #   gather allocated a fresh non-contiguous temp per layer per step. Measured
+        #   on longbench think-high at maxrun 8: 11.9 tok/s against 171.6 for the same
+        #   config without HiSparse — ~720ms per decode step for ~103MB of KV (8 req x
+        #   512 top-k x 584B x 43 layers), i.e. ~143MB/s, an order of magnitude under
+        #   what one H2D of that size should reach. Gathering both runs into ONE pinned
+        #   contiguous buffer and crossing once fixes the staging and the allocations.
+        #
+        # * device -> host (the eager backup) was then *regressed* by that same change:
+        #   writing a device gather into a column slice of a pinned 2-D buffer is a
+        #   strided D2H, which is worse than the contiguous copy it replaced (10.7
+        #   against 11.9 tok/s). The backup wants the mirror image — gather on the
+        #   device, cross contiguously — and it wants it batched across all 43 layers,
+        #   so it is handled by `copy_items_all_layer_d2h` instead.
         #
         # The fused `hisparse_copy_items` kernel cannot help here twice over: it is
         # gated on `src.device == dst.device`, and this padded row returns before
         # reaching it anyway (the DSV4 host pool row is 37440B while
         # page_size*item_size is 64*584=37376B, so the shape test above sends every
-        # DSV4 swap-in down this branch).
-        #
-        # So: gather values and scales into ONE pinned contiguous staging buffer,
-        # cross the bus once, and scatter on the device side where both ends are local.
+        # DSV4 transfer down this branch).
+        if src.is_cuda and not dst.is_cuda:
+            copy_items_all_layer_d2h(
+                [src], [dst], src_locs, dst_locs, item_size_bytes, page_size
+            )
+            return
+
         n = src_locs_src.numel()
         item = DSV4_VALUE_BYTES + DSV4_SCALE_BYTES
-        stage_host = _pinned_stage(n, item, src.dtype)
+        stage_host = _stage("h2d", 1, n, item, torch.uint8, None)[0]
         stage_host[:, :DSV4_VALUE_BYTES] = src_value[src_page, src_off]
         stage_host[:, DSV4_VALUE_BYTES:] = src_scale[src_page, src_off]
         stage_dev = stage_host.to(dst.device, non_blocking=True)
