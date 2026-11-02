@@ -30,11 +30,28 @@ logger = logging.getLogger(__name__)
     type=HookType.AROUND,
 )
 def capture_prepare_aligned_kunlun(original, self, *args, **kwargs):
-    # On by default. Without it one rank enters capture_prepare's DP collective
-    # (the DP-global-token path) while the other ranks are parked in
-    # capture_one's TP barrier; the mismatch spins on CPU forever (py-spy: 7x
-    # capture_one->barrier, 1x capture_prepare). Rendezvousing on the gloo group
-    # first keeps the collectives in the same order on every rank.
+    """Rendezvous every TP rank on the CPU group before ``capture_prepare``.
+
+    On by default. Without it one rank enters capture_prepare's DP collective
+    (the DP-global-token path) while the other ranks are parked in
+    capture_one's TP barrier; the mismatch spins on CPU forever (py-spy: 7x
+    capture_one->barrier, 1x capture_prepare). Rendezvousing on the gloo group
+    first keeps the collectives in the same order on every rank.
+
+    Args:
+        original: the wrapped ``DecodeCudaGraphRunner.capture_prepare``.
+        self: the ``DecodeCudaGraphRunner`` instance.
+        *args: forwarded unchanged to ``original``.
+        **kwargs: forwarded unchanged to ``original``.
+
+    Returns:
+        Whatever the wrapped ``capture_prepare`` returns.
+
+    Raises:
+        Nothing of its own: if the rendezvous cannot be set up (no distributed
+        group, an unusual backend) the call falls through to ``original``
+        unchanged, so a broken hint can never block boot.
+    """
     import os
 
     if os.environ.get("DSV4_CAPTURE_ALIGN", "1") != "1":  # default on

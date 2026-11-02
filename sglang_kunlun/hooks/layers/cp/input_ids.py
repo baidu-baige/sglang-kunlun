@@ -32,6 +32,19 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 def hash_topk_cp_shard_input_ids_kunlun(
     original, self, hidden_states, router_logits, input_ids, *args, **kwargs
 ):
+    """Shard ``input_ids`` to the locally owned rows before hash routing.
+
+    Under prefill context parallelism each rank holds only its slice of the
+    hidden states, but upstream passes the unsharded ``input_ids`` down to
+    ``HashTopK``. The hash router then indexes per-row and reads rows this rank
+    does not own. Sharding first restores the 1:1 row mapping.
+
+    The shard is skipped when the shapes already agree, which is the
+    non-CP case, so the hook is a no-op outside CP prefill.
+
+    Returns:
+        Whatever the wrapped ``HashTopK.forward`` returns.
+    """
     if os.environ.get("DSV4_CP_SHARD_INPUT_IDS", "1") != "0" and (
         input_ids is not None
         and hidden_states is not None
@@ -45,6 +58,20 @@ def hash_topk_cp_shard_input_ids_kunlun(
 
 
 def _shard_input_ids(input_ids: torch.Tensor, rows: int):
+    """Interleave-shard ``input_ids`` down to the locally owned ``rows``.
+
+    Returns None instead of raising whenever the CP helpers or the current
+    forward batch are unavailable, so the caller can leave the ids untouched
+    outside CP prefill.
+
+    Args:
+        input_ids: the unsharded token ids for the whole request.
+        rows: the number of hidden-state rows this rank holds.
+
+    Returns:
+        The sharded tensor, or None when CP is not active or the helpers are
+        missing.
+    """
     try:
         from sglang.srt.layers.cp.utils import cp_interleave_input_ids, is_cp_active
         from sglang.srt.model_executor.runner_utils.forward_batch import (

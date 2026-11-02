@@ -20,6 +20,16 @@ logger = logging.getLogger(__name__)
 
 
 def install() -> None:
+    """Install the guard on ``triton.runtime.jit.JITFunction.run``.
+
+    Idempotent: a marker on the patched callable leaves an already-wrapped run
+    alone, so calling this twice is harmless. Skips silently when Triton is
+    absent or its layout has drifted -- this is a diagnostic aid and must never
+    be the reason a server fails to boot.
+
+    Returns:
+        None.
+    """
     if os.environ.get("DSV4_TRITON_TRIPWIRE", "1") != "1":
         return
     try:
@@ -33,6 +43,15 @@ def install() -> None:
     original_run = JITFunction.run
 
     def run(self, *args, **kwargs):
+        """Raise instead of launching, naming the kernel that reached the device.
+
+        Replaces ``JITFunction.run`` so the failure happens at the call site,
+        before the kernel is queued.
+
+        Raises:
+            RuntimeError: always. The message names the module and kernel and
+                points at where a Kunlun replacement belongs.
+        """
         fn = getattr(self, "fn", None)
         name = getattr(fn, "__name__", "?")
         module = getattr(fn, "__module__", "?")
