@@ -19,4 +19,4 @@
 
 from . import deepseek_v4  # noqa: F401
 from . import deepseek_v4_nextn  # noqa: F401
-
+from . import deepseek_v2  # noqa: F401
