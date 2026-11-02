@@ -33,20 +33,7 @@ def _align(values):
 def _wrap_buf_infos(orig):
     def _wrapped(*args, **kwargs):
         ptrs, lens, items = orig(*args, **kwargs)
-        aligned = _align(lens)
-        _name = getattr(orig, "__qualname__", "?")
-        _seen = _wrap_buf_infos.__dict__.setdefault("_seen", set())
-        if _os.environ.get("DSV4_PD_STATE_LOG") == "1" and _name not in _seen:
-            _seen.add(_name)
-            logger.warning(
-                "[PDSTATE] name=%s buffers=%d data_lens=%s aligned=%s item_lens=%s",
-                _name,
-                len(ptrs),
-                list(lens)[:6],
-                aligned[:6],
-                list(items)[:6],
-            )
-        return ptrs, aligned, items
+        return ptrs, _align(lens), items
 
     return _wrapped
 
@@ -154,9 +141,6 @@ plugin_hook(
 # (a genuine prefill -> decode request), which is a stronger gate than the
 # fake-bootstrap self-warmup it replaces.
 # ---------------------------------------------------------------------------
-import os as _os
-
-
 @plugin_hook(
     "sglang.srt.entrypoints.http_server._send_disaggregation_warmup_requests",
     type=HookType.AROUND,
