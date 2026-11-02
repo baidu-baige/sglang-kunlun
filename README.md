@@ -7,20 +7,6 @@ specific bootstrap, runtime hooks, and kernels outside the SGLang source tree.
 
 [Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md)
 
-## Latest News
-
-- **2026/06** — The `sglang-kunlun` package was created at version `0.1.0`.
-- **Current development** — Kunlun platform registration, runtime bootstrap,
-  attention, KV-cache, MoE, quantization, speculative decoding, and
-  disaggregation hooks are maintained in this repository.
-- **Newly supported features**
-  - **BCG (Breakable CUDA Graph)** — breakable CUDA-graph capture for prefill,
-    enabled with `--cuda-graph-backend-prefill breakable`,
-    `--cuda-graph-max-bs-prefill 8192`, and
-    `--cuda-graph-bs-prefill 128 384 512 1024 2048 4096 7168 8192`.
-  - **HiSparse** — sparse attention, enabled with `--enable-hisparse` and
-    `--hisparse-config '{"top_k":512,"device_buffer_size":4096,"host_to_device_ratio":8}'`.
-
 ## Overview
 
 The plugin exposes the following SGLang entry points:
@@ -206,11 +192,7 @@ supported; it is not a complete compatibility matrix.
 
 | Model | Quantization | Notes |
 | --- | --- | --- |
-| DeepSeek-V3.2 | `w8a8_int8` | Validate with the target SGLang/Kunlun versions. |
-| GLM5, GLM5.1, GLM5.2 | `w8a8_int8` | Validate with the target SGLang/Kunlun versions. |
-| GLM5.3 | `w8a8_int8`, `w4a8` | Supports W4A8 in addition to W8A8 INT8. |
 | DeepSeek-V4-Flash-0731 | `w8a8_int8` | Current DSPARK launch example (Attention W8A8, MoE W4A8 INT8 Dynamic). |
-| MiniMax-M3 | `w8a8_int8` | Validate with the target SGLang/Kunlun versions. |
 
 ## Version Matrix
 
