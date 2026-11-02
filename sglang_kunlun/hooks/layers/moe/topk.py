@@ -45,13 +45,52 @@ from sglang.srt.layers.moe.topk import (
     fused_topk_native,
     fused_topk,
     fused_topk_softmax_torch_raw_logits,
-    biased_topk_impl,
 )
 from typing import Optional, NamedTuple, Tuple
 from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 import kunlun_ops
+
+
+def biased_topk_impl(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    scoring_func: str = "sigmoid",
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: Optional[float] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    apply_routed_scaling_factor_on_output: Optional[bool] = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Kunlun replacement for sglang.srt.layers.moe.topk.biased_topk_impl.
+
+    Wraps kunlun_ops.moe_fused_gate_dsv4 (via kunlun_fused_moe_gate) with the
+    same pre/post-processing the upstream JIT-kernel impl performs.
+    """
+    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+
+    num_rows, _ = gating_output.shape
+    device = gating_output.device
+
+    topk_weights = torch.empty(num_rows, topk, dtype=torch.float32, device=device)
+    topk_ids = torch.empty(num_rows, topk, dtype=torch.int32, device=device)
+    kunlun_ops.moe_fused_gate_dsv4(
+        gating_output.to(torch.float32),
+        correction_bias,
+        topk_weights,
+        topk_ids,
+        topk,
+        scoring_func,
+        num_fused_shared_experts,
+        renormalize,
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output,
+    )
+    return topk_weights, topk_ids
 
 
 class StandardTopKOutput(NamedTuple):
@@ -218,7 +257,7 @@ def select_experts_kunlun(
         layer_id=layer_id,
         expert_location_dispatch_info=expert_location_dispatch_info,
     )
-
+    
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits, block_statistic)

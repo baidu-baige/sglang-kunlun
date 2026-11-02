@@ -161,11 +161,15 @@ def _patch_flashinfer_optional_symbols() -> None:
 def _disable_xgrammar_import() -> None:
     """Prevent optional xgrammar from loading its CUDA extension on Kunlun."""
     import importlib.machinery
+    import importlib.util
     import sys
     import types
     from typing import Any
 
-    if "xgrammar" in sys.modules:
+    # if "xgrammar" in sys.modules:
+    #     return
+
+    if importlib.util.find_spec("xgrammar") is not None:
         return
 
     module = types.ModuleType("xgrammar")

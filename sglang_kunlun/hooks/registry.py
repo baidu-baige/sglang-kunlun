@@ -39,24 +39,26 @@ HOOK_MODULES = (
     "sglang_kunlun.hooks.distributed",
     "sglang_kunlun.hooks.disaggregation",
     "sglang_kunlun.hooks.entrypoints",
+    "sglang_kunlun.hooks.metrics",
     "sglang_kunlun.hooks.function_call",
     "sglang_kunlun.hooks.parser",
     "sglang_kunlun.hooks.jit_kernel",
     "sglang_kunlun.hooks.models",
     "sglang_kunlun.models",
     "sglang_kunlun.hooks.speculative",
+    "sglang_kunlun.hooks.constrained",
 )
 
 
 def register_all() -> None:
     """Import every hook module so decorators register with ``HookRegistry``."""
 
-    from sglang_kunlun.bootstrap.pre_shim import patch_grammar_backend_default
+    # from sglang_kunlun.bootstrap.pre_shim import patch_grammar_backend_default
 
-    try:
-        patch_grammar_backend_default()
-    except Exception as exc:
-        logger.warning("sglang-kunlun: grammar backend default patch failed: %s", exc)
+    # try:
+    #     patch_grammar_backend_default()
+    # except Exception as exc:
+    #     logger.warning("sglang-kunlun: grammar backend default patch failed: %s", exc)
 
     from sglang_kunlun.kernels import deep_geem_hook as _deep_geem_hook  # noqa: F401
     from sglang_kunlun.kernels import flashinfer_hook as _flashinfer_hook  # noqa: F401
