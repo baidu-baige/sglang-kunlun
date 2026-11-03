@@ -243,6 +243,8 @@ def fused_engram_gate_kunlun(
     k_weight: torch.Tensor,
     eps: float,
     clamp_value: float,
+    input_ids: Optional[torch.Tensor] = None,
+    image_token_id: Optional[int] = None,
 ) -> torch.Tensor:
     """FP32 RMS(x) * RMS(key), weighted dot, sigmoid gate, value residual.
 
@@ -253,16 +255,40 @@ def fused_engram_gate_kunlun(
     / row / token) lives inside the op. The torch expression below stays as the
     fallback for the cases the op rejects (mixed fp16/fp32 io, non-contiguous
     inputs), since `engram_gate`'s own CUDA guard does not cover every caller.
+
+    0.5.23 added ``input_ids`` / ``image_token_id``: rows whose id equals
+    ``image_token_id`` keep ``x`` unchanged -- no gate, no value residual. The
+    XSpeedGate op has no such input (it takes six arguments), so the passthrough
+    is applied to its output in torch afterwards; it is one device-side
+    ``torch.where`` on a ``[T,1,1]`` mask, no host sync, and it leaves the op on
+    the production path instead of falling back to torch for every multimodal
+    batch.
     """
     if _engram_gate_v2_usable(x, kv, q_weight, k_weight, eps):
         note_op_path("fused_engram_gate", "xspeedgate:fused_engram_gate")
         out = torch.ops.xspeedgate_ops.fused_engram_gate(
             x, kv, q_weight, k_weight, eps, clamp_value
         )
-        return out
+        return _keep_image_rows(out, x, input_ids, image_token_id)
     note_op_path("fused_engram_gate", "torch")
-    out = _fused_engram_gate_torch(x, kv, q_weight, k_weight, eps, clamp_value)
+    out = _fused_engram_gate_torch(
+        x, kv, q_weight, k_weight, eps, clamp_value, input_ids, image_token_id
+    )
     return out
+
+
+def _keep_image_rows(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    input_ids: Optional[torch.Tensor],
+    image_token_id: Optional[int],
+) -> torch.Tensor:
+    """0.5.23: image-token rows pass through ungated."""
+    if input_ids is None:
+        return out
+    assert image_token_id is not None and input_ids.shape == (x.shape[0],)
+    keep = (input_ids == image_token_id).reshape(x.shape[0], 1, 1)
+    return torch.where(keep, x, out)
 
 
 def _fused_engram_gate_torch(
@@ -272,6 +298,8 @@ def _fused_engram_gate_torch(
     k_weight: torch.Tensor,
     eps: float,
     clamp_value: float,
+    input_ids: Optional[torch.Tensor] = None,
+    image_token_id: Optional[int] = None,
 ) -> torch.Tensor:
     """Torch transcription of the engram gate, used when the op declines."""
     t, hc, d = x.shape
@@ -288,7 +316,8 @@ def _fused_engram_gate_torch(
     )
     dot = ((xf * weight) * key).sum(-1, keepdim=True) * rstd * (d**-0.5)
     gate = torch.sigmoid(torch.copysign(torch.sqrt(dot.abs().clamp_min(clamp_value)), dot))
-    return (xf + gate * value.unsqueeze(1)).to(x.dtype)
+    out = (xf + gate * value.unsqueeze(1)).to(x.dtype)
+    return _keep_image_rows(out, x, input_ids, image_token_id)
 
 
 @register_jit_op(
@@ -606,6 +635,8 @@ def engram_commit_history_kunlun(
     verify_ids: torch.Tensor,
     req_slots: torch.Tensor,
     commit_lens: torch.Tensor,
+    live_rows: Optional[torch.Tensor] = None,
+    gate: Optional[torch.Tensor] = None,
 ) -> None:
     """Anchor + accepted drafts slid into the per-request history ring.
 
@@ -636,6 +667,12 @@ def _engram_commit_history_torch(
     `history[slot]` then this batch's accepted ids form one window; the new row is
     `window[commit : commit + width]`. Same expression as
     `EngramHasher.commit_after_verify`'s torch fallback.
+
+    0.5.23 added ``live_rows`` / ``gate``: rows whose ``live_rows`` entry is 0 are
+    skipped, and a ``gate[0] == 0`` skips the whole update. Both are device
+    tensors, so the gate is applied with ``torch.where`` rather than a host read
+    (a ``.item()`` here would sync the decode critical path and is illegal under
+    graph capture).
     """
     width = history.shape[1]
     req = req_slots.to(torch.int64)
@@ -648,7 +685,15 @@ def _engram_commit_history_torch(
     cols = commit_lens.to(torch.int64).unsqueeze(-1) + torch.arange(
         width, device=window.device
     )
-    history[req] = window.gather(1, cols)
+    updated = window.gather(1, cols)
+    if live_rows is not None or gate is not None:
+        keep = torch.ones_like(req, dtype=torch.bool)
+        if live_rows is not None:
+            keep &= live_rows.reshape(-1)[: req.numel()] != 0
+        if gate is not None:
+            keep &= gate.reshape(-1)[:1].to(torch.bool)
+        updated = torch.where(keep.unsqueeze(-1), updated, history[req])
+    history[req] = updated
 
 
 @register_jit_op(
@@ -663,13 +708,20 @@ def engram_gather_kunlun(
     block_size: int,
     row_lo: int = 0,
     row_hi: int = 2**62,
+    sort_ids: bool = False,
 ) -> torch.Tensor:
     """Gather fp8 rows over a host pointer and dequantize with e8m0 block scales.
 
     `weight_ptr`/`scale_ptr` address host memory (the engram host table), so the
     rows are read through ctypes and only the gathered values cross to the
     device. Ids outside [row_lo, row_hi) produce a zero row.
+
+    0.5.23 added ``sort_ids``, which makes the Triton kernel read rows in address
+    order to improve host-page locality and scatter each row back to its original
+    position. It does not change the result, and this implementation already
+    walks ``ids`` row by row on the host, so the flag is accepted and ignored.
     """
+    del sort_ids
     n = ids.numel()
     if n == 0:
         return out
