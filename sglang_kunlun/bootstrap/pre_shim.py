@@ -451,6 +451,79 @@ def _provide_copy_pages_without_triton() -> None:
     sys.modules[name] = module
 
 
+def _provide_flash_mla_interface_if_unusable() -> None:
+    """Stand in for ``kernels.ops.attention.flash_mla_interface`` when the wheel is absent.
+
+    0.5.23 moved the FlashMLA entry points out of ``sgl_kernel.flash_mla`` into
+    ``sglang/kernels/ops/attention/flash_mla_interface.py``, which imports the
+    ``sgl-flash-mla`` wheel at module import time. The wheel in this image needs
+    ``xtorch_ops``, which the build does not ship::
+
+        flash_mla/flash_mla_interface.py:6  import xtorch_ops
+        ModuleNotFoundError: No module named 'xtorch_ops'
+
+    and ``DeepseekV4AttnBackend.__init__`` (``deepseek_v4_backend.py:1263``)
+    imports it under a plain ``if is_cuda():`` -- one of the CUDA gates 0.5.23
+    added on a patched path. Kunlun's ``is_cuda()`` is True (the platform reuses
+    the CUDA device type), so the gate opens and the import kills the scheduler
+    before any attention backend is built, even though Kunlun never launches a
+    FlashMLA kernel: ``SGLANG_HACK_FLASHMLA_BACKEND=kunlun`` and this plugin's
+    own ``kunlun_compressed`` backend serve that path, and the module's own
+    docstring says "CUDA only: HIP and XPU keep their own sgl-kernel ops".
+
+    So pre-seed the module with the names upstream reads, each raising if it is
+    ever actually invoked -- a wrong answer here must not be silent. Same
+    ``sys.modules`` mechanism as the small_copy / copy_pages / deep_gemm shims.
+    """
+    import importlib.util
+    import sys
+    import types
+
+    name = "sglang.kernels.ops.attention.flash_mla_interface"
+    if name in sys.modules:
+        return
+    if importlib.util.find_spec("flash_mla") is not None:
+        try:
+            importlib.import_module("flash_mla")
+            return  # the real wheel works; let upstream use it
+        except Exception as exc:
+            logger.info(
+                "Kunlun: flash_mla wheel unusable (%s: %s); stubbing %s",
+                type(exc).__name__,
+                str(exc)[:120],
+                name,
+            )
+
+    module = types.ModuleType(name)
+    module.__doc__ = (
+        "Kunlun stub: the sgl-flash-mla wheel cannot import on this build and "
+        "Kunlun serves MLA through its own backend."
+    )
+    # Upstream reads this as a plain int to size a split-KV decision.
+    module.SPLIT_KV_MIN_TOPK = 641
+
+    def _unsupported(_name):
+        def fail(*_a, **_kw):
+            raise RuntimeError(
+                f"flash_mla_interface.{_name} is not available on Kunlun; "
+                "the kunlun_compressed backend serves this path"
+            )
+
+        fail.__name__ = _name
+        return fail
+
+    for fn in (
+        "get_mla_metadata",
+        "flash_mla_with_kvcache",
+        "flash_mla_sparse_fwd",
+        "flash_mla_mega_prefill",
+        "flash_mla_mega_decode",
+    ):
+        setattr(module, fn, _unsupported(fn))
+    module._sglang_kunlun_stub = True
+    sys.modules[name] = module
+
+
 def _kunlun_pre_shim() -> None:
     """Force triton's active driver to advertise ``backend == "cuda"``."""
     import os
@@ -526,6 +599,13 @@ def _kunlun_pre_shim() -> None:
         _provide_copy_pages_without_triton()
     except Exception:
         logger.warning("Kunlun: copy_pages shim installation failed", exc_info=True)
+
+    try:
+        _provide_flash_mla_interface_if_unusable()
+    except Exception:
+        logger.warning(
+            "Kunlun: flash_mla_interface shim installation failed", exc_info=True
+        )
 
     try:
         from sglang_kunlun.bootstrap import sgl_kernel_stub
