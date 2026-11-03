@@ -5054,10 +5054,36 @@ def assign_extend_cache_locs_uniform_torch(
     batch_size: int,
     draft_token_num: int,
     device,
+    *,
+    full_v2p: Optional[torch.Tensor] = None,
+    swa_v2p: Optional[torch.Tensor] = None,
+    full_out: Optional[torch.Tensor] = None,
+    swa_out: Optional[torch.Tensor] = None,
+    page_size: int = 1,
+    positions_out: Optional[torch.Tensor] = None,
+    anchor_src: Optional[torch.Tensor] = None,
+    anchor_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Gather uniform target-verify cache slots without launching Triton."""
+    """Gather uniform target-verify cache slots without launching Triton.
+
+    0.5.23 added the optional fused outputs (virtual->physical FULL/SWA write
+    translation, ``positions_out``, ``anchor_out``) that
+    ``KVIndexTranslator.gather_window`` passes. Upstream's own non-Triton branch
+    refuses the translation (``assert full_v2p is None, "fused write translation
+    requires a Triton device"``) and fills ``positions_out`` / ``anchor_out``
+    eagerly; mirror that. The live DSV4 call site
+    (``eagle_utils.prepare_for_verify``) passes none of them, and
+    ``reads_are_translated`` is only consulted by the flashinfer / flashattention
+    / flashmla backends -- not ``kunlun_compressed``.
+    """
 
     del device
+    if full_v2p is not None or swa_v2p is not None:
+        raise NotImplementedError(
+            "fused virtual->physical write translation requires a Triton device; "
+            "the Kunlun replacement only serves the untranslated window"
+        )
+    del full_out, swa_out, page_size
     req_indices = req_pool_indices[:batch_size].to(torch.int64)
     token_rows = req_to_token.index_select(0, req_indices)
     token_offsets = torch.arange(
@@ -5066,6 +5092,10 @@ def assign_extend_cache_locs_uniform_torch(
         device=req_to_token.device,
     ).unsqueeze(0)
     token_offsets = token_offsets + start_offset[:batch_size].to(torch.int64).unsqueeze(1)
+    if positions_out is not None:
+        positions_out.copy_(token_offsets)
+    if anchor_out is not None:
+        anchor_out[:, 0].copy_(anchor_src.reshape(-1))
     return torch.gather(token_rows, 1, token_offsets).reshape(-1).to(torch.int64)
 
 
