@@ -5676,6 +5676,62 @@ def assign_req_to_token_pool(
     )
 
 
+# ── 稀疏预填的 SWA token-id 展开（0.5.23 新增，纯 Triton）─────────────────
+#
+# `base_attn_backend.resolve_prefill_shared_read_ends` →
+# `deepseek_v4_backend._snapshot_prefill_shared_reads` →
+# `_build_sparse_prefill_chunk_cache` → `sparse_prefill_utils.build` →
+# `sparse_prefill_kernels.build_swa_token_ids`，0.5.22 没有这个函数。
+# 它把每个请求「所有 query 的 SWA 窗口的位置并集」展平成 SWA cache 的物理
+# token id，只有 Triton 实现、没有 device 门，所以昆仑第一个 extend batch 就死在
+# "0 compatible backends for target (cuda)"。
+#
+# 上游自己把 lens/first_pos/offsets 三件都用 torch 算好了（只有最后的 gather 在
+# kernel 里），所以这里只需要把那段 gather 用 torch 写出来：
+#   swa_token_ids[off[i] + j] = full_to_swa[req_to_token[pool[i], first_pos[i] + j]]
+
+
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.sparse_prefill_kernels", "build_swa_token_ids"
+)
+def build_swa_token_ids_kunlun(
+    seq_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    full_to_swa: torch.Tensor,
+    swa_window: int,
+    total_swa: int,
+):
+    """Flat physical SWA-cache token ids for each request's SWA-window union."""
+    device = seq_lens.device
+    num_reqs = seq_lens.shape[0]
+
+    swa_gather_lens = torch.minimum(
+        seq_lens, extend_seq_lens + (swa_window - 1)
+    ).to(torch.int32)
+    swa_first_pos = (seq_lens - swa_gather_lens).to(torch.int32)
+    swa_offsets = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
+    swa_offsets[1:] = torch.cumsum(swa_gather_lens, dim=0).to(torch.int32)
+    swa_token_ids = torch.empty(total_swa, dtype=torch.int32, device=device)
+    if total_swa == 0:
+        return swa_token_ids, swa_first_pos, swa_gather_lens, swa_offsets
+
+    # One ragged gather instead of the kernel's (req, worker) grid: build the
+    # per-slot request index and within-request column, then translate once
+    # through req_to_token and once through full_to_swa.
+    lens64 = swa_gather_lens.to(torch.int64)
+    slot = torch.arange(total_swa, device=device, dtype=torch.int64)
+    req_of_slot = torch.repeat_interleave(
+        torch.arange(num_reqs, device=device, dtype=torch.int64), lens64
+    )
+    col = slot - swa_offsets[:-1].to(torch.int64)[req_of_slot]
+    pos = swa_first_pos.to(torch.int64)[req_of_slot] + col
+    full_ids = req_to_token[req_pool_indices.to(torch.int64)[req_of_slot], pos]
+    swa_token_ids.copy_(full_to_swa[full_ids.to(torch.int64)].to(torch.int32))
+    return swa_token_ids, swa_first_pos, swa_gather_lens, swa_offsets
+
+
 # ── logits softcap / fp32 cast（0.5.23 的 logits_processor 新走这条路）──────
 #
 # 0.5.23 的 `LogitsProcessor._copy_logits_to_buffer` 改成调
