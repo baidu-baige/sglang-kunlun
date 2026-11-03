@@ -170,7 +170,7 @@ def initialize_mqa_rope_policy_kunlun(result, self, config, *args, **kwargs):
     if self.compress_ratio:
         return result
 
-    from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
+    from sglang.kernels.ops.attention.dsv4.rope import precompute_freqs_cis
     from sglang.srt.models.deepseek_v4 import get_rope_config
 
     rope_theta, rope_scaling = get_rope_config(config)
@@ -279,7 +279,7 @@ def mqa_forward_global_head_layout_kunlun(
     for.
     """
     import sglang.srt.models.deepseek_v4 as upstream
-    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+    from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
         is_unified_kv_triton,
     )
     from sglang.srt.model_executor.forward_context import get_attn_backend

@@ -25,7 +25,7 @@ def disable_k3_fused_decode_kunlun(*args, **kwargs) -> bool:
 
 
 @plugin_hook(
-    "sglang.kernels.ops.attention.mla_output_gate.kimi_k3_mla_output_gate",
+    "sglang.kernels.ops.elementwise.mla_output_gate.kimi_k3_mla_output_gate",
     type=HookType.REPLACE,
 )
 def kimi_k3_mla_output_gate_kunlun(
@@ -34,7 +34,8 @@ def kimi_k3_mla_output_gate_kunlun(
     """Torch form of the MLA output gate, preserving the two-step rounding.
 
     0.5.22 moved the kernel from ``sglang.kernels.ops.kimi_k3.mla_output_gate``
-    to ``sglang.kernels.ops.attention.mla_output_gate``.
+    to ``sglang.kernels.ops.attention.mla_output_gate``; 0.5.23 moved it again
+    to ``sglang.kernels.ops.elementwise.mla_output_gate``.
     """
     return x * torch.sigmoid(gate)
 

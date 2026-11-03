@@ -98,7 +98,7 @@ def _round_to_e4m3_rne(v: torch.Tensor) -> torch.Tensor:
 
 def _fake_quant_compressed_kv_torch(x: torch.Tensor) -> torch.Tensor:
     """FP4 round-trip with one E4M3 scale per 16 compressed-KV elements."""
-    from sglang.kernels.ops.attention.dsv4.torch_quant import FP4_MAX, round_fp4
+    from sglang.kernels.ops.quantization.fp4_fake_quant import FP4_MAX, round_fp4
 
     blocks = x.float().unflatten(-1, (-1, 16))
     amax = blocks.abs().amax(dim=-1, keepdim=True)
@@ -109,7 +109,7 @@ def _fake_quant_compressed_kv_torch(x: torch.Tensor) -> torch.Tensor:
 
 
 @register_jit_op(
-    "sglang.kernels.ops.attention.dsv4.torch_quant", "fake_quant_compressed_kv"
+    "sglang.kernels.ops.quantization.fp4_fake_quant", "fake_quant_compressed_kv"
 )
 def fake_quant_compressed_kv_kunlun(x: torch.Tensor) -> torch.Tensor:
     """XPU-safe replacement for the E4M3-scaled FP4 round-trip."""
@@ -143,7 +143,7 @@ def rope_tail_fake_quant_fp4_kunlun(
     table's leading entries.
     """
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import rope_tail
-    from sglang.kernels.ops.attention.dsv4.torch_quant import (
+    from sglang.kernels.ops.quantization.fp4_fake_quant import (
         FP4_AMAX_FLOOR,
         fake_quant_fp4,
     )
@@ -718,7 +718,7 @@ def engram_gather_kunlun(
 
 
 @register_jit_op(
-    "sglang.kernels.ops.attention.dsv4.fp4_indexer", "quantize_fp4_indexer_tensor"
+    "sglang.kernels.ops.quantization.fp4_indexer_quant", "quantize_fp4_indexer_tensor"
 )
 def quantize_fp4_indexer_tensor_kunlun(
     x: torch.Tensor, rne: bool = False
@@ -768,7 +768,7 @@ def quantize_fp4_indexer_tensor_kunlun(
 
 
 @register_jit_op(
-    "sglang.kernels.ops.attention.dsv4.fp4_indexer", "store_fp4_index_k_cache"
+    "sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache", "store_fp4_index_k_cache"
 )
 def store_fp4_index_k_cache_kunlun(
     input: torch.Tensor,

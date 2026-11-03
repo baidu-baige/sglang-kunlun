@@ -104,7 +104,7 @@ def mqa_forward_prepare_kunlun(
     non-None can only mean the upstream gate condition changed -- better to blow
     up than to silently drop the packed Q/K output.
     """
-    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+    from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
         is_unified_kv_triton,
     )
 

@@ -1005,7 +1005,7 @@ def dsv4_init_compression_metadata_kunlun(
 
 
 @plugin_hook(
-    "sglang.kernels.ops.attention.dsv4_attn_metadata_kernels."
+    "sglang.kernels.ops.attention.dsv4.attn_metadata_kernels."
     "ExpandPrefillCausally.execute",
     type=HookType.REPLACE,
 )
@@ -1024,7 +1024,7 @@ def dsv4_expand_prefill_causally_kunlun(
     """Expand target-verify metadata with graph-safe Torch tensor operations."""
 
     del extend_start_loc
-    from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
+    from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
         ExpandPrefillCausallyResult,
     )
 
@@ -1782,7 +1782,7 @@ def dsv4_quant_k_cache_kunlun(k_bf16: torch.Tensor):
 
 
 @register_triton_op(
-    "sglang.kernels.ops.attention.dsv4.index_buf_accessor",
+    "sglang.kernels.ops.kvcache.dsv4_main_kv_store",
     "_set_k_and_s_triton",
     metadata={"call_style": "direct"},
 )
@@ -1913,7 +1913,7 @@ def get_last_loc_kernel(
 
 
 @register_triton_op(
-    "sglang.kernels.ops.kvcache.cache_ops",
+    "sglang.kernels.ops.attention.mla_qk_prep",
     "concat_and_cast_mha_k_kernel",
 )
 def concat_and_cast_mha_k_kernel(
@@ -1959,7 +1959,7 @@ def seqlens_expand_kernel(
 
 
 @register_triton_op(
-    "sglang.kernels.ops.attention.dsv4_attn_metadata_kernels",
+    "sglang.kernels.ops.attention.dsv4.attn_metadata_kernels",
     "_page_table_positions_kernel",
 )
 def page_table_positions_kernel(
@@ -2693,7 +2693,7 @@ def _dflash_correct_drafts_supported(
 
 
 @register_triton_op(
-    "sglang.srt.speculative.dflash_utils",
+    "sglang.kernels.ops.speculative.dflash",
     "_fused_correct_drafts_and_bonus_kernel",
 )
 def fused_correct_drafts_and_bonus_kernel(
@@ -3670,7 +3670,7 @@ def schedule_verify_lens_topk_kunlun(
 
 
 @register_triton_op(
-    "sglang.kernels.ops.kvcache.kv_indices",
+    "sglang.kernels.ops.attention.kv_indices",
     "create_chunked_prefix_cache_kv_indices",
 )
 def create_chunked_prefix_cache_kv_indices(
@@ -3981,7 +3981,7 @@ def _resolve_silu_and_mul_with_swiglu_limit_out():
     )
 
 
-@register_jit_op("sglang.kernels.ops.moe.dsv4", "silu_and_mul_clamp")
+@register_jit_op("sglang.kernels.ops.activation.silu_and_mul_clamp", "silu_and_mul_clamp")
 def dsv4_silu_and_mul_clamp_kunlun(
     input: torch.Tensor,
     output: torch.Tensor,
@@ -4726,7 +4726,7 @@ def _copy_fused_metadata_fallback(
         )
 
 
-@register_jit_op("sglang.kernels.ops.attention.fused_metadata_copy", "fused_metadata_copy_cuda")
+@register_jit_op("sglang.kernels.ops.attention.dsa.fused_metadata_copy", "fused_metadata_copy_cuda")
 def fused_metadata_copy_cuda(
     cache_seqlens_src: torch.Tensor,
     cu_seqlens_k_src: torch.Tensor,
@@ -4780,7 +4780,7 @@ def fused_metadata_copy_cuda(
     )
 
 
-@register_jit_op("sglang.kernels.ops.attention.fused_metadata_copy", "fused_metadata_copy_multi_cuda")
+@register_jit_op("sglang.kernels.ops.attention.dsa.fused_metadata_copy", "fused_metadata_copy_multi_cuda")
 def fused_metadata_copy_multi_cuda(
     cache_seqlens_src: torch.Tensor,
     cu_seqlens_k_src: torch.Tensor,
@@ -4966,7 +4966,7 @@ def assign_hidden_states_pool_triton(
 
 
 @register_jit_op(
-    "sglang.kernels.ops.attention.dsv4.c128_cleanup",
+    "sglang.kernels.ops.kvcache.dsv4_c128_cleanup",
     "clear_unaccepted_c128_draft_states",
 )
 def clear_unaccepted_c128_draft_states_torch(
@@ -6084,7 +6084,7 @@ def _dsv4_rotate_gptj_tail(
     return result
 
 @register_jit_op(
-    "sglang.kernels.ops.attention.dsv4.elementwise", "fused_rope_inplace"
+    "sglang.kernels.ops.attention.dsv4.norm_rope", "fused_rope_inplace"
 )
 def dsv4_fused_rope_inplace_kunlun(
     q: torch.Tensor,
@@ -6126,7 +6126,7 @@ def dsv4_fused_rope_inplace_kunlun(
 
 
 @register_jit_op(
-    "sglang.kernels.ops.attention.dsv4.elementwise",
+    "sglang.kernels.ops.attention.dsv4.norm_rope",
     "fused_q_indexer_rope_hadamard_quant",
 )
 def dsv4_fused_q_indexer_rope_hadamard_quant_kunlun(
@@ -6170,7 +6170,7 @@ def dsv4_fused_q_indexer_rope_hadamard_quant_kunlun(
 
 
 @register_jit_op(
-    "sglang.kernels.ops.attention.dsv4.elementwise", "fused_q_norm_rope"
+    "sglang.kernels.ops.attention.dsv4.norm_rope", "fused_q_norm_rope"
 )
 
 def dsv4_fused_q_norm_rope_kunlun(
@@ -6258,7 +6258,7 @@ def dsv4_fused_q_norm_rope_kunlun(
 
 
 @register_jit_op(
-    "sglang.kernels.ops.attention.dsv4.elementwise", "fused_k_norm_rope_flashmla"
+    "sglang.kernels.ops.attention.dsv4.norm_rope", "fused_k_norm_rope_flashmla"
 )
 def dsv4_fused_k_norm_rope_flashmla_kunlun(
     kv: torch.Tensor,
@@ -6407,49 +6407,7 @@ def apply_rope_with_cos_sin_cache_inplace(
 
 
 @register_triton_op(
-    "sglang.kernels.ops.attention.dsa.index_buf_accessor",
-    "_get_k_triton_kernel",
-)
-def _get_k_triton_kernel(
-    buf: torch.Tensor,
-    page_indices: torch.Tensor,
-    out: torch.Tensor,
-    seq_len: int,
-    page_size: int,
-    buf_numel_per_page: int,
-    index_head_dim: int,
-    *,
-    BLOCK_SIZE: int,
-) -> None:
-    """_get_k_triton_kernel"""
-    result = torch.ops.xspeedgate_ops.get_k_kernel(
-        buf, page_indices, seq_len, page_size, buf_numel_per_page, index_head_dim
-    )
-    out.copy_(result.to(out.dtype))
-
-
-@register_triton_op(
-    "sglang.kernels.ops.attention.dsa.index_buf_accessor",
-    "_get_s_triton_kernel",
-)
-def _get_s_triton_kernel(
-    buf: torch.Tensor,
-    page_indices: torch.Tensor,
-    out: torch.Tensor,
-    seq_len: int,
-    page_size: int,
-    buf_numel_per_page: int,
-    s_offset_in_page: int,
-) -> None:
-    """_get_s_triton_kernel"""
-    result = torch.ops.xspeedgate_ops.get_s_kernel(
-        buf, page_indices, seq_len, page_size, buf_numel_per_page, s_offset_in_page
-    )
-    out.copy_(result.to(out.dtype))
-
-
-@register_triton_op(
-    "sglang.kernels.ops.attention.dsa.index_buf_accessor",
+    "sglang.kernels.ops.kvcache.dsa_index_k_cache",
     "_set_k_and_s_triton_kernel",
 )
 def _set_k_and_s_triton_kernel(
@@ -6488,7 +6446,7 @@ def _set_k_and_s_triton_kernel(
 
 
 @register_triton_op(
-    "sglang.kernels.ops.attention.dsa.triton_kernel",
+    "sglang.kernels.ops.quantization.act_quant_triton",
     "_act_quant_kernel",
 )
 def _act_quant_kernel(
@@ -6709,7 +6667,7 @@ def _dsa_store_lens_and_cu(
 
 
 @register_jit_op(
-    "sglang.kernels.ops.attention.dsa_metadata", "fused_dsa_decode_metadata"
+    "sglang.kernels.ops.attention.dsa.metadata", "fused_dsa_decode_metadata"
 )
 def fused_dsa_decode_metadata(
     seq_lens: torch.Tensor,
@@ -6755,7 +6713,7 @@ def fused_dsa_decode_metadata(
 
 
 @register_jit_op(
-    "sglang.kernels.ops.attention.dsa_metadata", "fused_dsa_target_verify_metadata"
+    "sglang.kernels.ops.attention.dsa.metadata", "fused_dsa_target_verify_metadata"
 )
 def fused_dsa_target_verify_metadata(
     seq_lens: torch.Tensor,
@@ -6819,7 +6777,7 @@ def fused_dsa_target_verify_metadata(
 
 
 @register_jit_op(
-    "sglang.kernels.ops.attention.dsa_metadata", "fused_dsa_draft_extend_metadata"
+    "sglang.kernels.ops.attention.dsa.metadata", "fused_dsa_draft_extend_metadata"
 )
 def fused_dsa_draft_extend_metadata(
     seq_lens: torch.Tensor,
@@ -6899,7 +6857,7 @@ def fused_dsa_draft_extend_metadata(
 
 @register_triton_op(
     "sglang.kernels.ops.attention.dsa.cp_split",
-    "dsa_cp_interleave_q_seqs_kernel",
+    "_dsa_cp_interleave_q_seqs_kernel",
 )
 def dsa_cp_interleave_q_seqs_kernel(
     in_seqs: torch.Tensor,

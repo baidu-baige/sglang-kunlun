@@ -1042,7 +1042,7 @@ def forward_cuda(
     """forward_cuda"""
     # TODO: try to remove this patch
 
-    from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+    from sglang.kernels.ops.quantization.act_quant_triton import act_quant
 
     if TYPE_CHECKING:
         assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)

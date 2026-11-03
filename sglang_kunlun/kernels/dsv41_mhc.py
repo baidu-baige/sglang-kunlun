@@ -55,7 +55,7 @@ def hc_mix_stats_kunlun(
     return mixes
 
 
-@register_jit_op("sglang.kernels.ops.layernorm.mhc", "hc_combine")
+@register_jit_op("sglang.kernels.ops.layernorm.mhc", "mhc_combine")
 def hc_combine_kunlun(
     x_flat: torch.Tensor, pre: torch.Tensor, hc: int, out_dtype: torch.dtype
 ) -> torch.Tensor:
@@ -76,6 +76,13 @@ def hc_combine_kunlun(
 
     Fall back to the torch body when the op is missing or rejects the call;
     ``_dspark_warn_fallback`` logs one line so the degradation is never silent.
+
+    0.5.23 renamed the *upstream* target from ``hc_combine`` to ``mhc_combine``
+    (same signature), which is what the ``register_jit_op`` above points at; the
+    XSpeedGate op keeps its own name ``xspeedgate_ops.hc_combine``. Do not
+    confuse the target with ``elementwise.hc_combine.hc_combine``, which is the
+    HyperConnection gated-residual combine -- a different 7-parameter function
+    that an earlier repoint pass wired here by mistake.
     """
     m = x_flat.shape[0]
     h = x_flat.shape[1] // hc
