@@ -5676,6 +5676,69 @@ def assign_req_to_token_pool(
     )
 
 
+# ── logits softcap / fp32 cast（0.5.23 的 logits_processor 新走这条路）──────
+#
+# 0.5.23 的 `LogitsProcessor._copy_logits_to_buffer` 改成调
+# `activation.softcap.cast_to_float32_logits(logits, out)`，`_get_logits` 又把
+# `softcap_to_float32_logits` / `softcap_inplace_logits` / `gathered_softcap_logits`
+# 一起拉进来（logits_processor.py:26-35 全是 module 级 import）。整个模块只有
+# Triton 实现、没有任何 device 门，所以昆仑上第一个请求就死在
+# "0 compatible backends for target (cuda)"；0.5.22 没有 `cast_to_float32_logits`，
+# 那条路还是纯 torch，所以这是 0.5.23 新增的必修项。
+#
+# 四个入口都按上游 kernel 的语义用 torch 重写：softcap 是
+# `tanh(x / cap) * cap`，fp32 写出就是按 output 的 dtype copy。
+
+
+@register_jit_op("sglang.kernels.ops.activation.softcap", "softcap_inplace_logits")
+def softcap_inplace_logits_kunlun(full_logits, final_logit_softcapping):
+    """In-place ``tanh(x / cap) * cap``; a None cap is a no-op, as upstream."""
+    if final_logit_softcapping is None:
+        return full_logits
+    cap = float(final_logit_softcapping)
+    full_logits.copy_(torch.tanh(full_logits.float() / cap) * cap)
+    return full_logits
+
+
+@register_jit_op("sglang.kernels.ops.activation.softcap", "softcap_to_float32_logits")
+def softcap_to_float32_logits_kunlun(logits, final_logit_softcapping, output):
+    """Softcapped FP32 logits into an equally shaped, row-contiguous output."""
+    assert output.shape == logits.shape and output.dtype == torch.float32
+    x = logits.float()
+    if final_logit_softcapping is not None:
+        cap = float(final_logit_softcapping)
+        x = torch.tanh(x / cap) * cap
+    output.copy_(x)
+    return output
+
+
+@register_jit_op("sglang.kernels.ops.activation.softcap", "cast_to_float32_logits")
+def cast_to_float32_logits_kunlun(logits, output):
+    """FP32 logits into an equally shaped, row-contiguous output (no softcap)."""
+    assert output.shape == logits.shape and output.dtype == torch.float32
+    output.copy_(logits)
+    return output
+
+
+@register_jit_op("sglang.kernels.ops.activation.softcap", "gathered_softcap_logits")
+def gathered_softcap_logits_kunlun(gathered, final_logit_softcapping, output):
+    """Rank-major ``[world, tokens, shard]`` -> vocab-major ``output[tokens, :vocab]``.
+
+    Upstream fuses the transpose-and-softcap in one kernel; the torch form is the
+    same index map: vocab column ``v`` lives at ``(v // shard, token, v % shard)``.
+    """
+    world, num_tokens, shard_width = gathered.shape
+    vocab_size = output.shape[1]
+    assert output.shape[0] == num_tokens and vocab_size <= world * shard_width
+    flat = gathered.permute(1, 0, 2).reshape(num_tokens, world * shard_width)
+    x = flat[:, :vocab_size].float()
+    if final_logit_softcapping is not None:
+        cap = float(final_logit_softcapping)
+        x = torch.tanh(x / cap) * cap
+    output[:, :vocab_size].copy_(x)
+    return output
+
+
 @register_jit_op("sglang.kernels.ops.speculative.topk1", "draft_topk1_postprocess")
 def draft_topk1_postprocess(
     next_token_logits: torch.Tensor,
