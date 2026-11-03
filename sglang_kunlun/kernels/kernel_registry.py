@@ -136,10 +136,19 @@ def install() -> None:
     selector._kunlun_override_installed = True
 
     # Anything resolved before we got here would keep pointing at the CUDA impl.
+    # 0.5.23 removed ``selector.clear_cache()``; the cache it cleared is the
+    # ``lru_cache`` on ``selector._resolve``, so clear that directly and keep the
+    # old entry point as the 0.5.22 fallback. Before this, every boot logged
+    # "selector.clear_cache() failed / AttributeError" and left any op resolved
+    # earlier in the boot pointing at the CUDA implementation.
     try:
-        selector.clear_cache()
+        clear = getattr(selector, "clear_cache", None)
+        if clear is not None:
+            clear()
+        else:
+            selector._resolve.cache_clear()
     except Exception:
-        logger.warning("selector.clear_cache() failed", exc_info=True)
+        logger.warning("selector resolve-cache clear failed", exc_info=True)
 
     logger.info(
         "kernel_registry: installed %d Kunlun kernel override(s): %s",

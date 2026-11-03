@@ -386,6 +386,71 @@ def _stub_small_copy_fast_path() -> None:
     sys.modules[name] = module
 
 
+def _provide_copy_pages_without_triton() -> None:
+    """Serve ``kvcache.copy_pages`` in torch; its Triton decl needs 3.2+ to import.
+
+    0.5.23 added ``sglang/kernels/ops/kvcache/copy_pages.py`` and
+    ``mem_cache/unified_memory_pool.py`` imports ``copy_pages`` from it at module
+    import time. The kernel is declared
+    ``@triton.jit(do_not_specialize_on_alignment=[...])`` -- a keyword Triton 3.2
+    added, while this build ships 3.0.0 -- so the import itself raises
+    ``TypeError: jit() got an unexpected keyword argument`` and takes the whole
+    plugin load with it (``load_plugins`` -> ``register_all`` ->
+    ``hooks.speculative`` -> ``eagle_worker_v2`` -> the NPU graph runner ->
+    ``unified_memory_pool``). The 0.5.23 boot died there before printing a single
+    scheduler line.
+
+    Unlike ``small_copy``, declining is not an option: the callers
+    (``unified_memory_pool`` page defrag/shift) need the copy to happen. But
+    upstream already carries a device-agnostic version for its own non-CUDA
+    branch::
+
+        env = raw[: num_pages * page_bytes].view(num_pages, page_bytes)
+        env[dst_pages] = env[src_pages]
+
+    which is exactly what Kunlun wants (it reports ``is_cuda=True``, so the
+    upstream gate would send it to Triton). So pre-register a module whose
+    ``copy_pages`` is that torch form, before anything can import the real one.
+    Same ``sys.modules`` pre-seeding mechanism as the small_copy stub; no
+    monkeypatching of a loaded module.
+    """
+    import sys
+    import types
+
+    name = "sglang.kernels.ops.kvcache.copy_pages"
+    if name in sys.modules:
+        return
+
+    import torch
+
+    module = types.ModuleType(name)
+    module.__doc__ = (
+        "Kunlun replacement: upstream's copy_pages kernel needs Triton 3.2+ to "
+        "import, and its Triton path has no Kunlun backend to launch on. This is "
+        "upstream's own non-CUDA branch, done in torch."
+    )
+
+    def copy_pages(
+        raw: "torch.Tensor",
+        dst_pages: "torch.Tensor",
+        src_pages: "torch.Tensor",
+        num_pages: int,
+        page_bytes: int,
+    ) -> None:
+        """Copy src -> dst page sets; disjointness is the caller's contract."""
+        count = dst_pages.numel()
+        assert count == src_pages.numel()
+        if count == 0:
+            return
+        assert raw.dtype == torch.uint8 and raw.is_contiguous()
+        env = raw[: num_pages * page_bytes].view(num_pages, page_bytes)
+        env[dst_pages] = env[src_pages]
+
+    module.copy_pages = copy_pages
+    module._sglang_kunlun_stub = True
+    sys.modules[name] = module
+
+
 def _kunlun_pre_shim() -> None:
     """Force triton's active driver to advertise ``backend == "cuda"``."""
     import os
@@ -456,6 +521,11 @@ def _kunlun_pre_shim() -> None:
         _stub_small_copy_fast_path()
     except Exception:
         logger.warning("Kunlun: small_copy stub installation failed", exc_info=True)
+
+    try:
+        _provide_copy_pages_without_triton()
+    except Exception:
+        logger.warning("Kunlun: copy_pages shim installation failed", exc_info=True)
 
     try:
         from sglang_kunlun.bootstrap import sgl_kernel_stub
