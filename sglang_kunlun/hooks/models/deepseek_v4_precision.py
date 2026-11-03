@@ -278,15 +278,15 @@ def mqa_forward_global_head_layout_kunlun(
     request-hot-path global rebinding. All non-local Q and sink slots are zeroed,
     and only this rank's local output slice is returned.
 
-    0.5.22 added `defer_all_reduce`: when set, upstream skips wo_b's TP
-    all-reduce and returns `mhc.AttnOutput(partial)` so the reduction rides the
-    fused `all_reduce_mhc_post_combine_norm` launch inside the MHC post. That
-    kernel is Blackwell-only (`deepseek_v4_mhc.can_fuse_post` requires
-    `get_platform().is_blackwell`; the other caller is the ROCm
-    `deepseek_v4_fused_mhc` path), so on Kunlun the flag can only arrive as
-    False -- this hook mirrors the parameter and refuses loudly if it is ever
-    truthy instead of returning a reduced plain tensor the caller did not ask
-    for.
+    0.5.22 added `defer_all_reduce` and on that release it could only arrive as
+    False here, so this hook refused it. 0.5.23 made it the ordinary CUDA route:
+    `DeepseekV4CudaDecoderLayer.__init__` sets `self_attn.wo_b.reduce_results =
+    False` and `_run_boundary_attention` always passes `defer_all_reduce=True`,
+    with the reduction moved into `attn_boundary.finish()` ->
+    `AttentionTransport.prepare_output`, which wraps the unreduced rows in an
+    `UnreducedOutput(partial, group=...)` -- a declared transport sum, not the
+    Blackwell-only fused kernel. So the flag is now honoured by delegating the
+    wo_b projection to upstream's own `_project_wo_b` (see the tail).
 
     0.5.23 changed upstream's body in five places. Three are inert here:
 
@@ -311,16 +311,6 @@ def mqa_forward_global_head_layout_kunlun(
 
     if not upstream.get_attn_tp_context().input_scattered and x.shape[0] == 0:
         return x
-
-    # Placed after the empty-batch short circuit, matching the order of the
-    # upstream forward (that upstream short circuit also returns x directly and
-    # does not produce an AttnOutput).
-    if defer_all_reduce:
-        raise NotImplementedError(
-            "Kunlun MQA forward 无法把 wo_b 的 TP all-reduce 交给 MHC post 融合"
-            "（all_reduce_mhc_post_combine_norm 是 Blackwell/ROCm 专有 kernel），"
-            "defer_all_reduce=True 不支持。"
-        )
 
     # 0.5.23 新增的 mega attention：上游在 forward 里整条改道
     # （`_forward_mega` + `_project_wo_b`，并把 kernel_num_heads 固定成 64/128）。
@@ -525,9 +515,25 @@ def mqa_forward_global_head_layout_kunlun(
         o = dsv4_mqa_wo_a_einsum_kunlun(o, wo_a)
         _dsv4_dump(self, "self_attn.wo_a.output", o)
 
-    o, _ = self.wo_b(o.flatten(1))
-    _dsv4_dump(self, "self_attn.wo_b.output", o)
-    if self.attn_tp_size > 1 and self.attn_tp_size < upstream.get_parallel().tp_size:
-        o = upstream.attn_tp_all_reduce(o)
-    _dsv4_dump(self, "self_attn.output", o)
+    # wo_b + the TP reduction. Call upstream's own ``_project_wo_b`` instead of
+    # re-deriving it: 0.5.23 made `defer_all_reduce=True` the ordinary CUDA
+    # route (`DeepseekV4CudaDecoderLayer.__init__` sets
+    # `self_attn.wo_b.reduce_results = False` and `_run_boundary_attention`
+    # always passes it), so the reduction now belongs to
+    # `attn_boundary.finish()`. `_project_wo_b` is where upstream decides
+    # whether the defer actually applies (attn_tp_size, `_is_cuda`,
+    # `should_skip_mlp_all_reduce`), passes `skip_all_reduce` into `wo_b` and
+    # wraps the unreduced rows in `mhc.AttnOutput`. Copying that logic here
+    # would be a second opinion on a collective.
+    o = self._project_wo_b(o, defer_all_reduce)
+    _dsv4_dump(
+        self,
+        "self_attn.wo_b.output",
+        o.partial if isinstance(o, upstream.mhc.AttnOutput) else o,
+    )
+    _dsv4_dump(
+        self,
+        "self_attn.output",
+        o.partial if isinstance(o, upstream.mhc.AttnOutput) else o,
+    )
     return o
