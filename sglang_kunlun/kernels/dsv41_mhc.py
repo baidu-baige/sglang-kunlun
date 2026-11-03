@@ -127,3 +127,23 @@ def hc_broadcast_kunlun(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
     (cuda)". This is upstream's own fallback expression, verbatim.
     """
     return x.unsqueeze(1).repeat(1, hc_mult, 1)
+
+
+@register_jit_op("sglang.kernels.ops.layernorm.mhc", "mhc_stream_mean")
+def mhc_stream_mean_kunlun(
+    x: torch.Tensor, out: torch.Tensor | None = None
+) -> torch.Tensor:
+    """``[m, hc, h] -> [m, h]``, the mean over the mHC streams.
+
+    New in 0.5.23: ``DeepseekV4Model._forward_impl`` feeds the DSPARK aux hidden
+    states through this helper. Like ``hc_broadcast`` it carries an upstream
+    fallback, and like ``hc_broadcast`` the gate (``x.device.type != "cuda"``)
+    is false on Kunlun, so prefill graph capture died launching
+    ``_mhc_stream_mean_kernel`` with "0 compatible backends for target (cuda)".
+
+    Upstream's own comment says the Triton kernel is bitwise-equal to torch's
+    CUDA mean for the hc=4 mHC width over whole 1024-element blocks, so the
+    torch expression below is its reference, not an approximation.
+    """
+    y = x.mean(dim=1)
+    return y if out is None else out.copy_(y)

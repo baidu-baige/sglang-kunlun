@@ -820,6 +820,35 @@ def quantize_fp4_indexer_tensor_kunlun(
 
 
 @register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.fp4_indexer", "flat_selection_slots"
+)
+def flat_selection_slots_kunlun(
+    raw_indices: torch.Tensor,
+    request_starts: torch.Tensor,
+    slots: torch.Tensor,
+    page_indices: torch.Tensor,
+) -> None:
+    """``page_indices[r, j] = slots[request_starts[r] + raw_indices[r, j]]``, -1
+    where the request-local position is negative.
+
+    New in 0.5.23 (``v41_indexer.scoring.write_page_indices``). Upstream's
+    version is Triton-only -- no device gate, no fallback -- so on Kunlun it dies
+    with "0 compatible backends for target (cuda)". The expression is upstream's
+    own docstring; the index clamp only keeps the masked-out lanes in range.
+    """
+    rows, k = raw_indices.shape
+    if not rows or not k:
+        return
+    idx = request_starts.reshape(-1, 1).to(torch.int64) + raw_indices.to(torch.int64)
+    gathered = slots.reshape(-1)[idx.clamp_(0, slots.numel() - 1)]
+    page_indices[:rows, :k] = torch.where(
+        raw_indices >= 0,
+        gathered.to(page_indices.dtype),
+        torch.full((), -1, dtype=page_indices.dtype, device=page_indices.device),
+    )
+
+
+@register_jit_op(
     "sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache", "store_fp4_index_k_cache"
 )
 def store_fp4_index_k_cache_kunlun(
