@@ -2418,14 +2418,26 @@ def window_gather_kernel(
     req_pool_out_ptr: torch.Tensor,
     offsets_ptr: torch.Tensor,
     invalid_ptr: torch.Tensor,
+    valid_from_ptr: torch.Tensor,
     block_size: int,
     swa_window: int,
     W_BLOCK: int,
+    HAS_VALID_FROM: bool = False,
 ) -> None:
     """Build DSpark sliding-window metadata via xspeedgate_ops.
 
     The XPU kernel writes int32 offsets while the Triton call site allocates
     them as int64, so that output goes through a scratch buffer.
+
+    0.5.23 added ``valid_from`` / ``HAS_VALID_FROM``: when a request was just
+    placed by PD its SWA ring holds nothing below the cached prefix, so upstream
+    clamps the per-request context length to ``prefix - valid_from[req_pool]``
+    (``dspark_attn_metadata._window_gather_kernel``). ``swa_valid_from`` is
+    allocated for every DSPARK+SWA pool and written by
+    ``dspark_worker_v2`` on ``encoder_swa_reset``, so the clamp is live on the PD
+    decode path. The vendor kernel has no such input; apply the same clamp in
+    torch afterwards (``offsets``/``invalid`` are unaffected -- upstream derives
+    them from ``prefix`` and ``swa_window`` only).
     """
 
     bs = context_lens_ptr.numel()
@@ -2457,6 +2469,20 @@ def window_gather_kernel(
         offsets_ptr.copy_(offsets)
     if invalid is not invalid_ptr:
         invalid_ptr.copy_(invalid)
+
+    if HAS_VALID_FROM:
+        first_token = (
+            torch.arange(bs, device=seq_lens_casual_ptr.device, dtype=torch.int64)
+            * block_size
+        )
+        prefix = seq_lens_casual_ptr.reshape(-1)[first_token].to(torch.int64) - 1
+        req_pool = req_pool_rep_ptr.reshape(-1)[first_token].to(torch.int64)
+        allowed = (prefix - valid_from_ptr.reshape(-1)[req_pool]).clamp_min(0)
+        context_lens_ptr.copy_(
+            torch.minimum(context_lens_ptr.to(torch.int64), allowed).to(
+                context_lens_ptr.dtype
+            )
+        )
 
 
 @register_triton_op(
