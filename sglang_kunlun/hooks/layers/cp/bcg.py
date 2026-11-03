@@ -19,6 +19,15 @@ already strategy-agnostic and available here:
 So the only missing piece is the whitelist entry. Keep the upstream predicate
 as the fallback: a configuration upstream already accepts keeps its result, and
 every non-Kunlun configuration keeps its upstream verdict.
+
+0.5.23 turned ``srt/layers/cp/bcg.py`` into a package: the strategy dispatch
+(``get_cp_bcg_input_type``, ``supports_prefill_cp_bcg``) stayed in
+``bcg/__init__.py``, while ``PrefillCPBCGInput``, ``execute_prefill_cp_bcg`` and
+``_slice_output_rows`` moved to ``bcg/bcg.py`` (with per-strategy subclasses in
+``bcg/interleave_bcg.py`` and ``bcg/zigzag_bcg.py``). The hook targets below
+follow that split; ``InterleaveCPBCGInput`` does not override
+``select_replay_bucket_for_batch``, so hooking the base class still covers the
+interleave strategy this platform runs.
 """
 
 from __future__ import annotations
@@ -306,7 +315,7 @@ def is_cp_active_kunlun(original, forward_batch) -> bool:
 
 
 @plugin_hook(
-    "sglang.srt.layers.cp.bcg.execute_prefill_cp_bcg",
+    "sglang.srt.layers.cp.bcg.bcg.execute_prefill_cp_bcg",
     type=HookType.REPLACE,
 )
 def execute_prefill_cp_bcg_kunlun(
@@ -327,7 +336,7 @@ def execute_prefill_cp_bcg_kunlun(
     拆元组、gather 两个流、并把 ``hidden_states_before_norm`` 传给
     LogitsProcessor（0.5.19 的签名仍接受该参数）。
     """
-    from sglang.srt.layers.cp.bcg import _slice_output_rows
+    from sglang.srt.layers.cp.bcg.bcg import _slice_output_rows
     from sglang.srt.layers.cp.utils import cp_gather_after_forward
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
@@ -399,7 +408,7 @@ def execute_prefill_cp_bcg_kunlun(
 
 
 @plugin_hook(
-    "sglang.srt.layers.cp.bcg.PrefillCPBCGInput.select_replay_bucket_for_batch",
+    "sglang.srt.layers.cp.bcg.bcg.PrefillCPBCGInput.select_replay_bucket_for_batch",
     type=HookType.AROUND,
 )
 def select_replay_bucket_for_batch_kunlun(
