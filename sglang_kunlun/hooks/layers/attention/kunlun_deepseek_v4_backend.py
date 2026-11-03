@@ -9,9 +9,11 @@ from __future__ import annotations
 
 from typing import List, Literal, Optional, Tuple
 
+import functools
+import inspect
 import logging
 import os
-import cocopod  # noqa: F401  # Registers DSV4 XSpeedGate attention operators.
+import cocopod  # noqa: F401  # Preserve target operator registration.
 import torch
 
 from sglang.srt.environ import envs
@@ -31,13 +33,20 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 from sglang_kunlun.kernels.kernel_ops import (
     _dsv4_topk_torch_fallback,
+    build_causal_swa_page_indices_kunlun,
     dsv4_c4_paged_mqa_logits_torch,
     dsv4_compressed_attention_torch,
     dsv4_quant_k_cache_kunlun,
     dsv4_set_k_and_s_with_mapping_kunlun,
+    get_paged_mqa_logits_metadata_kunlun,
+    page_table_positions_kernel,
 )
 
 _DSV4_TENSOR_DUMP_CALLBACK = None
+
+def _hybrid_kernel_note(stage, layer, capturing, capture_phase, detail=""):
+    """Compatibility no-op; capture bookkeeping and exit reports are removed."""
+    return None
 
 
 def set_dsv4_tensor_dump_callback(callback):
@@ -146,6 +155,72 @@ def _clamp_c128_prefill_topk(
     return min(compressed_topk, max(chunk_start_pos // compress_ratio, 1))
 
 
+_TOPK_VEC_PAGE_CAP_WARNED: set = set()
+
+
+@plugin_hook(
+    "sglang.srt.layers.attention.dsv4.indexer.topk_transform_pytorch_vectorized",
+    type=HookType.AROUND,
+)
+def topk_transform_pytorch_vectorized_kunlun(
+    original_fn,
+    scores,
+    seq_lens,
+    page_tables,
+    out_page_indices,
+    page_size,
+    out_raw_indices=None,
+):
+    """Clamp seq_lens to the page-table-addressable length so top-k cannot pick
+    positions beyond the page table and read out of bounds.
+
+    Upstream `_topk_transform_vectorized` applies only a lower bound to page_idx,
+    no upper bound:
+
+        page_idx = raw_indices >> page_bits
+        physical_pages = torch.gather(page_tables, 1, page_idx.clamp(min=0).long())
+
+    The `c4_seq_lens` passed in from the C4 indexer decode/verify path
+    (`run_topk_transform` in `indexer.py`) is the live compressed length, while
+    `logits` / `page_table` are buffers fixed at graph-capture time. Under long
+    context the live length can exceed what the page table covers, so the chosen
+    position is shifted right out of the page table and the gather goes
+    out-of-bounds immediately -- on Kunlun this surfaces as gather_2d's
+    "load/store operation exceed memory size", reported as
+    status=700 illegal memory access, and the scheduler exits directly.
+
+    Clamping rationale: positions beyond `page_tables.shape[1] * page_size` have
+    no page-table entry to address anyway. After clamping they are masked to
+    -inf in `valid_mask` and never enter top-k. A hit warns once -- at that
+    point the top-k range for the long-context rows has been truncated, which
+    loses precision, so it must be visible in the logs.
+    """
+    width = int(scores.shape[1])
+    cap = width
+    if page_tables is not None and page_tables.dim() == 2:
+        page_cap = int(page_tables.shape[1]) * int(page_size)
+        if page_cap < cap:
+            cap = page_cap
+            key = (page_cap, width)
+            if key not in _TOPK_VEC_PAGE_CAP_WARNED:
+                _TOPK_VEC_PAGE_CAP_WARNED.add(key)
+                logger.warning(
+                    "DSV4 topk: page table addresses %d compressed tokens but the "
+                    "score buffer is %d wide; clamping seq_lens to the page table "
+                    "(long-context rows get truncated)",
+                    page_cap,
+                    width,
+                )
+    return original_fn(
+        scores,
+        seq_lens.clamp(max=cap),
+        page_tables,
+        out_page_indices,
+        page_size,
+        out_raw_indices,
+    )
+
+
 @plugin_hook(
     "sglang.srt.layers.attention.deepseek_v4_backend._create_flashmla_metadata",
     type=HookType.REPLACE,
@@ -250,25 +325,616 @@ def _flash_mla_with_kvcache_reference(
     type=HookType.REPLACE,
 )
 def flash_mla_with_kvcache_kunlun(*args, **kwargs):
-    """Replace the unavailable sgl_kernel FlashMLA callable on Kunlun."""
+    """Kunlun equivalent; does not execute the CUDA FlashMLA kernels."""
     if args:
         raise TypeError("Kunlun FlashMLA replacement requires keyword arguments")
-    return _flash_mla_with_kvcache_reference(**kwargs)
+    q = kwargs.get("q")
+    fallback_to_reference = kwargs.pop("kunlun_fallback_to_reference", True)
+    result = _try_flash_mla_hybrid(**kwargs)
+    if result is not None or not fallback_to_reference:
+        return result
+    # Neither hybrid nor this reference can reinterpret packed bytes as K/V.
+    for name in ("k_cache", "extra_k_cache"):
+        cache = kwargs.get(name)
+        if cache is not None and (
+            cache.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+            or cache.shape[-1] != kwargs["q"].shape[-1]
+        ):
+            raise ValueError("Kunlun FlashMLA reference requires typed unpacked KV")
+    result = _flash_mla_with_kvcache_reference(**kwargs)
+    return result
+
+
+def _hybrid_trace_before(arguments, layer_id, context):
+    """Compatibility seam for migrated callers; production tracing is removed."""
+    return None
+
+
+def _hybrid_trace_after(record, arguments, rc):
+    """No diagnostic synchronization or tensor inspection in production."""
+    return None
+
+
+_KUNLUN_HYBRID_SEQ_LENS_ATTR = "_kunlun_hybrid_seq_lens_i32"
+_KUNLUN_HYBRID_SEQ_LENS_FRESH_ATTR = "_kunlun_hybrid_seq_lens_fresh"
+
+
+def _hybrid_seq_lens_cache(owner):
+    cache = getattr(owner, _KUNLUN_HYBRID_SEQ_LENS_ATTR, None)
+    if cache is None:
+        cache = {}
+        setattr(owner, _KUNLUN_HYBRID_SEQ_LENS_ATTR, cache)
+    return cache
+
+
+def _hybrid_seq_lens_key(seq_lens, n):
+    return (seq_lens.device.type, seq_lens.device.index, n)
+
+
+def _hybrid_seq_lens_prerefresh_enabled() -> bool:
+    """``SGLANG_KUNLUN_DSV4_HYBRID_PREREFRESH``: A/B switch for the hoisted mirror.
+
+    Default on.  Set to ``0`` and ``init_forward_metadata_out_graph`` stops
+    refreshing the int32 ``seq_lens`` mirror, so the decode layer loop falls
+    back to casting per layer and the capture records one copy per hybrid layer
+    again -- the pre-hoist behaviour, same binary, for measuring what the
+    hoist is worth.
+    """
+
+    return os.environ.get("SGLANG_KUNLUN_DSV4_HYBRID_PREREFRESH", "1") != "0"
+
+
+def _report_topk_route(route, raw_indices, capture_enabled, hisparse_decode) -> None:
+    """Compatibility no-op; does not alter the selected top-k implementation."""
+    return None
+
+
+def _low_ratio_index_bmm_enabled() -> bool:
+    """``DSV4_LOW_RATIO_INDEX_BMM``: batched-matmul form of the indexer scores.
+
+    Default on.  Set to ``0`` to restore the broadcast-multiply-then-sum form,
+    which is the same contraction but materialises an ``[rows, heads, chunk,
+    head_dim]`` intermediate -- the reason the low-ratio decode indexer runs
+    out of memory when the chunk or the row block grows.  Kept as an A/B
+    because the two forms accumulate in different precision.
+    """
+
+    return os.environ.get("DSV4_LOW_RATIO_INDEX_BMM", "1") != "0"
+
+
+def _refresh_hybrid_seq_lens_i32(owner, forward_batch) -> None:
+    """Refresh the hybrid adapter's int32 ``seq_lens`` mirror for this forward.
+
+    The decode layer loop used to cast per layer: the buffer is keyed by
+    ``(device, bucket)`` and *not* by layer, so all ~38 hybrid layers wrote
+    byte-identical lengths into the same address and the capture recorded every
+    one of those copies.  Replaying them is pure overhead.  One refresh here
+    serves every layer and lets the capture record nothing.
+
+    Stays device-only on pointer-stable tensors because this hook is itself
+    capturable (``MetadataGlueGraph`` records ``init_forward_metadata_out_graph``
+    per replay key): a host-computed source would replay frozen at its
+    capture-time value.  ``forward_batch.seq_lens`` is the runner's static graph
+    buffer, already padded to the bucket with ``seq_len_fill_value``, which is
+    what the per-layer copy read too -- so the padded tail keeps its old values.
+
+    The stamp records which bucket was refreshed; ``_hybrid_seq_lens_i32``
+    refuses to trust a buffer this hook did not just fill.  Like
+    ``_kunlun_capture_phase`` next to it, this relies on the hook running once
+    per forward ahead of the layers, which is the contract of
+    ``init_forward_metadata``/the graph runner's replay prep.
+    """
+
+    setattr(owner, _KUNLUN_HYBRID_SEQ_LENS_FRESH_ATTR, None)
+    seq_lens = getattr(forward_batch, "seq_lens", None)
+    if seq_lens is None or seq_lens.numel() == 0:
+        return
+    n = seq_lens.numel()
+    cache = _hybrid_seq_lens_cache(owner)
+    key = _hybrid_seq_lens_key(seq_lens, n)
+    buffer = cache.get(key)
+    if buffer is None:
+        buffer = torch.empty(n, dtype=torch.int32, device=seq_lens.device)
+        cache[key] = buffer
+    buffer.copy_(seq_lens)
+    setattr(owner, _KUNLUN_HYBRID_SEQ_LENS_FRESH_ATTR, key)
+
+
+def _hybrid_seq_lens_i32(owner, seq_lens, n, capturing):
+    """Fixed-address int32 mirror of ``seq_lens[:n]``.
+
+    ``ForwardBatch.seq_lens`` is int64 in sglang's graph slot while the operator
+    wants contiguous int32, and a per-call ``.to(torch.int32)`` would hand
+    capture a fresh allocation on every replay.  So one buffer is kept per
+    ``(device, n)`` and ``_refresh_hybrid_seq_lens_i32`` fills it once per
+    forward, outside the graph; the layer loop below is then a pure lookup and
+    the capture records no copy at all.
+
+    The in-place copy is the fallback for callers that never run that hook
+    (standalone users and tests).  It is a device-side op, so under capture it
+    records once per layer -- exactly the cost the refresh exists to remove.
+
+    Returns ``None`` when no buffer exists for this shape under capture; the
+    capture itself must never allocate.
+    """
+
+    cache = _hybrid_seq_lens_cache(owner)
+    key = _hybrid_seq_lens_key(seq_lens, n)
+    buffer = cache.get(key)
+    if (
+        buffer is not None
+        and getattr(owner, _KUNLUN_HYBRID_SEQ_LENS_FRESH_ATTR, None) == key
+    ):
+        return buffer
+    if buffer is None:
+        if capturing:
+            return None
+        buffer = torch.empty(n, dtype=torch.int32, device=seq_lens.device)
+        cache[key] = buffer
+    buffer.copy_(seq_lens[:n])
+    return buffer
+
+
+def _kunlun_hybrid_decode_enabled() -> bool:
+    """``SGLANG_KUNLUN_DSV4_HYBRID_DECODE``: kill switch for the hybrid decode adapter.
+
+    Default on (``"1"``), so an unset environment keeps the current behaviour.
+    Set to ``0`` and ``_try_flash_mla_hybrid`` bails on every call, which drops
+    decode onto the legacy ``xspeedgate_ops.compressed_attention`` kernel. The
+    DSV4 call site passes ``kunlun_fallback_to_reference=False``, so this is a
+    true A/B against the legacy kernel -- it does NOT divert to the slow torch
+    reference.
+
+    The guard lives inside the adapter rather than at the call sites so it also
+    covers the upstream ``flash_mla_with_kvcache`` REPLACE hook, not just the
+    direct DSV4 decode call.
+    """
+    return os.environ.get("SGLANG_KUNLUN_DSV4_HYBRID_DECODE", "1") == "1"
+
+
+def _try_flash_mla_hybrid(
+    q, k_cache, indices, *, head_dim_v=512, softmax_scale=None,
+    attn_sink=None, topk_length=None, extra_k_cache=None,
+    extra_indices_in_kvcache=None, extra_topk_length=None,
+    kunlun_decode_lengths=None, kunlun_compress_ratio=None,
+    kunlun_layer_id=None, kunlun_forward_batch=None, kunlun_backend=None, **_,
+):
+    """Eager decode adapter; None retains the caller's existing fallback.
+
+    Only typed, full 512-dimensional K=V caches are supported. FlashMLA FP8
+    (528/584 bytes) and Kunlun mixed INT8 (604 bytes) are NOT this layout.
+    These length/index checks synchronize; never use them in graph capture.
+    """
+    capturing = q.is_cuda and torch.cuda.is_current_stream_capturing()
+    # ``capturing`` is False during the two eager warmup passes sglang runs
+    # before every graph capture, yet those passes are exactly as synthetic as
+    # the capture itself: ``seq_lens`` is the graph fill value and the window
+    # lengths come from a dummy page table.  The backend records the phase from
+    # ``init_forward_metadata_out_graph(..., in_capture=...)``, which runs once
+    # per replay with False, so use that -- not ``capturing`` -- to decide
+    # whether the data-dependent checks below are looking at a real batch.
+    capture_phase = bool(getattr(kunlun_backend, "_kunlun_capture_phase", False))
+
+    def bail(reason):
+        """Keep the fallback decision without diagnostic bookkeeping."""
+        return None
+
+    if not _kunlun_hybrid_decode_enabled():
+        return bail("kill_switch")
+
+    if (
+        kunlun_compress_ratio not in (1, 2, 4, 128)
+        or q.ndim != 4 or q.shape[1] != 1 or q.shape[0] == 0
+        or q.shape[-1] != 512 or head_dim_v != 512
+        or q.dtype not in (torch.float16, torch.bfloat16)
+        or extra_k_cache is None or extra_indices_in_kvcache is None
+        or topk_length is None or extra_topk_length is None
+    ):
+        return bail("unsupported-shape-or-metadata")
+    n, _, heads, dim = q.shape
+    if attn_sink is not None and (
+        attn_sink.shape != (heads,) or attn_sink.device != q.device
+    ):
+        return bail("attn-sink-shape")
+    caches = (k_cache, extra_k_cache)
+    for name, cache in zip(("win", "com"), caches):
+        if (
+            cache.dtype != q.dtype or cache.device != q.device
+            or cache.ndim < 2 or cache.shape[-1] != dim
+            or cache.numel() == 0 or not cache.is_contiguous()
+        ):
+            return bail(f"cache-layout:{name}")
+    lengths = kunlun_decode_lengths
+    if lengths is not None:
+        if (
+            lengths.device.type != "cpu" or lengths.numel() != n
+            or lengths.dtype not in (torch.int32, torch.int64)
+        ):
+            return bail("decode-lengths-host-mismatch")
+        # ``kunlun_decode_lengths`` is the host-side compatibility argument.
+        # The scheduler commonly publishes it as CPU int64.  Converting that
+        # host tensor to contiguous CPU int32 is capture-safe; unlike a
+        # device-side conversion, it does not enqueue work on the captured
+        # CUDA stream.  The authoritative replay-time lengths remain
+        # ``kunlun_forward_batch.seq_lens`` below.
+        lengths = lengths.reshape(n).to(torch.int32).contiguous()
+    win_idx, com_idx = indices, extra_indices_in_kvcache
+    for name, idx in zip(("win", "com"), (win_idx, com_idx)):
+        if (
+            idx.ndim != 3 or idx.shape[:2] != (n, 1)
+            or idx.shape[-1] == 0 or idx.dtype != torch.int32
+            or idx.device != q.device
+        ):
+            return bail(f"index-layout:{name}")
+    # A padded index width is a stride, NOT the valid length. The scheduler
+    # already publishes these lengths together with the index tensors. Do not
+    # copy indices to the host or compare device metadata from every layer:
+    # that turns a one-token decode into a per-layer synchronization point.
+    # The scheduler's device sequence lengths are the authoritative per-step
+    # values.  Do not manufacture a device tensor from the host copy in the
+    # layer loop: the ForwardBatch already owns this tensor.
+    if kunlun_forward_batch is not None:
+        raw_seq_lens = kunlun_forward_batch.seq_lens
+        if raw_seq_lens.device != q.device or raw_seq_lens.numel() < n:
+            return bail("device-seq-lens-mismatch")
+        # int64 in sglang's graph slot, int32 contiguous for the operator; the
+        # mirror keeps one address for the whole capture/replay lifetime.
+        device_lengths = _hybrid_seq_lens_i32(
+            kunlun_backend or kunlun_forward_batch, raw_seq_lens, n, capturing
+        )
+        if device_lengths is None:
+            return bail("no-int32-seq-lens-buffer-for-this-shape")
+    else:
+        if lengths is None:
+            return bail("no-decode-lengths")
+        if capturing:
+            return bail("capture-without-forward-batch")
+        device_lengths = lengths.to(q.device, dtype=torch.int32)
+    if not capturing and bool((device_lengths <= 0).any()):
+        return bail("non-positive-seq-lens")
+    expected = (
+        device_lengths.clamp_max(win_idx.shape[-1]),
+        (device_lengths // kunlun_compress_ratio).clamp_max(com_idx.shape[-1]),
+    )
+    for name, idx, explicit, inferred, cache in zip(
+        ("win", "com"), (win_idx, com_idx), (topk_length, extra_topk_length),
+        expected, caches
+    ):
+        if (
+            explicit.numel() != n
+            or explicit.device != q.device
+            or explicit.dtype not in (torch.int32, torch.int64)
+        ):
+            return bail(f"topk-length-tensor:{name}")
+        if capturing and (
+            explicit.dtype != torch.int32 or not explicit.is_contiguous()
+        ):
+            return bail(f"topk-length-layout-in-capture:{name}")
+        # Both checks stay on the device.  The scalar reductions are deliberate:
+        # this adapter has no asynchronous "try and report invalid metadata"
+        # operator, so silently omitting them would turn malformed dynamic
+        # indices into out-of-bounds reads.  Unlike the old implementation,
+        # they do not copy an index tensor or a length tensor to the host.
+        # Skipped for the whole capture phase, not merely for ``capturing``:
+        # during it both sides are placeholders -- the dummy batch's ``seq_lens``
+        # is the graph fill value while the window lengths come from a dummy page
+        # table -- so the comparison says nothing about the batch the graph will
+        # replay.  Replay re-runs ``init_forward_metadata_out_graph`` and never
+        # calls this adapter, and real eager decode still reports
+        # ``capture_phase`` False, so the guard keeps its teeth where it matters.
+        if not capture_phase:
+            if not torch.equal(explicit.reshape(n).to(torch.int32), inferred):
+                # Eager only, so the D2H here is allowed and worth the diagnosis:
+                # the capture warmup runs on a dummy batch whose ``seq_lens`` is
+                # the graph fill value, and this check compares it against the
+                # scheduler's real top-k lengths.
+                return bail(
+                    f"topk-lengths-disagree-with-seq-lens:{name} "
+                    f"explicit={explicit.reshape(n)[:4].tolist()} "
+                    f"inferred={inferred[:4].tolist()} seq_lens="
+                    f"{device_lengths[:4].tolist()}"
+                )
+            active = (
+                torch.arange(idx.shape[-1], device=q.device)[None, None, :]
+                < inferred.reshape(n, 1, 1)
+            )
+            rows = cache.numel() // dim
+            if bool((((idx < 0) | (idx >= rows)) & active).any()):
+                return bail(f"index-out-of-range:{name}")
+            if bool((inferred <= 0).any()):
+                return bail(f"zero-inferred-topk:{name}")
+    try:
+        import kunlun_ops
+    except ImportError:
+        return bail("kunlun_ops-missing")
+    op = getattr(kunlun_ops, "hybrid_attention", None)
+    if op is None:
+        return bail("hybrid_attention-op-missing")
+    q3 = q.squeeze(1)
+    if capturing and not q3.is_contiguous():
+        return bail("q-non-contiguous-in-capture")
+    graph_buffer_key = (
+        kunlun_layer_id, n, heads, dim, q.dtype, q.device.type, q.device.index
+    )
+    if capturing:
+        # CUDA graph replay requires the exact same storage addresses.  These
+        # buffers are allocated during the eager warmup call and keyed by the
+        # layer and graph bucket.  A graph capture that arrives before warmup
+        # falls back instead of allocating from inside capture.
+        graph_buffers = getattr(
+            kunlun_backend, "_kunlun_hybrid_graph_buffers", None
+        )
+        if graph_buffers is None and kunlun_forward_batch is not None:
+            graph_buffers = getattr(
+                kunlun_forward_batch, "_kunlun_hybrid_graph_buffers", None
+            )
+        buffers = (
+            graph_buffers.get(graph_buffer_key)
+            if graph_buffers is not None else None
+        )
+        if buffers is None:
+            return bail("no-graph-buffers-for-this-shape")
+        out, lse, max_logits = buffers
+    else:
+        q3 = q3.contiguous()
+        out = torch.empty_like(q3)
+        lse = torch.empty((n, heads), dtype=torch.float32, device=q.device)
+        max_logits = torch.empty_like(lse)
+        if kunlun_backend is not None or kunlun_forward_batch is not None:
+            owner = kunlun_backend or kunlun_forward_batch
+            graph_buffers = getattr(owner, "_kunlun_hybrid_graph_buffers", None)
+            if graph_buffers is None:
+                graph_buffers = {}
+                setattr(owner, "_kunlun_hybrid_graph_buffers", graph_buffers)
+            graph_buffers[graph_buffer_key] = (out, lse, max_logits)
+    if kunlun_forward_batch is not None:
+        metadata_owner = kunlun_backend or kunlun_forward_batch
+        metadata_cache = getattr(
+            metadata_owner, "_kunlun_hybrid_decode_metadata", None
+        )
+        if metadata_cache is None:
+            metadata_cache = {}
+            setattr(
+                metadata_owner,
+                "_kunlun_hybrid_decode_metadata",
+                metadata_cache,
+            )
+        # LoD is shape metadata, not request metadata.  Reuse it by device and
+        # bucket; sequence lengths are refreshed below from ForwardBatch on
+        # every call and are never keyed by data_ptr (ForwardBatch tensors are
+        # commonly updated in-place between steps).
+        bucket = n
+        cache_key = (q.device.type, q.device.index, bucket)
+        metadata = metadata_cache.get(cache_key)
+        if metadata is None and capturing:
+            return bail("no-lod-metadata-for-this-bucket")
+        if metadata is None:
+            lod_cpu = torch.arange(bucket + 1, dtype=torch.int32)
+            metadata = (
+                lod_cpu,
+                lod_cpu.to(q.device),
+            )
+            metadata_cache[cache_key] = metadata
+        lod_cpu, lod_xpu = metadata
+        # Reuse the mirror built above: re-reading ``seq_lens`` here would
+        # reintroduce the int64/layout mismatch this replaced.
+        lengths_xpu = device_lengths
+    else:
+        # Standalone callers/tests do not have a ForwardBatch to own the
+        # lifetime. The serving path above is the one that eliminates the
+        # per-layer H2D copies.
+        lod_cpu = torch.arange(n + 1, dtype=torch.int32)
+        lod_xpu = lod_cpu.to(q.device)
+        lengths_xpu = device_lengths
+    # FlashMLA returns KV-only LSE. Fold sink ourselves so the contract does
+    # not depend on whether hybrid includes sink in its returned LSE.
+    op_arguments = dict(
+        q=q3, win_kv_cache=k_cache.reshape(-1, dim),
+        win_indices=win_idx.squeeze(1).contiguous(),
+        com_kv_cache=extra_k_cache.reshape(-1, dim),
+        com_indices=com_idx.squeeze(1).contiguous(),
+        o=out, max_logits=max_logits, lse=lse,
+        qlod_cpu=lod_cpu, qlod_xpu=lod_xpu,
+        kvseqlen_cpu=lengths if lengths is not None else device_lengths,
+        kvseqlen_xpu=lengths_xpu,
+        sm_scale=dim**-0.5 if softmax_scale is None else softmax_scale,
+        is_causal=True, max_window_size=win_idx.shape[-1],
+        compress_ratio=kunlun_compress_ratio, com_topk=com_idx.shape[-1],
+        attn_sink=None, side_stream=-1,
+    )
+    trace = _hybrid_trace_before(op_arguments, kunlun_layer_id, {
+        "topk_length": topk_length, "extra_topk_length": extra_topk_length,
+        "sink_folded_after_kernel": attn_sink,
+    })
+
+    _hybrid_kernel_note(
+        "enter", kunlun_layer_id, capturing, capture_phase,
+        f"ratio={kunlun_compress_ratio} bs={n}",
+    )
+    rc = op(**op_arguments)
+    _hybrid_kernel_note(
+        "exit", kunlun_layer_id, capturing, capture_phase, f"rc={rc}"
+    )
+    _hybrid_trace_after(trace, op_arguments, rc)
+    # Never retry after a failed launch: the stream/device may be invalid.
+    if isinstance(rc, int) and rc != 0:
+        raise RuntimeError(f"kunlun_ops.hybrid_attention failed with rc={rc}")
+    if attn_sink is not None:
+        out = (out.float() * torch.sigmoid(
+            lse - attn_sink.float().view(1, heads)
+        ).unsqueeze(-1)).to(q.dtype)
+    return out.unsqueeze(1), lse.unsqueeze(-1)
+
+
+_KUNLUN_SPARSE_PREFILL_RATIOS = (0, 128)
+
+
+def _kunlun_sparse_prefill_enabled() -> bool:
+    """``SGLANG_KUNLUN_DSV4_SPARSE_PREFILL``: kill switch for the prefill branch.
+
+    Needs the `flash_mla_sparse_fwd` entrypoint from kunlun_ops 0.1.237 (with
+    the matching xpytorch, for the `dsa_prefill_with_mixed_cache` XFA symbol).
+    On 0.1.227 the branch dies on the first prefill: that build compiles the
+    kernel out below XHPC 20260820 and returns r=1.
+    """
+    return os.environ.get("SGLANG_KUNLUN_DSV4_SPARSE_PREFILL", "1") == "1"
 
 
 @plugin_hook(
-    "sglang.kernels.ops.attention.dsv4.attn.get_paged_mqa_logits_metadata",
+    "sgl_kernel.flash_mla.flash_mla_sparse_fwd",
     type=HookType.REPLACE,
 )
-def _get_paged_mqa_logits_metadata_kunlun(seq_lens, page_size, num_sm):
-    """Kunlun: bypass sglang JIT compile of paged_mqa_metadata.cuh.
+@plugin_hook(
+    "sgl_kernel.flash_mla_sparse_fwd",
+    type=HookType.REPLACE,
+)
+def flash_mla_sparse_fwd_kunlun(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Kunlun ``flash_mla_sparse_fwd`` on ``kunlun_ops.flash_mla_sparse_fwd``.
 
-    The upstream JIT kernel requires C++20 ``std::bit_cast`` (needs gcc-11+
-    libstdc++), which the current build env (gcc-10) cannot provide. The
-    downstream Kunlun path (``_compute_c4_logits_kunlun`` via XSpeedGate ops)
-    does not consume ``deep_gemm_metadata``, so an empty placeholder is safe.
+    The CUDA op is ``sm90::fwd::sparse_attn_fwd_kernel`` from the FlashMLA fork
+    (``torch.ops.sgl_kernel.sparse_prefill_fwd``); on Kunlun ``sgl_kernel`` is
+    the stub package, so every caller would get a ``_StubModule``. kunlun_ops
+    0.1.237 added a same-named entrypoint built to match that contract, with
+    native ``topk_length`` and ``attn_sink`` -- measured against a torch
+    reference at bf16 noise level (4e-3) for both. The older
+    ``sparse_prefill_fwd`` is not used: it is compiled out below XHPC 20260820
+    ("DO NOT SUPPORT dsa_prefill"), and ``sparse_prefill_fwd_opt`` leaves every
+    lane of ``indices`` live, which the ragged ``topk_length`` rows need.
+
+    The allocating Kunlun ABI takes indices as [s_q, h_kv, topk]; the older
+    out-buffer ABI takes [s_q, topk]. Both use kv as [s_kv, 1, d_qk].
+    ``is_causal`` stays off and the cu_seqlens stay None: the indices are
+    rebased into a gathered workspace, so neither positional masking nor the
+    batch split means anything to them.
+
+    Args:
+        q: Queries with shape [s_q, h_q, d_qk].
+        kv: Gathered key/value workspace with one KV head.
+        indices: Workspace indices per query, with an optional singleton head axis.
+        sm_scale: Scale applied to attention logits.
+        d_v: Value dimension of the attention output.
+        attn_sink: Optional per-head attention sink.
+        topk_length: Optional valid index-prefix length for each query.
+
+    Returns:
+        Attention output, maximum logits, and log-sum-exp tensors.
     """
-    return torch.empty(0, dtype=torch.int32, device=seq_lens.device)
+    import kunlun_ops
+
+    if q.dim() != 3:
+        raise ValueError(f"q must be [s_q, h_q, d_qk], got {tuple(q.shape)}")
+    if indices.dim() == 3:
+        if indices.shape[1] != 1:
+            raise ValueError(
+                f"kunlun sparse prefill needs one kv head, got {tuple(indices.shape)}"
+            )
+    elif indices.dim() == 2:
+        # The op now documents indices as [s_q, h_kv, topk]; keep the kv-head
+        # axis the FlashMLA signature carries instead of squeezing it away, so
+        # both caller shapes land on the one layout it expects.
+        indices = indices.unsqueeze(1)
+    else:
+        raise ValueError(
+            f"indices must be [s_q, h_kv, topk] or [s_q, topk], got {tuple(indices.shape)}"
+        )
+    kv3 = kv.reshape(kv.shape[0], 1, kv.shape[-1])
+
+    # The kernel's own arguments, hoisted so the probe and the shape dump record
+    # exactly what it receives (post-``contiguous`` / post-cast) rather than the
+    # caller's views.
+    q_arg = q.contiguous()
+    kv_arg = kv3.contiguous()
+    indices_arg = indices.to(torch.int32).contiguous()
+    topk_length_arg = (
+        topk_length.to(torch.int32).contiguous() if topk_length is not None else None
+    )
+    sink_arg = (
+        attn_sink.to(torch.float32).contiguous() if attn_sink is not None else None
+    )
+
+    # kunlun_ops 0.1.237+ce32dc7a reshaped this entrypoint: the outputs are
+    # allocated by the op and returned, the lods are renamed to
+    # ``cu_seqlens_*``, and batch_num / max_seq_q / max_seq_kv / head_num /
+    # kv_lora_rank / rope_head_dim / topk are all inferred from the shapes
+    # instead of being passed. ``is_causal`` must stay explicit: it defaults to
+    # True there but the indices are rebased into a gathered workspace, so
+    # positional masking means nothing to them (same reason the cu_seqlens stay
+    # None).
+    if _sparse_mla_allocates_outputs():
+        out, max_logits, lse, _ = kunlun_ops.flash_mla_sparse_fwd(
+            q_arg,
+            kv_arg,
+            indices_arg,
+            sm_scale,
+            d_v=d_v,
+            is_causal=False,
+            topk_length=topk_length_arg,
+            attn_sink=sink_arg,
+        )
+    else:
+        # Earlier 0.1.237 wheels expose the explicit out-buffer ABI. Both
+        # variants share a package version, so inspect the callable contract.
+        tokens, heads, qk_dim = q_arg.shape
+        if not 0 < d_v <= qk_dim:
+            raise ValueError(f"invalid sparse MLA value width {d_v} for {qk_dim}")
+        out = torch.empty((tokens, heads, d_v), dtype=q_arg.dtype, device=q_arg.device)
+        max_logits = torch.empty((tokens, heads), dtype=torch.float32, device=q_arg.device)
+        lse = torch.empty_like(max_logits)
+        status = kunlun_ops.flash_mla_sparse_fwd(
+            q=q_arg, kv=kv_arg, indices=indices_arg.squeeze(1),
+            o=out, max_logits=max_logits, lse=lse,
+            qlod_cpu=None, qlod_xpu=None, kvlod_cpu=None, kvlod_xpu=None,
+            batch_num=1, max_seq_q=tokens, max_seq_kv=kv_arg.shape[0],
+            head_num=heads, kv_lora_rank=d_v, rope_head_dim=qk_dim - d_v,
+            softmax_scale=sm_scale, is_causal=False, topk=indices_arg.shape[-1],
+            topk_length=topk_length_arg, attn_sink=None,
+        )
+        if status != 0:
+            raise RuntimeError(f"Kunlun sparse MLA failed with status {status}")
+        # The out-buffer wheel leaves empty rows unwritten and ignores its
+        # attn_sink argument. Compute sink normalization from its natural-log
+        # LSE explicitly, always passing None so newer out-buffer wheels cannot
+        # apply the sink twice.
+        columns = torch.arange(indices_arg.shape[-1], device=q_arg.device)
+        live = indices_arg.squeeze(1) >= 0
+        if topk_length_arg is not None:
+            live = live & (columns[None, :] < topk_length_arg.reshape(-1, 1))
+        nonempty = live.any(dim=-1)
+        out.masked_fill_(~nonempty[:, None, None], 0)
+        max_logits.masked_fill_(~nonempty[:, None], -float("inf"))
+        lse.masked_fill_(~nonempty[:, None], -float("inf"))
+        if sink_arg is not None:
+            sink = sink_arg.reshape(1, heads)
+            factor = torch.sigmoid(lse - sink)
+            out.copy_((out.float() * factor[:, :, None]).to(out.dtype))
+            max_logits.copy_(torch.maximum(max_logits, sink))
+            lse.copy_(torch.logaddexp(lse, sink))
+    return out, max_logits, lse
+
+
+@functools.cache
+def _sparse_mla_allocates_outputs() -> bool:
+    import kunlun_ops
+
+    return "d_v" in inspect.signature(kunlun_ops.flash_mla_sparse_fwd).parameters
+
+
+# ``get_paged_mqa_logits_metadata`` used to be replaced here with an empty
+# placeholder: the upstream JIT kernel needs C++20 ``std::bit_cast`` (gcc-11+
+# libstdc++) which this build env cannot provide. XSpeedGate now ships the op
+# (``kernel_ops.get_paged_mqa_logits_metadata_kunlun``), and
+# ``KunlunDeepseekV4AttnBackend.init_forward_metadata_indexer`` calls it to fill
+# ``deep_gemm_metadata`` -- upstream's ``__post_init__`` short-circuits that field
+# to ``None`` on Kunlun (``SGLANG_FP8_PAGED_MQA_LOGITS_TORCH`` is set), so the
+# registered op would otherwise never run.
 
 
 class KunlunDSV4AttnMetadata(DSV4AttnMetadata):
@@ -367,7 +1033,15 @@ class KunlunDSV4AttnMetadata(DSV4AttnMetadata):
                     )
                 ),
             )
-            setattr(self, f"c{ratio}_sparse_raw_indices", None)
+            # V4.1 prefill writes request-local positions as well as pool slots.
+            # Decode keeps its page-only buffers, including graph-owned storage.
+            setattr(
+                self,
+                f"c{ratio}_sparse_raw_indices",
+                torch.full_like(
+                    getattr(self, f"c{ratio}_sparse_page_indices"), -1
+                ) if is_prefill else None,
+            )
         self.c0_flashmla_metadata = None
         self.c1_flashmla_metadata = None
         self.c2_flashmla_metadata = None
@@ -448,20 +1122,24 @@ def _get_graph_extend_aux(
 
 
 def _verify_row_lod_enabled(forward_batch) -> bool:
-    """eager 的 TARGET_VERIFY 必须用 per-row LoD，和 sglang 0.5.8 一致。
+    """Eager TARGET_VERIFY must use per-row LoD, matching sglang 0.5.8.
 
-    ``xspeedgate_ops.compressed_attention`` 拿不到 ``win_lengths`` /
-    ``extra_lengths``，它唯一的 per-row 掩码来自 ``kv_lens`` 加 LoD 布局。把
-    gamma+1 个 query 行当成一个 item、共用一个 request 级 ``kv_len``，每一行就都能
-    读到整个窗口——包括后面几个 verify 位置上的草稿 token，于是 target 直接抄了它
-    本该校验的草稿。
+    ``xspeedgate_ops.compressed_attention`` has no access to ``win_lengths`` /
+    ``extra_lengths``; its only per-row mask comes from ``kv_lens`` plus the LoD
+    layout. Treating gamma+1 query rows as one item that shares a request-level
+    ``kv_len`` lets every row read the whole window -- including the draft
+    tokens at the later verify positions, so the target directly copies the
+    drafts it was supposed to verify.
 
-    0.5.8 的昆仑后端（该算子已验证可用）走的是 decode 型契约：
-    ``qlod = arange(n+1)``、``kvseqlen = seq_lens_casual``（每个 verify 位置的精确
-    因果长度 L+j+1）。``_make_cp_prefill_lod`` 正好构造这个，复用它。
+    The 0.5.8 Kunlun backend (whose operator is already validated) uses the
+    decode-style contract: ``qlod = arange(n+1)`` and
+    ``kvseqlen = seq_lens_casual`` (the exact causal length L+j+1 at each verify
+    position). ``_make_cp_prefill_lod`` constructs exactly this, so reuse it.
 
-    capture 期走的是 graph 专用实现（见 ``_make_verify_row_lod_graph_safe``），因为
-    这里的构造需要 H2D，录不进图。``DSV4_VERIFY_ROW_LOD=0`` 可 A/B 回旧行为。
+    During capture the graph-specific implementation is used (see
+    ``_make_verify_row_lod_graph_safe``), because this construction needs H2D
+    and cannot be captured into the graph. ``DSV4_VERIFY_ROW_LOD=0`` A/Bs back
+    to the old behavior.
     """
     if forward_batch is None or not forward_batch.forward_mode.is_target_verify():
         return False
@@ -545,9 +1223,9 @@ def _dsa_cp_prefill_ranks(forward_batch) -> Optional[tuple]:
     the layers run, so every per-token metadata field the Kunlun boundary consumes
     is already CP-local while ``forward_batch.extend_seq_lens_cpu`` stays global.
     """
-    # CP-V1 废弃把 round-robin 改名成 interleave
-    # （`can_dsa_prefill_cp_round_robin_split` → `can_dsa_prefill_cp_interleave`），
-    # 判据和 token→rank 映射都没变。
+    # CP-V1 deprecation renamed round-robin to interleave
+    # (`can_dsa_prefill_cp_round_robin_split` -> `can_dsa_prefill_cp_interleave`);
+    # the criterion and token->rank mapping are unchanged.
     try:
         from sglang.srt.layers.attention.dsa.utils import (
             can_dsa_prefill_cp_interleave as _can_cp_split,
@@ -847,8 +1525,54 @@ def _serialize_graph_replay() -> None:
     _cross_rank_step_barrier()
 
 
+def _build_paged_mqa_logits_metadata_kunlun(indexer_metadata):
+    """Build the paged-MQA SM schedule through the Kunlun XSpeedGate op.
+
+    Upstream ``PagedIndexerMetadata.__post_init__`` (``dsv4/metadata.py``) sets
+    ``deep_gemm_metadata = None`` whenever ``SGLANG_FP8_PAGED_MQA_LOGITS_TORCH``
+    is set -- and the Kunlun launch scripts set it -- so the registered
+    ``sglang.kernels.ops.attention.dsv4.attn.get_paged_mqa_logits_metadata``
+    replacement never runs. Rebuild the schedule here, mirroring upstream's
+    ``row_chunk`` / ``rows_per_chunk`` splitting, so the field matches the
+    non-Kunlun contract instead of staying ``None``.
+    """
+    import deep_gemm
+
+    compressed_seq_lens = indexer_metadata.compressed_seq_lens.to(torch.int32)
+    if compressed_seq_lens.dim() == 1:
+        compressed_seq_lens = compressed_seq_lens.unsqueeze(-1)
+    page_size = indexer_metadata.compressed_page_size
+    num_sm = deep_gemm.get_num_sms()
+    num_rows = compressed_seq_lens.shape[0]
+    if indexer_metadata.row_chunk > 0:
+        return torch.stack(
+            [
+                get_paged_mqa_logits_metadata_kunlun(
+                    compressed_seq_lens[start : start + indexer_metadata.row_chunk],
+                    page_size,
+                    num_sm,
+                )
+                for start in range(0, num_rows, indexer_metadata.row_chunk)
+            ]
+        )
+    if indexer_metadata.rows_per_chunk is not None:
+        return [
+            get_paged_mqa_logits_metadata_kunlun(
+                compressed_seq_lens[start : start + indexer_metadata.rows_per_chunk],
+                page_size,
+                num_sm,
+            )
+            for start in range(0, num_rows, indexer_metadata.rows_per_chunk)
+        ]
+    return get_paged_mqa_logits_metadata_kunlun(compressed_seq_lens, page_size, num_sm)
+
+
 class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
     """0.5.14 DSV4 control flow with the Kunlun attention boundary."""
+
+    # Kunlun DSV4 graph-extend needs uniform queries per request; ragged
+    # (compact) verify runs on the eager per-row LoD path instead.
+    supports_ragged_verify_graph: bool = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -890,9 +1614,235 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         self._attention_graph_extend_aux = {}
         self._c4_decode_aux = {}
 
+    def init_forward_metadata_indexer(
+        self,
+        core_attn_metadata,
+        *,
+        compress_ratio: int = 4,
+        use_prefill_cuda_graph: bool = False,
+    ):
+        """Build the indexer metadata and fill the Kunlun paged-MQA schedule.
+
+        ``super()`` leaves ``deep_gemm_metadata`` at ``None`` on Kunlun (the
+        launch scripts set ``SGLANG_FP8_PAGED_MQA_LOGITS_TORCH``), which
+        short-circuits the registered ``get_paged_mqa_logits_metadata`` op. Build
+        it here through that op so the field matches the upstream contract.
+
+        Args:
+            core_attn_metadata: Core metadata for the current attention batch.
+            compress_ratio: Compression ratio used to construct indexer metadata.
+            use_prefill_cuda_graph: Whether metadata is built for prefill capture.
+
+        Returns:
+            Indexer metadata with its paged-MQA schedule populated.
+        """
+        indexer_metadata = super().init_forward_metadata_indexer(
+            core_attn_metadata,
+            compress_ratio=compress_ratio,
+            use_prefill_cuda_graph=use_prefill_cuda_graph,
+        )
+        if indexer_metadata.deep_gemm_metadata is None:
+            indexer_metadata.deep_gemm_metadata = (
+                _build_paged_mqa_logits_metadata_kunlun(indexer_metadata)
+            )
+        return indexer_metadata
+
     _WINDOW_WARNED = False
 
+    def _low_ratio_index_topk(
+        self, layer, x, q_lora, req, pos, forward_batch, *, rows_per_request=None
+    ):
+        # 0.5.22 owns candidate metadata in v41_indexer. Adapt the fused decode
+        # path at this live entry point, preserving newer sparse-table schemes.
+        from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
+            BlockIds,
+            DenseBlocksBackend,
+        )
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            skip_candidate_filtering,
+            skip_low_ratio_indexer,
+        )
+
+        mode = forward_batch.forward_mode
+        candidate = layer.indexer.is_candidate_source or layer.indexer.uses_candidates
+        if (
+            not (mode.is_decode() or mode.is_target_verify())
+            or skip_candidate_filtering()
+            or (candidate and not isinstance(self.decode_candidates, DenseBlocksBackend))
+        ):
+            return super()._low_ratio_index_topk(
+                layer, x, q_lora, req, pos, forward_batch,
+                rows_per_request=rows_per_request,
+            )
+        if skip_low_ratio_indexer(layer.compress_ratio):
+            return
+        published = self.forward_metadata.candidate_metadata
+        self.candidate_masks = (
+            {"rows": published.decode_mask}
+            if isinstance(published, BlockIds) and published.decode_mask is not None
+            else None
+        )
+        if layer.indexer.uses_candidates and self.candidate_masks is None:
+            return super()._low_ratio_index_topk(
+                layer, x, q_lora, req, pos, forward_batch,
+                rows_per_request=rows_per_request,
+            )
+        self._low_ratio_index_topk_sm90_decode(layer, x, q_lora, req, pos)
+        if layer.indexer.is_candidate_source and self.candidate_masks is not None:
+            mask = self.candidate_masks["rows"]
+            block_size = layer.indexer.candidate_block_size
+            padding = (-mask.shape[1]) % block_size
+            blocked = torch.nn.functional.pad(mask, (0, padding)).unflatten(
+                -1, (-1, block_size)
+            ).any(-1)
+            count = min(layer.indexer.candidate_topk_blocks, blocked.shape[1])
+            values, ids = blocked.to(torch.int32).topk(count, dim=-1)
+            ids = ids.to(torch.int32).masked_fill(values == 0, -1)
+            self._publish_candidate_metadata(BlockIds(blocks=ids, decode_mask=mask))
+
+    def _low_ratio_fp4_lut(self, device) -> torch.Tensor:
+        """Device-resident E2M1 fp4 code->value table for the fused indexer op.
+
+        Cached per device so graph capture records at most one tiny H2D copy
+        (the table is a module-level CPU constant). Shares the exact values the
+        pool's dequant readback uses, keeping the op bit-identical to the native
+        row-wise path.
+        """
+        cache = getattr(self, "_low_ratio_fp4_lut_cache", None)
+        if cache is not None and cache.device == device:
+            return cache
+        from sglang.srt.layers.quantization.fp8 import DSV4_DEQUANT_FP4_TABLE
+
+        lut = DSV4_DEQUANT_FP4_TABLE.to(device=device, dtype=torch.float32).contiguous()
+        self._low_ratio_fp4_lut_cache = lut
+        return lut
+
     def _low_ratio_index_topk_sm90_decode(self, layer, x, q_lora, req, pos) -> None:
+        env = os.environ.get("DSV4_LOW_RATIO_INDEXER_KUNLUN", "1")
+        use_kunlun = (
+            env not in ("0", "false", "False")
+            if env is not None
+            else True
+        )
+        if use_kunlun:
+            return self._low_ratio_index_topk_sm90_decode_kunlun(
+                layer, x, q_lora, req, pos
+            )
+        return self._low_ratio_index_topk_sm90_decode_native(
+            layer, x, q_lora, req, pos
+        )
+
+    def _low_ratio_index_topk_sm90_decode_kunlun(self, layer, x, q_lora, req, pos) -> None:
+        """Low-ratio decode/verify indexer top-k via the fused XSpeedGate
+        ``dsv41_low_ratio_indexer`` kernel on Kunlun.
+        """
+        ratio = layer.compress_ratio
+        indexer = layer.indexer
+        core = self.forward_metadata.core_metadata
+        pool = self.token_to_kv_pool
+
+        rows = req.shape[0]
+        page_indices = core.sparse_page_indices(ratio)
+        page_indices.fill_(-1)
+        if rows == 0:
+            return
+
+        block_size = int(getattr(indexer, "candidate_block_size", 0) or 0)
+        metadata = (
+            self.forward_metadata.c1_indexer_metadata
+            if ratio == 1
+            else self.forward_metadata.c2_indexer_metadata
+        )
+        assert metadata is not None
+        window = min(
+            metadata.max_compressed_seq_len,
+            self.req_to_token.shape[1] // ratio,
+        )
+        # 0519 aligned window downward to a multiple of block_size here; the
+        # migration dropped this line and replaced it with a modulo-window bail
+        # condition. Measured window=262411 block_size=8 (remainder 3), so decode
+        # bailed to the native torch path every time: the fused indexer op never
+        # ran (slow), and the native path is normally not covered, so its
+        # out-of-bounds access surfaced as status=700. Aligning back lets it take
+        # the same fused path as 0519.
+        if block_size >= 1:
+            window = (window // block_size) * block_size
+        k = min(int(indexer.index_topk), window)
+
+        # Delegate to the native kernel when the fused op's static constraints
+        # cannot be satisfied.
+        _bail = (
+            block_size < 1
+            or 128 % block_size != 0
+            or window < block_size
+            or k < 1
+            or k > 512
+            or not hasattr(torch.ops.xspeedgate_ops, "dsv41_low_ratio_indexer")
+        )
+        if _bail:
+            return self._low_ratio_index_topk_sm90_decode_native(
+                layer, x, q_lora, req, pos
+            )
+
+        # Do not cast q to bf16 here: the fused op requires head_w to have the
+        # same dtype as q (otherwise it raises dsv41_low_ratio_indexer: head_w
+        # dtype must match q), and on this precision-validated 0519 path both
+        # are the plugin-native fp16. Keep it consistent with 0519.
+        q = indexer.queries(q_lora, layer.freqs_cis[pos]).contiguous()  # [R,32,128]
+        head_w = indexer.head_weights(x).contiguous()  # [R,32]
+        k_pool = pool.get_index_k_with_scale_buffer(layer.layer_id)
+        fp4_lut = self._low_ratio_fp4_lut(q.device)
+
+        req_i = req.to(torch.int32).contiguous()
+        pos_i = pos.to(torch.int32).contiguous()
+        req_to_token = self.req_to_token
+        if req_to_token.dtype != torch.int32:
+            req_to_token = req_to_token.to(torch.int32)
+        req_to_token = req_to_token.contiguous()
+
+        is_publish = bool(getattr(indexer, "is_candidate_source", False))
+        consume_mask = None
+        if getattr(indexer, "uses_candidates", False):
+            masks = getattr(self, "candidate_masks", None)
+            if isinstance(masks, dict):
+                m = masks.get("rows")
+                if torch.is_tensor(m) and m.shape[0] == rows:
+                    consume_mask = m
+        is_consume = consume_mask is not None
+
+        if is_consume:
+            cm = consume_mask.to(torch.bool)
+            if cm.shape[1] < window:
+                cm = torch.nn.functional.pad(cm, (0, window - cm.shape[1]))
+            cand_mask = cm[:, :window].contiguous()
+        else:
+            # Ignored when `is_consume` is False, but the op still type-checks it.
+            cand_mask = torch.zeros((rows, window), dtype=torch.bool, device=q.device)
+
+        page_out, published = torch.ops.xspeedgate_ops.dsv41_low_ratio_indexer(
+            q,
+            head_w,
+            k_pool,
+            fp4_lut,
+            req_to_token,
+            req_i,
+            pos_i,
+            cand_mask,
+            int(ratio),
+            int(k),
+            int(window),
+            max(int(getattr(indexer, "candidate_topk_blocks", 0) or 0), 1),
+            int(block_size),
+            is_publish,
+            is_consume,
+        )
+
+        page_indices[:rows, :k] = page_out
+        if is_publish:
+            # Row-keyed mask shared with the native path's consume layers.
+            self.candidate_masks = {"rows": published.to(torch.bool)}
+
+    def _low_ratio_index_topk_sm90_decode_native(self, layer, x, q_lora, req, pos) -> None:
         """Capture-safe low-ratio decode/verify indexer top-k.
 
         Upstream routes non-Blackwell decode through the SM90 `fp4_index_logits_decode`
@@ -909,10 +1859,9 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
           `j in [0, window)` and masked by that row's own visible length, which is
           the reference's per-request `lc = max(lens)` set expressed per row (rows
           of a request share `req`, hence share the candidate slots for a given j);
-        * `window` is static -- `DSV4_LOW_RATIO_INDEX_WINDOW` (default 32768) capped
-          by the capture's max sequence length -- so no shape depends on data. For a
-          compressed length that fits the window this is identical to the reference;
-          beyond it the window is a documented approximation.
+        * `window` comes from the current paged metadata's reserved compressed
+          length, bounded by the request table capacity; it never reads device
+          lengths on the host or silently truncates them to a legacy env cap.
         * the window is chunked and a running top-k is kept across chunks, so the
           transient tensors stay bounded while the result is still the exact top-k
           over the whole window.
@@ -923,23 +1872,37 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         """
         ratio = layer.compress_ratio
         indexer = layer.indexer
-        core = self.forward_metadata.core_attn_metadata
+        core = self.forward_metadata.core_metadata
         pool = self.token_to_kv_pool
         rows = x.shape[0]
         if rows == 0:
             return
         topk = indexer.index_topk
-        cap = int(os.environ.get("DSV4_LOW_RATIO_INDEX_WINDOW", "32768"))
-        window = min(self.MAX_SEQ_LEN_FOR_CAPTURE // ratio + 1, cap)
+        metadata = (
+            self.forward_metadata.c1_indexer_metadata
+            if ratio == 1 else self.forward_metadata.c2_indexer_metadata
+        )
+        window = min(metadata.max_compressed_seq_len, self.req_to_token.shape[1] // ratio)
         k = min(topk, window)
 
         page_indices = core.sparse_page_indices(ratio)
+        raw_indices = core.sparse_raw_indices(ratio)
         page_indices.fill_(-1)
+        if k == 0:
+            return
 
         q = indexer.queries(q_lora, layer.freqs_cis[pos])  # [R, H, index_head_dim]
         head_w = indexer.head_weights(x)  # [R, H]
-        visible = ((pos + 1) // ratio).to(torch.int64)  # compressed length per row
+        visible = ((pos + 1) // ratio).to(torch.int64).clamp(0, window)
         req_i = req.to(torch.int64).reshape(-1)
+        # Under graph replay the req / pos of padding rows are leftovers from the
+        # previous round; indexing req_to_token with them directly would go
+        # out-of-bounds (Kunlun reports gather load/store exceed memory size,
+        # crashing the scheduler with status=700 illegal memory access). Clamp
+        # both the row index and the visible length into the legal range: padding
+        # rows degrade to reading row 0, and the result is masked out by reach
+        # afterward.
+        req_i = req_i.clamp(0, self.req_to_token.shape[0] - 1)
         device = x.device
         neg = torch.finfo(torch.float32).min
         req_width = self.req_to_token.shape[1] - 1
@@ -950,22 +1913,13 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             self.candidate_masks, dict
         ):
             consume = self.candidate_masks.get("rows")
+        # published must use the full `window` width, not `effective_window`,
+        # because consumer layers index it with [j0 : j0 + jc] up to `window`.
         published = (
             torch.zeros((rows, window), dtype=torch.bool, device=device)
             if publish
             else None
         )
-
-        if not KunlunDeepseekV4AttnBackend._WINDOW_WARNED and bool(
-            (visible > window).any()
-        ):
-            KunlunDeepseekV4AttnBackend._WINDOW_WARNED = True
-            logger.warning(
-                "low-ratio indexer: visible compressed length exceeds the static "
-                "window %d; candidates beyond it are not scored. Raise "
-                "DSV4_LOW_RATIO_INDEX_WINDOW for exact results.",
-                window,
-            )
 
         best_val = torch.full((rows, k), neg, dtype=torch.float32, device=device)
         # Unfilled slots sort last: the attention op reads a *leading* prefix of
@@ -974,45 +1928,84 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         # position and is filtered by the `reach` mask below.
         best_j = torch.full((rows, k), window, dtype=torch.int64, device=device)
 
-        from sglang.srt.layers.attention.dsv4.indexer import select_candidate_blocks
-
         jc = int(os.environ.get("DSV4_LOW_RATIO_INDEX_CHUNK", "2048"))
+        jc = max(jc, k)
         rc = int(os.environ.get("DSV4_LOW_RATIO_INDEX_ROWS", "64"))
-        for j0 in range(0, window, jc):
+        # Iterate the reserved bound, so capture never reads device lengths.
+        effective_window = window
+        # Select candidate blocks globally across the full visible range,
+        # not independently per chunk (which degenerates to keeping all blocks
+        # when topk_blocks exceeds the per-chunk block count).
+        global_candidates = bool(publish)
+        if global_candidates:
+            block_size = indexer.candidate_block_size
+            if jc % block_size:
+                raise ValueError("candidate score chunks must align to blocks")
+            block_scores = torch.full(
+                (rows, ((effective_window + jc - 1) // jc) * (jc // block_size)),
+                -torch.inf,
+                dtype=torch.float32,
+                device=device,
+            )
+        for j0 in range(0, effective_window, jc):
             j = torch.arange(j0, j0 + jc, device=device)  # static width
             tok_pos = (j * ratio).clamp_max(req_width)
-            valid = j.unsqueeze(0) < visible.unsqueeze(1)
+            valid = (j.unsqueeze(0) < visible.unsqueeze(1)) & (j[None, :] < window)
             for r0 in range(0, rows, rc):
                 r1 = min(r0 + rc, rows)
                 slots = self.req_to_token[req_i[r0:r1, None], tok_pos[None, :]] // ratio
                 v = valid[r0:r1]
+                slots = slots.masked_fill(~v, 0)
                 index_k = pool.get_low_ratio_index_k_dequant(
                     layer.layer_id, slots.reshape(-1)
                 ).reshape(r1 - r0, jc, -1)
                 # `DeepseekV41Indexer.scores` with a per-row K: bf16 up to the
                 # reduction, then relu, head-weight and head sum in fp32.
-                dots = (q[r0:r1].unsqueeze(2) * index_k.unsqueeze(1)).sum(dim=-1)
+                #
+                # The broadcast form materialises [R, H, jc, d] before
+                # reducing, which is what makes this loop OOM: at the capture
+                # bucket (rows=64, H=64, d=128) that is ~2 MiB per unit of
+                # ``jc``, so even the default jc=2048 wants ~4 GiB on top of a
+                # pool that is already ~89 GiB deep. ``matmul`` is the same
+                # contraction without the 4-D intermediate (d times less
+                # transient memory) and accumulates in fp32 rather than in the
+                # input dtype. ``DSV4_LOW_RATIO_INDEX_BMM=0`` restores the old
+                # form.
+                if _low_ratio_index_bmm_enabled():
+                    # [R,H,d] x [R,d,jc] -> [R,H,jc]. ``bmm`` rather than
+                    # ``matmul``: the contract is strictly 3-D with a per-row
+                    # K, so a rank surprise should raise instead of silently
+                    # broadcasting back into the 4-D form this exists to avoid.
+                    # (Upstream's ``einsum("bhd,nd->bhn")`` shares one K across
+                    # rows; here ``index_k`` is gathered per row, so that form
+                    # does not apply.)
+                    dots = torch.bmm(q[r0:r1], index_k.to(q.dtype).transpose(1, 2))
+                else:
+                    dots = (q[r0:r1].unsqueeze(2) * index_k.unsqueeze(1)).sum(dim=-1)
                 s = (dots.relu() * head_w[r0:r1].unsqueeze(-1)).sum(dim=1).float()
                 s = s.masked_fill(~v, neg)
                 if consume is not None:
-                    s = s.masked_fill(~consume[r0:r1, j0 : j0 + jc], neg)
-                if published is not None:
-                    published[r0:r1, j0 : j0 + jc] = select_candidate_blocks(
-                        s,
-                        visible[r0:r1, None],
-                        topk_blocks=indexer.candidate_topk_blocks,
-                        block_size=indexer.candidate_block_size,
-                    )
+                    mask = consume[r0:r1, j0 : j0 + jc]
+                    mask = torch.nn.functional.pad(mask, (0, jc - mask.shape[1]))
+                    s = s.masked_fill(~mask, neg)
+                if global_candidates:
+                    block_scores[
+                        r0:r1, j0 // block_size : (j0 + jc) // block_size
+                    ] = s.masked_fill(~v, -torch.inf).unflatten(
+                        -1, (-1, block_size)
+                    ).amax(dim=-1)
                 cand_val, cand_j = s.topk(k, dim=-1, sorted=False)
                 merged_val = torch.cat([best_val[r0:r1], cand_val], dim=1)
                 merged_j = torch.cat([best_j[r0:r1], j0 + cand_j], dim=1)
                 top = merged_val.topk(k, dim=-1, sorted=False)
                 best_val[r0:r1] = top.values
-                best_j[r0:r1] = merged_j.gather(1, top.indices)
+                best_j[r0:r1] = merged_j.gather(
+                    1, top.indices.clamp(0, merged_j.shape[1] - 1)
+                )
 
         # Sort the (value, position) pairs by position so valid entries form the
         # leading prefix the attention op expects; `best_val` must follow.
-        order = best_j.argsort(dim=-1)
+        order = best_j.argsort(dim=-1).clamp(0, best_j.shape[1] - 1)
         best_j = best_j.gather(1, order)
         best_val = best_val.gather(1, order)
         reach = (best_j < visible.unsqueeze(1)) & (best_val > neg)
@@ -1021,6 +2014,19 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         page_indices[:, :k] = torch.where(
             reach, sel_slots, torch.full_like(sel_slots, -1)
         ).to(torch.int32)
+        if global_candidates:
+            count = min(indexer.candidate_topk_blocks, block_scores.shape[1])
+            chosen = block_scores.topk(count, dim=-1)
+            cand_mask = torch.zeros_like(block_scores, dtype=torch.bool)
+            cand_mask.scatter_(1, chosen.indices, torch.isfinite(chosen.values))
+            cand_mask = cand_mask.repeat_interleave(block_size, dim=-1)
+            # Pad to full window width so consumers can slice without F.pad
+            # at consumption time (which would break cudagraph capture).
+            if cand_mask.shape[1] < window:
+                cand_mask = torch.nn.functional.pad(
+                    cand_mask, (0, window - cand_mask.shape[1])
+                )
+            published = cand_mask[:, :window]
         if published is not None:
             self.candidate_masks = {"rows": published}
 
@@ -1032,11 +2038,35 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         ``swa_replay_start`` (4.1) is the per-row window floor used by decoder
         SWA bounded replay: offsets below it are never written at the tail
         layers, so the window is clamped at the floor instead of at 0.
+
+        Runs the XSpeedGate ``causal_swa_page_indices_kernel`` op -- the Kunlun
+        replacement for upstream ``build_causal_swa_page_indices_triton``
+        (``kernel_ops.build_causal_swa_page_indices_kunlun``). Upstream only
+        reaches that triton symbol through ``BuildCausalSwaPageIndices.execute``,
+        which this backend bypasses, so the op has to be called directly here.
+        The op writes -1 for lanes outside the per-row window/floor and pads the
+        width to ``PAGE_INDEX_ALIGNED_SIZE``; the Kunlun compressed-attention
+        path wants dense non-negative page indices (slot 0 marks an
+        invalid/tombstoned SWA slot) and masks the tail with ``swa_topk_lengths``,
+        so the sentinels are folded back to 0.
         """
-        # Match the contract: invalid history offsets are clamped to the
-        # first physical row and remain valid indices; the length tensor masks
-        # those rows. Upstream 0.5.14 writes -1 here, which changes graph replay
-        # inputs and is not accepted by the Kunlun compressed-attention path.
+        if hasattr(torch.ops.xspeedgate_ops, "causal_swa_page_indices_kernel"):
+            swa_page_indices = build_causal_swa_page_indices_kunlun(
+                req_to_token=self.req_to_token,
+                full_to_swa_mapping=self.token_to_kv_pool.full_to_swa_index_mapping,
+                req_pool_indices_repeated=req_pool_indices_repeated,
+                seq_lens_casual=seq_lens_casual,
+                swa_window=upstream.SWA_WINDOW,
+                page_index_aligned_size=upstream.PAGE_INDEX_ALIGNED_SIZE,
+                swa_replay_start=swa_replay_start,
+            )
+            return swa_page_indices.clamp_min_(0)
+
+        # Torch fallback for wheels that predate the op. Match the contract:
+        # invalid history offsets are clamped to the first physical row and
+        # remain valid indices; the length tensor masks those rows. Upstream
+        # 0.5.14 writes -1 here, which changes graph replay inputs and is not
+        # accepted by the Kunlun compressed-attention path.
         pos_causal = seq_lens_casual - 1
         lower = (
             torch.zeros_like(pos_causal).unsqueeze(1)
@@ -1056,9 +2086,11 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             ),
             offsets.clamp(min=0, max=self.req_to_token.shape[1] - 1),
         ]
-        # 上游 ``_causal_swa_page_indices_kernel`` 对每次 load 都做掩码，超出该行因果
-        # 长度的 lane 不会真的访存；这里是稠密改写，会读所有 lane，所以映射查表要手动
-        # clamp——越界 lane 由 ``swa_topk_lengths`` 掩掉。
+        # Upstream ``_causal_swa_page_indices_kernel`` masks every load, so lanes
+        # beyond the row's causal length never actually access memory; this is a
+        # dense rewrite that reads all lanes, so the mapping lookup must be
+        # clamped manually -- out-of-bounds lanes are masked by
+        # ``swa_topk_lengths``.
         mapping = self.token_to_kv_pool.full_to_swa_index_mapping
         mapped = mapping[
             raw_indices.clamp(min=0, max=mapping.shape[0] - 1)
@@ -1067,6 +2099,12 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
 
     def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
         """Initialize out-of-graph metadata and refresh replay lengths."""
+        # ``_try_flash_mla_hybrid`` has to tell the capture phase (both eager
+        # warmup passes and the capture itself) apart from real eager decode:
+        # during capture both sides of its length validation are placeholders.
+        # This hook also runs once per replay with ``in_capture=False``, so the
+        # flag cannot go stale.
+        self._kunlun_capture_phase = in_capture
         if in_capture and _is_graph_extend_mode(forward_batch.forward_mode):
             _get_graph_extend_aux(
                 self._attention_graph_extend_aux,
@@ -1075,6 +2113,16 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 forward_batch.seq_lens.device,
             )
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
+        if (
+            forward_batch.forward_mode.is_decode_or_idle()
+            and _hybrid_seq_lens_prerefresh_enabled()
+        ):
+            # Hoisted out of the decode layer loop: the hybrid adapter's int32
+            # mirror is per (device, bucket), not per layer, so one refresh here
+            # feeds all hybrid layers and the capture records zero copies.
+            # Runs before the warmup/capture forward and before every replay,
+            # which is what keeps the recorded launches reading fresh lengths.
+            _refresh_hybrid_seq_lens_i32(self, forward_batch)
         _refresh_graph_host_lengths(
             forward_batch,
             self._attention_decode_aux,
@@ -1270,8 +2318,8 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             )
             return F.pad(tensor, pad, value=value)
 
-        # 0.5.22 把 ``PagedIndexerMetadata.c4_seq_lens`` 改名成
-        # ``compressed_seq_lens``（同时新增 compress_ratio/row_chunk 等字段）。
+        # 0.5.22 renamed ``PagedIndexerMetadata.c4_seq_lens`` to
+        # ``compressed_seq_lens`` (and added compress_ratio/row_chunk etc.).
         c4_seq_lens = match_num_queries(
             indexer_metadata.compressed_seq_lens, value=1
         )
@@ -1481,9 +2529,9 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         """Skip FlashMLA metadata refresh, matching the Kunlun backend."""
         metadata = self.forward_metadata
         if isinstance(metadata, upstream.DSV4Metadata) and isinstance(
-            metadata.core_attn_metadata, upstream.DSV4AttnMetadata
+            metadata.core_metadata, upstream.DSV4AttnMetadata
         ):
-            core = metadata.core_attn_metadata
+            core = metadata.core_metadata
             core.c0_flashmla_metadata = None
             core.c1_flashmla_metadata = None
             core.c4_flashmla_metadata = None
@@ -1492,6 +2540,65 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         current_raw = getattr(self, "_current_capture_raw", None)
         if current_raw is not None:
             self.forward_metadata = current_raw
+
+    def _build_page_table(
+        self,
+        req_to_token: torch.Tensor,
+        req_pool_indices_repeated: torch.Tensor,
+        seq_lens_casual: torch.Tensor,
+        max_seq_len: int,
+    ) -> torch.Tensor:
+        """Build the per-row page table through the Kunlun ``page_table_positions`` op.
+
+        Upstream only reaches the registered replacement for
+        ``_page_table_positions_kernel`` through
+        ``BuildPageTablePositions.execute`` (``dsv4_attn_metadata_kernels.py``),
+        which this backend bypasses by building the metadata itself, so the op
+        (``kernel_ops.page_table_positions_kernel``) has to be called directly --
+        the same wiring ``get_swa_page_indices`` uses for the SWA indices. The op
+        returns the page table already divided by ``page_size`` and samples the
+        columns ``p * page_size`` exactly like the ``req_to_token[:, :span:
+        page_size]`` slice it replaces, so the widened ``_dsv4_page_table_span``
+        is preserved.
+        """
+        page_size = self.page_size
+        span = _dsv4_page_table_span(max_seq_len, seq_lens_casual)
+        if (
+            span > 0
+            and req_to_token.dtype == torch.int32
+            and req_to_token.stride(-1) == 1
+            and hasattr(torch.ops.xspeedgate_ops, "page_table_positions")
+        ):
+            # The op samples ``p * page_size`` for ``p < num_pages``; clamp the
+            # span to the row width so the last sample stays inside the source
+            # row, matching the slice's own truncation.
+            span = min(span, req_to_token.shape[1])
+            num_pages = (span + page_size - 1) // page_size
+            num_q = seq_lens_casual.shape[0]
+            kw = dict(dtype=torch.int32, device=seq_lens_casual.device)
+            seq_lens_out = torch.empty(num_q, **kw)
+            positions_out = torch.empty(num_q, **kw)
+            page_table = torch.empty((num_q, num_pages), **kw)
+            topk_out = torch.empty(num_q, **kw)
+            page_table_positions_kernel(
+                req_to_token,
+                req_pool_indices_repeated,
+                seq_lens_casual,
+                seq_lens_out,
+                positions_out,
+                page_table,
+                topk_out,
+                req_to_token.stride(0),
+                num_pages,
+                page_size,
+                upstream.SWA_WINDOW,
+                256,
+            )
+            return page_table
+
+        # Torch fallback for wheels that predate the op, or non-int32 rows.
+        page_table = req_to_token[req_pool_indices_repeated, :span:page_size]
+        return (page_table // page_size).to(torch.int32)
 
     def make_core_attn_metadata(
         self,
@@ -1531,12 +2638,14 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             "4.1 request-window (encoder SWA bounded replay) is not supported by "
             "the Kunlun DSV4 backend"
         )
-        # 0.5.19 的 backend 上有个 ``self.swa_page_size = 128`` 常量，和
-        # ``SWA_WINDOW`` 恒等，所以这里原来的断言是恒真的；0.5.22 把这个冗余
-        # 字段删掉了。池子上的 ``swa_page_size`` 是**另一个量**（= 服务的
-        # ``page_size``，本部署是 256），上游自己断言的是
+        # The 0.5.19 backend had a ``self.swa_page_size = 128`` constant that was
+        # identical to ``SWA_WINDOW``, so the original assertion here was
+        # tautologically true; 0.5.22 deleted this redundant field. The
+        # ``swa_page_size`` on the pool is a **different quantity** (= the served
+        # ``page_size``, 256 in this deployment), and upstream itself asserts
         # ``token_to_kv_pool.swa_page_size % SWA_WINDOW == 0``
-        # （``deepseek_v4_backend.py:1154``），本方法进来前就已经查过了。
+        # (``deepseek_v4_backend.py:1154``), which was already checked before
+        # this method runs.
         assert self.token_to_kv_pool.swa_page_size % upstream.SWA_WINDOW == 0
         seq_lens_casual = seq_lens_casual.to(torch.int32)
         swa_page_indices = self.get_swa_page_indices(
@@ -1570,17 +2679,16 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             swa_topk_lengths = torch.minimum(
                 swa_topk_lengths, floored.clamp_min(0).to(swa_topk_lengths.dtype)
             )
-        page_table = req_to_token[
-            req_pool_indices_repeated,
-            : _dsv4_page_table_span(max_seq_len, seq_lens_casual) : self.page_size,
-        ]
+        page_table = self._build_page_table(
+            req_to_token, req_pool_indices_repeated, seq_lens_casual, max_seq_len
+        )
         metadata = KunlunDSV4AttnMetadata(
             page_size=self.page_size,
             raw_out_loc=out_loc,
             seq_lens_casual=seq_lens_casual,
             cuda_int32_kwargs=self.cuda_int32_kwargs,
             positions_casual=seq_lens_casual - 1,
-            page_table=(page_table // self.page_size).to(torch.int32),
+            page_table=page_table,
             swa_page_indices=swa_page_indices,
             swa_topk_lengths=torch.clamp(seq_lens_casual, max=upstream.SWA_WINDOW),
             # 0.5.22 renamed the dataclass field ``c4_sparse_topk`` to
@@ -1634,20 +2742,25 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         dspark_block_size: int,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> KunlunDSV4AttnMetadata:
-        """DSpark draft block 前向的 core metadata（只有窗口，没有压缩分支）。
+        """Core metadata for the DSpark draft block forward (window only, no
+        compressed branch).
 
-        ``init_forward_metadata_dspark_draft_block`` 以 ``need_compress=False``
-        走 prefill，draft 不碰 c4/c128，只用滑动窗口。上游
-        ``get_dspark_swa_page_indices`` 已经为 gamma 个 draft 行构造了 per-row 因果
-        窗口索引（相关 kernel 有昆仑替换实现），昆仑侧唯一要改的是无效 lane 的约定：
-        填 page 0 而不是 -1，尾部由 ``swa_topk_lengths`` 掩掉。
+        ``init_forward_metadata_dspark_draft_block`` runs prefill with
+        ``need_compress=False``; the draft does not touch c4/c128 and only uses
+        the sliding window. Upstream ``get_dspark_swa_page_indices`` already
+        built per-row causal window indices for the gamma draft rows (the
+        relevant kernels have Kunlun replacement implementations), so the only
+        thing Kunlun has to change is the convention for invalid lanes: fill
+        page 0 instead of -1, with the tail masked out by ``swa_topk_lengths``.
         """
-        # 0.5.19 的 backend 上有个 ``self.swa_page_size = 128`` 常量，和
-        # ``SWA_WINDOW`` 恒等，所以这里原来的断言是恒真的；0.5.22 把这个冗余
-        # 字段删掉了。池子上的 ``swa_page_size`` 是**另一个量**（= 服务的
-        # ``page_size``，本部署是 256），上游自己断言的是
+        # The 0.5.19 backend had a ``self.swa_page_size = 128`` constant that was
+        # identical to ``SWA_WINDOW``, so the original assertion here was
+        # tautologically true; 0.5.22 deleted this redundant field. The
+        # ``swa_page_size`` on the pool is a **different quantity** (= the served
+        # ``page_size``, 256 in this deployment), and upstream itself asserts
         # ``token_to_kv_pool.swa_page_size % SWA_WINDOW == 0``
-        # （``deepseek_v4_backend.py:1154``），本方法进来前就已经查过了。
+        # (``deepseek_v4_backend.py:1154``), which was already checked before
+        # this method runs.
         assert self.token_to_kv_pool.swa_page_size % upstream.SWA_WINDOW == 0
         seq_lens_casual = seq_lens_casual.to(torch.int32)
         if dspark_swa_buffers is not None:
@@ -1659,17 +2772,16 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 out_loc=out_loc,
                 block_size=dspark_block_size,
             )
-        page_table = req_to_token[
-            req_pool_indices_repeated,
-            : _dsv4_page_table_span(max_seq_len, seq_lens_casual) : self.page_size,
-        ]
+        page_table = self._build_page_table(
+            req_to_token, req_pool_indices_repeated, seq_lens_casual, max_seq_len
+        )
         metadata = KunlunDSV4AttnMetadata(
             page_size=self.page_size,
             raw_out_loc=out_loc,
             seq_lens_casual=seq_lens_casual,
             cuda_int32_kwargs=self.cuda_int32_kwargs,
             positions_casual=seq_lens_casual - 1,
-            page_table=(page_table // self.page_size).to(torch.int32),
+            page_table=page_table,
             swa_page_indices=swa_page_indices,
             swa_topk_lengths=swa_topk_lengths,
             # See the prefill builder above: 0.5.22 constructor field names.
@@ -1701,18 +2813,23 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
     def _make_verify_row_lod_graph_safe(
         self, core_metadata, num_queries: int, device: torch.device
     ):
-        """capture 安全的 per-row TARGET_VERIFY LoD。
+        """Capture-safe per-row TARGET_VERIFY LoD.
 
-        ``_make_cp_prefill_lod`` 表达的是同一个契约，但要走 D2H 再新建 CPU 张量，录不
-        进图（replay 时录下的 H2D 会读到已释放的 host 缓冲）。所以 capture 期原先退回
-        request-level LoD——正是让 verify 行 j 读到行 j+1.. 草稿 KV 的那个布局（见
-        ``_verify_row_lod_enabled``），这就是 CUDA graph 下退化成单 token 死循环、
-        accept len 钉在 gamma+1 而 eager 干净的原因。
+        ``_make_cp_prefill_lod`` expresses the same contract but has to do a D2H
+        and then build a new CPU tensor, which cannot be captured into the graph
+        (on replay the recorded H2D would read a freed host buffer). So during
+        capture it previously fell back to request-level LoD -- exactly the
+        layout that lets verify row j read the draft KV of rows j+1.. (see
+        ``_verify_row_lod_enabled``), which is why under CUDA graph it degrades
+        to a single-token dead loop with accept len pinned at gamma+1 while
+        eager is clean.
 
-        这里 ``q_lod`` 是常量 ``arange``（可以烘死），``kv_lens`` 由录进图的设备端 op
-        从 ``seq_lens_casual`` 填充，而该缓冲每次 replay 前由 ``copy_`` 原地刷新；
-        ``kv_lens_cpu`` 保持占位符，与 request-level capture 路径原本的假设一致。
-        ``DSV4_VERIFY_ROW_LOD_GRAPH=0`` 可 A/B 回旧行为。
+        Here ``q_lod`` is a constant ``arange`` (which can be baked in), and
+        ``kv_lens`` is filled by a device-side op recorded into the graph from
+        ``seq_lens_casual``, a buffer refreshed in-place by ``copy_`` before
+        every replay; ``kv_lens_cpu`` stays a placeholder, consistent with the
+        original assumption of the request-level capture path.
+        ``DSV4_VERIFY_ROW_LOD_GRAPH=0`` A/Bs back to the old behavior.
         """
         aux = self._verify_row_lod_aux.get(num_queries)
         if aux is None:
@@ -1747,11 +2864,14 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             q_lod_cpu, q_lod, kv_lens_cpu, kv_lens = aux
             kv_lens.copy_(forward_batch.seq_lens[:batch_size].to(torch.int32))
             if os.environ.get("DSV4_KUNLUN_DECODE_HOST_KVLEN", "1") == "1":
-                # ``kv_lens_cpu`` 原先一直保持 ``ones`` 初值（只有设备端被回填），于是
-                # ``compressed_topk = max(kv_lens_cpu.max() // ratio, 1)`` 恒为 1：
-                # 压缩分支只读到 1 条 entry，而 257 token 时 c4 应该是 64 条。prefill
-                # 的 host 长度是真值所以不受影响，这也是与 CUDA 参考实现的分歧只从
-                # decode 的第一个 c4 层（layer 2）开始的原因。
+                # ``kv_lens_cpu`` previously kept its ``ones`` initial value (only
+                # the device side was backfilled), so
+                # ``compressed_topk = max(kv_lens_cpu.max() // ratio, 1)`` was
+                # always 1: the compressed branch read only 1 entry, while at
+                # 257 tokens c4 should be 64 entries. prefill's host length is
+                # the true value so it is unaffected, which is why the divergence
+                # from the CUDA reference only starts at the first c4 layer
+                # (layer 2) of decode.
                 _copy_host_lengths_(
                     kv_lens_cpu, _seq_lens_cpu_i32(forward_batch), fill_value=1
                 )
@@ -1762,14 +2882,14 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         ):
             if _verify_row_lod_enabled(forward_batch):
                 return _make_cp_prefill_lod(
-                    self.forward_metadata.core_attn_metadata, num_queries, device
+                    self.forward_metadata.core_metadata, num_queries, device
                 )
             if (
                 forward_batch.forward_mode.is_target_verify()
                 and os.environ.get("DSV4_VERIFY_ROW_LOD_GRAPH", "1") == "1"
             ):
                 return self._make_verify_row_lod_graph_safe(
-                    self.forward_metadata.core_attn_metadata, num_queries, device
+                    self.forward_metadata.core_metadata, num_queries, device
                 )
             batch_size = forward_batch.batch_size
             aux = _get_graph_extend_aux(
@@ -1787,7 +2907,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
 
         if _dsa_cp_prefill_ranks(forward_batch) is not None:
             return _make_cp_prefill_lod(
-                self.forward_metadata.core_attn_metadata, num_queries, device
+                self.forward_metadata.core_metadata, num_queries, device
             )
 
         lengths = forward_batch.extend_seq_lens_cpu
@@ -1871,6 +2991,99 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             swa_pool.page_size,
         )
 
+    def _low_ratio_prefill_reads_page_indices(self, forward_batch) -> bool:
+        """Kunlun prefill always needs the paged index set.
+
+        This upstream switch is the opposite of **its own** sparse-prefill
+        decision: when it thinks ``flash_mla_sparse_fwd`` will run, it hands the
+        indexer ``out_page_indices=None`` and writes only ``out_raw_indices``
+        (the two branches of ``write_prefill``,
+        ``v41_indexer/scoring.py:348-352``). But the Kunlun backend only takes
+        that path for ``_KUNLUN_SPARSE_PREFILL_RATIOS`` (0 and 128); every
+        low-ratio indexer layer (ratio 1/2/4) falls back to
+        ``compressed_attention`` (or its torch reference implementation), and
+        that path reads ``c{ratio}_sparse_page_indices``.
+
+        After 0.5.22 split prefill's ``c{ratio}_sparse_raw_indices`` into
+        separate -1 buffers, if nobody writes the page buffer it stays -1:
+        within the window things still work, so generation looks fluent, but
+        everything earlier than the SWA window disappears (measured effective
+        retrieval range collapses to about 60 tokens, while the old stack still
+        answers correctly on the same probe at 450 tokens). So this
+        unconditionally returns True; when ratio 0/128 really takes sparse
+        prefill, writing the page index once more has no semantic impact.
+        """
+        return True
+
+    def _maybe_forward_prefill_sparse(
+        self,
+        q: torch.Tensor,
+        layer,
+        forward_batch,
+        compress_ratio: Literal[0, 1, 2, 4, 128],
+        attn_sink: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Run pure prefill on the sparse-attention op, or return None to fall
+        back to ``compressed_attention``.
+
+        Upstream ``_forward_prefill_sparse`` gathers the SWA window and the
+        compressed cache into one flat workspace and hands it to
+        ``flash_mla_sparse_fwd``, which ``flash_mla_sparse_fwd_kunlun`` replaces
+        with ``kunlun_ops.sparse_prefill_fwd``. Nothing in that path is
+        CUDA-specific once ``dequantize_k_cache_paged`` has its Kunlun gather
+        (``kernel_ops.dsv4_dequantize_k_cache_paged_kunlun``), so the whole
+        chunk-cache scaffolding is reused as-is -- its two hot kernels already
+        run on XSpeedGate (``build_swa_token_ids``, ``combine_topk_swa_indices``).
+
+        The gate mirrors upstream's (``deepseek_v4_backend.py``: extend without
+        speculation, no late-layer tail, no request window) plus the Kunlun-only
+        exclusions: CP prefill splits the rows per rank in a way the chunk cache
+        does not model, graph capture cannot host the data-dependent workspace
+        sizing, and the reference-attention debug paths must stay reachable.
+        """
+        if not _kunlun_sparse_prefill_enabled():
+            return None
+        if compress_ratio not in _KUNLUN_SPARSE_PREFILL_RATIOS:
+            return None
+        if not forward_batch.forward_mode.is_extend_without_speculative():
+            return None
+        if self.is_dspark_draft:
+            return None
+        if self.forward_metadata.late_layer_tail is not None:
+            return None
+        if self.token_to_kv_pool.request_window is not None:
+            return None
+        if _dsa_cp_prefill_ranks(forward_batch) is not None:
+            return None
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        if (
+            os.environ.get("DSV4_KUNLUN_REFERENCE_ONLY") == "1"
+            or os.environ.get("DSV4_KUNLUN_REFERENCE_ATTN") == "1"
+        ):
+            return None
+        if attn_sink is None:
+            # Upstream asserts a sink on this path; without one the post-hoc
+            # sink fold in flash_mla_sparse_fwd_kunlun has nothing to apply.
+            return None
+
+        # Upstream takes (b, 1, h_q, d_qk) and squeezes dim 1. Its workspace is
+        # bf16, so q is cast to match; on a fp16 pool that rounds the gathered
+        # KV from 10 to 7 mantissa bits, which `compressed_attention` does not
+        # do. Worth measuring before this path is widened past c0/c128.
+        q_4d = q if q.ndim == 4 else q.unsqueeze(1)
+        original_dtype = q_4d.dtype
+        out = super()._forward_prefill_sparse(
+            q=q_4d.to(torch.bfloat16),
+            layer_id=layer.layer_id,
+            compress_ratio=compress_ratio,
+            forward_batch=forward_batch,
+            token_to_kv_pool=self.token_to_kv_pool,
+            core_attn_metadata=self.forward_metadata.core_metadata,
+            attn_sink=attn_sink,
+        )
+        return out.to(original_dtype) if out.dtype != original_dtype else out
+
     def forward(
         self,
         q: torch.Tensor,
@@ -1884,17 +3097,25 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         **_,
     ) -> torch.Tensor:
         """Run Kunlun attention for the requested compression ratio."""
+        # TEMP DEBUG: confirm the Kunlun backend forward is really on the call chain.
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
             return q.new_empty(q.shape[0], q.shape[1], layer.v_head_dim)
         assert k is v, "DeepseekV4 shares k and v"
         if save_kv_cache:
             self.store_cache(layer.layer_id, k, forward_batch)
 
-        core = self.forward_metadata.core_attn_metadata
+        sparse_out = self._maybe_forward_prefill_sparse(
+            q, layer, forward_batch, compress_ratio, attn_sink
+        )
+        if sparse_out is not None:
+            return sparse_out
+
+        core = self.forward_metadata.core_metadata
         pool = self.token_to_kv_pool
         cache_dim = pool.swa_kv_pool.kv_cache_total_dim
-        # `swa_window_size` 在新版 `DeepSeekV4TokenToKVPool` 里被删了，它一直只是
-        # `swa_page_size`（SWA ring 的每请求宽度）的别名。
+        # `swa_window_size` was deleted in the new `DeepSeekV4TokenToKVPool`; it
+        # was always just an alias for `swa_page_size` (the per-request width of
+        # the SWA ring).
         swa_size = pool.swa_page_size
         win_cache = pool.get_swa_key_buffer_radix(layer.layer_id)
         win_cache = win_cache.reshape(-1, cache_dim)
@@ -1903,19 +3124,22 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         win_indices = win_indices[:, :swa_size].contiguous()
         win_lengths = self._match_queries(core.swa_topk_lengths, q.shape[0], 0)
         if self.is_dspark_draft:
-            # draft 窗口构造器把 ``swa_topk_lengths`` 之后的 lane 标成 -1，而
-            # ``compressed_attention`` 没有 window-length 参数。所以 -1 不能简单
-            # clamp 成 page 0——算子会把它当成真 KV 参与 softmax（实测 192 个 lane 里
-            # 有 59 个无效，约 31% 权重落在无关 token 上）。它的窗口循环上界是
-            # ``min(kv_len, max_window_size)``，因此掩掉尾部的办法是把 kv_len 夹到
-            # 窗口长度，见下面的 clamp。
+            # The draft window constructor marks lanes beyond
+            # ``swa_topk_lengths`` as -1, and ``compressed_attention`` has no
+            # window-length parameter. So -1 cannot simply be clamped to page 0
+            # -- the op would treat it as real KV and include it in softmax
+            # (measured 59 of 192 lanes invalid, about 31% of weight landing on
+            # unrelated tokens). Its window loop upper bound is
+            # ``min(kv_len, max_window_size)``, so the way to mask the tail is
+            # to clamp kv_len to the window length, see the clamp below.
             if (
                 win_lengths.numel()
                 and os.environ.get("DSV4_KUNLUN_DRAFT_WINDOW_COMPACT", "0") == "1"
             ):
-                # DSV4_KUNLUN_DRAFT_WINDOW_KVLEN=0 时的旧退路：压缩 lane 维度让
-                # ``max_window_size`` 自己成为掩码。但 ``valid`` 是设备端取值、
-                # 结果 shape 依赖数据，录不进 CUDA graph。
+                # Old fallback when DSV4_KUNLUN_DRAFT_WINDOW_KVLEN=0: compress
+                # the lane dimension so ``max_window_size`` itself becomes the
+                # mask. But ``valid`` is a device-side value and the result shape
+                # depends on data, which cannot be captured into a CUDA graph.
                 valid = int(win_lengths.max().item())
                 valid = max(1, min(valid, win_indices.shape[1]))
                 win_indices = win_indices[:, :valid].contiguous()
@@ -1951,6 +3175,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             or os.environ.get("DSV4_KUNLUN_REFERENCE_ATTN") == "1"
             or dsv4_stable_dsa_enabled()
             or _cp_short_prompt_needs_reference(forward_batch)
+            or not hasattr(torch.ops.xspeedgate_ops, "compressed_attention")
         ):
 
             if extra_cache is not None:
@@ -1984,6 +3209,50 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             )
             return reference_out
 
+        # forward overrides upstream._forward_attention: the sgl_kernel hook
+        # alone is not reachable from serving. Call it before legacy index
+        # clamping, with actual decode lengths rather than padded capacities.
+        # Verify/extend, draft, CP and c0 keep their old paths.  Decode graph
+        # capture is supported by the hybrid adapter when its eager warmup has
+        # installed fixed-address output and metadata buffers.
+        if (
+            forward_batch.forward_mode.is_decode()
+            and not self.is_dspark_draft
+            and _dsa_cp_prefill_ranks(forward_batch) is None
+            and compress_ratio in (1, 2, 4, 128)
+            and extra_cache is not None
+            and win_cache.dtype in (torch.float16, torch.bfloat16)
+        ):
+            # Resolve the host mirror at most once for this backend forward.
+            # The operator receives the authoritative device seq_lens below;
+            # the CPU value is only its legacy host-side metadata argument.
+            decode_lengths_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+            if decode_lengths_cpu is None:
+                decode_lengths_cpu = _seq_lens_cpu_i32(forward_batch)
+            page_width = pool.page_size // compress_ratio
+            hybrid_extra = extra_cache[:, : page_width * cache_dim].reshape(
+                -1, cache_dim
+            )
+            hybrid_result = flash_mla_with_kvcache_kunlun(
+                q=q_3d.to(win_cache.dtype).unsqueeze(1), k_cache=win_cache,
+                indices=win_indices.unsqueeze(1), head_dim_v=layer.v_head_dim,
+                softmax_scale=self.softmax_scale, attn_sink=local_sink,
+                topk_length=win_lengths, extra_k_cache=hybrid_extra,
+                extra_indices_in_kvcache=extra_indices.unsqueeze(1),
+                extra_topk_length=extra_lengths,
+                # The hybrid adapter consumes device seq_lens directly when
+                # the scheduler did not publish a CPU mirror.  This keeps the
+                # decode layer loop free of a per-layer D2H.
+                kunlun_decode_lengths=decode_lengths_cpu,
+                kunlun_compress_ratio=compress_ratio,
+                kunlun_layer_id=layer.layer_id,
+                kunlun_forward_batch=forward_batch,
+                kunlun_backend=self,
+                kunlun_fallback_to_reference=False,
+            )
+            if hybrid_result is not None:
+                return hybrid_result[0].squeeze(1).to(original_dtype)
+
         if q_3d.dtype != win_cache.dtype:
             q_3d = q_3d.to(win_cache.dtype)
         q_lod_cpu, q_lod, kv_lens_cpu, kv_lens = self._make_lod(
@@ -1994,13 +3263,16 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             and win_lengths.numel()
             and os.environ.get("DSV4_KUNLUN_DRAFT_WINDOW_KVLEN", "1") == "1"
         ):
-            # ``compressed_attention`` 的窗口循环上界是 ``min(kv_len,
-            # max_window_size)``，而 draft 的 kv_len 是整个序列长度，远超
-            # ``swa_topk_lengths``，无效 lane 会全被 attend。把 kv_len 夹到窗口长度
-            # 等价于 lane 压缩，但 shape 不依赖数据，能被 capture。draft 各行共用同一
-            # 个窗口长度，所以这里取 ``max()`` 是精确的。
-            # 只夹设备端张量：``kv_lens_cpu`` 在 capture 期是占位符。实测同时夹它
-            # 产生逐字节相同的 836 token 输出。
+            # ``compressed_attention``'s window loop upper bound is ``min(kv_len,
+            # max_window_size)``, while the draft's kv_len is the whole sequence
+            # length, far beyond ``swa_topk_lengths``, so all invalid lanes would
+            # be attended. Clamping kv_len to the window length is equivalent to
+            # lane compression, but the shape does not depend on data and can be
+            # captured. All draft rows share the same window length, so taking
+            # ``max()`` here is exact.
+            # Only clamp the device-side tensor: ``kv_lens_cpu`` is a placeholder
+            # during capture. Measured clamping it too produces byte-identical
+            # 836-token output.
             kv_lens = torch.minimum(kv_lens, win_lengths.max().to(kv_lens.dtype))
         cp_prefill = _dsa_cp_prefill_ranks(forward_batch) is not None
         if int(q_lod_cpu[-1].item()) != q_3d.shape[0]:
@@ -2043,13 +3315,17 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                     and kv_lens_cpu.numel()
                     and os.environ.get("DSV4_VERIFY_PREFIX_TOPK", "1") == "1"
                 ):
-                    # ``compressed_topk`` 是作用于所有 query 行的单个标量，原先取自
-                    # 最长的那一行。TARGET_VERIFY 里最长的是最后一个草稿位置，于是每
-                    # 一行（包括只有它是已提交的第 0 行）都被允许读到覆盖草稿块的那条
-                    # 压缩项，而这条项就是本次前向里发布的。改成按最短行（即已提交
-                    # 前缀）来定上界：0..K-1 项只覆盖 < K*ratio <= 前缀的位置，任何行
-                    # 都到不了未提交位置。信息没丢——被排除的 token 本来就在精确 SWA
-                    # 窗口（>=128）里。
+                    # ``compressed_topk`` is a single scalar applied to all query
+                    # rows, originally taken from the longest row. In
+                    # TARGET_VERIFY the longest is the last draft position, so
+                    # every row (including row 0, which is the only committed one)
+                    # was allowed to read the compressed entry covering the draft
+                    # block, and that entry is published in this very forward.
+                    # Change it to bound by the shortest row (i.e. the committed
+                    # prefix): entries 0..K-1 only cover positions < K*ratio <=
+                    # prefix, so no row can reach an uncommitted position. No
+                    # information is lost -- the excluded tokens are already
+                    # inside the exact SWA window (>=128).
                     max_seq_len = int(kv_lens_cpu.min().item())
                 compressed_topk = min(
                     max(max_seq_len // compress_ratio, 1), extra_indices.shape[1]
@@ -3068,48 +4344,57 @@ def _forward_compress_zeroed_kunlun(
     return rotate_activation(kv_compressed) if rotate else kv_compressed
 
 
-# ── CP 预填索引器：dense fp4 logits 仅 deep_gemm 有，改走上游的纯 torch 实现 ──
+# ── CP prefill indexer: dense fp4 logits exist only in deep_gemm; route to
+# upstream's pure torch implementation ──
 #
-# 现象：P 开 CP 后，**真实请求**进来时 8 个 rank 全挂
+# Symptom: with CP enabled on P, when a **real request** arrives all 8 ranks
+# crash
 #     ImportError: cannot import name 'fp8_fp4_mqa_logits' from 'deep_gemm'
-# 链路：
-#     forward_low_ratio_sources(2832) → _forward_low_ratio_sources_cp(2902)
-#       → _low_ratio_index_topk_dense(3313) → _dense_fp4_mqa_logits(339)
-#         → from deep_gemm import fp8_fp4_mqa_logits
+# Call chain:
+#     forward_low_ratio_sources(2832) -> _forward_low_ratio_sources_cp(2902)
+#       -> _low_ratio_index_topk_dense(3313) -> _dense_fp4_mqa_logits(339)
+#         -> from deep_gemm import fp8_fp4_mqa_logits
 #
-# 上游本来有分派（`_low_ratio_index_topk`，3200-3233）：
+# Upstream already has a dispatch (`_low_ratio_index_topk`, 3200-3233):
 #     elif self._use_dense_fp4_prefill_indexer(fb) and _is_sm100_or_newer():
-#         self._low_ratio_index_topk_extend(...)   # dense fp4（deep_gemm）
+#         self._low_ratio_index_topk_extend(...)   # dense fp4 (deep_gemm)
 #     else:
-#         self._low_ratio_index_topk_torch(...)    # 纯 torch 回退
-# 其中 `_use_dense_fp4_prefill_indexer` 读的就是 `SGLANG_DSV41_TORCH_PREFILL_INDEXER`
-# （脚本里设成 1）。**但 CP 分支绕过了这个分派**，直接调 `_low_ratio_index_topk_dense`
-# ⇒ 开关对 CP 不生效，请求期必然撞 deep_gemm。
+#         self._low_ratio_index_topk_torch(...)    # pure torch fallback
+# `_use_dense_fp4_prefill_indexer` reads `SGLANG_DSV41_TORCH_PREFILL_INDEXER`
+# (set to 1 in the script). **But the CP branch bypasses this dispatch** and
+# calls `_low_ratio_index_topk_dense` directly, -> the switch has no effect on
+# CP, so requests inevitably hit deep_gemm.
 #
-# 为什么 1-token 的 warmup 没炸：插件里 `_cp_short_prompt_needs_reference` 把退化批次
-# 送去了 Torch 参考路径；只有真实 prompt 才走到这里。
+# Why the 1-token warmup did not blow up: `_cp_short_prompt_needs_reference` in
+# the plugin routes degenerate batches to the Torch reference path; only real
+# prompts reach here.
 #
-# 做法：AROUND 挂 `_low_ratio_index_topk_dense`，当「开关要求 torch」或「deep_gemm
-# 取不到 fp8_fp4_mqa_logits」时，重定向到上游自带的 `_low_ratio_index_topk_torch`。
-# **不复制上游任何方法**，直接复用那份纯 torch 实现 —— 它自带分块
-# （`_TORCH_INDEXER_SCORE_BUDGET_BYTES` 控制 `[rows, heads, lc]` 中间张量，就是为
-# 16k prompt 控显存加的），语义上也已按请求分组处理。
+# Approach: hook `_low_ratio_index_topk_dense` AROUND and, when "the switch
+# requires torch" or "deep_gemm cannot get fp8_fp4_mqa_logits", redirect to
+# upstream's own `_low_ratio_index_topk_torch`. **Do not copy any upstream
+# method** -- directly reuse that pure torch implementation. It has its own
+# tiling (`_TORCH_INDEXER_SCORE_BUDGET_BYTES` controls the `[rows, heads, lc]`
+# intermediate tensor, added to cap memory for 16k prompts), and semantically
+# it already processes per request group.
 #
-# `req` 怎么构造：dense 版把 `q_lens`（tensor）与 `q_lens_cpu`（list）作为参数收进来了，
-# 它们是本 rank **每个请求的本地行数**（CP 下每 rank 只算自己的行），
-# 据此 `repeat_interleave` 可精确重建每行的请求下标；torch 版正是按
-# `torch.unique_consecutive(req)` 分请求遍历的，而本 rank 的行天然按请求连续排列。
+# How `req` is constructed: the dense version receives `q_lens` (tensor) and
+# `q_lens_cpu` (list) as parameters; they are the **per-request local row
+# counts** of this rank (under CP each rank only computes its own rows), from
+# which `repeat_interleave` can exactly rebuild each row's request index. The
+# torch version iterates per request via `torch.unique_consecutive(req)`, and
+# this rank's rows are naturally contiguous per request.
 #
-# 开关沿用 `SGLANG_DSV41_TORCH_PREFILL_INDEXER`；此外 deep_gemm 不可用时也会自动
-# 走这条路，免得忘记设开关就炸。
+# The switch reuses `SGLANG_DSV41_TORCH_PREFILL_INDEXER`; additionally, when
+# deep_gemm is unavailable this path is taken automatically, so it does not
+# blow up just because someone forgot to set the switch.
 
 
 def _dense_fp4_indexer_usable() -> bool:
-    """dense fp4 索引器是否可用（依赖 deep_gemm 的 fp8_fp4_mqa_logits）。"""
+    """Whether the dense fp4 indexer is usable (depends on deep_gemm's fp8_fp4_mqa_logits)."""
     if envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get():
         return False
     try:
         from deep_gemm import fp8_fp4_mqa_logits  # noqa: F401
-    except Exception:  # noqa: BLE001 - 任何导入失败都说明不可用
+    except Exception:  # noqa: BLE001 - any import failure means unavailable
         return False
     return True

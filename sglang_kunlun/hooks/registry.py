@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 HOOK_MODULES = (
     "sglang_kunlun.hooks.utils.common",
     "sglang_kunlun.hooks.server_args",
+    # Release hook for startup argument validation: must register before any arg_groups parsing.
+    "sglang_kunlun.hooks.arg_groups",
     "sglang_kunlun.hooks.layers",
     "sglang_kunlun.hooks.hisparse",
     "sglang_kunlun.hooks.mem_cache",

@@ -7,6 +7,50 @@ from typing import Any
 _MISSING = object()
 
 
+def memfd_create(name, flags=1):
+    """Linux memfd with os-compatible flags (default MFD_CLOEXEC).
+
+    Some Python builds omit os.memfd_create despite libc/kernel support.
+    This is an explicit call-site fallback, never a global os monkey patch.
+
+    Args:
+        name: File name accepted by os.fsencode; embedded nulls are rejected.
+        flags: Unsigned memfd flags, defaulting to MFD_CLOEXEC.
+
+    Returns:
+        An open file descriptor owned by the caller.
+    """
+    import ctypes
+    import errno
+    import operator
+    import os
+    import sys
+
+    native = getattr(os, "memfd_create", None)
+    if native is not None:
+        return native(name, flags)
+    if sys.platform != "linux":
+        raise OSError(errno.ENOSYS, "memfd_create requires Linux")
+    encoded = os.fsencode(name)
+    if b"\0" in encoded:
+        raise ValueError("embedded null byte")
+    flags = operator.index(flags)
+    if not 0 <= flags <= 0xFFFFFFFF:
+        raise OverflowError("flags must fit an unsigned int")
+    libc = ctypes.CDLL(None, use_errno=True)
+    create = getattr(libc, "memfd_create", None)
+    if create is None:
+        # Do not guess architecture-dependent syscall numbers.
+        raise OSError(errno.ENOSYS, "libc does not expose memfd_create")
+    create.argtypes = (ctypes.c_char_p, ctypes.c_uint)
+    create.restype = ctypes.c_int
+    fd = create(encoded, flags)
+    if fd == -1:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return fd
+
+
 def server_arg(name: str, default: Any = _MISSING) -> Any:
     """读取 ServerArgs 字段当前生效的值。
 
