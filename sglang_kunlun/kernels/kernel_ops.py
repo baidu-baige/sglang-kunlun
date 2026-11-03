@@ -1796,7 +1796,10 @@ def fused_k_norm_rope_flashmla(
     Step 2: ``xspeedgate_ops.flashinfer_rotary_embedding`` on rope part
     Step 3: ``xspeedgate_ops.set_k_and_s_v4`` (bf16) or torch FP8 quant+write
     """
-    _fused_k_norm_rope_flashmla_kunlun(kv, kv_weight, eps, freqs_cis, positions, out_loc, kvcache, page_size)
+    if kvcache.dtype in (torch.bfloat16, torch.float16):
+        _fused_k_norm_rope_flashmla_kunlun(kv, kv_weight, eps, freqs_cis, positions, out_loc, kvcache, page_size)
+    else:
+        _fused_k_norm_rope_flashmla_torch(kv, kv_weight, eps, freqs_cis, positions, out_loc, kvcache, page_size)
 
 
 @register_jit_op("sglang.jit_kernel.dsv4.elementwise", "fused_rope_inplace")
