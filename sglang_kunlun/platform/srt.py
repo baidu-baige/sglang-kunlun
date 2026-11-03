@@ -48,11 +48,19 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
     #   * ``hicache_device_kernels``：保持 False。插件自己用
     #     ``hooks/mem_cache/kunlun_hicache.py`` 接管传输，host pool 跳过上游的
     #     staging buffer 是正确的；本部署也没开 hicache。
+    #   * ``supports_pynccl``（0.5.23 新增）：保持 False，并且**显式写出来**。
+    #     ``parallel_state.init_model_parallel_group`` 在 0.5.23 新增了
+    #     ``if platform.is_out_of_tree() and not capabilities.supports_pynccl:
+    #     use_pynccl = False``。插件的
+    #     ``hooks/distributed/parallel_state.py`` 本来就把 ``use_pynccl`` 写死成
+    #     False（昆仑没有 pynccl），所以语义一致；写出来是为了下一版默认值翻转时
+    #     不再重演 0.5.22 ``graph_capture`` 那次静默降级。
     capabilities = PlatformCapabilities(
         supports_triton=False,
         graph_capture=True,
         piecewise_graph=False,
         hicache_device_kernels=False,
+        supports_pynccl=False,
     )
 
     def __init__(self) -> None:
