@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -9,6 +10,16 @@ import torch
 INT4_UNSIGNED_SCALE_MULT = 15.0
 INT4_SIGNED_SCALE_MULT = 7.0
 INT8_SCALE_MULT = 127.0
+
+# DSV4_MOE_PRESORT_TORCH=1 swaps moe_pre_sorted for a torch-native implementation (see
+# `_moe_pre_sorted_torch`). Motivation in T022: on the `kunlun_ops` path,
+# `infer_moe_ffn_pre_sorted_split_m` goes out of bounds on dspark's verify batch and
+# crashes the device, while pre-sort itself is pure index math (sort + gather + prefix
+# sum); torch writes it short and fast, which neatly separates "metadata miscomputed"
+# from "the GEMM itself is wrong".
+_PRESORT_TORCH = os.environ.get("DSV4_MOE_PRESORT_TORCH", "0") not in (
+    "0", "", "false", "False"
+)
 
 __all__ = [
     "INT4_SIGNED_SCALE_MULT",
@@ -211,6 +222,67 @@ def dequant_int4_moe(
     return weight.reshape(num_experts, output_size, packed_input_size * 8)
 
 
+def _moe_pre_sorted_torch(
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    *,
+    index_have_neg: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Torch-native pre-sort with the same contract as `kunlun_ops.moe_pre_sorted`.
+
+    Semantics of the three return values (inferred from `moe_post`; see the docstring there):
+      * `sorted_x[r]`            -- the hidden of the token corresponding to sorted row r
+      * `sorted_tokens_idx[i*K+k]` -- which sorted row lane (token i, expert k) lands in;
+                                      **-1** when routed to another EP rank
+      * `sorted_tokens_num_lod`  -- a length-E+1 prefix sum; local expert e occupies
+                                    the row range `[lod[e], lod[e+1])`
+
+    The implementation sets the key of an "external lane" to `num_experts` so it sorts
+    last, thus local rows naturally occupy `[0, lod[E])`; the trailing rows belong to no
+    expert and the GEMM will not read them (they are dirty just like the Kunlun kernel;
+    we also do not zero them here, keeping behavior consistent).
+
+    No host sync anywhere (no `.item()`/`nonzero()`); shapes depend only on
+    `topk_ids.shape`, so this can go into a CUDA graph.
+    """
+    n, k = topk_ids.shape
+    nk = n * k
+    dev = x.device
+    # The chosen key is deliberately kept int32 and uses a same-shape masked_fill: on
+    # Kunlun, `torch.where` with a 0-dim other goes through the broadcast kernel, and the
+    # int64 broadcast of a long prefill (16384 tokens x top-k) times out the device task
+    # (KL_XID_KERNEL_EXCEPTION, where.cpp -> broadcast_calc_common). Semantics are
+    # identical to the original where.
+    flat = topk_ids.reshape(-1).to(torch.int32)
+    if index_have_neg:
+        owned = flat >= 0
+        key = flat.masked_fill(~owned, num_experts).to(torch.int64)
+    else:
+        owned = None
+        key = flat.to(torch.int64)
+    # stable keeps the original lane order within an expert; row order itself does not
+    # affect the final result (moe_post reads back via sorted_tokens_idx), but a stable
+    # sort makes A/B comparison easier to inspect.
+    order = torch.argsort(key, stable=True)
+    lane_token = torch.arange(n, device=dev).repeat_interleave(k)
+    sorted_x = x.index_select(0, lane_token.index_select(0, order)).contiguous()
+
+    # Inverse permutation: lane -> sorted row number
+    pos = torch.empty(nk, dtype=torch.int32, device=dev)
+    pos.scatter_(0, order, torch.arange(nk, dtype=torch.int32, device=dev))
+    if owned is not None:
+        pos = pos.masked_fill(owned.logical_not(), -1)
+
+    # Row counts per key -> take the prefix sum of only the first num_experts buckets
+    # (bucket num_experts is external lanes)
+    counts = torch.zeros(num_experts + 1, dtype=torch.int32, device=dev)
+    counts.scatter_add_(0, key, torch.ones(nk, dtype=torch.int32, device=dev))
+    lod = torch.zeros(num_experts + 1, dtype=torch.int32, device=dev)
+    lod[1:] = counts[:num_experts].cumsum(0).to(torch.int32)
+    return sorted_x, pos, lod
+
+
 def moe_pre_sorted(
     x: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -222,6 +294,10 @@ def moe_pre_sorted(
     """Sort routed tokens and return kernel metadata for expert projections."""
     import kunlun_ops
 
+    if _PRESORT_TORCH:
+        return _moe_pre_sorted_torch(
+            x, topk_ids, num_experts, index_have_neg=index_have_neg
+        )
     top_k = topk_ids.shape[1]
     if block_statistic is None or block_statistic.shape != (12, num_experts):
         block_statistic = torch.empty(
@@ -303,20 +379,23 @@ def moe_post(
 ) -> torch.Tensor:
     """Combine sorted expert outputs with router weights.
 
-    两个 dtype 约束来自 kunlun_ops.moe_post：normed_scale 必须"同 x 或 fp32"，
-    y 必须同 x。而走 int8 grouped 路径时 moe_fc 固定用 bf16 产出 down（见上面的
-    kernel_dtype），此时若模型是 fp16、topk_weights 就是 fp16，bf16 + fp16 这个组合
-    算子不接受，会报 "moe_post not support x/normed_scale dtype"。
-    所以 normed_scale 统一升到 fp32（实测对 bf16/fp16 的 x 都合法），
-    输出再按 output_dtype 落回模型 dtype。
+    The two dtype constraints come from kunlun_ops.moe_post: normed_scale must be "same
+    as x or fp32", and y must be the same as x. On the int8 grouped path moe_fc always
+    produces `down` in bf16 (see kernel_dtype above); then if the model is fp16,
+    topk_weights is fp16, and the bf16 + fp16 combination is rejected by the op with
+    "moe_post not support x/normed_scale dtype". So normed_scale is uniformly promoted to
+    fp32 (measured legal for both bf16 and fp16 x), and the output is cast back to the
+    model dtype per output_dtype.
 
-    EP 下路由到别的 rank 的 (token, top-k) lane，`sorted_tokens_idx` 是 -1，且 `down`
-    里没有对应行被写（`moe_fc` 用 `torch.empty` 分配）。`kunlun_ops.moe_post` 不跳过
-    这些 lane，于是每个 rank 都把未初始化内存乘上真实路由权重加进去，EP all-reduce 再
-    累 8 份 —— 实测 routed 贡献大 7 倍、对参考实现 cos 0.48（shared expert cos 0.9999、
-    `moe_fc` 单算子 cos 0.99996，都是对的）。
+    Under EP, lanes (token, top-k) routed to another rank have `sorted_tokens_idx` = -1 and
+    no corresponding row written in `down` (`moe_fc` allocates with `torch.empty`).
+    `kunlun_ops.moe_post` does not skip those lanes, so each rank multiplies uninitialized
+    memory by the real router weights and adds it in, and the EP all-reduce then accumulates
+    8 copies -- measured routed contribution 7x too large, cos 0.48 vs the reference (shared
+    expert cos 0.9999, single-op `moe_fc` cos 0.99996, both correct).
 
-    所以在这里把外来 lane 掩掉：权重置 0，索引 clamp 到 0 保证不寻址负行。
+    So mask external lanes out here: zero the weights and clamp the index to 0 so negative
+    rows are never addressed.
     """
     import kunlun_ops
 
@@ -324,7 +403,7 @@ def moe_post(
     output = torch.empty(output_shape, dtype=down.dtype, device=down.device)
     moe_index = sorted_tokens_idx.view_as(topk_weights)
     owned = moe_index >= 0
-    # 无条件的逐元素运算，不做 host 同步，可以进 CUDA graph。
+    # Unconditional elementwise ops, no host sync, safe for CUDA graph capture.
     normed_scale = topk_weights.to(torch.float32) * owned
     moe_index = moe_index.clamp_min(0)
     dequant_scale = torch.ones_like(topk_weights, dtype=torch.float32)

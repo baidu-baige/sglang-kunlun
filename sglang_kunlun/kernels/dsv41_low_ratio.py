@@ -12,10 +12,13 @@ Registered symbols:
   * sglang.kernels.ops.attention.dsv4.pair_pool_decode.pair_pool_decode
   * sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4.rope_tail_fake_quant_fp4
   * sglang.kernels.ops.embeddings.engram_gate.fused_engram_gate
+    (XSpeedGate `fused_engram_gate`, torch fallback for the inputs it rejects)
   * sglang.kernels.ops.embeddings.engram_gather.engram_gather
   * sglang.kernels.ops.embeddings.engram_hash.engram_hash_ids
   * sglang.kernels.ops.embeddings.engram_hash.engram_hash_ids_and_commit
+  * sglang.kernels.ops.embeddings.engram_hash.engram_hash_extend_and_commit
   * sglang.kernels.ops.embeddings.engram_hash.engram_commit_history
+    (XSpeedGate `engram_commit_history`, torch fallback for the inputs it rejects)
 """
 
 from __future__ import annotations
@@ -26,7 +29,13 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 
-from sglang_kunlun.kernels.kernel_ops import register_jit_op
+from sglang_kunlun.kernels.kernel_ops import (
+    note_op_path,
+    op_probe,
+    op_probe_shape,
+    register_jit_op,
+    register_triton_op,
+)
 
 
 @register_jit_op("sglang.kernels.ops.layernorm.rmsnorm_fp32", "rmsnorm_fp32")
@@ -89,7 +98,7 @@ def _round_to_e4m3_rne(v: torch.Tensor) -> torch.Tensor:
 
 def _fake_quant_compressed_kv_torch(x: torch.Tensor) -> torch.Tensor:
     """FP4 round-trip with one E4M3 scale per 16 compressed-KV elements."""
-    from sglang.srt.layers.attention.dsv4.torch_quant import FP4_MAX, round_fp4
+    from sglang.kernels.ops.attention.dsv4.torch_quant import FP4_MAX, round_fp4
 
     blocks = x.float().unflatten(-1, (-1, 16))
     amax = blocks.abs().amax(dim=-1, keepdim=True)
@@ -134,7 +143,10 @@ def rope_tail_fake_quant_fp4_kunlun(
     table's leading entries.
     """
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import rope_tail
-    from sglang.kernels.ops.attention.dsv4.torch_quant import fake_quant_fp4
+    from sglang.kernels.ops.attention.dsv4.torch_quant import (
+        FP4_AMAX_FLOOR,
+        fake_quant_fp4,
+    )
 
     if positions is not None:
         assert positions.dim() == 1 and positions.shape[0] == x.shape[0], (
@@ -142,10 +154,83 @@ def rope_tail_fake_quant_fp4_kunlun(
             x.shape,
         )
         freqs = freqs[positions]
+    if (
+        x.is_cuda
+        and x.dtype == torch.bfloat16
+        and x.shape[-1] in (128, 512)
+        and rope_dim == 64
+        and (compressed_kv or block_size == 32)
+        and hasattr(torch.ops.xspeedgate_ops, "rope_tail_fake_quant_fp4_kernel")
+    ):
+        # Gather positions at the new wrapper boundary before invoking the old
+        # operator ABI, which receives per-token frequencies.
+        packed = x.contiguous()
+        out = torch.empty_like(packed)
+        if packed.numel() == 0:
+            return out
+        x_rows = packed.reshape(-1, packed.shape[-1])
+        out_rows = out.reshape_as(x_rows)
+        f = torch.view_as_real(freqs).contiguous()
+        torch.ops.xspeedgate_ops.rope_tail_fake_quant_fp4_kernel(
+            x_rows, f, out_rows, x_rows.stride(0), out_rows.stride(0),
+            f.stride(0), x_rows.shape[0] // packed.shape[0],
+            packed.shape[-1], rope_dim, 16 if compressed_kv else block_size,
+            FP4_AMAX_FLOOR, inverse, compressed_kv, x_rows.shape[0],
+        )
+        return out
     rotated = rope_tail(x, freqs, rope_dim, inverse)
     if compressed_kv:
         return _fake_quant_compressed_kv_torch(rotated)
     return fake_quant_fp4(rotated, block_size)
+
+
+# Keep the 0.5.22 RoPE wrapper above: it owns the new positions contract.
+_ENGRAM_GATE_V2_COMBOS = frozenset(
+    {
+        (torch.bfloat16, torch.bfloat16),
+        (torch.bfloat16, torch.float32),
+        (torch.float16, torch.float16),
+        (torch.float32, torch.bfloat16),
+        (torch.float32, torch.float32),
+    }
+)
+
+
+def _engram_gate_v2_usable(
+    x: torch.Tensor,
+    kv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float,
+) -> bool:
+    """Whether `xspeedgate_ops::fused_engram_gate` accepts these inputs.
+
+    Mirrors `check_fused_engram_gate_inputs`
+    (`XSpeedGate/wrapper/src/fusion/fused_engram_gate.cpp:113`): io dtype
+    (`x`/`kv`) and weight dtype each in bf16/fp16/fp32, `x.dtype == kv.dtype`,
+    q/k weights sharing one dtype, the `(io, weight)` pair in
+    `_ENGRAM_GATE_V2_COMBOS`, everything contiguous and on the same device,
+    `eps > 0`. Anything else keeps the torch path instead of tripping a
+    TORCH_CHECK deep inside a forward.
+
+    The `hasattr` comes first because the op is newer than the deployed wheel:
+    without this check a run would die with `AttributeError: '_OpNamespace' ...
+    has no attribute 'fused_engram_gate'` instead of falling back. Same guard
+    style as `_dsv4_native_rope_supported`.
+    """
+    if not hasattr(torch.ops.xspeedgate_ops, "fused_engram_gate"):
+        return False
+    if x.dtype is not kv.dtype:
+        return False
+    if q_weight.dtype is not k_weight.dtype:
+        return False
+    if (x.dtype, q_weight.dtype) not in _ENGRAM_GATE_V2_COMBOS:
+        return False
+    if not all(t.is_contiguous() for t in (x, kv, q_weight, k_weight)):
+        return False
+    if any(t.device != x.device for t in (kv, q_weight, k_weight)):
+        return False
+    return eps > 0.0
 
 
 @register_jit_op(
@@ -161,8 +246,34 @@ def fused_engram_gate_kunlun(
 ) -> torch.Tensor:
     """FP32 RMS(x) * RMS(key), weighted dot, sigmoid gate, value residual.
 
-    x [T, HC, D], kv [T, (HC+1)*D] laid out head-major with the value段 last.
+    x [T, HC, D], kv [T, (HC+1)*D] laid out head-major with the value segment last.
+
+    Runs on the XSpeedGate `fused_engram_gate` op when the inputs fit its
+    contract — that is the production path, the shape dispatch (feature-parallel
+    / row / token) lives inside the op. The torch expression below stays as the
+    fallback for the cases the op rejects (mixed fp16/fp32 io, non-contiguous
+    inputs), since `engram_gate`'s own CUDA guard does not cover every caller.
     """
+    if _engram_gate_v2_usable(x, kv, q_weight, k_weight, eps):
+        note_op_path("fused_engram_gate", "xspeedgate:fused_engram_gate")
+        out = torch.ops.xspeedgate_ops.fused_engram_gate(
+            x, kv, q_weight, k_weight, eps, clamp_value
+        )
+        return out
+    note_op_path("fused_engram_gate", "torch")
+    out = _fused_engram_gate_torch(x, kv, q_weight, k_weight, eps, clamp_value)
+    return out
+
+
+def _fused_engram_gate_torch(
+    x: torch.Tensor,
+    kv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float,
+    clamp_value: float,
+) -> torch.Tensor:
+    """Torch transcription of the engram gate, used when the op declines."""
     t, hc, d = x.shape
     xf = x.float()
     kvf = kv.float()
@@ -269,6 +380,99 @@ def engram_hash_ids_kunlun(
 
 
 @register_jit_op(
+    "sglang.kernels.ops.embeddings.engram_hash", "engram_hash_extend_and_commit"
+)
+def engram_hash_extend_and_commit_kunlun(
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    history: torch.Tensor,
+    commit_history: torch.Tensor,
+    req_slots: torch.Tensor,
+    starts: torch.Tensor,
+    lengths: torch.Tensor,
+    num_real: int,
+    history_via_slots: bool,
+    out_cache_loc: Optional[torch.Tensor],
+    token_map: torch.Tensor,
+    multipliers: torch.Tensor,
+    primes: torch.Tensor,
+    offsets: torch.Tensor,
+    pad_id: int,
+    image_token_id: Optional[int] = None,
+    mm_pad_shift: int = 0,
+) -> torch.Tensor:
+    """Eager extend: finish every hash against old history before committing.
+
+    Live request slots must be distinct, as in upstream. Boolean selection here
+    is intentionally eager-only; decode/verify graph paths use other entries.
+
+    Args:
+        input_ids: Flattened extend tokens, including optional trailing padding.
+        positions: Absolute token positions used for n-gram history masking.
+        history: Old history, indexed by request or by request-pool slot.
+        commit_history: Persistent history to update after all hashes are read.
+        req_slots: Distinct pool slots for live requests.
+        starts: Per-request offsets into the flattened token array.
+        lengths: Per-request extend lengths; zero-length requests do not commit.
+        num_real: Number of non-padding tokens.
+        history_via_slots: Whether history rows are addressed through req_slots.
+        out_cache_loc: Optional mask; a zero final-token slot prevents commit.
+        token_map: Original-to-compressed vocabulary mapping.
+        multipliers: Per-layer n-gram hash multipliers.
+        primes: Hash moduli for each layer, n-gram size and head.
+        offsets: Per-head embedding-table offsets.
+        pad_id: Compressed padding token ID.
+        image_token_id: Optional image token that blocks history contribution.
+        mm_pad_shift: Threshold used to normalize multimodal placeholder IDs.
+
+    Returns:
+        Hash IDs for every token and layer, with commit_history updated in place.
+    """
+    bs = req_slots.numel()
+    num_tokens = input_ids.numel()
+    width = multipliers.shape[1] - 1
+    assert 0 <= num_real <= num_tokens
+    assert starts.numel() == lengths.numel() == bs
+    assert history.is_contiguous() and commit_history.is_contiguous()
+    assert all(t.ndim == 1 and t.stride(0) == 1 for t in (req_slots, starts, lengths))
+    lens = lengths.to(torch.int64)
+    starts64 = starts.to(torch.int64)
+    # The existing torch hash gathers even padded rows before masking them.
+    # Give it a full row map, and a safe dummy source when no real tokens exist.
+    row = torch.zeros(num_tokens, dtype=torch.int64, device=input_ids.device)
+    hash_history = history
+    hash_slots = req_slots if history_via_slots else None
+    hash_starts = starts64
+    if num_real:
+        row[:num_real] = torch.repeat_interleave(
+            torch.arange(bs, device=input_ids.device), lens, output_size=num_real
+        )
+        row[num_real:] = row[0]
+    else:
+        hash_history = history.new_zeros((1, width))
+        hash_slots = None
+        hash_starts = starts64.new_zeros(1)
+    out, tokens = engram_hash_ids_kunlun(
+        input_ids, positions, mode=2, history=hash_history,
+        token_map=token_map, multipliers=multipliers, primes=primes,
+        offsets=offsets, pad_id=pad_id, num_real=num_real,
+        req_slots=hash_slots, row=row, starts=hash_starts,
+        image_token_id=image_token_id, mm_pad_shift=mm_pad_shift,
+    )
+    if num_tokens and bs:
+        last = (starts64 + lens - 1).clamp(0, num_tokens - 1)
+        live = lens > 0
+        if out_cache_loc is not None:
+            live = live & (out_cache_loc[last] != 0)
+        # Do not redirect inactive requests to the spare row: it stays untouched.
+        commit_history[req_slots.to(torch.int64)[live]] = (
+            tokens[last[live], :width].flip(-1).to(commit_history.dtype)
+        )
+    return out
+
+
+@register_jit_op(
     "sglang.kernels.ops.embeddings.engram_hash", "engram_hash_ids_and_commit"
 )
 def engram_hash_ids_and_commit_kunlun(
@@ -287,15 +491,16 @@ def engram_hash_ids_and_commit_kunlun(
     mm_pad_shift: int = 0,
     block_t: int = 32,
 ) -> torch.Tensor:
-    """Decode 期的 hash id + 原地推进 history，torch 版。
+    """Decode-phase hash id + in-place history advance, torch version.
 
-    上游把 commit 融进了 `_engram_hash_kernel`（`write_tokens=False` 且给
-    `out_cache_loc`），`EngramHasher.forward` 在这条路上提前 return，所以只覆盖
-    `engram_hash_ids` 不够：不注册这个符号，每个 decode step 都会走进 triton，
-    报 `AssertionError: libcuda.so cannot found!`。
+    Upstream folded the commit into `_engram_hash_kernel` (`write_tokens=False` and passing
+    `out_cache_loc`); `EngramHasher.forward` returns early on that path, so covering only
+    `engram_hash_ids` is not enough: without registering this symbol, every decode step would enter triton,
+    reporting `AssertionError: libcuda.so cannot found!`.
 
-    commit 的表达式与 hasher 自己的 torch 分支一致：新行 = 该 token 及其 `width-1` 个
-    最近前驱，oldest-first。`out_cache_loc == 0` 的行是 graph padding，不能落表。
+    The commit expression matches the hasher's own torch branch: the new row = this token plus its `width-1`
+    most recent predecessors, oldest-first. Rows with `out_cache_loc == 0` are graph padding and must not be
+    written to the table.
     """
     out, tokens = engram_hash_ids_kunlun(
         input_ids,
@@ -318,20 +523,79 @@ def engram_hash_ids_and_commit_kunlun(
     )
     width = history.shape[1]
     if width:
-        # 无条件逐元素，不做 host 同步、不产生数据相关形状，可以进 CUDA graph。
-        # `out_cache_loc == 0` 的行是 graph padding，重定向到 history 末尾那行保留槽位
-        # （`init_history` 按 `num_req_slots + 1` 分配，注释写的就是 "a spare row for
-        # graph padding"，`pad_row = num_req_slots = history.shape[0] - 1`）。
-        # 这和上游自己的 torch 分支同一套写法（`engram.py:371`:
-        # `commit_rows = torch.where(out_loc == 0, self.pad_row, commit_rows)`）。
+        # Unconditionally element-wise, no host sync, no data-dependent shapes, so it can enter the CUDA graph.
+        # Rows with `out_cache_loc == 0` are graph padding; redirect them to the spare slot at the end of history
+        # (`init_history` allocates `num_req_slots + 1` rows, and its comment literally says "a spare row for
+        # graph padding", with `pad_row = num_req_slots = history.shape[0] - 1`).
+        # This is the same formulation as upstream's own torch branch (`engram.py:371`:
+        # `commit_rows = torch.where(out_loc == 0, self.pad_row, commit_rows)`).
         #
-        # 先前用布尔掩码选行（`req_slots[out_cache_loc != 0]`）+ `rows.numel()` 判空，
-        # 在 capture 期是数据相关形状 + host 读：实测 decode graph 捕获时在这一行
-        # 申请 10.14 GiB 直接 OOM。
+        # Previously we selected rows with a boolean mask (`req_slots[out_cache_loc != 0]`) +
+        # `rows.numel()` emptiness check,
+        # which during capture is a data-dependent shape + host read: in practice the decode graph capture allocated
+        # 10.14 GiB at this line and OOM'd directly.
         pad_row = history.shape[0] - 1
         rows = torch.where(out_cache_loc == 0, pad_row, req_slots.to(torch.int64))
         history[rows] = tokens[:, :width].flip(-1).to(history.dtype)
     return out
+
+
+# Two capacity limits from `engram_commit_history.cpp`, measured empirically: bs=4097 reports "exceeds SM
+# cache capacity 4096", width=513 reports "exceeds LM capacity 512".
+_ECH_MAX_BS, _ECH_MAX_WIDTH = 4096, 512
+
+
+def _engram_commit_history_op_args(
+    history: torch.Tensor,
+    verify_ids: torch.Tensor,
+    req_slots: torch.Tensor,
+    commit_lens: torch.Tensor,
+) -> "tuple | None":
+    """Normalized (verify_ids, req_slots, commit_lens) for the op, or None when
+    `xspeedgate_ops::engram_commit_history` cannot serve this call.
+
+    The op's contract (`XSpeedGate/wrapper/src/embedding/engram_commit_history.cpp`):
+    `history` / `verify_ids` 2D int32 with `stride(1) == 1` (row padding is fine),
+    `req_slots` 1D contiguous int32/int64, `commit_lens` 1D contiguous int32, one
+    row each per request, `bs <= 4096`, `width <= 512`.
+
+    `verify_ids` arrives int64 -- `verify_ids_2d` is built from the int64 draft
+    token ids -- and is cast here; it is [bs, verify_block], so the copy is
+    negligible. `history` is never cast: the op updates it in place, so handing
+    over a converted copy would silently drop the commit.
+
+    The documented `commit <= width` precondition is deliberately not enforced.
+    Checking it means reading `commit_lens` on the host, and the kernel was
+    verified bit-exact against the torch reference for `commit` up to the verify
+    block (width 3, commits 4/5/6), i.e. it implements the same general formula
+    upstream does. Distinct `req_slots` stays the caller's invariant -- one row
+    per live request -- exactly as upstream's own kernel assumes.
+    """
+    if not hasattr(torch.ops.xspeedgate_ops, "engram_commit_history"):
+        return None
+    if not history.is_cuda or history.dim() != 2 or verify_ids.dim() != 2:
+        return None
+    if history.dtype is not torch.int32 or history.stride(1) != 1:
+        return None
+    if req_slots.dim() != 1 or commit_lens.dim() != 1:
+        return None
+    if any(t.device != history.device for t in (verify_ids, req_slots, commit_lens)):
+        return None
+    bs, num_verify = verify_ids.shape
+    if req_slots.shape[0] != bs or commit_lens.shape[0] != bs:
+        return None
+    if num_verify < 1 or bs > _ECH_MAX_BS or history.shape[1] > _ECH_MAX_WIDTH:
+        return None
+
+    verify = verify_ids
+    if verify.dtype is not torch.int32:
+        verify = verify.to(torch.int32)
+    if verify.stride(1) != 1:
+        verify = verify.contiguous()
+    slots = req_slots
+    if slots.dtype not in (torch.int32, torch.int64):
+        slots = slots.to(torch.int64)
+    return verify, slots.contiguous(), commit_lens.to(torch.int32).contiguous()
 
 
 @register_jit_op(
@@ -343,15 +607,37 @@ def engram_commit_history_kunlun(
     req_slots: torch.Tensor,
     commit_lens: torch.Tensor,
 ) -> None:
-    """Anchor + accepted drafts slid into the per-request history ring, in torch.
+    """Anchor + accepted drafts slid into the per-request history ring.
+
+    Runs on the XSpeedGate `engram_commit_history` op, which updates `history`
+    in place; `_engram_commit_history_torch` stays as the fallback for the calls
+    its contract rejects. Only reachable through
+    `EngramHasher.commit_after_verify`, i.e. the DSpark verify path.
+    """
+    if req_slots.numel() == 0 or history.shape[1] == 0:
+        return
+    args = _engram_commit_history_op_args(history, verify_ids, req_slots, commit_lens)
+    if args is None:
+        note_op_path("engram_commit_history", "torch")
+        _engram_commit_history_torch(history, verify_ids, req_slots, commit_lens)
+    else:
+        note_op_path("engram_commit_history", "xspeedgate:engram_commit_history")
+        torch.ops.xspeedgate_ops.engram_commit_history(history, *args)
+
+
+def _engram_commit_history_torch(
+    history: torch.Tensor,
+    verify_ids: torch.Tensor,
+    req_slots: torch.Tensor,
+    commit_lens: torch.Tensor,
+) -> None:
+    """Torch transcription, used when the op declines.
 
     `history[slot]` then this batch's accepted ids form one window; the new row is
     `window[commit : commit + width]`. Same expression as
     `EngramHasher.commit_after_verify`'s torch fallback.
     """
     width = history.shape[1]
-    if req_slots.numel() == 0 or width == 0:
-        return
     req = req_slots.to(torch.int64)
     window = torch.cat(
         [history[req], verify_ids.to(history.dtype)]
@@ -431,35 +717,6 @@ def engram_gather_kunlun(
     return out
 
 
-def _ceil_ue8m0_exp_torch(sf: torch.Tensor) -> torch.Tensor:
-    """`_ceil_ue8m0_exp`: biased exponent, rounded up when a mantissa is present,
-    clamped to [1, 254]."""
-    bits = sf.contiguous().view(torch.int32)
-    exp = (bits >> 23) & 0xFF
-    exp = exp + ((bits & 0x7FFFFF) != 0).to(torch.int32)
-    return exp.clamp(1, 254)
-
-
-def _fp4_e2m1_code_torch(v: torch.Tensor, rne: bool) -> torch.Tensor:
-    """`_fp4_e2m1_code` / `_fp4_e2m1_code_rne`: e2m1 code with the sign in bit 3."""
-    ax = v.abs().clamp_max(6.0)
-    thresholds = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
-    if rne:
-        idx = torch.zeros_like(ax, dtype=torch.int32)
-        is_boundary = torch.zeros_like(ax, dtype=torch.bool)
-        for t in thresholds:
-            idx = idx + (ax >= t).to(torch.int32)
-            is_boundary = is_boundary | (ax == t)
-        # Round-half-to-even: an odd index exactly on a boundary drops to the even one.
-        idx = torch.where(is_boundary & ((idx & 1) == 1), idx - 1, idx)
-    else:
-        idx = torch.zeros_like(ax, dtype=torch.int32)
-        for t in thresholds:
-            idx = idx + (ax > t).to(torch.int32)
-    sign = ((v < 0) & (idx != 0)).to(torch.int32)
-    return idx | (sign << 3)
-
-
 @register_jit_op(
     "sglang.kernels.ops.attention.dsv4.fp4_indexer", "quantize_fp4_indexer_tensor"
 )
@@ -469,26 +726,45 @@ def quantize_fp4_indexer_tensor_kunlun(
     """Per-32 UE8M0 FP4 quantize into (packed int8 [n, 64], packed scales [n] int32).
 
     Four 32-element groups per 128-wide row; group scale is
-    ``ceil_pow2_exp(max(|x|)/6)`` stored as one byte each in the int32, and the
+    ``ceil_pow2_exp(max(max(|x|)/6, 1e-4))`` stored as one byte each in the int32, and the
     payload packs two 4-bit e2m1 codes per byte (low nibble = even column).
+
+    Use the native bf16 op when installed, otherwise transcribe upstream
+    ``fp4_indexer.quantize_fp4_indexer_row`` with device-side torch operations.
+    kunlun_ops.indexer_k_quant_and_cache only supports FP8, not this format.
     """
     assert x.shape[-1] == 128
-    x = x.contiguous().view(-1, 128)
-    n = x.shape[0]
-    x_fp4 = torch.empty((n, 64), device=x.device, dtype=torch.int8)
-    x_sf = torch.empty((n,), device=x.device, dtype=torch.int32)
-    if n == 0:
-        return x_fp4, x_sf
-    xf = x.to(torch.float32).view(n, 4, 32)
-    sf = (xf.abs().amax(dim=2) / 6.0).clamp_min(1.0e-4)
-    exp = _ceil_ue8m0_exp_torch(sf)
-    x_sf.copy_(
-        exp[:, 0] | (exp[:, 1] << 8) | (exp[:, 2] << 16) | (exp[:, 3] << 24)
-    )
-    scale = (exp << 23).view(torch.float32).unsqueeze(-1)
-    code = _fp4_e2m1_code_torch(xf / scale, rne).view(n, 64, 2)
-    x_fp4.copy_(((code[..., 0] & 0x0F) | ((code[..., 1] & 0x0F) << 4)).to(torch.int8))
-    return x_fp4, x_sf
+    if (
+        x.is_cuda and x.dtype == torch.bfloat16
+        and hasattr(torch.ops.xspeedgate_ops, "quantize_fp4_indexer_tensor")
+    ):
+        return torch.ops.xspeedgate_ops.quantize_fp4_indexer_tensor(x, rne)
+    rows = x.contiguous().view(-1, 128)
+    payload = torch.empty((rows.shape[0], 64), dtype=torch.int8, device=x.device)
+    scales = torch.empty((rows.shape[0],), dtype=torch.int32, device=x.device)
+    # Bound temporary storage during prefill; chunk sizes depend only on shape.
+    for start in range(0, rows.shape[0], 4096):
+        blocks = rows[start:start + 4096].float().reshape(-1, 4, 32)
+        sf = (blocks.abs().amax(-1) / 6.0).clamp_min(1e-4)
+        bits = sf.contiguous().view(torch.int32)
+        exponent = (((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0)).clamp(1, 254)
+        scale = (exponent << 23).view(torch.float32)
+        values = blocks / scale.unsqueeze(-1)
+        magnitude = values.abs().clamp(max=6.0)
+        code = torch.zeros_like(values, dtype=torch.int32)
+        # At boundaries the default chooses the smaller magnitude; RNE chooses
+        # the even E2M1 code. Negative zero is canonicalized to code zero.
+        for i, boundary in enumerate((0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)):
+            up = magnitude >= boundary if rne and i % 2 else magnitude > boundary
+            code = code + up.to(torch.int32)
+        code = code | (((values < 0) & (code != 0)).to(torch.int32) << 3)
+        code = code.reshape(-1, 128)
+        payload[start:start + 4096] = (code[:, ::2] | (code[:, 1::2] << 4)).to(torch.int8)
+        scales[start:start + 4096] = (
+            exponent[:, 0] | (exponent[:, 1] << 8)
+            | (exponent[:, 2] << 16) | (exponent[:, 3] << 24)
+        )
+    return payload, scales
 
 
 @register_jit_op(
@@ -504,29 +780,55 @@ def store_fp4_index_k_cache_kunlun(
 ) -> None:
     """Scatter the quantized index-K payload and its 4 scale bytes into the paged
     cache: payload at ``page, page_offset*64``, scales at ``page, page_size*64 +
-    page_offset*4``."""
+    page_offset*4``.
+
+    Prefer ``xspeedgate_ops::store_fp4_index_k_cache`` when available, otherwise
+    scatter bytes with torch, including caches with padded page strides.
+    One difference from the Triton kernel it replaces: the Kunlun path treats
+    ``loc <= 0`` and out-of-range slots as a whole-row no-op (slot 0 is padding),
+    instead of writing them.
+    """
     assert input.shape[-1] == 128
+    assert page_size > 0
+    assert cache.ndim == 2 and cache.shape[1] == page_size * 68
+    assert cache.dtype == torch.uint8 and cache.stride(1) == 1
+    assert cache.device == input.device == loc.device
+    assert loc.ndim == 1 and loc.dtype in (torch.int32, torch.int64)
+    assert loc.numel() == input.numel() // 128
     k_fp4, k_sf = quantize_fp4_indexer_tensor_kunlun(input.contiguous(), rne=rne)
     n_tokens = input.numel() // input.shape[-1]
     if n_tokens == 0:
         return
-    assert cache.shape[1] == page_size * (64 + 4)
-    u8 = cache.view(torch.uint8)
-    flat = u8.reshape(-1)
-    loc = loc.to(torch.int64)
-    page = loc // page_size
-    page_offset = loc - page * page_size
-
-    payload_base = page * u8.stride(0) + page_offset * 64
-    payload_idx = payload_base[:, None] + torch.arange(64, device=cache.device)
-    flat[payload_idx] = k_fp4.view(torch.uint8)
-
-    scale_base = page * u8.stride(0) + page_size * 64 + page_offset * 4
-    scale_idx = scale_base[:, None] + torch.arange(4, device=cache.device)
-    scale_bytes = torch.stack(
-        [(k_sf >> (8 * i)) & 0xFF for i in range(4)], dim=1
-    ).to(torch.uint8)
-    flat[scale_idx] = scale_bytes
+    assert cache.shape[0] > 0
+    if (
+        input.is_cuda and cache.is_contiguous()
+        and hasattr(torch.ops.xspeedgate_ops, "store_fp4_index_k_cache")
+    ):
+        torch.ops.xspeedgate_ops.store_fp4_index_k_cache(
+            k_fp4, k_sf, cache, loc.contiguous(), page_size
+        )
+        return
+    payload_lane = torch.arange(64, device=cache.device)
+    scale_lane = torch.arange(4, device=cache.device)
+    for start in range(0, n_tokens, 4096):
+        locations = loc[start:start + 4096].to(torch.int64)
+        valid = (locations > 0) & (locations < cache.shape[0] * page_size)
+        # Slot zero is reserved. Invalid rows write its original bytes back;
+        # no boolean compaction, host synchronization or data-dependent shapes.
+        safe = torch.where(valid, locations, 0)
+        page = (safe // page_size).unsqueeze(-1)
+        slot = (safe % page_size).unsqueeze(-1)
+        pcol = slot * 64 + payload_lane
+        scol = page_size * 64 + slot * 4 + scale_lane
+        data = k_fp4[start:start + 4096].view(torch.uint8)
+        sf = ((k_sf[start:start + 4096, None] >> (scale_lane * 8)) & 255).to(torch.uint8)
+        # XPU where does not support uint8; select losslessly in int32.
+        cache[page, pcol] = torch.where(
+            valid[:, None], data.to(torch.int32), cache[page, pcol].to(torch.int32)
+        ).to(torch.uint8)
+        cache[page, scol] = torch.where(
+            valid[:, None], sf.to(torch.int32), cache[page, scol].to(torch.int32)
+        ).to(torch.uint8)
 
 
 def _fp32_to_e4m3_bytes(v: torch.Tensor) -> torch.Tensor:
@@ -552,6 +854,95 @@ def _fp32_to_e4m3_bytes(v: torch.Tensor) -> torch.Tensor:
     byte = torch.where(a == 0.0, torch.zeros_like(byte), byte)
     byte = byte.clamp(0, 0x7E)  # 448 = 0b0_1111_110; above it saturates
     return (byte | (sign << 7)).to(torch.uint8)
+
+
+_FLASHMLA_BYTES_PER_TOKEN = 584  # 448 fp8 nope + 7 ue8m0 scale + 1 pad + 128 B bf16 rope
+_FLASHMLA_SLOT_BYTES = 576
+
+
+def _flashmla_page_bytes(page_size: int) -> int:
+    """``ceil_div(584 * page_size, 576) * 576`` -- the op's (and CUDA's) page stride."""
+    raw = _FLASHMLA_BYTES_PER_TOKEN * page_size
+    return -(-raw // _FLASHMLA_SLOT_BYTES) * _FLASHMLA_SLOT_BYTES
+
+
+def _fused_store_flashmla_unsupported(
+    input: torch.Tensor, cache_u8: torch.Tensor, indices: torch.Tensor, page_size: int
+) -> Optional[str]:
+    """Return why ``fused_store_flashmla_cache`` cannot run this call, else None.
+
+    Mirrors ``check_inputs`` in
+    ``XSpeedGate/wrapper/src/attention/fused_store_flashmla_cache.cpp``. The
+    ``hasattr`` comes first because the op is newer than the deployed wheel
+    (``xspeedgate_ops-1.6.0`` does not export it), so without the guard the
+    FlashMLA store would die with ``AttributeError: '_OpNamespace' ...`` instead
+    of keeping the torch transcription. Same guard style as
+    ``_engram_gate_v2_usable``.
+    """
+    if not hasattr(torch.ops.xspeedgate_ops, "fused_store_flashmla_cache"):
+        return "xspeedgate_ops has no fused_store_flashmla_cache"
+    if input.dtype is not torch.bfloat16:
+        return f"input dtype {input.dtype} is not bfloat16"
+    if input.dim() != 2 or input.shape[1] != 512:
+        return f"input shape {tuple(input.shape)} is not [num_tokens, 512]"
+    if indices.dim() != 1 or indices.dtype not in (torch.int32, torch.int64):
+        return "indices must be 1D int32/int64"
+    if indices.shape[0] != input.shape[0]:
+        return "indices length does not match the input rows"
+    if page_size <= 0 or page_size & (page_size - 1):
+        return f"page_size={page_size} is not a power of two"
+    if cache_u8.dim() != 2 or not cache_u8.is_contiguous():
+        return "cache must be a contiguous 2D byte tensor"
+    if cache_u8.shape[1] < _flashmla_page_bytes(page_size):
+        return (
+            f"cache page is {cache_u8.shape[1]} B, the op needs "
+            f"{_flashmla_page_bytes(page_size)} B"
+        )
+    if indices.device != input.device or cache_u8.device != input.device:
+        return "input/cache/indices are on different devices"
+    return None
+
+
+def _fused_store_latent_unsupported(
+    input: torch.Tensor, cache: torch.Tensor, indices: torch.Tensor, page_size: int
+) -> Optional[str]:
+    """Return why ``fused_store_latent_cache`` cannot run this call, else None.
+
+    Mirrors ``check_fused_store_latent_cache_args`` in
+    ``XSpeedGate/wrapper/src/attention/fused_store_latent_cache.cpp``. This is the
+    XSpeedGate op for the **Kunlun half cache** layout: the plain fp16
+    ``[num_pages, page_size*512]`` latent that ``dsv4_create_buffer_kunlun``
+    allocates, i.e. exactly the torch scatter-copy the half-cache branch below
+    runs (no quantization, no scale). The ``hasattr`` guard comes first so wheels
+    older than ``1.6.0+c9bac3b`` (which only export ``fused_store_flashmla_cache``)
+    keep the torch transcription instead of dying with ``AttributeError``.
+    """
+    if not hasattr(torch.ops.xspeedgate_ops, "fused_store_latent_cache"):
+        return "xspeedgate_ops has no fused_store_latent_cache"
+    if input.dtype is not torch.bfloat16:
+        return f"input dtype {input.dtype} is not bfloat16"
+    if input.dim() != 2 or input.shape[1] != 512:
+        return f"input shape {tuple(input.shape)} is not [num_tokens, 512]"
+    if indices.dim() != 1 or indices.dtype not in (torch.int32, torch.int64):
+        return "indices must be 1D int32/int64"
+    if indices.shape[0] != input.shape[0]:
+        return "indices length does not match the input rows"
+    if page_size <= 0 or page_size & (page_size - 1):
+        return f"page_size={page_size} is not a power of two"
+    if cache.dtype is not torch.float16:
+        return f"cache dtype {cache.dtype} is not float16"
+    if cache.dim() != 2 or not cache.is_contiguous():
+        return "cache must be a contiguous 2D fp16 tensor"
+    if cache.shape[0] < 1:
+        return "cache must have at least one page"
+    if cache.shape[1] != page_size * 512:
+        return (
+            f"cache row is {cache.shape[1]}, the op needs "
+            f"page_size*512={page_size * 512}"
+        )
+    if indices.device != input.device or cache.device != input.device:
+        return "input/cache/indices are on different devices"
+    return None
 
 
 @register_jit_op(
@@ -587,33 +978,47 @@ def fused_store_cache_kunlun(
     n = input.shape[0]
     if n == 0:
         return
+    # Entry probe comes first: xspeedgate's fused_store_flashmla_cache only covers the 584B byte
+    # layout branch, while the Kunlun half cache returns early below. To know "whether this path is reached", first
+    # check whether the function itself was called and what dtype the cache is.
     if freqs_cis is not None:
-        # V4.1 的 CUDA kernel 把 64 维 RoPE 尾部的旋转折进了 store，让 fp4/fp8 只 round
-        # 一次。昆仑池是 plain fp16，没有可融合的量化——但此时上游传进来的是**未旋转**的
-        # latent，静默存下去就是错值路径。
+        # V4.1's CUDA kernel folds the rotation of the 64-dim RoPE tail into the store, so fp4/fp8 only round
+        # once. The Kunlun pool is plain fp16 with no fusable quantization — but here upstream passes an **unrotated**
+        # latent, and silently storing it would be a wrong-value path.
         raise NotImplementedError(
             "fused_store_cache(freqs_cis=...) reaches the Kunlun half-cache path; "
             "the caller must pass the already-rotated latent (freqs_cis=None)"
         )
     if cache.dtype in (torch.float16, torch.bfloat16):
-        # 昆仑半 cache 布局。`DeepSeekV4SingleKVPool` 在本平台被 hook 过
-        # （`hooks/mem_cache/common.py::dsv4_create_buffer_kunlun` /
-        # `dsv4_get_bytes_per_token_kunlun`）：一页是
-        # `page_size * (qk_nope_head_dim + qk_rope_head_dim)` 个 `store_dtype` **元素**，
-        # 即 plain fp16/bf16 latent，不是 N 卡 FlashMLA 的 584 B/token 打包
-        # （448 fp8 nope + 7 ue8m0 scale + 1 pad + 128 B bf16 rope）。XSpeedGate 两侧
-        # （写 `set_k_and_s_v4_with_mapping`、读 `compressed_attention`）也是这个布局。
+        # Kunlun half-cache layout. `DeepSeekV4SingleKVPool` has been hooked on this platform
+        # (`hooks/mem_cache/common.py::dsv4_create_buffer_kunlun` /
+        # `dsv4_get_bytes_per_token_kunlun`): one page is
+        # `page_size * (qk_nope_head_dim + qk_rope_head_dim)` `store_dtype` **elements**,
+        # i.e. plain fp16/bf16 latent, not the N-card FlashMLA 584 B/token packing
+        # (448 fp8 nope + 7 ue8m0 scale + 1 pad + 128 B bf16 rope). Both sides of XSpeedGate
+        # (write `set_k_and_s_v4_with_mapping`, read `compressed_attention`) use this same layout.
         #
-        # 把 FlashMLA 字节打包写进这个 buffer，就是当初每个 CSA2（ratio 1/2）层 attention
-        # 输出 NaN 的原因：压缩 KV 池只有 `set_extra_key_buffer_fused` →
-        # `set_key_buffer_fused` → 这里一条写入路径，布局不匹配的表现是池子里的行接近
-        # fp16 上限（≈65000）且带 NaN，然后是最终 hidden state 全 0、logits 完全均匀。
+        # Writing the FlashMLA byte packing into this buffer was exactly why every CSA2 (ratio 1/2) layer's attention
+        # output NaN: the compressed KV pool has only `set_extra_key_buffer_fused` →
+        # `set_key_buffer_fused` → here, a single write path; the layout mismatch shows up as rows near
+        # the fp16 limit (≈65000) with NaN, then a fully-zero final hidden state and completely uniform logits.
         dim = input.shape[-1]
         num_pages = cache.shape[0]
         assert cache.numel() == num_pages * page_size * dim, (
             f"half-cache page mismatch: cache{tuple(cache.shape)} vs "
             f"page_size={page_size} dim={dim}"
         )
+        reason = _fused_store_latent_unsupported(input, cache, indices, page_size)
+        if reason is None:
+            # XSpeedGate's fp16 scatter-write op: equivalent to the torch advanced indexing below
+            # (out-of-range rows are skipped),
+            # but avoids the two page/slot int64 tensors and one `input.to(fp16)` intermediate tensor.
+            note_op_path("fused_store_cache", "xspeedgate:fused_store_latent_cache")
+            torch.ops.xspeedgate_ops.fused_store_latent_cache(
+                input.contiguous(), cache, indices.contiguous(), page_size
+            )
+            return
+        note_op_path("fused_store_cache", f"torch half-cache ({reason})")
         loc = indices.to(torch.int64).reshape(-1)
         page = loc // page_size
         slot = loc - page * page_size
@@ -621,6 +1026,17 @@ def fused_store_cache_kunlun(
         view[page, slot] = input.to(cache.dtype)
         return
     u8 = cache.view(torch.uint8)
+    reason = _fused_store_flashmla_unsupported(input, u8, indices, page_size)
+    if reason is None:
+        # XSpeedGate fuses the fp8 quantize + ue8m0 scales + rope copy into one
+        # kernel, writing the same 584 B/token FlashMLA slot layout the torch
+        # transcription below builds byte by byte.
+        note_op_path("fused_store_cache", "xspeedgate:fused_store_flashmla_cache")
+        torch.ops.xspeedgate_ops.fused_store_flashmla_cache(
+            input.contiguous(), u8, indices.contiguous(), page_size
+        )
+        return
+    note_op_path("fused_store_cache", f"torch ({reason})")
     flat = u8.reshape(-1)
     bpp = u8.shape[1]
     tile = 64

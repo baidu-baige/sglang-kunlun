@@ -39,15 +39,18 @@ def compute_kv_to_cache_kunlun(
 ) -> None:
     """Normalize and rotate KV, then use the dirty 0.5.14 direct writer.
 
-    0.5.22 新增 `q_rope`（[T, H, head_dim]）：上游让同一次 fused norm+rope+store
-    launch 顺带把 query heads 也 rope 掉。唯一的调用点是 `_forward_prepare` 的
-    `q_rope=q if fuse_q_rope else None`，而 `fuse_q_rope` 只可能由
-    `_hip.compute_q_b` 置真（非 HIP 分支写死 `fuse_q_rope = False`），
-    `fused_k_norm_rope_flashmla` 里也是 `assert _is_hip, "only the ROCm K launch
-    ropes q"`、XPU 分支直接 `assert q is None`。所以 Kunlun 上它恒为 None；
-    融进同一个 launch 做不到，但"返回时 query heads 已 rope"这个契约能照样满足：
-    把它挂到下面那次 `fused_rope_inplace` 的 q 位上（XPU 后端本来就是 q、k 两次
-    triton rope），而不是悄悄丢掉一个 Q 没转的张量。
+    0.5.22 adds `q_rope` ([T, H, head_dim]): upstream lets the same fused
+    norm+rope+store launch also rope the query heads along the way. Its only call
+    site is `q_rope=q if fuse_q_rope else None` in `_forward_prepare`, and
+    `fuse_q_rope` can only be set true by `_hip.compute_q_b` (the non-HIP branch
+    hardcodes `fuse_q_rope = False`); `fused_k_norm_rope_flashmla` also asserts
+    `assert _is_hip, "only the ROCm K launch ropes q"` while the XPU branch
+    directly does `assert q is None`. So on Kunlun it is always None. Fusing it
+    into the same launch is not possible, but the "query heads are roped on
+    return" contract can still be satisfied: attach it to the q slot of the
+    `fused_rope_inplace` call below (the XPU backend already does two triton rope
+    calls for q and k), instead of silently dropping a tensor whose Q was not
+    rotated.
     """
     if qkv_a is not None:
         kv = qkv_a[..., self.q_lora_rank :]
@@ -61,7 +64,7 @@ def compute_kv_to_cache_kunlun(
     if q_rope is None:
         fused_rope_inplace(kv_rope, None, self.freqs_cis, positions)
     else:
-        # 0.5.22 的 q_rope：Q 和 KV 一起转（上游一个 launch，这里 q/k 两个参数）。
+        # 0.5.22 q_rope: rotate Q and KV together (one launch upstream, two q/k args here).
         fused_rope_inplace(
             q_rope[..., -self.qk_rope_head_dim :],
             kv_rope,
@@ -90,24 +93,28 @@ def mqa_forward_prepare_kunlun(
 ):
     """Use the single-call Q/KV RoPE order for prefill and decode.
 
-    0.5.22 新增 `q_rope_out` / `k_nope_out` / `k_rope_out`：unified_kv 的 fp8
-    双池（nope + rope 两个 buffer）布局下，上游让 `fused_qk_norm_rope_swa_store`
-    把打包后的 Q 和 K 直接写进调用方预分配的这三块 buffer（`MQALayer.forward`
-    只在 `unified_fp8_decode or unified_fp8_prefill` 分支里才 new_empty 它们，
-    且全部按关键字传入）。这条路径必须走上游实现，所以三者原样转发给
-    `original_fn`；Kunlun 快路径本身被 `is_unified_kv_triton()` 排除在外，
-    拿到非 None 只能说明上游的门条件变了，宁可炸也不要把 Q/K 的打包输出静默丢掉。
+    0.5.22 adds `q_rope_out` / `k_nope_out` / `k_rope_out`: under the unified_kv
+    fp8 dual-pool (nope + rope two buffers) layout, upstream lets
+    `fused_qk_norm_rope_swa_store` write the packed Q and K directly into these
+    three buffers preallocated by the caller (`MQALayer.forward` only
+    `new_empty`s them in the `unified_fp8_decode or unified_fp8_prefill` branch,
+    and always passes them by keyword). This path must go through the upstream
+    implementation, so all three are forwarded as-is to `original_fn`; the Kunlun
+    fast path is itself excluded by `is_unified_kv_triton()`, so getting a
+    non-None can only mean the upstream gate condition changed -- better to blow
+    up than to silently drop the packed Q/K output.
     """
     from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
         is_unified_kv_triton,
     )
 
-    # 0.5.22 吸收了这段逻辑：``MQALayer`` 不再在构造期快照
-    # ``dsa_enable_prefill_cp``（这个字段现在只留在
-    # ``DeepseekV4DecoderLayer`` 上），上游 ``_forward_prepare`` 自己就是
-    # 一行 ``use_cp = is_cp_active(forward_batch)``
-    # （``deepseek_v4.py:1846``）。沿用同一个判定，否则读 MQALayer 上已不存在
-    # 的属性会在第一个 prefill batch 上 AttributeError。
+    # 0.5.22 absorbed this logic: ``MQALayer`` no longer snapshots
+    # ``dsa_enable_prefill_cp`` at construction time (that field now only lives
+    # on ``DeepseekV4DecoderLayer``); upstream ``_forward_prepare`` itself is
+    # just one line ``use_cp = is_cp_active(forward_batch)``
+    # (``deepseek_v4.py:1846``). Reuse the same check, otherwise reading an
+    # attribute that no longer exists on MQALayer raises AttributeError on the
+    # first prefill batch.
     from sglang.srt.layers.cp.utils import is_cp_active
 
     use_cp = is_cp_active(forward_batch)
@@ -133,10 +140,11 @@ def mqa_forward_prepare_kunlun(
             k_rope_out=k_rope_out,
         )
 
-    # 0.5.22 的 unified_kv fp8 双池输出 buffer 只在上面那条 original_fn 分支上
-    # 有意义（`is_unified_kv_triton()` 为真时已经转走了）。真走到这里还非 None，
-    # 说明上游的门条件变了，静默忽略会让调用方拿着一块没人写过的 buffer 去做
-    # attention / ring store。
+    # The 0.5.22 unified_kv fp8 dual-pool output buffers are only meaningful on
+    # the original_fn branch above (they are already routed away when
+    # `is_unified_kv_triton()` is true). If they are still non-None here, the
+    # upstream gate condition changed; silently ignoring them would let the
+    # caller run attention / ring store on a buffer nobody ever wrote.
     if q_rope_out is not None or k_nope_out is not None or k_rope_out is not None:
         raise NotImplementedError(
             "Kunlun 的 _forward_prepare 快路径不产出 unified_kv fp8 的打包 Q/K "
@@ -156,10 +164,13 @@ def mqa_forward_prepare_kunlun(
     q_lora = self.q_norm(q_lora)
     q, _ = self.wq_b(q_lora)
     q = q.view(-1, self.n_local_heads, self.head_dim)
-    # Q 的 per-head 无权重 RMSNorm 是 V4 专属。上游用 `config.q_head_norm` 控制
-    # （`_compute_q_b` 的 `fused_q_norm_rope` 分支），V4 是 True、**V4.1 是 False**；
-    # checkpoint 自带的参考实现也只归一化低秩 q_lora，从不碰 per-head Q。无条件做会让
-    # 每层 Q 被多归一化一次（layer 0 实测 |Q|max 31.4 → 11.1），输出全错但量级看着正常。
+    # Per-head weightless RMSNorm on Q is V4-specific. Upstream controls it with
+    # `config.q_head_norm` (the `fused_q_norm_rope` branch of `_compute_q_b`);
+    # V4 is True, **V4.1 is False**. The reference implementation shipped with
+    # the checkpoint also only normalizes the low-rank q_lora and never touches
+    # per-head Q. Doing it unconditionally normalizes every layer's Q one extra
+    # time (layer 0 measured |Q|max 31.4 → 11.1), leaving all outputs wrong
+    # while the magnitude looks normal.
     if getattr(self, "q_head_norm", True):
         import kunlun_ops
 
@@ -237,10 +248,11 @@ def moe_gate_forward_kunlun(
 ):
     """Match the Kunlun DSV4 router GEMM contract.
 
-    logits 走 **fp32**，与上游所有 CUDA 路径（`tiny_gemm_bf16(out_dtype=fp32)` /
-    `linear_bf16_fp32`）和参考实现（`Gate.forward`: `linear(x.float(), weight.float())`）
-    一致。V4.1 是 384 个 expert + top-6，fp16 只有约 3 位十进制有效数字，`sqrtsoftplus`
-    分数接近时会选错 expert。
+    logits go through **fp32**, matching all upstream CUDA paths
+    (`tiny_gemm_bf16(out_dtype=fp32)` / `linear_bf16_fp32`) and the reference
+    implementation (`Gate.forward`: `linear(x.float(), weight.float())`). V4.1
+    has 384 experts + top-6; fp16 only has about 3 decimal significant digits,
+    so `sqrtsoftplus` scores that are close together can pick the wrong expert.
     """
 
     del gemm_output_zero_allocator, forward_batch
@@ -327,96 +339,39 @@ def hc_pre_kunlun(
     return y, post, comb, False
 
 
-# hc_post 的 REPLACE hook 统一由 deepseek_v4_precision.py 提供（那份额外带 fp16
-# nan_to_num 兜底），此处不再重复注册。
+# The hc_post REPLACE hook is provided uniformly by deepseek_v4_precision.py
+# (that copy additionally has an fp16 nan_to_num fallback), so it is not
+# registered again here.
 
 
-# ---------------------------------------------------------------------------
-# compressed-tensors 量化配置的命名对齐
+# Quantization name mapping is installed at the loader consumption point by
+# hooks/model_loader/quant_injection.py, including the 0.5.22 getter API.
+
+
+# The problem that the fused wqkv_a cannot get the per-channel weight_scale.
 #
-# W4A8 那份 checkpoint 的 quantization_config 是按 **checkpoint 原始命名** 导出的
-# （``layers.N.attn.*`` / ``layers.N.ffn.*``、wq_a 与 wkv 未融合），而 sglang 的模块
-# 路径是 ``layers.N.self_attn.*`` / ``layers.N.mlp.*``、且默认把 wq_a+wkv 融合成
-# wqkv_a。两者对不上时 find_matched_target 会直接抛
-# "Unable to find matching target for model.layers.0.self_attn.wqkv_a"。
+# The upstream wq_a+wkv fusion branch (`elif fuse_wqa_wkv and (...)` in
+# sglang/srt/models/deepseek_v4.py) only recognizes ``.weight`` and
+# ``.weight_scale_inv`` (fp8 block-quant naming), not the compressed-tensors
+# per-channel ``.weight_scale``. So these two scales fall into the generic
+# branch and get renamed to ``self_attn.wq_a.weight_scale``, while the model
+# only has the fused ``wqkv_a.weight_scale``; the log reports
+# "not found in params_dict", the fused module's scale keeps its initial value
+# => int8 dequant produces garbage => logits become garbage => decoding produces
+# an empty string. Note that ``.weight`` itself is correctly cat-fused; only the
+# scale is missing, and loading does not error out, making it hard to detect.
 #
-# sglang 本来就有这个对齐通道：loader.py 里
-# ``hf_to_sglang_mapper = getattr(model_class, "hf_to_sglang_mapper", None)``，
-# 拿到后调 ``quant_config.apply_weight_name_mapper()``。但 DSV4 的模型类没有定义这个
-# 属性，于是通道是空的。这里把它补上。
-#
-# 规则写成正则模式串上的子串替换（WeightsMapper 按 key 长度倒序匹配、命中一条即停），
-# 所以更长的 wq_a/wkv→wqkv_a 规则会先于通用的 attn→self_attn 规则生效。
-# 对已经用 sglang 命名导出的 W8A8 checkpoint 这些规则全部不命中，是无害的空操作
-# （``layers\.\d+\.self_attn\.`` 里不含 ``layers\.\d+\.attn\.``）。
-# ---------------------------------------------------------------------------
-_DSV4_QUANT_NAME_MAP_BASE = {
-    # DSpark draft 用 fuse_wqa_wkv=False，mtp 侧本来就不融合。
-    r"mtp\.\d+\.attn\.": r"mtp\.\d+\.self_attn\.",
-    r"layers\.\d+\.attn\.": r"layers\.\d+\.self_attn\.",
-    r"layers\.\d+\.ffn\.": r"layers\.\d+\.mlp\.",
-    r"mtp\.\d+\.ffn\.": r"mtp\.\d+\.mlp\.",
-}
-
-# 开融合时才把 wq_a/wkv 折到 wqkv_a 上（两者 scheme 相同，映射后合并成一个 key）。
-# 关融合时必须不折，否则模型里是分开的 wq_a / wkv 两个模块、反而匹配不上。
-_DSV4_QUANT_NAME_MAP_FUSED = {
-    r"layers\.\d+\.attn\.wq_a$": r"layers\.\d+\.self_attn\.wqkv_a$",
-    r"layers\.\d+\.attn\.wkv$": r"layers\.\d+\.self_attn\.wqkv_a$",
-}
-
-
-def _build_dsv4_quant_name_map(fuse_wqa_wkv: bool) -> dict:
-    mapping = dict(_DSV4_QUANT_NAME_MAP_BASE)
-    if fuse_wqa_wkv:
-        mapping.update(_DSV4_QUANT_NAME_MAP_FUSED)
-    return mapping
-
-
-def _install_dsv4_quant_name_mapper() -> None:
-    from sglang.srt import environ as _environ
-    from sglang.srt.models.utils import WeightsMapper
-
-    fuse = bool(_environ.envs.SGLANG_OPT_FUSE_WQA_WKV.get())
-    mapper = WeightsMapper(orig_to_new_substr=_build_dsv4_quant_name_map(fuse))
-    targets = []
-    from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
-
-    targets.append(DeepseekV4ForCausalLM)
-    try:
-        from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
-
-        targets.append(DeepseekV4ForCausalLMDSpark)
-    except ImportError:
-        pass
-    for cls in targets:
-        # 已经自带 mapper 的话不覆盖（上游若后续补上，以上游为准）。
-        if getattr(cls, "hf_to_sglang_mapper", None) is None:
-            cls.hf_to_sglang_mapper = mapper
-
-
-_install_dsv4_quant_name_mapper()
-
-
-# 融合后的 wqkv_a 拿不到 per-channel weight_scale 的问题。
-#
-# 上游的 wq_a+wkv 融合分支（sglang/srt/models/deepseek_v4.py 的 `elif fuse_wqa_wkv and (...)`）
-# 只认 ``.weight`` 和 ``.weight_scale_inv``（fp8 块量化命名），不认 compressed-tensors 的
-# per-channel ``.weight_scale``。于是这两份 scale 掉进通用分支、被改名成
-# ``self_attn.wq_a.weight_scale``，而模型里只有融合后的 ``wqkv_a.weight_scale``，
-# 日志报 "not found in params_dict"、融合模块的 scale 保持初值 => int8 反量化出垃圾
-# => logits 变垃圾 => 解码出空串。注意 ``.weight`` 本身是被正确 cat 融合的，只有 scale 缺失，
-# 加载阶段不报错，很难发现。
-#
-# 这里不改上游，而是在进 load_weights 之前把权重流里的两份 scale 先合并、直接以融合后的名字
-# ``...wqkv_a.weight_scale`` 交出去，上游的通用分支就能在 params_dict 里找到它、正常加载。
-# 合并方式和 ``.weight`` 完全一致：per-channel scale 是 per-output-channel，
-# 融合就是把输出通道按 q、kv 顺序接起来，所以同样是 ``torch.cat([q, kv], dim=0)``。
+# Here we do not change upstream; instead, before entering load_weights we merge
+# the two scales in the weight stream first and hand them out directly under the
+# fused name ``...wqkv_a.weight_scale``, so the upstream generic branch can find
+# it in params_dict and load it normally. The merge is exactly like ``.weight``:
+# a per-channel scale is per-output-channel, and fusion concatenates output
+# channels in q, kv order, so it is likewise ``torch.cat([q, kv], dim=0)``.
 _WQKV_A_SCALE_SHARDS = {".wq_a.weight_scale": "q", ".wkv.weight_scale": "kv"}
 
 
 def _fuse_wqkv_a_weight_scales(weights):
-    """把 wq_a / wkv 的 weight_scale 合并成融合后 wqkv_a 的那一份。"""
+    """Merge the wq_a / wkv weight_scales into the fused wqkv_a one."""
     pending: dict = {}
     for name, tensor in weights:
         shard = next(
@@ -433,7 +388,9 @@ def _fuse_wqkv_a_weight_scales(weights):
         if len(bucket) == 2:
             yield fused, torch.cat([bucket["q"], bucket["kv"]], dim=0)
             del pending[fused]
-    # 只凑到一半的按原名交回去，让上游按原逻辑报 not found，不要静默吞掉。
+    # If only half of a pair arrived, hand it back under its original name and
+    # let upstream report "not found" via its own logic; do not swallow it
+    # silently.
     for fused, bucket in pending.items():
         for shard, tensor in bucket.items():
             back = ".wq_a." if shard == "q" else ".wkv."
@@ -445,14 +402,17 @@ def _fuse_wqkv_a_weight_scales(weights):
     type=HookType.AROUND,
 )
 def fuse_wqkv_a_weight_scale_kunlun(original_fn, self, weights, *args, **kwargs):
-    """开融合时，先把 wq_a/wkv 的 weight_scale 合并再交给上游 loader。"""
+    """When fusion is on, merge the wq_a/wkv weight_scales before handing them to the upstream loader."""
     from sglang.srt import environ as _environ
 
-    # 有些 checkpoint 自带 MTP 输入补偿（QuaRot/R1 旋转补偿，作用点是 draft 收到的
-    # target hidden）。上游不认识这个模块，会以
-    # "model.norm.mtp_input_correction.blocks not found in params_dict." 丢掉它。
-    # 这条 hook 只覆盖走 DeepseekV4 loader 的模型：把补偿块从权重流里摘出来挂到模型上，
-    # 再由 mtp_production 在 draft-extend 边界施加（或由 NextN 自带的 rot_weight 槽位施加）。
+    # Some checkpoints ship an MTP input correction (QuaRot/R1 rotation
+    # correction, applied to the target hidden that the draft receives). Upstream
+    # does not recognize this module and drops it with
+    # "model.norm.mtp_input_correction.blocks not found in params_dict." This
+    # hook only covers models going through the DeepseekV4 loader: strip the
+    # correction blocks from the weight stream and attach them to the model, then
+    # apply them at the draft-extend boundary via mtp_production (or via NextN's
+    # own rot_weight slot).
     weights = strip_correction_blocks(self, weights)
     if not _environ.envs.SGLANG_OPT_FUSE_WQA_WKV.get():
         return original_fn(self, weights, *args, **kwargs)
@@ -540,9 +500,9 @@ def _prepare_deepseek_v4_weights_kunlun(weights, quant_config):
                 yield prefix + suffix, bucket[key]
 
 
-# ── 让 V4.1 在开 CP 的同时保留 vision（ViT）──────────────────────────────
+# ── Let V4.1 keep vision (ViT) while CP is enabled ─────────────────────────
 #
-# 上游 `models/deepseek_v4.py:4613-4621` 有一段硬校验：
+# Upstream `models/deepseek_v4.py:4613-4621` has a hard check:
 #
 #     if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
 #         if (get_parallel().attn_cp_size != 1
@@ -551,29 +511,48 @@ def _prepare_deepseek_v4_weights_kunlun(weights, quant_config):
 #             raise ValueError(
 #                 "V4.1 vision currently supports TP/EP/DP without CP, PP or MoE A2A")
 #
-# 这个限制对应的真实缺口是：**"VL 感知的路由"只接在 forward_normal /
-# forward_normal_dual_stream 上**（`deepseek_v2.py:1021` / `:1243` 才查
-# `e_score_correction_bias_vl`）。开 CP 之后 forward 走的是 CP 分支，不再查这个偏置。
+# The real gap behind this restriction is that **"VL-aware routing" is only
+# wired into forward_normal / forward_normal_dual_stream** (only
+# `deepseek_v2.py:1021` / `:1243` look up `e_score_correction_bias_vl`). Once CP
+# is enabled, forward goes through the CP branch and no longer looks up this
+# bias.
 #
-# 而这个偏置**只对 `input_ids == image_token_id` 的 token 生效**
-# （`multimodal/dsv41/vl_routing.py` 里要么 `bias_alt_token_id=image_token_id`，
-# 要么 `torch.where(input_ids == image_token_id, bias_vl, bias)`）——
-# **纯文本请求里没有任何 token 等于 image_token_id**，所以缺这块对文本任务
-# 数值没有影响；图片请求会静默用错路由偏置。因此本 hook 只适用于"纯文本路径"。
+# And this bias **only takes effect for tokens where `input_ids ==
+# image_token_id`** (in `multimodal/dsv41/vl_routing.py`, either
+# `bias_alt_token_id=image_token_id`, or
+# `torch.where(input_ids == image_token_id, bias_vl, bias)`). **A pure-text
+# request has no token equal to image_token_id**, so missing this piece has no
+# numerical impact on text tasks; image requests would silently use the wrong
+# routing bias. Therefore this hook only applies to the "pure-text path".
 #
-# 做法：只在 `DeepseekV4ForCausalLM.__init__` 期间，把 `deepseek_v4` 模块里的
-# `get_parallel` 换成"attn_cp_size 报 1、其余字段透传"的代理，让校验通过；
-# `__init__` 退出时立刻恢复。选这个点位的依据：
-#   * `ParallelState` 是 `@dataclass(frozen=True, slots=True)`，改不了实例；
-#   * `deepseek_v4.py` 里 `attn_cp_size` 只有两处读取 —— 4617 的校验（在
-#     `__init__` 内）和 4176 的 forward（`__init__` 期间不会执行），
-#     所以代理的作用面只有那一个校验。
+# 2026-10-22 update: the "only applies to the pure-text path" statement above no
+# longer holds -- both gaps on the image path are patched in
+# hooks/model_executor/cp_mm_embeds.py (merging image features under CP, and
+# restoring mm hash ids to image_token_id so the VL bias selects image tokens).
+# The full 900 MMMU examples already run in the normal range; see
+# 文档/DSV41/改动说明.md issues 4/5.
 #
-# `SGLANG_KUNLUN_ALLOW_VISION_WITH_CP=0` 可关掉，回到上游行为。
+# Approach: only during `DeepseekV4ForCausalLM.__init__`, replace `get_parallel`
+# in the `deepseek_v4` module with a proxy that "reports attn_cp_size as 1 and
+# passes everything else through", and replace `get_moe_a2a_backend` with a proxy
+# that "reports is_none() as True and passes everything else through" (see
+# `A2aAsNone`; it is required on the D side when deepep is enabled), so the check
+# passes; restore immediately when `__init__` exits. The rationale for this
+# injection point:
+#   * `ParallelState` is `@dataclass(frozen=True, slots=True)`, so the instance
+#     cannot be modified;
+#   * in `deepseek_v4.py`, `attn_cp_size` is read in only two places -- the check
+#     at 4617 (inside `__init__`) and the forward at 4176 (not executed during
+#     `__init__`), so the proxy's blast radius is just that one check.
+#
+# `SGLANG_KUNLUN_ALLOW_VISION_WITH_CP=0` disables this and returns to upstream
+# behavior.
 
 
 class _AttnCpAsOne:
-    """`get_parallel()` 的透传代理：只把 `attn_cp_size` 报成 1，其余原样透传。"""
+    """Pass-through proxy for `get_parallel()`: only reports `attn_cp_size` as 1,
+    passes everything else through unchanged.
+    """
 
     __slots__ = ("_state",)
 
@@ -582,8 +561,45 @@ class _AttnCpAsOne:
 
     @property
     def attn_cp_size(self) -> int:
-        """报 1 表示开 CP；其他字段原样透传。"""
+        """Report 1 to indicate CP is on; pass all other fields through unchanged."""
         return 1
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_state"), name)
+
+
+class A2aAsNone:
+    """Pass-through proxy for `get_moe_a2a_backend()`: only reports `is_none()` as True.
+
+    Why it also needs proxying: the third condition of the same vision gate is
+    `not get_moe_a2a_backend().is_none()`, which **is hit on the D side when
+    deepep is enabled** (D is dp8 -> attn_cp_size=1, so the attn_cp proxy above
+    does not help). Measured: when only attn_cp is allowed through, all 8
+    schedulers on the D side hit
+    `ValueError: V4.1 vision currently supports TP/EP/DP without CP, PP or MoE A2A`.
+
+    Why this replacement is safe -- the key is the **module namespace**:
+      * `deepseek_v4.py:108` is `from sglang.srt.layers.moe import get_moe_a2a_backend`,
+        so replacing `deepseek_v4.get_moe_a2a_backend` only affects reads inside
+        that module;
+      * the real place that decides what MoE to build based on the a2a backend is
+        `EPMoE.__init__` (`layers/moe/ep_moe/layer.py:106,142`), which uses the
+        same-named binding **in its own module** and is unaffected, so deepep's
+        dispatcher is still constructed normally;
+      * the other 10 `get_moe_a2a_backend()` calls in `deepseek_v4.py` are all in
+        methods on the forward path (`_run_moe_ffn_dp_sync` /
+        `op_mhc_prepare_attn`, etc.), which are not executed during `__init__`.
+    Together: the proxy's blast radius is just that one gate condition.
+    """
+
+    __slots__ = ("_state",)
+
+    def __init__(self, state):
+        object.__setattr__(self, "_state", state)
+
+    def is_none(self) -> bool:
+        """Report True for is_none(); pass everything else through."""
+        return True
 
     def __getattr__(self, name):
         return getattr(object.__getattribute__(self, "_state"), name)
@@ -594,7 +610,7 @@ class _AttnCpAsOne:
     type=HookType.AROUND,
 )
 def allow_vision_with_cp(original_fn, self, *args, **kwargs):
-    """开 CP 时绕过 "V4.1 vision ... without CP" 校验，ViT 照常构造。"""
+    """Bypass the "V4.1 vision ... without CP" check when CP is on, so ViT is constructed normally."""
     import logging
     import os
 
@@ -606,16 +622,23 @@ def allow_vision_with_cp(original_fn, self, *args, **kwargs):
     if not getattr(_dsv4, "_kunlun_cp_vision_warned", False):
         _dsv4._kunlun_cp_vision_warned = True
         logging.getLogger(__name__).warning(
-            "V4.1：已放宽 'vision without CP' 校验（真实 attn_cp_size=%s）。"
-            "ViT 会照常构造并加载权重；但 VL 路由偏置在 CP 路径上不会被查 —— "
-            "纯文本无影响，图片请求会静默算错。"
+            "V4.1：已放宽 'vision without CP/A2A' 校验"
+            "（真实 attn_cp_size=%s、moe_a2a_backend=%s）。"
+            "ViT 会照常构造并加载权重。放行本身带出的两个缺口已由 "
+            "hooks/model_executor/cp_mm_embeds.py 补上："
+            "(1) CP 下 _execute_extend_cp 不合并图片特征；"
+            "(2) VL 路由偏置因为 mm hash id 而选不中图片 token。"
             "如需回到上游行为：SGLANG_KUNLUN_ALLOW_VISION_WITH_CP=0",
             getattr(_dsv4.get_parallel(), "attn_cp_size", "?"),
+            _dsv4.get_moe_a2a_backend(),
         )
 
     real_get_parallel = _dsv4.get_parallel
+    real_get_a2a = _dsv4.get_moe_a2a_backend
     try:
         _dsv4.get_parallel = lambda: _AttnCpAsOne(real_get_parallel())
+        _dsv4.get_moe_a2a_backend = lambda: A2aAsNone(real_get_a2a())
         return original_fn(self, *args, **kwargs)
     finally:
         _dsv4.get_parallel = real_get_parallel
+        _dsv4.get_moe_a2a_backend = real_get_a2a
