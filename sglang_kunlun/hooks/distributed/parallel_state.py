@@ -71,7 +71,7 @@ def kunlun_init_model_parallel_group(
     rank_offset: int = 0,
     max_world_size: Optional[int] = None,
 ):
-    """Kunlun: init GroupCoordinator with XPU/NPU/HPU communicators."""
+    """Kunlun: init GroupCoordinator with XPU/HPU communicators."""
     from sglang.srt.distributed.parallel_state import (
         _ENABLE_CUSTOM_ALL_REDUCE,
         _ENABLE_MSCCLPP,
@@ -96,7 +96,9 @@ def kunlun_init_model_parallel_group(
         use_torch_symm_mem_all_reduce=use_torch_symm_mem_allreduce,
         use_hpu_communicator=True,
         use_xpu_communicator=True,
-        use_npu_communicator=True,
+        # 0.5.23 dropped ``use_npu_communicator`` from both
+        # ``GroupCoordinator.__init__`` and upstream's own call here. Passing it
+        # is a TypeError on every rank during scheduler init.
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
         recovered_rank=recovered_rank,
