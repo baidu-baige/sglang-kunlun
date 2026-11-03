@@ -65,6 +65,11 @@ def create_moe_dispatcher_kunlun(moe_runner_config, quant_method=None):
         return StandardDispatcher(moe_runner_config)
     if a2a_backend.is_deepep() or a2a_backend.is_mooncake():
         dispatcher = MaybeTboDeepEPDispatcher(
+            # 0.5.23 added this: upstream's create_moe_dispatcher threads the
+            # per-layer runner backend down so the flashinfer dispatchers can
+            # branch on it. The DeepEP path only stores it, but pass it for
+            # parity -- the next release may start reading it.
+            runner_backend=moe_runner_config.runner_backend,
             group=get_tp_group().device_group,
             router_topk=moe_runner_config.top_k,
             permute_fusion=True,

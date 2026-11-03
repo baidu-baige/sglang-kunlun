@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import torch
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
-from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     TopKConfig,
@@ -145,7 +144,12 @@ def select_experts_kunlun(
     topk_group = topk_config.topk_group
     num_expert_group = topk_config.num_expert_group
     renormalize = topk_config.renormalize
-    num_fused_shared_experts = topk_config.num_fused_shared_experts
+    # 0.5.23 moved the shared-expert knobs into ``TopKConfig.shared_experts``
+    # (a ``SharedExpertsConfig``) and renamed the accessor, so the old
+    # ``topk_config.num_fused_shared_experts`` attribute no longer exists --
+    # reading it would be an AttributeError on every MoE forward. The gates'
+    # *parameter* name is still ``num_fused_shared_experts``.
+    num_fused_shared_experts = topk_config.num_shared_topk_slots
     custom_routing_function = topk_config.custom_routing_function
     # 0.5.22: a per-token ``dynamic_expert_bias`` supersedes the static
     # per-expert ``topk_config.correction_bias`` (upstream topk.py:2563).
@@ -277,7 +281,11 @@ def select_experts_kunlun(
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
         elif (
-            get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            # 0.5.23 reads the runner backend off the config instead of the
+            # process-global ``get_moe_runner_backend()``; the global is still
+            # there but no longer what upstream consults here.
+            topk_config.runner_backend is not None
+            and topk_config.runner_backend.is_flashinfer_trtllm_routed()
             and scoring_func == "softmax"
             and correction_bias is None
         ):

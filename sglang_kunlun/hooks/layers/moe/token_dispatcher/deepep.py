@@ -875,10 +875,19 @@ class DeepEPDispatcher(BaseDispatcher):
         async_finish: bool = False,
         return_recv_hook: bool = False,
         buffer_slot: int = 0,
+        # 0.5.23: ``MaybeTboDeepEPDispatcher.__init__`` always forwards
+        # ``runner_backend=`` to ``DeepEPDispatcher`` on the deepep path
+        # (``two_batch_overlap.py:1164``), so a replacement class that does not
+        # accept it is a TypeError at MoE construction on every deepep boot.
+        # Upstream threads it into the impls' ``common_kwargs``, but nothing on
+        # the DeepEP path reads it back (only the flashinfer dispatchers do), so
+        # keep it on the wrapper and out of the Kunlun impls' kwargs.
+        runner_backend=None,
     ):
         super().__init__()
 
         self.deepep_mode = deepep_mode
+        self.runner_backend = runner_backend
 
         common_kwargs = dict(
             group=group,

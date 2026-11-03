@@ -193,7 +193,17 @@ def initialize_mqa_rope_policy_kunlun(result, self, config, *args, **kwargs):
     type=HookType.REPLACE,
 )
 def compute_q_b_kunlun(self, q, positions, q_out=None):
-    """Write Q norm/RoPE into contiguous local storage before a TP-slice copy."""
+    """Write Q norm/RoPE into contiguous local storage before a TP-slice copy.
+
+    0.5.23 added an early `return q` for `use_mega_attention` (the mega path
+    norms and ropes Q inside its own kernel). That backend is rejected in
+    `mqa_forward_global_head_layout_kunlun`, so this body always runs the
+    norm+RoPE; the assert keeps the two hooks from drifting apart.
+    """
+    assert not getattr(self, "use_mega_attention", False), (
+        "mega attention is not implemented on Kunlun; see "
+        "mqa_forward_global_head_layout_kunlun"
+    )
     from sglang.srt.models.deepseek_v4 import fused_q_norm_rope
 
     _dsv4_dump(self, "self_attn.wq_b.input.q_norm", q)
@@ -277,6 +287,21 @@ def mqa_forward_global_head_layout_kunlun(
     False -- this hook mirrors the parameter and refuses loudly if it is ever
     truthy instead of returning a reduced plain tensor the caller did not ask
     for.
+
+    0.5.23 changed upstream's body in five places. Three are inert here:
+
+    * the `unified_kv_kernels.env_gate` import moved to
+      `srt.layers.attention.dsv4.unified_kv_gate` (followed below);
+    * the Q padding buffer was extracted into `MQALayer._zero_padded_q`, which
+      this rewrite does not use -- it builds its own TP-global `q_global`;
+    * `_wo_a_quant_freqs` adds a `wo_a_quant_freqs` rope kwarg, but it returns
+      None unless `_wo_a_fp8_mxscale_prequant` is bound, and that import is
+      HIP-only (`deepseek_v4.py:462-484`), so the kwarg can never appear here.
+
+    The remaining two are handled: the new `use_mega_attention` route is
+    rejected loudly (see below), and the breakable-graph output buffer is
+    allocated with `dtype=x.dtype` to match upstream's fix for TRT-LLM returning
+    BF16 under FP8 queries.
     """
     import sglang.srt.models.deepseek_v4 as upstream
     from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
@@ -295,6 +320,17 @@ def mqa_forward_global_head_layout_kunlun(
             "Kunlun MQA forward 无法把 wo_b 的 TP all-reduce 交给 MHC post 融合"
             "（all_reduce_mhc_post_combine_norm 是 Blackwell/ROCm 专有 kernel），"
             "defer_all_reduce=True 不支持。"
+        )
+
+    # 0.5.23 新增的 mega attention：上游在 forward 里整条改道
+    # （`_forward_mega` + `_project_wo_b`，并把 kernel_num_heads 固定成 64/128）。
+    # 门是 `is_dsv41 and _is_cuda and kernel.dsv4_attn_backend == "flashmla_mega"`
+    # （`deepseek_v4.py:1509`），基线跑的是 `kunlun_compressed`，所以只能是 False。
+    # 这条路径在昆仑没有实现，静默走非 mega 分支等于换了一套数值，所以显式拒绝。
+    if getattr(self, "use_mega_attention", False):
+        raise NotImplementedError(
+            "Kunlun MQA forward 没有 mega attention 实现"
+            "（上游 0.5.23 的 flashmla_mega 路径），use_mega_attention=True 不支持。"
         )
 
     attn_backend = get_attn_backend()
@@ -397,6 +433,9 @@ def mqa_forward_global_head_layout_kunlun(
         ):
             o = attn_q.new_empty(
                 (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
+                # 0.5.23: TRT-LLM 即使拿 FP8 query 也返回 BF16，所以输出缓冲按
+                # 输入 x 的 dtype 分配，而不是跟着 attn_q。
+                dtype=x.dtype,
             )
             upstream.bcg_deepseek_v4_attention_with_output(
                 attn_q,

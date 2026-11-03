@@ -573,11 +573,19 @@ def draft_extend_for_decode_kunlun(self, batch, batch_result, *, kv_loc_plan=Non
     if output.hidden_states is not None:
         output.hidden_states = output.hidden_states[select_index]
     if self.server_args.speculative_use_rejection_sampling:
-        probs = upstream.renorm_draft_probs(
-            output.next_token_logits, batch.sampling_info, True
+        # 0.5.23 replaced the `renorm_draft_probs` + `fast_sample` pair here
+        # with `sample_draft_proposal`, which draws X from q and returns
+        # (q, q(X), X) together, and threads the per-request sampling seed plus
+        # the row positions into the draw. The accept test is only unbiased if
+        # the q handed to verify is exactly the distribution X came from, so use
+        # upstream's combined helper rather than re-deriving q.
+        draft_probs, topk_p, topk_index = upstream.sample_draft_proposal(
+            output.next_token_logits,
+            batch.sampling_info.temperatures,
+            batch.sampling_info.top_ks,
+            sampling_seed=batch.sampling_info.sampling_seed,
+            positions=batch_result.new_seq_lens,
         )
-        topk_p, topk_index = upstream.fast_sample(probs, num_samples=1)
-        draft_probs = probs
     elif self.topk == 1 and not upstream._is_hip:
         topk_index = torch.argmax(output.next_token_logits, dim=-1, keepdim=True)
         topk_p = torch.ones_like(topk_index, dtype=torch.float32)
