@@ -2600,6 +2600,39 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         page_table = req_to_token[req_pool_indices_repeated, :span:page_size]
         return (page_table // page_size).to(torch.int32)
 
+    def resolve_prefill_shared_read_ends(
+        self, forward_batch, *, num_qo_tokens: int, build_snapshot: bool = True
+    ):
+        """Answer UNKNOWN: Kunlun has not audited its prefill shared reads.
+
+        0.5.23 added a fine-grained write-after-read barrier for prefill
+        (`base_attn_backend.resolve_prefill_shared_read_ends`, default on via
+        `SGLANG_ENABLE_PREFILL_WAR_READ_DONE`). Asked for a snapshot, the DSV4
+        backend builds one through two kernels that are new in this release and
+        Triton-only, with no device gate:
+        `sparse_prefill_kernels.build_swa_token_ids` and
+        `.combine_topk_swa_indices` (reached via
+        `_snapshot_prefill_shared_reads` -> `_build_sparse_prefill_chunk_cache`
+        -> `sparse_prefill_utils.build`). On Kunlun the first extend batch died
+        there with "0 compatible backends for target (cuda)".
+
+        `SharedReadEnds.UNKNOWN` is upstream's own value for this situation --
+        "not audited -> coarse whole-forward fence" (base_attn_backend.py:30) --
+        and the coarse fence is exactly what 0.5.22 did, since the fine-grained
+        path did not exist there. So this gives up a 0.5.23 *performance*
+        feature and keeps the 0.5.22 memory-ordering semantics, rather than
+        inventing a Kunlun-only switch or porting two kernels whose output is
+        only consumed by that optimization.
+
+        Reinstating it means implementing `combine_topk_swa_indices` (the
+        top-k/SWA merge with replay floors and scanned-prefix lengths) for XPU;
+        `build_swa_token_ids` already has a torch form in `kernel_ops`.
+        """
+        from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
+
+        del forward_batch, num_qo_tokens, build_snapshot
+        return SharedReadEnds.UNKNOWN
+
     def make_core_attn_metadata(
         self,
         req_to_token: torch.Tensor,
