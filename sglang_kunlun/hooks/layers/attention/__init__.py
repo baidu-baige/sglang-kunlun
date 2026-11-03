@@ -28,3 +28,5 @@ from . import nsa  # noqa: E402,F401
 from . import dsv4  # noqa: E402,F401
 from . import fla  # noqa: E402,F401
 from . import vision  # noqa: E402,F401
+from . import dsv41_sparse  # noqa: E402,F401
+from . import dsv41_torch_indexer  # noqa: E402,F401

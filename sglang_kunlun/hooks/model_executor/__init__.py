@@ -2,6 +2,8 @@
 from . import breakable_cuda_graph  # noqa: F401
 from . import capture_align  # noqa: F401
 from . import model_runner_kv_cache_mixin  # noqa: F401
+from . import forward_batch_info  # noqa: F401
+from . import cp_mm_embeds  # noqa: F401
 
 import torch
 
@@ -15,16 +17,17 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 def compute_logical_to_all_physical_map_kunlun(
     original_fn, physical_to_logical_map: torch.Tensor, **kwargs
 ):
-    """把 expert-location 映射表的逐元素循环放到 host 上跑。
+    """Move the expert-location map's per-element loop to the host.
 
-    上游 `_compute_logical_to_all_physical_map` 用双层 Python 循环遍历整张
-    `[num_layers, num_physical_experts]` 表，每个元素一次 `.item()`（注释写着
-    "rarely called, so we use for loops for maximum clarity"）。在 N 卡上只是慢，
-    在昆仑上每次 `.item()` 都是一次设备同步——DeepSeek-V4.1 是 40 层 × 384 个
-    physical expert = 15360 次，启动会明显卡顿。
+    Upstream `_compute_logical_to_all_physical_map` uses a double Python loop over the whole
+    `[num_layers, num_physical_experts]` table, one `.item()` per element (the comment says
+    "rarely called, so we use for loops for maximum clarity"). On N cards it is merely slow;
+    on Kunlun every `.item()` is a device sync -- DeepSeek-V4.1 has 40 layers x 384 physical
+    experts = 15360 of them, so startup stalls noticeably.
 
-    上游逻辑一行不改，只是先把张量搬到 host，结果再搬回原 device（上游是按
-    `device=physical_to_logical_map.device` 构造的）。
+    Upstream logic is unchanged line for line; the tensor is first moved to the host and the
+    result is moved back to the original device (upstream constructs it with
+    `device=physical_to_logical_map.device`).
     """
     device = physical_to_logical_map.device
     out = original_fn(physical_to_logical_map=physical_to_logical_map.cpu(), **kwargs)

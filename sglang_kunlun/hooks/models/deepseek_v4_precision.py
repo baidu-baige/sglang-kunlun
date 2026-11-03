@@ -96,7 +96,7 @@ def hc_post_kunlun(
         x.shape[-1],
     )
     if out.dtype is torch.float16:
-        # 融合 MHC-post 在长上下文下会溢出成 inf/NaN，fp16 必须兜一下
+        # The fused MHC-post overflows to inf/NaN under long context, so fp16 must be guarded.
         out = torch.nan_to_num(out)
     return out
 
@@ -151,10 +151,11 @@ def _restore_requested_fp16_parameter_dtype(*linears):
     type=HookType.AFTER,
 )
 def initialize_mqa_attention_parameter_dtype_kunlun(result, self, *args, **kwargs):
-    """把 wo_a 恢复成请求的 dtype。
+    """Restore wo_a to the requested dtype.
 
-    上游在共享基类里把 wo_a 的 params_dtype 硬编码成 bf16，而 target 的 MQALayer
-    和 DSpark draft 的 DSparkAttention 都是它的子类，所以必须挂在基类上。
+    Upstream hardcodes wo_a's params_dtype to bf16 in the shared base class, and
+    both target's MQALayer and DSpark draft's DSparkAttention are its subclasses,
+    so this must be attached to the base class.
     """
     _restore_requested_fp16_parameter_dtype(self.wo_a)
     return result
@@ -200,7 +201,22 @@ def compute_q_b_kunlun(self, q, positions, q_out=None):
     _dsv4_dump(self, "self_attn.wq_b.output", q)
     q = q.view(-1, self.n_local_heads, self.head_dim)
     local_q_out = torch.empty_like(q)
-    fused_q_norm_rope(q, local_q_out, self.eps, self.freqs_cis, positions)
+    # Q's per-head weight-free RMSNorm is controlled by `config.q_head_norm`: it
+    # is True for V4 and **False for V4.1** (`configs/deepseek_v41.py:48`).
+    # Upstream `_compute_q_b` uses exactly this to decide whether to pass eps or
+    # None to `fused_q_norm_rope` (None = RoPE only,
+    # `kernels/ops/attention/dsv4/elementwise.py:194`). This code previously
+    # passed `self.eps` unconditionally, so V4.1's Q was normalized one extra
+    # time per layer: measured q's RMS was pinned to 1.000000 (the same on every
+    # layer), while the old stack was 1.75~2.12 and varied per layer; attention
+    # logits were therefore systematically too small, dropping wq_b's per-layer
+    # magnitude information, so under long prompts the model could not focus
+    # precisely and only repeated nearby content (short prompts still answer
+    # correctly, so it is easily mistaken for "weak long-context capability").
+    # The same decision already exists in the fast path of
+    # `hooks/models/deepseek_v4.py`.
+    norm_eps = self.eps if getattr(self, "q_head_norm", False) else None
+    fused_q_norm_rope(q, local_q_out, norm_eps, self.freqs_cis, positions)
     _dsv4_dump(self, "self_attn.q_local_after_norm_rope", local_q_out)
     if q_out is None:
         return local_q_out
@@ -232,7 +248,7 @@ def compute_kv_bf16_kunlun(self, x, positions, qkv_a=None):
 
 
 def _dsa_use_prefill_cp(forward_batch) -> bool:
-    """0.5.22 不再从 ``models.deepseek_v4`` re-export 这个判定。"""
+    """0.5.22 no longer re-exports this decision from ``models.deepseek_v4``."""
     from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 
     return dsa_use_prefill_cp(forward_batch)
@@ -271,8 +287,9 @@ def mqa_forward_global_head_layout_kunlun(
     if not upstream.get_attn_tp_context().input_scattered and x.shape[0] == 0:
         return x
 
-    # 放在空 batch 短路之后，和上游 forward 的顺序一致（上游那条短路同样直接
-    # 返回 x、不产出 AttnOutput）。
+    # Placed after the empty-batch short circuit, matching the order of the
+    # upstream forward (that upstream short circuit also returns x directly and
+    # does not produce an AttnOutput).
     if defer_all_reduce:
         raise NotImplementedError(
             "Kunlun MQA forward 无法把 wo_b 的 TP all-reduce 交给 MHC post 融合"
@@ -286,9 +303,9 @@ def mqa_forward_global_head_layout_kunlun(
         and self.alt_streams is not None
         and upstream.get_is_capture_mode()
         and x.shape[0] <= self._multi_stream_bs_limit
-        # 0.5.22 删掉了 MQALayer 上的 ``dsa_enable_prefill_cp`` 快照；
-        # ``dsa_use_prefill_cp`` 的第二个参数留空时自己调
-        # ``is_dsa_enable_prefill_cp()``，所以这里直接问它。
+        # 0.5.22 deleted the ``dsa_enable_prefill_cp`` snapshot on MQALayer;
+        # with its second argument left empty, ``dsa_use_prefill_cp`` calls
+        # ``is_dsa_enable_prefill_cp()`` itself, so ask it directly here.
         and not _dsa_use_prefill_cp(forward_batch)
         and not (upstream._is_hip and self.compressor is None)
     )
@@ -339,9 +356,11 @@ def mqa_forward_global_head_layout_kunlun(
             )
         kv = None
     else:
-        # 0.5.22 给 _forward_prepare 加了 q_rope_out/k_nope_out/k_rope_out（unified_kv
-        # fp8 双池的打包 Q/K 输出）。这条 Q head 布局只分配 bf16 的 q_global/q_out，
-        # 不走双池布局，所以三者保持默认 None，等价于上游的非 unified-fp8 分支。
+        # 0.5.22 added q_rope_out/k_nope_out/k_rope_out to _forward_prepare (the
+        # packed Q/K outputs of the unified_kv fp8 dual-pool). This Q head layout
+        # only allocates bf16 q_global/q_out and does not use the dual-pool
+        # layout, so the three stay at the default None, equivalent to the
+        # upstream non-unified-fp8 branch.
         q, kv = self._forward_prepare(
             x,
             positions,
@@ -403,9 +422,10 @@ def mqa_forward_global_head_layout_kunlun(
             o = o[:, tp_slice, :]
 
     if upstream._is_npu:
-        # 0.5.22 的 rope in-place helper 叫 ``fused_rope_inplace``
-        # （``deepseek_v4.py:1404`` 就是这么调的）；NPU 分支在昆仑上不可达，
-        # 但名字要指向真实存在的符号。
+        # The 0.5.22 rope in-place helper is called ``fused_rope_inplace``
+        # (that is how ``deepseek_v4.py:1404`` calls it); the NPU branch is
+        # unreachable on Kunlun, but the name must point at a symbol that really
+        # exists.
         upstream.fused_rope_inplace(
             o[..., -self.qk_rope_head_dim :],
             None,

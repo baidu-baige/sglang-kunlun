@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
 import logging
 import os
 import sys
@@ -18,6 +19,15 @@ logger = logging.getLogger(__name__)
 _ENABLE_DSV4_ACCURACY_DUMPS = False
 
 import xspeedgate_ops
+
+# cocopod registers operators such as einsum_tgd_grd_tgr into the torch.ops.xspeedgate_ops
+# namespace as an "umbrella". The xspeedgate_ops/__init__.py at +9228079 has `import cocopod`, but the one
+# currently in use (+c9bac3b) does not, so import it explicitly here; otherwise dsv4_mqa_wo_a_einsum_kunlun would
+# AttributeError: '_OpNamespace' 'xspeedgate_ops' object has no attribute 'einsum_tgd_grd_tgr'.
+try:
+    import cocopod  # noqa: F401  # side effect: register the operators under the xspeedgate_ops namespace
+except ImportError:
+    cocopod = None
 
 
 def _debug_tensor_meta(name: str, value: object) -> str:
@@ -180,9 +190,69 @@ def dsv4_mqa_forward_with_full_sink_kunlun(original_fn, self, *args, **kwargs):
         self._attn_sink_local = original_local_sink
 
 
+def _op_trace_enabled() -> bool:
+    """Migrated diagnostics are disabled; operator dispatch is unchanged."""
+    return False
+
+
+def _traced(spec: KernelSpec, impl: Callable) -> Callable:
+    """Preserve the installer seam without wrapping or counting calls."""
+    return impl
+
+
+def op_trace_counts() -> Dict[KernelKey, int]:
+    """Compatibility accessor after removal of diagnostic counters."""
+    return {}
+
+
+def note_op_path(name: str, variant: str) -> None:
+    """Compatibility no-op: callers retain their existing dispatch decisions."""
+    return None
+
+
+def op_probe(op: str, stage: str, detail: str = "") -> None:
+    """Compatibility no-op after removal of enter/exit probes."""
+    return None
+
+
+def op_probe_counts() -> Dict[str, int]:
+    """Compatibility accessor after removal of diagnostic counters."""
+    return {}
+
+
+def op_probe_rank() -> int:
+    """This process's global rank; 0 when ``torch.distributed`` is not up."""
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return 0
+
+
+def op_probe_shape(
+    op: str,
+    stage: str,
+    tensors: Mapping[str, object],
+    scalars: Optional[Mapping[str, object]] = None,
+    key=None,
+) -> None:
+    """Compatibility no-op after removal of shape probes."""
+    return None
+
+
+def dump_op_io(op: str, inputs=None, outputs=None, **scalars) -> None:
+    """Compatibility no-op; no manifests or atexit writers are installed."""
+    return None
+
+
+def shape_dump_records() -> List[dict]:
+    """Compatibility accessor after removal of diagnostic manifests."""
+    return []
+
+
 def install() -> None:
     """Install all registered Kunlun kernel replacements into upstream modules."""
 
+    trace = _op_trace_enabled()
     for spec in _TRITON_OPS.values():
         replacement = (
             spec.impl
@@ -191,7 +261,49 @@ def install() -> None:
         )
         _patch_symbol(spec, replacement)
     for spec in _JIT_OPS.values():
-        _patch_symbol(spec, spec.impl)
+        _patch_symbol(spec, _traced(spec, spec.impl) if trace else spec.impl)
+    _bind_dsv4_topk_explicitly(trace)
+
+
+def _dspark_warn_fallback(op: str, reason: str) -> None:
+    """Record fallback routes only when the existing operator trace is enabled."""
+    note_op_path(op, f"torch ({reason})")
+
+
+# ``dsv4/indexer.py`` binds the top-k transforms with ``from
+# sglang.kernels.ops.attention.dsv4 import topk_transform_paged`` at its own
+# import time, so whether ``_patch_symbol`` reaches that binding depends on
+# whether the module is already in ``sys.modules`` when ``install()`` runs.
+# When it is not, the alias keeps pointing at the upstream implementation:
+# ``topk.py:113`` then dispatches XPU to ``torch.ops.sgl_kernel.topk_transform``
+# and ``topk_transform_paged_v2`` JIT-builds a CUDA kernel, which dies on this
+# host with ``fatal error: concepts`` (no C++20 host compiler). Bind the
+# consumer module explicitly and report what the name actually resolves to, so
+# "is the fused XPU op wired in?" is answerable from the log instead of by
+# inference.
+_DSV4_TOPK_BINDINGS = (
+    ("topk_transform_paged", "dsv4_topk_transform_512_kunlun"),
+    ("topk_transform_paged_v2", "dsv4_topk_transform_512_v2_kunlun"),
+)
+
+
+def _bind_dsv4_topk_explicitly(trace: bool) -> None:
+    """Force ``dsv4.indexer``'s top-k aliases onto the Kunlun implementations."""
+
+    try:
+        import sglang.srt.layers.attention.dsv4.indexer as dsv4_indexer
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("kernel_ops: dsv4.indexer unavailable, top-k not bound: %s", exc)
+        return
+    for name, impl_name in _DSV4_TOPK_BINDINGS:
+        impl = globals().get(impl_name)
+        if impl is None:
+            logger.warning("kernel_ops: %s missing, %s left as-is", impl_name, name)
+            continue
+        spec = _JIT_OPS.get(("sglang.kernels.ops.attention.dsv4.topk", name))
+        if spec is not None and trace:
+            impl = _traced(spec, impl)
+        setattr(dsv4_indexer, name, impl)
 
 
 def _dsv4_plan_payload(plan):
@@ -203,12 +315,12 @@ def _dsv4_plan_payload(plan):
 
 
 def _assert_v4_kv_layout(layout, where: str) -> None:
-    """拒绝 V4.1 的打包 KV 布局。
+    """Reject V4.1's packed KV layouts.
 
-    DSV4.1 给每个 paged KV 写入路径都带上 `KVLayout`（V4=584B fp8+bf16、V41=528B、
-    V41_FP4=288B）。昆仑池存的是 plain fp16/bf16 latent，对应上游的 V4 slot；其余打包
-    格式没有 XSpeedGate 写入实现，所以必须显式报错，不能静默写成 reader 解析不了的布局
-    —— 这类不匹配的表现是 attention 输出 NaN，而不是报错。
+    DSV4.1 attaches a `KVLayout` to every paged KV write path (V4=584B fp8+bf16, V41=528B,
+    V41_FP4=288B). The Kunlun pool stores plain fp16/bf16 latent, corresponding to the upstream V4 slot; the other packed
+    formats have no XSpeedGate write implementation, so we must fail explicitly instead of silently writing a layout the reader cannot parse
+    -- this kind of mismatch shows up as NaN attention output rather than an error.
     """
     if layout is None:
         return
@@ -348,6 +460,27 @@ def dsv4_create_paged_compress_data_kunlun(
 _DEFAULT_TOPK_TILE_BYTES = 512 * 1024 * 1024
 
 
+_TOPK_PAGE_CAP_WARNED: set = set()
+
+
+def _warn_topk_page_cap(page_cap: int, width: int) -> None:
+    """Warn once when the page table cannot cover the whole sequence (deduped by (page_cap, width)).
+
+    A hit means the long context was truncated to page_cap tokens participating in top-k -- better than an out-of-range crash,
+    but lossy in precision, so it must be visible from the logs.
+    """
+    key = (page_cap, width)
+    if key in _TOPK_PAGE_CAP_WARNED:
+        return
+    _TOPK_PAGE_CAP_WARNED.add(key)
+    logger.warning(
+        "DSV4 topk fallback: page table covers %d tokens but score width is %d; "
+        "clamping seq_lens to the page table (long-context rows get truncated)",
+        page_cap,
+        width,
+    )
+
+
 def _dsv4_topk_torch_fallback(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -369,6 +502,17 @@ def _dsv4_topk_torch_fallback(
     if rows == 0:
         return
     width = int(scores.shape[1])
+    # Upstream `_topk_transform_vectorized` only clamps page_idx with clamp(min=0), without setting
+    # an upper bound based on page_tables' column count: after selecting a position past the page table,
+    # `torch.gather(page_tables, 1, page_idx)` reads out of bounds directly, which on Kunlun shows up as
+    # gather_2d's "load/store operation exceed memory size" (status=700
+    # illegal memory access) and kills the scheduler on the spot. During decode graph replay the captured
+    # page table may be narrower than the live seq_lens, so clamp to the length the page table can actually address -- the same
+    # protection as the seq_lens clamp already present in the fused `topk_transform` branch.
+    _page_cap = int(page_tables.shape[1]) * int(page_size)
+    if _page_cap < width:
+        _warn_topk_page_cap(_page_cap, width)
+    seq_lens = seq_lens.clamp(max=min(width, _page_cap))
     row_bytes = max(1, width * 4) * 2
     chunk = max(1, min(rows, _DEFAULT_TOPK_TILE_BYTES // row_bytes))
     if chunk >= rows:
@@ -391,6 +535,29 @@ def _dsv4_topk_torch_fallback(
             page_size,
             None if out_raw_indices is None else out_raw_indices[lo:hi],
         )
+
+
+_FUSED_TOPK_ENTRY_SEEN: set = set()
+
+
+def _report_fused_topk_entry(out_raw_indices) -> None:
+    """Report, once per outcome, that the fused XPU top-k was actually reached.
+
+    Binding the symbol is not the same as executing it: the caller may live in
+    a dispatch branch that never runs.  ``[DSV4 topk binding]`` answers "which
+    function does the name point at"; this answers "was it called, and did it
+    take the fused path or the ``out_raw_indices`` torch fallback".
+    """
+
+    key = out_raw_indices is None
+    if key in _FUSED_TOPK_ENTRY_SEEN:
+        return
+    _FUSED_TOPK_ENTRY_SEEN.add(key)
+    logger.warning(
+        "DSV4 fused topk entered: out_raw_indices=%s path=%s",
+        "None" if out_raw_indices is None else tuple(out_raw_indices.shape),
+        "xspeedgate_fused" if out_raw_indices is None else "torch_fallback",
+    )
 
 
 _C4_LOGITS_CHUNK_BYTES_ENV = "SGLANG_KUNLUN_C4_LOGITS_CHUNK_BYTES"
@@ -694,6 +861,7 @@ def dsv4_topk_transform_512_kunlun(
     requests ``out_raw_indices`` (the XPU kernel does not emit raw indices).
     """
 
+    _report_fused_topk_entry(out_raw_indices)
     if out_raw_indices is not None:
         _dsv4_topk_torch_fallback(
             scores,
@@ -801,16 +969,16 @@ def dsv4_init_compression_metadata_kunlun(
     page_size: int = 0,
     compute_page_indices: bool = True,
 ):
-    """桥接 0.5.19 的 CP-v2 长度契约。
+    """Bridge the 0.5.19 CP-v2 length contract.
 
-    0.5.19 起 ``raw_out_loc`` 是「每个逻辑 token 一行」的**未 pad** 数组
-    （``init_compression_metadata`` 的断言 ``raw_out_loc.shape[0] == num_tokens``），
-    而 ``seq_lens/positions/page_table`` 是按 per-rank 分区 pad 过的元数据长度；
-    vendor 算子要求两者等长。这里把 ``raw_out_loc`` 补到元数据长度再调算子——
-    补的行填 0（SWA 池保留的 dummy 槽，与 0.5.17 的 pad 行一致）——然后把两个
-    out_loc 输出裁回 ``raw_out_loc`` 原有的行数：``c4_out_loc``/``c128_out_loc``
-    属于 core 的 ``_CP_GLOBAL_FIELDS``（未 pad），其余 per-row 输出保持 pad 长度、
-    与 ``seq_lens_casual`` 对齐（``_CP_REINDEX_FIELDS``）。
+    Since 0.5.19 ``raw_out_loc`` is an **unpadded** array with "one row per logical token"
+    (``init_compression_metadata`` asserts ``raw_out_loc.shape[0] == num_tokens``),
+    while ``seq_lens/positions/page_table`` are per-rank-partition-padded metadata lengths;
+    the vendor op requires the two to be equal. Here we pad ``raw_out_loc`` up to the metadata length before calling the op --
+    the padded rows are filled with 0 (the dummy slot the SWA pool reserves, matching 0.5.17's pad rows) -- then trim the two
+    out_loc outputs back to ``raw_out_loc``'s original row count: ``c4_out_loc``/``c128_out_loc``
+    belong to core's ``_CP_GLOBAL_FIELDS`` (unpadded), while the remaining per-row outputs keep the padded length,
+    aligned with ``seq_lens_casual`` (``_CP_REINDEX_FIELDS``).
     """
     meta_len = int(seq_lens.shape[0])
     loc_len = int(raw_out_loc.shape[0])
@@ -1010,8 +1178,8 @@ def dsv4_compressor_decode_plan_kunlun(
     from sglang.kernels.ops.attention.dsv4.compress import CompressorDecodePlan
     if compress_ratio not in (4, 128):
         raise ValueError(f"unsupported compression ratio: {compress_ratio}")
-    # 与上游自己的 XPU 分支一致：request-ring 的 plan 布局（unified KV、ratio 4）没有
-    # XSpeedGate 实现。昆仑池不是 `_unified_kv`，所以调用方传的恒为 False。
+    # Consistent with upstream's own XPU branch: the request-ring plan layout (unified KV, ratio 4) has no
+    # XSpeedGate implementation. The Kunlun pool is not `_unified_kv`, so callers always pass False.
     if use_req_ring:
         raise NotImplementedError(
             "use_req_ring is not supported by the Kunlun compress plan builder"
@@ -1028,28 +1196,28 @@ def dsv4_compressor_decode_plan_kunlun(
     return CompressorDecodePlan(compress_ratio, plan_d)
 
 
-#: c4/c128 state ring 为「尚未提交的投机位置」预留的余量。XSpeedGate 的
-#: ``plan_compress_prefill_v2`` 把它写死成 ``min(ring_size - cr, 4)``（对应上游
-#: ``c_plan.cuh`` 老版本的 ``kMaxMTPDraftTokens = 4``），而 DSPARK 的 verify window 是 6，
-#: 于是最后几个 query 位置的 state 没落进 ring，下一步读到的是别人的历史 —— 同一请求多次
-#: 发送结果不一致。上游 H20 侧的修复是把常量改成 8；算子签名不暴露 mtp_pad，也没有本地
-#: xtdk 工具链重编，所以这里在框架侧按 pad=8 补出算子少给的那几行 plan_w。
-#: 0（默认）= 按 ring 几何推导，见 ``_dsv4_compress_state_write_pad``；非 0 = 强制覆盖，
-#: 仅用于复验。原来这里写死 8：能盖住当前 6 的 verify window，但和上游语义不一致，
-#: draft token 数一调大就会重新踩坑。
+#: The slack the c4/c128 state ring reserves for "not-yet-committed speculative positions". XSpeedGate's
+#: ``plan_compress_prefill_v2`` hardcodes it as ``min(ring_size - cr, 4)`` (matching the old upstream
+#: ``c_plan.cuh`` ``kMaxMTPDraftTokens = 4``), while DSPARK's verify window is 6,
+#: so the last few query positions' state does not land in the ring and the next step reads someone else's history -- the same request sent
+#: multiple times yields inconsistent results. The upstream H20-side fix changes the constant to 8; the op signature does not expose mtp_pad, and there is no local
+#: xtdk toolchain rebuild, so here we pad out, on the framework side, the few plan_w rows the op omits (pad=8).
+#: 0 (default) = derive from the ring geometry, see ``_dsv4_compress_state_write_pad``; non-zero = force override,
+#: for re-verification only. Previously this was hardcoded to 8: it covers the current 6-wide verify window, but is inconsistent with upstream semantics,
+#: and it would hit the same pitfall again as soon as the draft token count is raised.
 _DSV4_MTP_PAD_OVERRIDE = int(os.environ.get("DSV4_MTP_PAD", "0"))
 
 def _dsv4_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
-    """state ring 能服务的最大 draft token 数，即 plan 的 ``mtp_pad``。
+    """The maximum number of draft tokens the state ring can serve, i.e. the plan's ``mtp_pad``.
 
-    与社区a1fe4e3一致：``ring_size > window_size ? ring_size - window_size + 2 : 0``
-    （``c_plan.cuh`` 的 mtp_pad、``deepseek_v4_memory_pool.get_compress_state_write_pad``）。
-    v0.5.17 kernel 里还是 ``min(ring_size - cr, kMaxMTPDraftTokens=4)``，4 小于
-    DSPARK 的 6-token verify window，尾部位置进不了 ring，下一步读到的是上一个占用者的
-    state —— 同一请求多次发送结果不一致。投机配置下本公式给出 c4=10、c128=130。
+    Consistent with community commit a1fe4e3: ``ring_size > window_size ? ring_size - window_size + 2 : 0``
+    (the mtp_pad in ``c_plan.cuh``, and ``deepseek_v4_memory_pool.get_compress_state_write_pad``).
+    The v0.5.17 kernel still uses ``min(ring_size - cr, kMaxMTPDraftTokens=4)``; 4 is less than
+    DSPARK's 6-token verify window, so the tail positions cannot enter the ring and the next step reads the previous occupant's
+    state -- the same request sent multiple times yields inconsistent results. Under speculative config this formula gives c4=10, c128=130.
 
-    升级到带这个修复的 sglang / 重编算子之后，本函数和
-    ``_dsv4_augment_prefill_plan_w`` 一起删掉。
+    Once we upgrade to an sglang carrying this fix / rebuild the ops, delete this function together with
+    ``_dsv4_augment_prefill_plan_w``.
     """
 
     window_size = compress_ratio * (2 if compress_ratio == 4 else 1)
@@ -1060,17 +1228,17 @@ def _dsv4_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
 
 
 def _dsv4_num_draft_tokens() -> int | None:
-    """投机的 draft token 数；拿不到就返回 None（不阻塞启动）。"""
+    """The speculative draft token count; return None when unavailable (do not block startup)."""
 
     try:
         from sglang_kunlun.compat import server_arg
 
         return server_arg("speculative_num_draft_tokens")
-    except Exception:  # pragma: no cover - 仅用于日志与断言
+    except Exception:  # pragma: no cover - only used for logging and assertions
         return None
 
 
-#: 打印 compress plan 的行数/有效行数（诊断 BCG 下的定形 plan）。
+#: Print the compress plan's row count / valid row count (diagnose the fixed-shape plan under BCG).
 _DEBUG_COMPRESS_PLAN = os.environ.get("SGLANG_KUNLUN_DEBUG_COMPRESS_PLAN") == "1"
 
 
@@ -1086,16 +1254,16 @@ def _dsv4_augment_prefill_plan_w(
     ring_size: int,
     mtp_pad: int,
 ) -> torch.Tensor:
-    """按更大的 ``mtp_pad`` 补齐 plan_w 缺的行。
+    """Fill in the missing plan_w rows for a larger ``mtp_pad``.
 
-    算子用的是 ``first_w_pos = min(last_c_pos - (overlap ? cr : 0), seq_len - vendor_pad)``，
-    我们要的是同一公式换成 ``new_pad``。两者只差 ``[fw_new, fw_old)`` 这一小段位置，
-    每个请求最多 ``new_pad - vendor_pad`` 行，所以直接补行、不用重算整张表。
+    The op uses ``first_w_pos = min(last_c_pos - (overlap ? cr : 0), seq_len - vendor_pad)``,
+    and we want the same formula with ``new_pad``. The two differ only in the small ``[fw_new, fw_old)`` range,
+    at most ``new_pad - vendor_pad`` rows per request, so just append rows instead of recomputing the whole table.
 
-    plan_w 是 ``[num_q_tokens, 8] uint8`` = ``(uint32 ragged_id, int32 write_loc)``，
-    有效行在前、尾部填 ``(-1, -1)`` 哨兵；有效行数上界是 ``sum(extend_lens) <= num_q_tokens``，
-    而每个位置最多产生一行，所以补的行一定放得进哨兵区。全程只用张量算子（无 D2H），
-    可以被 CUDA graph 捕获。
+    plan_w is ``[num_q_tokens, 8] uint8`` = ``(uint32 ragged_id, int32 write_loc)``,
+    with valid rows first and ``(-1, -1)`` sentinels filling the tail; the valid row count is bounded by ``sum(extend_lens) <= num_q_tokens``,
+    and each position produces at most one row, so the appended rows are guaranteed to fit in the sentinel region. The whole path uses only tensor ops (no D2H),
+    so it can be captured by the CUDA graph.
     """
 
     num_rows = int(plan_w.shape[0])
@@ -1127,7 +1295,7 @@ def _dsv4_augment_prefill_plan_w(
     else:
         raw = req_to_token[rid.unsqueeze(1), position].to(torch.int64)
         swa = full_to_state[torch.clamp(raw, min=0)].to(torch.int64)
-        # r2t / f2s 里的空洞是负数，这些位置还没有 state，补出来只会写坏别人的行
+        # The holes in r2t / f2s are negative; these positions have no state yet, and writing them would corrupt someone else's row
         valid &= (raw >= 0) & (swa >= 0)
         write_loc = (swa // swa_page_size) * ring_size + swa % ring_size
 
@@ -1141,7 +1309,7 @@ def _dsv4_augment_prefill_plan_w(
     combined = torch.cat([rows, extra.to(torch.int32)], dim=0)
     keep = combined[:, 0] >= 0
     total = int(combined.shape[0])
-    # 有效行按原序压到前面；无效行全丢到最后一行（一定在 num_rows 之外，且此时它必然空闲）
+    # Pack valid rows to the front in original order; dump all invalid rows into the last row (guaranteed beyond num_rows, and necessarily free at this point)
     dest = torch.cumsum(keep.to(torch.int64), 0) - 1
     dest = torch.where(keep, dest, torch.full_like(dest, total - 1))
     packed = torch.full((total, 2), -1, dtype=torch.int32, device=combined.device)
@@ -1188,10 +1356,10 @@ def dsv4_compressor_prefill_plan_kunlun(
     if num_q_tokens < req_pool_indices.shape[0]:
         raise ValueError("num_q_tokens must be at least the batch size")
     if use_cuda_graph and _compressor_runs_eager():
-        # 压缩器已经是 eager 断点（``cp/bcg.py`` 的 forward_core_compressor 钩子），
-        # 算子的工作量直接等于 plan 的行数：定形 plan 会补到 ``num_q_tokens`` 行，
-        # c128 下每行照样走一遍压缩 —— 实测 20 次调用 387ms/步（compact plan 5ms）。
-        # 断点之后没有被图捕获的东西读 plan，所以这里回退成紧凑 plan 是安全的。
+        # The compressor is already an eager breakpoint (the forward_core_compressor hook in ``cp/bcg.py``),
+        # and the op's workload equals the plan's row count directly: a fixed-shape plan would pad to ``num_q_tokens`` rows,
+        # and under c128 every row still runs a full compression -- measured 20 calls at 387ms/step (compact plan 5ms).
+        # Nothing captured by the graph reads the plan after this breakpoint, so falling back to a compact plan here is safe.
         use_cuda_graph = False
     pin_buffer = torch.empty(
             0,
@@ -1526,15 +1694,15 @@ def dsv4_compress_norm_rope_store_v2_kunlun(
     kvcache_scale: Optional[torch.Tensor] = None,
     rope_cache=None,
     fp4_k_write_metadata=None,
-    # 4.1 给每个 paged KV 写入都带上布局标记；昆仑池是 plain fp16/bf16 半 cache，
-    # 对应上游的 V4 布局。
+    # 4.1 attaches a layout marker to every paged KV write; the Kunlun pool is a plain fp16/bf16 half cache,
+    # corresponding to the upstream V4 layout.
     layout=None,
-    # 0.5.22 新增 fp8_2buff / kvcache_rope：unified-KV FP8 把 latent 拆成
-    # "nope fp8 payload + 独立 rope 池" 两个 buffer（`is_unified_kv_fp8()` 时
-    # compressor_v2 才会把 kv_cache_rope 传进来，并走 module.forward_fp8_2buff）。
-    # XSpeedGate 的 dsv4_compress_norm_rope_store_v2 只会写单个 plain half cache，
-    # 没有第二个 rope 池的写入实现，所以这里显式报错而不是丢掉参数 —— 静默忽略
-    # 会把 rope 写进 nope 池，表现为 attention 输出 NaN。
+    # 0.5.22 adds fp8_2buff / kvcache_rope: unified-KV FP8 splits the latent into
+    # two buffers, "nope fp8 payload + a separate rope pool" (only when `is_unified_kv_fp8()`
+    # does compressor_v2 pass kv_cache_rope in and take module.forward_fp8_2buff).
+    # XSpeedGate's dsv4_compress_norm_rope_store_v2 only writes a single plain half cache,
+    # with no write implementation for the second rope pool, so here we fail explicitly instead of dropping the argument -- silently ignoring
+    # it would write rope into the nope pool, showing up as NaN attention output.
     fp8_2buff: bool = False,
     kvcache_rope: Optional[torch.Tensor] = None,
 ) -> None:
@@ -1820,7 +1988,7 @@ def page_table_positions_kernel(
         f"req_to_token must be 2D int32, got dim={req_to_token_ptr.dim()} "
         f"dtype={req_to_token_ptr.dtype}",
     )
-    # 算子内部用 stride(0)/ceil(max_seq_len/page_size) 推导，必须与入参一致
+    # The op internally derives stride(0)/ceil(max_seq_len/page_size), which must match the arguments
     _dspark_require(
         req_to_token_ptr.stride(0) == rt_stride and req_to_token_ptr.stride(1) == 1,
         op,
@@ -1860,6 +2028,319 @@ def page_table_positions_kernel(
     positions_out_ptr.copy_(positions)
     page_table_ptr.copy_(page_table)
     topk_out_ptr.copy_(topk)
+
+
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4_attn_metadata_kernels",
+    "build_causal_swa_page_indices_triton",
+)
+def build_causal_swa_page_indices_kunlun(
+    *,
+    req_to_token: torch.Tensor,
+    full_to_swa_mapping: torch.Tensor,
+    req_pool_indices_repeated: torch.Tensor,
+    seq_lens_casual: torch.Tensor,
+    swa_window: int,
+    page_index_aligned_size: int,
+    swa_replay_start: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Build the causal SWA window page-index table on the XSpeedGate kernel.
+
+    Replaces the whole launcher (``dsv4_attn_metadata_kernels.py:544``) instead
+    of just ``_causal_swa_page_indices_kernel``: the op derives
+    ``padded_width`` from the same ceil-div and allocates its own
+    ``[num_qo, padded_width]`` int32 output, so the upstream ``torch.empty`` and
+    the copy back into it both disappear.
+
+    Semantics match ``build_causal_swa_page_indices`` (the torch baseline)
+    element for element, including the ``full < 0 -> -1`` slots: the op checks
+    the sign explicitly, where the torch path only lands on ``-1`` because
+    ``full_to_swa_mapping[-1]`` is the sentinel and the Triton path reads out of
+    bounds there.
+
+    ``full_to_swa_mapping`` is int64 upstream (the SWA allocator builds it that
+    way) and the op dispatches on int32, so it is cast per call -- same contract
+    as the DSpark sibling ``swa_page_indices_kernel`` above.
+
+    Args:
+        req_to_token: Request-to-full-cache token mapping.
+        full_to_swa_mapping: Full-cache slot to SWA slot mapping.
+        req_pool_indices_repeated: Request pool index for each query row.
+        seq_lens_casual: Causal sequence length for each query row.
+        swa_window: Maximum number of tokens in each sliding window.
+        page_index_aligned_size: Alignment used to pad the output width.
+        swa_replay_start: Optional per-row lower bound for replay windows.
+
+    Returns:
+        An int32 SWA page-index table with invalid slots set to -1.
+    """
+
+    op = "causal_swa_page_indices_kernel"
+    _dspark_require(
+        req_to_token.dim() == 2
+        and req_to_token.dtype == torch.int32
+        and req_to_token.stride(1) == 1,
+        op,
+        f"req_to_token must be 2D int32 with row-contiguous rows, got "
+        f"dim={req_to_token.dim()} dtype={req_to_token.dtype} "
+        f"strides={req_to_token.stride()}",
+    )
+    _dspark_require(
+        req_pool_indices_repeated.shape[0] == seq_lens_casual.shape[0],
+        op,
+        f"req_pool_indices_repeated length {req_pool_indices_repeated.shape[0]} "
+        f"!= seq_lens_casual length {seq_lens_casual.shape[0]}",
+    )
+    _dspark_require(
+        swa_window > 0 and page_index_aligned_size > 0,
+        op,
+        f"swa_window={swa_window} / "
+        f"page_index_aligned_size={page_index_aligned_size} must be > 0",
+    )
+
+    # int32/int64 are the two pool-index template instances; anything else
+    # (upstream builds this from req_pool_indices) is normalized to int32.
+    if req_pool_indices_repeated.dtype not in (torch.int32, torch.int64):
+        req_pool_indices_repeated = req_pool_indices_repeated.to(torch.int32)
+
+    out = torch.ops.xspeedgate_ops.causal_swa_page_indices_kernel(
+        req_to_token,
+        full_to_swa_mapping.to(torch.int32).contiguous(),
+        req_pool_indices_repeated.contiguous(),
+        seq_lens_casual.to(torch.int32).contiguous(),
+        swa_window,
+        page_index_aligned_size,
+        None
+        if swa_replay_start is None
+        else swa_replay_start.to(torch.int32).contiguous(),
+    )
+    return out
+
+
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.attn",
+    "get_paged_mqa_logits_metadata",
+)
+def get_paged_mqa_logits_metadata_kunlun(
+    seq_lens: torch.Tensor, page_size: int, num_sm: int
+) -> torch.Tensor:
+    """Build the paged-MQA-logits SM schedule on the XSpeedGate kernel.
+
+    Replaces the whole launcher (``dsv4/attn.py:56``): the op flattens and casts
+    ``seq_lens`` itself, allocates the ``[num_sm + 1, 2]`` metadata, and sizes
+    its own multi-block workspace with the same ``kMBTileSize = 4096`` split, so
+    the upstream ``new_empty`` pair and the ``bs > 2048`` branch disappear.
+
+    ``page_size`` is passed through only to keep the upstream 64/128 assert --
+    the schedule is a 256-token split of the sequence lengths and does not
+    depend on it.
+
+    Args:
+        seq_lens: Sequence lengths to partition into scheduling work.
+        page_size: KV page size, restricted to 64 or 128.
+        num_sm: Number of workers for the paged-MQA schedule.
+
+    Returns:
+        Scheduling metadata with shape [num_sm + 1, 2].
+    """
+
+    op = "get_paged_mqa_logits_metadata"
+    _dspark_require(
+        page_size in (64, 128), op, f"page_size must be 64 or 128, got {page_size}"
+    )
+    _dspark_require(1 <= num_sm <= 1024, op, f"num_sm must be in [1, 1024], got {num_sm}")
+
+    metadata = torch.ops.xspeedgate_ops.get_paged_mqa_logits_metadata(
+        seq_lens, page_size, num_sm
+    )
+    return metadata
+
+
+@register_jit_op(
+    "sglang.kernels.ops.moe.moe_align_small_numel",
+    "moe_align_small_numel",
+)
+def moe_align_small_numel_kunlun(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+) -> None:
+    """Single-launch MoE align for tiny batches on the XSpeedGate kernel.
+
+    Replaces the launcher (``moe/moe_align_small_numel.py:114``). The op writes
+    the three buffers in place under the same "+1 offset" convention
+    (``num_experts`` is ``E + 1``, bucket 0 is the EP-filtered ``-1`` expert),
+    and like the triton kernel it leaves ``sorted_token_ids`` beyond
+    ``num_tokens_post_pad`` unwritten.
+
+    Intra-bucket order may differ from the triton kernel's pair-index order --
+    both are valid permutations within a bucket and ``fused_moe`` only reads the
+    block-padded layout, which is identical.
+
+    The op caps ``numel`` at 1024 (the kernel's pairwise tensors), above the
+    upstream ``SMALL_NUMEL_LIMIT = 64`` gate, so every call the call site routes
+    here fits.
+
+    Args:
+        topk_ids: Expert assignments for the token/top-k pairs.
+        num_experts: Expert bucket count including the filtered-expert bucket.
+        block_size: Alignment for each expert's token count.
+        sorted_token_ids: Output buffer receiving the padded token ordering.
+        expert_ids: Output buffer receiving the expert for each block.
+        num_tokens_post_pad: Output buffer receiving the total padded token count.
+    """
+
+    op = "moe_align_small_numel"
+    _dspark_require(
+        topk_ids.dtype == torch.int32,
+        op,
+        f"topk_ids must be int32, got {topk_ids.dtype}",
+    )
+    _dspark_require(
+        sorted_token_ids.dtype == torch.int32
+        and expert_ids.dtype == torch.int32
+        and num_tokens_post_pad.dtype == torch.int32,
+        op,
+        "sorted_token_ids/expert_ids/num_tokens_post_pad must be int32, got "
+        f"{sorted_token_ids.dtype}/{expert_ids.dtype}/{num_tokens_post_pad.dtype}",
+    )
+    _dspark_require(
+        topk_ids.numel() <= 1024,
+        op,
+        f"numel {topk_ids.numel()} exceeds the kernel's 1024 capacity",
+    )
+
+    torch.ops.xspeedgate_ops.moe_align_small_numel(
+        topk_ids.contiguous(),
+        num_experts,
+        block_size,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_pad,
+    )
+
+
+@register_jit_op(
+    "sglang.kernels.ops.embeddings.vocab_parallel_embedding",
+    "vocab_parallel_embedding",
+)
+def vocab_parallel_embedding_kunlun(
+    input_: torch.Tensor,
+    weight: torch.Tensor,
+    org_vocab_start_index: int,
+    org_vocab_end_index: int,
+    num_org_vocab_padding: int,
+    added_vocab_start_index: int,
+    added_vocab_end_index: int,
+) -> torch.Tensor:
+    """Fused vocab-parallel embedding lookup on the XSpeedGate kernel.
+
+    Replaces the launcher (``embeddings/vocab_parallel_embedding.py:56``): the
+    op allocates the ``input_.shape + [hidden]`` output itself and zeroes the
+    rows whose token falls outside this shard's two vocab windows, matching the
+    upstream masked-load semantics.
+
+    Both int32/int64 ids and fp32/fp16/bf16 weights are native template
+    instances, so nothing is cast here.
+
+    Args:
+        input_: Token IDs to look up.
+        weight: This shard's embedding table.
+        org_vocab_start_index: Inclusive start of the original vocabulary shard.
+        org_vocab_end_index: Exclusive end of the original vocabulary shard.
+        num_org_vocab_padding: Padding between original and added vocabulary rows.
+        added_vocab_start_index: Inclusive start of the added vocabulary shard.
+        added_vocab_end_index: Exclusive end of the added vocabulary shard.
+
+    Returns:
+        Embeddings with out-of-shard token rows zeroed.
+    """
+
+    op = "vocab_parallel_embedding"
+    _dspark_require(
+        input_.dtype in (torch.int32, torch.int64),
+        op,
+        f"input must be int32 or int64, got {input_.dtype}",
+    )
+    _dspark_require(
+        weight.dim() == 2 and weight.stride(1) == 1,
+        op,
+        f"weight must be 2D with contiguous rows, got dim={weight.dim()} "
+        f"strides={weight.stride()}",
+    )
+
+    return torch.ops.xspeedgate_ops.vocab_parallel_embedding(
+        input_.contiguous(),
+        weight.contiguous(),
+        org_vocab_start_index,
+        org_vocab_end_index,
+        num_org_vocab_padding,
+        added_vocab_start_index,
+        added_vocab_end_index,
+    )
+
+
+# 0.5.22 folds Q RoPE into fused_k_norm_rope_flashmla; no deleted-module
+# registration. Keep this callable for the Kunlun fused boundary.
+def q_rope_store_kunlun(
+    q: torch.Tensor,
+    output: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> None:
+    """Rotate Q's 64-wide tail into ``output`` on the XSpeedGate kernel.
+
+    Replaces the launcher (``dsv4/q_rope_store.py:69``), which picks between a
+    decode and a prefill triton kernel by shape; the op covers both from one
+    entry point.
+
+    ``output`` keeps whatever Q padding the call site allocated: only lanes
+    ``[448, 512)`` are rotated, lanes ``[0, 448)`` are copied verbatim, and rows
+    /heads outside the passed views are never touched -- verified against the
+    torch reference on the strided ``heads < padded_heads`` layout the real call
+    site uses.
+
+    Args:
+        q: Query tensor with 512 lanes per head.
+        output: Destination matching q's shape and dtype, updated in place.
+        freqs_cis: Contiguous complex64 rotary-frequency table.
+        positions: Position index for each query row.
+    """
+
+    op = "q_rope_store"
+    _dspark_require(
+        q.dim() == 3 and q.shape[2] == 512,
+        op,
+        f"q must be [rows, heads, 512], got {tuple(q.shape)}",
+    )
+    _dspark_require(
+        q.shape == output.shape and q.dtype == output.dtype,
+        op,
+        f"output must match q shape/dtype, got {tuple(output.shape)}/{output.dtype} "
+        f"vs {tuple(q.shape)}/{q.dtype}",
+    )
+    _dspark_require(
+        q.stride(1) == 512 and output.stride(1) == 512,
+        op,
+        f"q/output head stride must be 512, got {q.stride(1)}/{output.stride(1)}",
+    )
+    _dspark_require(
+        freqs_cis.dtype == torch.complex64 and freqs_cis.is_contiguous(),
+        op,
+        f"freqs_cis must be contiguous complex64, got {freqs_cis.dtype}",
+    )
+    _dspark_require(
+        positions.dtype in (torch.int32, torch.int64),
+        op,
+        f"positions must be int32 or int64, got {positions.dtype}",
+    )
+
+    torch.ops.xspeedgate_ops.q_rope_store(
+        q, output, freqs_cis, positions.contiguous()
+    )
 
 
 def _dspark_kernel_out(
@@ -2174,6 +2655,43 @@ def gather_row_bonus_kernel(
         out_ptr[:n].copy_(out)
 
 
+# Consistent with DFLASH_CHUNK in `compute_dflash_correct_drafts_and_bonus.cpp`: a single core must hold
+# one input row at a time, so block_size has an upper bound; bs is covered by the kernel's grid-stride loop and has no upper bound.
+_DFLASH_CORRECT_DRAFTS_MAX_BLOCK = 320
+_DFLASH_CORRECT_DRAFTS_DTYPES = (torch.int32, torch.int64)
+
+
+def _dflash_correct_drafts_supported(
+    candidates: torch.Tensor, target_predict: torch.Tensor, block_size: int
+) -> Optional[str]:
+    """Return why ``compute_dflash_correct_drafts_and_bonus`` cannot run, else None.
+
+    Mirrors the TORCH_CHECKs in
+    ``XSpeedGate/wrapper/src/attention/compute_dflash_correct_drafts_and_bonus.cpp``.
+    The ``hasattr`` comes first because the op is newer than the deployed wheel
+    (``xspeedgate_ops-1.6.0`` does not export it), and without the guard a DFlash
+    run would die with ``AttributeError: '_OpNamespace' ...`` instead of keeping
+    the torch path. Same guard style as ``_engram_gate_v2_usable``.
+    """
+
+    if not hasattr(torch.ops.xspeedgate_ops, "compute_dflash_correct_drafts_and_bonus"):
+        return "xspeedgate_ops has no compute_dflash_correct_drafts_and_bonus"
+    if candidates.dtype is not target_predict.dtype:
+        return f"dtypes differ: {candidates.dtype} vs {target_predict.dtype}"
+    if candidates.dtype not in _DFLASH_CORRECT_DRAFTS_DTYPES:
+        return f"dtype {candidates.dtype} is not int32/int64"
+    if not (candidates.is_contiguous() and target_predict.is_contiguous()):
+        return "candidates/target_predict must be contiguous"
+    if candidates.device != target_predict.device:
+        return "candidates/target_predict on different devices"
+    if not 1 < block_size <= _DFLASH_CORRECT_DRAFTS_MAX_BLOCK:
+        return (
+            f"block_size={block_size} outside the per-core LM chunk "
+            f"(1, {_DFLASH_CORRECT_DRAFTS_MAX_BLOCK}]"
+        )
+    return None
+
+
 @register_triton_op(
     "sglang.srt.speculative.dflash_utils",
     "_fused_correct_drafts_and_bonus_kernel",
@@ -2186,17 +2704,18 @@ def fused_correct_drafts_and_bonus_kernel(
     block_size: int,
     BLOCK: int = 0,
 ) -> None:
-    """Greedy DFlash/DSpark accept lengths + bonus tokens, in plain torch.
+    """Greedy DFlash/DSpark accept lengths + bonus tokens.
 
     0.5.19 added a Triton fast path to
     ``dflash_utils.compute_dflash_correct_drafts_and_bonus`` that is taken for
     any ``candidates.is_cuda`` tensor, which includes Kunlun XPU (dispatch key
     ``cuda``); Triton has no Kunlun backend, so the launch fails with
-    ``0 compatible backends for target (cuda)``. This replacement reproduces the
-    kernel contract with the same reduction the upstream CPU branch uses: accept
-    while ``candidates[:, 1:] == target_predict[:, :-1]`` consecutively (leading
-    match count, capped at ``block_size - 1``), then read the bonus token at
-    that index.
+    ``0 compatible backends for target (cuda)``. The XSpeedGate op of the same
+    name implements the kernel contract directly; the torch reduction below is
+    kept for the inputs it does not cover (wide Domino blocks, older wheels) and
+    is the same rule the upstream CPU branch uses: accept while
+    ``candidates[:, 1:] == target_predict[:, :-1]`` consecutively (leading match
+    count, capped at ``block_size - 1``), then read the bonus token at that index.
     """
     candidates = candidates_ptr.reshape(-1, block_size)
     target_predict = target_predict_ptr.reshape(-1, block_size)
@@ -2204,15 +2723,345 @@ def fused_correct_drafts_and_bonus_kernel(
     if bs == 0:
         return
 
-    matches = candidates[:, 1:] == target_predict[:, :-1]
-    correct_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
-    rows = torch.arange(bs, device=target_predict.device)
-    bonus = target_predict[rows, correct_len.to(torch.int64)]
+    op = "compute_dflash_correct_drafts_and_bonus"
+    # Record the full kernel inputs (candidates/target_predict/two outputs + block_size), dedupe by shape
+    # signature and log only on rank 0; `path` separates the xspeedgate and torch-fallback routes.
+    probe_tensors = {
+        "candidates": candidates,
+        "target_predict": target_predict,
+        "num_correct_drafts": num_correct_drafts_ptr,
+        "bonus_tokens": bonus_tokens_ptr,
+    }
+    reason = _dflash_correct_drafts_supported(candidates, target_predict, block_size)
+    if reason is None:
+        correct_len, bonus = (
+            torch.ops.xspeedgate_ops.compute_dflash_correct_drafts_and_bonus(
+                candidates, target_predict
+            )
+        )
+    else:
+        _dspark_warn_fallback(op, reason)
+        matches = candidates[:, 1:] == target_predict[:, :-1]
+        correct_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
+        rows = torch.arange(bs, device=target_predict.device)
+        bonus = target_predict[rows, correct_len.to(torch.int64)]
 
     num_correct_drafts_ptr.reshape(-1)[:bs].copy_(
         correct_len.to(num_correct_drafts_ptr.dtype)
     )
     bonus_tokens_ptr.reshape(-1)[:bs].copy_(bonus.to(bonus_tokens_ptr.dtype))
+
+
+@register_jit_op(
+    "sglang.kernels.ops.speculative.row_argmax",
+    "row_argmax",
+)
+def row_argmax_kunlun(x: torch.Tensor) -> torch.Tensor:
+    """``x.argmax(dim=-1)`` for the DSpark verify logits, without Triton.
+
+    ``dspark_accept._row_argmax`` opts into ``row_argmax`` for every DSV4.1
+    target (``dspark_verify.py:171`` passes ``fused_argmax=True``) as soon as the
+    logits are ``is_cuda`` -- which Kunlun XPU is, dispatch key ``cuda``. The
+    upstream implementation is a two-stage split reduction written as two
+    ``@triton.jit`` kernels, and it is the only thing left on the DSpark accept
+    path that launches Triton directly instead of going through a kernel_ops
+    replacement.
+
+    That launch cannot work here. ``xpu_fla/python/triton_mock.py`` turns
+    ``triton.jit`` into a no-op whenever the real Triton backend fails to
+    initialise, so the decorated kernels stay plain Python functions and
+    ``kernel[grid](...)`` raises ``'function' object is not subscriptable`` while
+    the decode cuda graph is captured -- all 8 ranks die inside
+    ``init_cuda_graphs`` and the server never comes up.
+
+    Keeping the genuine ``triton.jit`` is not the alternative it looks like. The
+    probe only fails because ``launch_dsv41_int4.sh`` drops ``/usr/local/xre/so``
+    (the sole provider of ``libcuda.so.1``) to dodge the libxpurt ABI mismatch;
+    put the library back and Triton does compile, but the driver then rejects the
+    sm86 binary at load time with ``CUDA_ERROR_NOT_SUPPORTED``. There is no
+    configuration of this container in which a Triton kernel runs on XPU.
+
+    ``torch.argmax`` is what upstream itself uses whenever ``fused_argmax`` is
+    off, and it is the contract the fused kernel approximates -- the fused one
+    deviates only in NaN selection (``dspark_accept.py:670-672``), so this is if
+    anything the stricter of the two.
+    """
+
+    return torch.argmax(x, dim=-1)
+
+
+@register_jit_op(
+    "sglang.kernels.ops.speculative.dspark.commit_swa",
+    "committed_swa_locations",
+)
+def committed_swa_locations_kunlun(
+    cache_loc: torch.Tensor,
+    full_to_swa_mapping: torch.Tensor,
+    commit_lens: torch.Tensor,
+    width: int,
+) -> torch.Tensor:
+    """XSpeedGate ``committed_swa_locations``: committed full slots -> draft SWA slots.
+
+    ``dspark_kv_inject._inject_mla`` takes this Triton helper for any
+    ``cache_loc.is_cuda`` tensor (``dspark_kv_inject.py:124``) -- true on Kunlun
+    XPU, where no Triton kernel can launch (see ``row_argmax_kunlun`` for why the
+    ``triton.jit`` no-op is the only workable regime).
+
+    The op is the same computation with the result handed back through an
+    ``out`` argument instead of a return value, so the only adaptation is
+    allocating ``out`` as int32 with ``cache_loc``'s shape; its three inputs
+    match the hook's one-to-one in order. The inputs go in contiguous and
+    flattened because the op takes no strides and TORCH_CHECKs ``cache_loc``
+    for 1D -- rows come from ``width`` alone, so flattening is a no-op in
+    meaning and keeps a ``[bs, width]`` caller on the op instead of the
+    fallback. Verified element-identical against the torch body below on
+    ``bs in {1, 4, 8, 32}``, ``width=6``, mapping sizes up to 1737985, both 1D
+    and ``[bs, width]`` inputs, including the negative-``cache_loc`` wrap -- so
+    the op implements Python's negative indexing too, not just the
+    non-negative case.
+
+    Contract copied from ``_committed_swa_locations``, and what the torch
+    fallback below reproduces: rows are ``width`` wide, a slot counts as
+    committed when its column is below the row's commit length, committed slots
+    read ``full_to_swa_mapping[loc]`` with Python-style negative index wrap, and
+    everything else is ``-1``. The fallback is kept free of host syncs so it
+    stays capturable in the decode cuda graph.
+
+    Args:
+        cache_loc: Full-cache locations arranged in rows of width slots.
+        full_to_swa_mapping: Mapping from full-cache locations to SWA locations.
+        commit_lens: Number of committed slots in each row.
+        width: Number of candidate slots per request.
+
+    Returns:
+        Int32 SWA locations with cache_loc's shape and -1 for uncommitted slots.
+    """
+
+    out_shape = cache_loc.shape
+    n = cache_loc.numel()
+    if n == 0:
+        return torch.empty_like(cache_loc, dtype=torch.int32)
+
+    op = "committed_swa_locations"
+    xsg = torch.ops.xspeedgate_ops
+    if hasattr(xsg, "committed_swa_locations"):
+        out = torch.empty(n, dtype=torch.int32, device=cache_loc.device)
+        try:
+            xsg.committed_swa_locations(
+                cache_loc.reshape(-1).contiguous(),
+                full_to_swa_mapping.contiguous(),
+                commit_lens.contiguous(),
+                out,
+                width,
+            )
+        except RuntimeError as exc:
+            # The op's dtype/layout constraints are undocumented, so its own
+            # TORCH_CHECKs are the only guard. Those throw before the launch,
+            # with `out` still untouched, which makes falling through to the
+            # torch body safe. An out-of-bounds write inside the kernel hangs
+            # the device instead and never surfaces in Python, so that case is
+            # not something `except` can cover.
+            _dspark_warn_fallback(op, f"{type(exc).__name__}: {exc}")
+        else:
+            note_op_path(op, "xspeedgate")
+            return out.reshape(out_shape)
+    else:
+        _dspark_warn_fallback(
+            op, "xspeedgate_ops.committed_swa_locations is unavailable"
+        )
+
+    note_op_path(op, "torch")
+    rows = commit_lens.numel()
+    loc = cache_loc.reshape(rows, width).to(torch.long)
+    col = torch.arange(width, device=cache_loc.device).view(1, -1)
+    committed = col < commit_lens.to(torch.long).view(-1, 1)
+
+    # Uncommitted slots are never read, so park them on a valid index rather
+    # than letting a stale/negative location index the mapping out of bounds.
+    loc = torch.where(committed, loc, torch.zeros_like(loc))
+    loc = torch.where(loc < 0, loc + full_to_swa_mapping.numel(), loc)
+
+    swa = full_to_swa_mapping[loc].to(torch.int32)
+    swa = torch.where(committed, swa, torch.full_like(swa, -1))
+    return swa.reshape(out_shape)
+
+
+def _sharded_greedy_reduce(
+    value: torch.Tensor,
+    index: torch.Tensor,
+    valid: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Shared (value, lowest-index) argmax reduction over the last dim.
+
+    Both halves of ``sharded_greedy_step`` run the same reduction, and both give
+    NaN priority the way ``torch.argmax`` does: if any live lane is NaN the
+    winners are the NaN lanes, otherwise the lanes holding the maximum. Ties --
+    including ties between NaNs -- resolve to the lowest index, and a reduction
+    with no live lane at all yields the ``2147483647`` sentinel.
+    """
+
+    nan = valid & value.isnan()
+    has_nan = nan.any(dim=-1, keepdim=True)
+    live = valid & ~nan
+    maximum = torch.where(live, value, float("-inf")).amax(dim=-1, keepdim=True)
+    wins = torch.where(has_nan, nan, live & (value == maximum))
+    sentinel = torch.full_like(index, 2147483647)
+    winner = torch.where(wins, index, sentinel).amin(dim=-1)
+    best = torch.where(
+        has_nan.squeeze(-1),
+        torch.full_like(maximum.squeeze(-1), float("nan")),
+        maximum.squeeze(-1),
+    )
+    return best, winner
+
+
+# The 0.5.22 sampler uses the markov greedy entry points registered above.
+# Keep the implementation available without registering the removed module.
+def sharded_greedy_step_kunlun(
+    bias: torch.Tensor,
+    base_local: torch.Tensor,
+    *,
+    group,
+    vocab_start: int,
+    gather=None,
+) -> torch.Tensor:
+    """Exact greedy pick over the TP-sharded vocab.
+
+    ``DSparkDraftSampler.__call__`` takes this fast path for every DSV4.1 draft
+    head that reports ``supports_sharded_greedy``
+    (``deepseek_v4_dspark.py:511-517``), so the DSpark draft sampler cannot be
+    captured at all while the two upstream ``@triton.jit`` kernels are inert
+    Python functions -- see ``row_argmax_kunlun`` for why they are, and why
+    reviving real Triton is not on the table here.
+
+    XSpeedGate ``sharded_greedy_partial`` / ``sharded_greedy_finish`` stand in
+    for those two kernels one for one. The torch branch below stays as the
+    fallback for builds that ship neither op, and for operands they refuse: the
+    ops pin ``bias`` to bf16 and ``base_local`` to fp16, which is what this head
+    produces today (the markov W2 GEMM is bf16 under
+    ``SGLANG_DSPARK_OPT_MARKOV_W2_BF16``, itself a precondition of
+    ``supports_sharded_greedy``, and the block logits carry the lm_head dtype),
+    but casting to reach them would move the result.
+
+    The transport is untouched in either branch: one
+    ``(value, global-index-bits)`` pair per 4096-wide block of the shard per row,
+    the same padded partition width on every rank, indices carried as int32 bits
+    through a float32 buffer and never converted numerically. That matters
+    because the collective runs across all 8 ranks -- any change to the shape or
+    the dtype of ``partial`` would have to land on every rank at once.
+
+    Both branches match the two kernels lane for lane, including the details
+    that are easy to lose: the ``WIDTH`` mask (``base_local`` is padded wider
+    than ``bias``, and the final shard can be entirely padding), NaN priority
+    with lowest-index tie-breaking, and stripping the sign bit the NVLink push
+    transport sets on ``+0`` so that token id 0 survives the round trip.
+
+    Args:
+        bias: Per-row bias for the valid local vocabulary.
+        base_local: Local logits, possibly padded beyond bias's width.
+        group: Tensor-parallel group providing world_size and all_gather.
+        vocab_start: Global token ID corresponding to local column zero.
+        gather: Optional collective callable accepting flattened partial winners.
+
+    Returns:
+        One int64 global winning token ID per row, breaking ties by lowest ID.
+    """
+
+    assert bias.ndim == base_local.ndim == 2
+    assert bias.shape[0] == base_local.shape[0]
+    assert bias.shape[1] <= base_local.shape[1]
+    assert bias.stride(1) == base_local.stride(1) == 1
+    rows, width = bias.shape
+    block = 4096
+    parts = (base_local.shape[1] + block - 1) // block
+    assert parts > 0
+    padded = parts * block
+
+    op = "sharded_greedy_step"
+    xsg = torch.ops.xspeedgate_ops
+    if (
+        bias.dtype == torch.bfloat16
+        and base_local.dtype == torch.float16
+        and hasattr(xsg, "sharded_greedy_partial")
+        and hasattr(xsg, "sharded_greedy_finish")
+    ):
+        try:
+            op_probe(
+                op,
+                "enter",
+                f"rows={rows} width={width} parts={parts} "
+                f"world={group.world_size} vocab_start={vocab_start}",
+            )
+            partial = torch.empty(
+                (rows, parts, 2), dtype=torch.float32, device=bias.device
+            )
+            xsg.sharded_greedy_partial(
+                bias, base_local, partial, width, vocab_start, parts, block
+            )
+            if gather is not None:
+                gathered = gather(partial.reshape(rows, parts * 2))
+            else:
+                gathered = (
+                    group.all_gather(partial, dim=0)
+                    if group.world_size > 1
+                    else partial
+                )
+            out = torch.empty(rows, dtype=torch.int64, device=bias.device)
+            # ``finish`` only checks the flat capacity, and the layout it walks
+            # -- ((rank * rows + row) * parts + part) * 2 -- is the same one the
+            # torch branch below reshapes by hand.
+            xsg.sharded_greedy_finish(
+                gathered.contiguous(), out, rows, parts, group.world_size
+            )
+            op_probe(op, "exit", f"rows={rows}")
+        except RuntimeError as exc:
+            # The TORCH_CHECKs throw before any launch, and both ops only write
+            # buffers allocated right here, so the fallback still sees pristine
+            # ``bias`` / ``base_local`` and recomputes the whole step.
+            _dspark_warn_fallback(op, f"{type(exc).__name__}: {exc}")
+        else:
+            note_op_path(op, "xspeedgate")
+            return out
+    else:
+        _dspark_warn_fallback(
+            op,
+            "xspeedgate_ops.sharded_greedy_partial/finish is unavailable or "
+            f"bias dtype is {bias.dtype} and base_local dtype is "
+            f"{base_local.dtype} (the ops require bfloat16 and float16)",
+        )
+
+    note_op_path(op, "torch")
+    value = base_local[:, :width].to(torch.float32) + bias.to(torch.float32)
+    if padded > width:
+        value = torch.nn.functional.pad(value, (0, padded - width), value=0.0)
+    value = value.view(rows, parts, block)
+
+    columns = torch.arange(padded, device=bias.device, dtype=torch.int32)
+    valid = (columns < width).view(1, parts, block).expand(rows, parts, block)
+    index = (columns + vocab_start).view(1, parts, block).expand(rows, parts, block)
+
+    best, winner = _sharded_greedy_reduce(value, index, valid)
+    partial = torch.stack((best, winner.view(torch.float32)), dim=-1)
+
+    if gather is not None:
+        gathered = gather(partial.reshape(rows, parts * 2))
+    else:
+        gathered = (
+            group.all_gather(partial, dim=0) if group.world_size > 1 else partial
+        )
+
+    # Flat layout of the transport, identical for both gather styles:
+    # ((rank * rows + row) * parts + part) * 2.
+    gathered = gathered.reshape(group.world_size, rows, parts, 2)
+    value = gathered[..., 0].permute(1, 0, 2).reshape(rows, -1)
+    index = gathered[..., 1].reshape(-1).view(torch.int32).view(
+        group.world_size, rows, parts
+    ).permute(1, 0, 2).reshape(rows, -1)
+    index = index & 2147483647
+    valid = index != 2147483647
+
+    _, winner = _sharded_greedy_reduce(value, index, valid)
+    return winner.to(torch.int64)
 
 
 @register_triton_op(
@@ -2257,7 +3106,7 @@ def mixed_accept_select_kernel(
         f"{sampling_bonus_ptr.dtype}",
     )
 
-    # vendor 算子把 bs 行整表缓存到 SM，硬性 bs <= 64；running bs 可以超过它。
+    # The vendor op caches the whole bs-row table into SM, hard-requiring bs <= 64; the running bs may exceed it.
     if bs > 64:
         is_greedy = greedy_mask_ptr[:bs].to(torch.bool)
         correct_len_ptr[:bs].copy_(
@@ -2494,10 +3343,10 @@ def compact_row_index_kernel(
 ) -> None:
     """Map padded rows to compact request/within-row indices."""
     del BLOCK, NBITS
-    # 上游 triton 也是 tl.load(incl_ptr + bs - 1)，bs==0 本来就不是合法输入
+    # Upstream triton also does tl.load(incl_ptr + bs - 1); bs==0 is not a legal input in the first place
     _dspark_require(bs > 0, "compact_row_index", f"bs must be > 0, got {bs}")
     incl = incl_ptr[:bs].to(torch.int64)
-    # vendor 算子收 verify_lens 并在内部做 cumsum，这里从 incl 还原
+    # The vendor op takes verify_lens and does cumsum internally; here we recover it from incl
     verify_lens = torch.diff(incl, prepend=incl.new_zeros(1))
     req, within, valid = torch.ops.xspeedgate_ops.compact_row_index(
         verify_lens, n, str(req_out_ptr.device)
@@ -2551,8 +3400,8 @@ def compact_verify_ids_triton(
 ) -> torch.Tensor:
     """Build the compact verify-token ids for a ragged verify layout."""
 
-    # vendor 算子对齐上层 python 函数（行索引 + gather 一次算完），
-    # 因此这里替换 host 函数而不是 _compact_verify_ids_gather_kernel。
+    # The vendor op aligns with the upper-level python function (row index + gather computed in one go),
+    # so here we replace the host function instead of _compact_verify_ids_gather_kernel.
     op = "compact_verify_ids"
     verify_lens = layout.verify_lens.to(device=device)
     if verify_lens.dtype not in (torch.int32, torch.int64):
@@ -2573,7 +3422,7 @@ def compact_verify_ids_triton(
         f"{tuple(tokens.shape)}",
     )
 
-    if bs <= 1024:  # vendor 硬性上限
+    if bs <= 1024:  # vendor hard limit
         return torch.ops.xspeedgate_ops.compact_verify_ids(
             block_ids,
             tokens,
@@ -2650,9 +3499,9 @@ def commit_inject_layout_kernel(
 ) -> None:
     """Build committed SWA locations and absolute positions."""
     del BLOCK
-    # vendor 算子要求 req_to_token 为 int64，而线上 req_to_token 是 int32；
-    # 这里只把本次用到的那几行取出来转成 int64（整表 cast 太贵），
-    # 并把 req_pool 重映射成 0..n_req-1。
+    # The vendor op requires req_to_token to be int64, while the live req_to_token is int32;
+    # here we only pull out the few rows used this time and cast them to int64 (casting the whole table is too expensive),
+    # and remap req_pool to 0..n_req-1.
     n_req = (n + stride - 1) // stride
     request_rows = req_pool_ptr[:n_req].to(torch.int64)
     token_pool = req_to_token_ptr.as_strided(req_to_token_ptr.shape, (rt_stride, 1))
@@ -2716,6 +3565,108 @@ def build_out_tokens_kernel(
     )
     if out is not out_ptr:
         out_ptr.reshape(-1)[:n_out].copy_(out.reshape(-1)[:n_out])
+
+
+@register_jit_op(
+    "sglang.kernels.ops.speculative.dspark.dspark_schedule",
+    "schedule_verify_lens_topk_triton",
+)
+def schedule_verify_lens_topk_kunlun(
+    *,
+    confidence: torch.Tensor,
+    budget: int,
+    cfg,
+) -> torch.Tensor:
+    """Confidence-driven per-request verify-length schedule on XSpeedGate.
+
+    Mirrors ``dspark_schedule.schedule_verify_lens_topk_triton`` (survival
+    cumprod -> global top-k budget select -> clamp finalize) but runs the three
+    ``schedule_topk_*`` XSpeedGate kernels instead of Triton. It is only reached
+    when the DSpark budget planner is active (``speculative_adaptive`` or an SPS
+    table); in the default static-block config the planner returns early and this
+    replacement is never called, so wiring it cannot perturb that config.
+
+    The vendor ``schedule_topk_selected_extra_kernel`` is specialised to
+    ``cols == 5`` and ``n <= 256`` (bs up to ~51). Anything outside that window
+    falls back to the torch reference so correctness never depends on the fast
+    path being eligible.
+
+    Args:
+        confidence: Per-request confidence for each draft position.
+        budget: Global budget for selecting additional verification positions.
+        cfg: Scheduling limits and survival-probability threshold.
+
+    Returns:
+        Per-request verification lengths bounded by the configured limits.
+    """
+
+    op = "schedule_verify_lens_topk"
+    num_requests, gamma = confidence.shape
+    max_len = cfg.resolved_max_verify_len()
+    device = confidence.device
+    cols = min(max_len, gamma)
+    n = num_requests * cols
+
+    xsg = torch.ops.xspeedgate_ops
+    have_ops = all(
+        hasattr(xsg, name)
+        for name in (
+            "schedule_topk_prep_kernel",
+            "schedule_topk_selected_extra_kernel",
+            "schedule_topk_finalize_kernel",
+        )
+    )
+    # The selected_extra kernel is skipped when budget <= 0, so its
+    # cols==5 / n<=256 contract only has to hold when a budget is actually spent.
+    vendor_ok = (
+        have_ops
+        and num_requests > 0
+        and (budget <= 0 or (cols == 5 and 0 <= n <= 256))
+    )
+    if not vendor_ok:
+        _dspark_warn_fallback(
+            op,
+            f"cols={cols}, n={n}, budget={budget} outside vendor support "
+            "(needs cols==5, n<=256); using torch reference",
+        )
+        from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
+            schedule_verify_lens_topk,
+        )
+
+        return schedule_verify_lens_topk(confidence=confidence, budget=budget, cfg=cfg)
+
+    note_op_path(op, "xspeedgate")
+    confidence_c = confidence.contiguous()
+    selected_extra = torch.empty(num_requests, dtype=torch.int32, device=device)
+    survival = torch.empty((num_requests, cols), dtype=torch.float32, device=device)
+    # prep: survival[:, :cols] = cumprod(confidence[:, :cols]); selected_extra = 0
+    xsg.schedule_topk_prep_kernel(
+        confidence_c, survival, selected_extra, int(gamma), int(cols), 0
+    )
+    if budget > 0 and n > 0:
+        # global top-k budget select, accumulated per request into selected_extra
+        xsg.schedule_topk_selected_extra_kernel(
+            survival,
+            selected_extra,
+            int(budget),
+            int(cols),
+            int(n),
+            float(cfg.survival_eps),
+            0,
+            0,
+        )
+    verify_lens = torch.empty(num_requests, dtype=torch.int32, device=device)
+    # finalize: clamp(min_verify_len + selected_extra, lower_bound, max_len)
+    xsg.schedule_topk_finalize_kernel(
+        selected_extra,
+        verify_lens,
+        int(cfg.min_verify_len),
+        max(int(cfg.min_verify_len), 1),
+        int(max_len),
+        int(num_requests),
+        0,
+    )
+    return verify_lens
 
 
 @register_triton_op(
@@ -3092,23 +4043,195 @@ _DSV4_LAST_NUM_TOKEN_NON_PADDED: dict = {}
 
 @register_jit_op("sglang.kernels.ops.moe.dsv4", "mask_topk_ids")
 def mask_topk_ids(topk_ids: torch.Tensor, num_token_non_padded: torch.Tensor) -> None:
-    """Mask padded token rows in MoE top-k ids on Kunlun.
+    """XSpeedGate ``mask_topk_ids_padded_region``: mask padded rows in MoE top-k ids.
 
     Boolean-mask assignment is shape-dependent and therefore not capturable, so
-    the padded rows would keep stale gate output during graph replay. masked_fill_
-    over a static-shaped mask is capturable. The fill value is 0, not upstream's
-    -1: every Kunlun MoE kernel indexes per-expert buffers by id, and -1 is the
-    out-of-range value that faults them. Routing weights for padded rows are
-    irrelevant because their output rows are discarded; what matters is that the
-    ids are constant, so real rows always get the same expert grouping.
+    the padded rows would keep stale gate output during graph replay. Both
+    branches below are capturable: the op writes in place over a static shape,
+    and the torch fallback uses masked_fill_ over a static-shaped mask.
+
+    The op writes upstream's **-1** into the padded rows, while the torch body
+    kept 0 out of caution. On this line -1 is in fact the better value, and the
+    whole chain behind the gate handles it:
+
+    * ``index_have_neg`` is ``moe_ep_size > 1`` in both compressed-tensors MoE
+      schemes, true under EP8, so ``moe_pre_sorted`` treats a negative id the
+      same as a lane routed to another EP rank: it goes into the ``num_experts``
+      bucket and gets ``sorted_tokens_idx = -1``;
+    * ``moe_fc`` never indexes by expert id, only by that sorted index;
+    * ``moe_post`` masks exactly those lanes -- weight 0, index clamped to 0 --
+      so nothing addresses a negative row and the padded output rows come out 0.
+
+    So a padded row stops consuming an expert row instead of being routed to
+    expert 0 to produce output that is discarded afterwards. The two branches
+    therefore differ on the padded rows (-1 vs 0) and agree on every real row;
+    the fallback stays at 0 because that is the value that is also safe when
+    ``index_have_neg`` is false (``ep_size == 1``), which this hook cannot see.
+
+    The op only accepts int32 ids (``topk_ids must be int32``) -- the DSV4 gate
+    hands out int32, so the dtype guard here is for other callers, not this
+    line. ``_dspark_warn_fallback`` logs any degradation once.
     """
 
     _DSV4_LAST_NUM_TOKEN_NON_PADDED[topk_ids.device] = num_token_non_padded
+
+    op = "mask_topk_ids"
+    xsg = torch.ops.xspeedgate_ops
+    if topk_ids.dtype == torch.int32 and hasattr(xsg, "mask_topk_ids_padded_region"):
+        try:
+            xsg.mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+        except RuntimeError as exc:
+            # TORCH_CHECKs throw before the launch, and a partial in-place write
+            # is harmless here because the fallback masks the same rows again.
+            _dspark_warn_fallback(op, f"{type(exc).__name__}: {exc}")
+        else:
+            note_op_path(op, "xspeedgate")
+            return
+    else:
+        _dspark_warn_fallback(
+            op,
+            "xspeedgate_ops.mask_topk_ids_padded_region is unavailable or "
+            f"topk_ids dtype is {topk_ids.dtype} (the op requires int32)",
+        )
+
+    note_op_path(op, "torch")
     indices = torch.arange(
         0, topk_ids.shape[0], device=topk_ids.device, dtype=torch.int64
     )
     padded = (indices >= num_token_non_padded.reshape(()).to(torch.int64)).unsqueeze(1)
     topk_ids.masked_fill_(padded, 0)
+
+
+@register_jit_op("sglang.kernels.ops.moe.moe_route_radix", "route_radix")
+def moe_route_radix_kunlun(
+    scores: torch.Tensor,
+    bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    apply_scale: bool,
+    sorted: bool = False,
+):
+    """K3 radix-select router (896 experts, top-16) on the XSpeedGate operator.
+
+    Upstream ``route_radix`` is a CUDA JIT kernel (``moe/route_radix.cuh``) that
+    ``moe_fused_gate`` dispatches to for covered inputs instead of running the 16
+    dependent argmax rounds of ``_router_triton_kernel``.
+    ``xspeedgate_ops.moe_route_radix`` is parameter-for-parameter identical to it
+    (``XSpeedGate/wrapper/src/moe/moe_route_radix.cpp``) and its TORCH_CHECKs are
+    exactly upstream ``covered()``, so the caller keeps using that predicate and
+    nothing needs a dtype/layout fixup here. ``sorted=False`` (the production
+    dispatch) returns the winners in expert-id order.
+
+    Args:
+        scores: Routing scores for each token and expert.
+        bias: Expert-selection bias.
+        topk: Number of selected experts per token.
+        renormalize: Whether to normalize the selected routing weights.
+        routed_scaling_factor: Scale for the selected weights when enabled.
+        apply_scale: Whether to apply routed_scaling_factor.
+        sorted: Whether to request score-sorted rather than expert-ID ordering.
+
+    Returns:
+        Selected routing weights and expert IDs.
+    """
+
+    weights, ids = torch.ops.xspeedgate_ops.moe_route_radix(
+        scores,
+        bias,
+        int(topk),
+        bool(renormalize),
+        float(routed_scaling_factor),
+        bool(apply_scale),
+        bool(sorted),
+    )
+    return weights, ids
+
+
+def _moe_route_radix_usable(
+    scores: torch.Tensor, bias: Optional[torch.Tensor], topk: int
+) -> bool:
+    """Whether the K3 radix router covers this gate call.
+
+    ``covered()`` is pure Python (shape/dtype/stride only) so it is reused
+    verbatim; the ``hasattr`` guards wheels older than the op.
+    """
+
+    if bias is None or not hasattr(torch.ops.xspeedgate_ops, "moe_route_radix"):
+        return False
+    from sglang.kernels.ops.moe.moe_route_radix import covered
+
+    return bool(covered(scores, bias, topk))
+
+
+def _moe_gate_sqrtsoftplus_log1p(
+    scores, bias, topk, num_fused_shared_experts, renormalize,
+    routed_scaling_factor, apply_routed_scaling_factor_on_output,
+    bias_alt, input_ids, bias_alt_token_id, num_token_non_padded,
+    renormalize_epsilon,
+):
+    """Device-only torch fallback for the ungrouped V4.1 Triton contract."""
+    assert scores.ndim == 2
+    assert scores.dtype in (torch.float32, torch.float16, torch.bfloat16)
+    assert bias is not None and bias.ndim == 1
+    assert bias.dtype in (torch.float32, torch.float16, torch.bfloat16)
+    rows, experts = scores.shape
+    assert bias.shape == (experts,)
+    routed = topk - num_fused_shared_experts
+    assert num_fused_shared_experts >= 0 and 0 < routed <= experts
+    if input_ids is not None:
+        assert bias_alt is not None and bias_alt_token_id is not None
+        assert bias_alt.shape == bias.shape and input_ids.shape == (rows,)
+    scale = 1.0 if routed_scaling_factor is None else routed_scaling_factor
+    x = scores.float()
+    # Do not use log(1 + exp(x)): it loses small positive scores.
+    activated = torch.where(x > 20.0, x, torch.log1p(torch.exp(x))).sqrt()
+    row_bias = bias.float()
+    if input_ids is not None:
+        row_bias = torch.where(
+            (input_ids == bias_alt_token_id)[:, None], bias_alt.float(), row_bias
+        )
+    ranking = activated + row_bias
+    ranking = torch.where(torch.isnan(ranking), float("inf"), ranking)
+    ids = torch.arange(experts, device=scores.device)[None, :]
+    remaining = torch.ones_like(ranking, dtype=torch.bool)
+    weights = torch.empty((rows, topk), dtype=torch.float32, device=scores.device)
+    indices = torch.empty((rows, topk), dtype=torch.int32, device=scores.device)
+    # Explicit argmax/min-id avoids topk's unspecified tie order, including
+    # all -inf rows. Keep remaining separately so no expert is selected twice.
+    for slot in range(routed):
+        maximum = ranking.max(dim=1, keepdim=True).values
+        winner = torch.where(remaining & (ranking == maximum), ids, experts).min(
+            dim=1, keepdim=True
+        ).values
+        weights[:, slot:slot + 1] = activated.gather(1, winner)
+        indices[:, slot:slot + 1] = winner.to(torch.int32)
+        remaining = remaining & (ids != winner)
+        ranking = ranking.masked_fill(~remaining, -float("inf"))
+    routed_sum = weights[:, :routed].sum(dim=1, keepdim=True)
+    if num_fused_shared_experts:
+        weights[:, routed:] = routed_sum / scale
+        indices[:, routed:] = torch.arange(
+            experts, experts + num_fused_shared_experts,
+            dtype=torch.int32, device=scores.device,
+        )
+    if renormalize:
+        norm = (
+            routed_sum + renormalize_epsilon
+            if renormalize_epsilon > 0.0
+            else torch.where(routed_sum > 0.0, routed_sum, 1.0)
+        )
+        weights = weights / norm
+    if apply_routed_scaling_factor_on_output:
+        weights = weights * scale
+    if num_token_non_padded is not None:
+        live = (
+            torch.arange(rows, device=scores.device)
+            < num_token_non_padded.to(device=scores.device).reshape(())
+        )[:, None]
+        weights = weights.masked_fill(~live, 0.0)
+        indices = indices.masked_fill(~live, -1)
+    return weights, indices
 
 
 @register_jit_op("sglang.kernels.ops.moe.moe_fused_gate", "moe_fused_gate")
@@ -3137,9 +4260,13 @@ def moe_fused_gate_dsv4_kunlun(
     # model_type == "deepseek_v41", together with fused_gate_packed_ids).
     sqrtsoftplus_log1p: bool = False,
 ):
-    """Match the monkey-patched DeepSeek-V4 fused MoE gate.
+    """Match the patched DeepSeek-V4 / V4.1 fused MoE gate.
 
-    4.1 added the V4.1 vision-language routing contract: ``bias_alt`` replaces
+    V4.1 log1p routing uses the adjacent torch fallback, including epsilon
+    normalization and NaN-first/min-id selection. Legacy native routing below
+    retains its existing behavior.
+
+    The vision-language routing contract: ``bias_alt`` replaces
     ``bias`` on rows whose ``input_ids == bias_alt_token_id``, rows at or past
     the device scalar ``num_token_non_padded`` become zero weight / id -1, and
     ``renormalize_epsilon`` selects ``sum + eps`` over the zero-sum guard. The
@@ -3148,8 +4275,6 @@ def moe_fused_gate_dsv4_kunlun(
     path (``vl_routing.vision_topk``) passes ``bias_alt``, so text-only routing
     pays nothing.
     """
-    import kunlun_ops
-
     if num_expert_group != 1 or topk_group != 1:
         raise ValueError("grouped routing is not supported by the DSV4 fused gate")
     if moe_softcapping != 0.0:
@@ -3159,17 +4284,15 @@ def moe_fused_gate_dsv4_kunlun(
             "packed_out (FlashInfer routed-MoE form) is not supported by the "
             "Kunlun fused gate"
         )
-    # 0.5.22: the V4.1 sqrtsoftplus numerics are baked into the Kunlun operator
-    # (V4 open-coded log1p, NaNs ranked last), so there is no way to switch it to
-    # the log1p form / NaN-first ordering from here. Refuse instead of ignoring:
-    # a silently different activation shifts routing on a subset of tokens, which
-    # only shows up as an accuracy drift much later.
-    if sqrtsoftplus_log1p:
-        raise NotImplementedError(
-            "sqrtsoftplus_log1p (DeepSeek-V4.1 routing numerics: log1p "
-            "sqrtsoftplus with NaNs ranked first) is not supported by the "
-            "Kunlun fused gate; moe_fused_gate_dsv4 implements the V4 formula"
+    if sqrtsoftplus_log1p and scoring_func.lower() == "sqrtsoftplus":
+        return _moe_gate_sqrtsoftplus_log1p(
+            scores, bias, topk, num_fused_shared_experts, renormalize,
+            routed_scaling_factor, apply_routed_scaling_factor_on_output,
+            bias_alt, input_ids, bias_alt_token_id, num_token_non_padded,
+            renormalize_epsilon,
         )
+
+    import kunlun_ops
 
     if scoring_func == "sigmoid" and apply_routed_scaling_factor_on_output:
         # MiniMax-M3 contract (its only caller is the MiniMax sigmoid branch in
@@ -3190,6 +4313,36 @@ def moe_fused_gate_dsv4_kunlun(
         )
 
     num_rows = scores.shape[0]
+
+    # K3 radix-select fast path, same dispatch condition as upstream
+    # `moe_fused_gate` (moe_fused_gate.py:420): sigmoid scoring, no fused shared
+    # expert, no per-token bias / padding / renorm-epsilon, and an input the
+    # radix kernel covers ([M, 896] fp32|bf16 rows, fp32 bias, top-16). The DSV4
+    # routers (384 experts, bf16 bias) never match, so they keep the
+    # `moe_fused_gate_dsv4` path below.
+    if (
+        scoring_func.lower() == "sigmoid"
+        and num_fused_shared_experts == 0
+        and input_ids is None
+        and bias_alt is None
+        and num_token_non_padded is None
+        and renormalize_epsilon == 0.0
+        and bias is not None
+        and bias.stride(0) == 1
+        and _moe_route_radix_usable(scores, bias, topk)
+    ):
+        # Call the override directly rather than through the patched upstream
+        # symbol: the fast path must not depend on install() ordering.
+        return moe_route_radix_kunlun(
+            scores,
+            bias,
+            topk,
+            renormalize,
+            routed_scaling_factor,
+            apply_routed_scaling_factor_on_output,
+            sorted=False,
+        )
+
 
     def run(inp: torch.Tensor, bias_vec: torch.Tensor):
         weights = torch.empty(num_rows, topk, dtype=torch.float32, device=inp.device)
@@ -4655,8 +5808,69 @@ def chain_speculative_sampling_triton(
     # also returns the ``residual_scale`` the correction distribution needs.
     block_verification: bool = False,
 ) -> None:
-    """Torch replacement for chain speculative rejection sampling on Kunlun."""
+    """XSpeedGate ``speculative_sampling_classic_kernel``: chain rejection sampling.
 
+    Upstream ``chain_speculative_sampling_triton`` is a wrapper that launches a
+    triton kernel of the same name, and the XSpeedGate op was built against that
+    *wrapper* boundary: all 14 arguments match one-to-one in name and order,
+    including the two the wrapper itself marks "not used"
+    (``retrive_next_sibling`` / ``deterministic``, which upstream never forwards
+    to the kernel). They pass straight through with no shape or stride fixup on
+    the Kunlun side. ``predicts`` / ``accept_index`` / ``accept_token_num`` are
+    in-place outputs.
+
+    DSpark reaches this call site (op-trace hits
+    ``speculative.reject_sampling.chain_speculative_sampling_triton``), and the
+    torch body below is a ``for bid in range(batch_size)`` loop with a per-step
+    ``.item()``, so it synchronises host and device once per token. That is where
+    the replacement pays off.
+
+    DSpark's caller (``dspark_accept.py:134``) passes ``threshold_single=1.0``,
+    ``threshold_acc=1.0`` and ``deterministic=True``, which are the op's own
+    defaults, so wiring it changes no numerics through those three. They are
+    still forwarded as given rather than hardcoded here.
+
+    Fall back to the torch body when the op is missing or rejects this call;
+    ``_dspark_warn_fallback`` logs one line so the degradation is never silent.
+    """
+
+    op = "speculative_sampling_classic_kernel"
+    xsg = torch.ops.xspeedgate_ops
+    if not block_verification and hasattr(xsg, "speculative_sampling_classic_kernel"):
+        try:
+            xsg.speculative_sampling_classic_kernel(
+                predicts,
+                accept_index,
+                accept_token_num,
+                candidates,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                uniform_samples,
+                uniform_samples_for_final_sampling,
+                target_probs,
+                draft_probs,
+                float(threshold_single),
+                float(threshold_acc),
+                bool(deterministic),
+            )
+        except RuntimeError as exc:
+            # The op's dtype and layout constraints are undocumented, so its own
+            # TORCH_CHECKs are the only guard. Those throw before the launch,
+            # while the three outputs are still untouched, which makes falling
+            # back here safe. An out-of-bounds write inside the kernel hangs the
+            # device instead and never surfaces in Python, so that case is not
+            # something `except` should try to cover.
+            _dspark_warn_fallback(op, f"{type(exc).__name__}: {exc}")
+        else:
+            note_op_path(op, "xspeedgate")
+            return
+    else:
+        _dspark_warn_fallback(
+            op, "xspeedgate_ops.speculative_sampling_classic_kernel is unavailable"
+        )
+
+    note_op_path(op, "torch")
     """Batched, sync-free chain rejection sampling.
 
     Semantically identical to the row-by-row reference below, but every decision
@@ -4973,18 +6187,28 @@ def dsv4_fused_q_norm_rope_kunlun(
 
     import kunlun_ops
 
-    normalized = torch.empty_like(q_input)
-    kunlun_ops.rmsnorm(
-        q_input,
-        None,
-        normalized,
-        eps,
-        False,
-        True,
-        None,
-        None,
-        None,
-    )
+    # Since 0.5.22 `_compute_q_b` calls this entry with `eps=None` when `q_head_norm=False`
+    # (the DSV4.1 config default), with the contract "only do RoPE, no norm"
+    # (upstream `elementwise.py:194` treats `eps is not None` as the JIT norm switch).
+    # Previously this ran RMSNorm unconditionally, so q was normalized to an RMS constantly equal to 1,
+    # the attention logits shrank overall and wq_b's magnitude information was lost layer by layer -- measured: the new stack has
+    # q_rms=1.000000 (same for every layer), the old stack 1.75~2.12 (different per layer),
+    # so under long prompts the model cannot focus precisely and just repeats nearby content.
+    if eps is None:
+        normalized = q_input
+    else:
+        normalized = torch.empty_like(q_input)
+        kunlun_ops.rmsnorm(
+            q_input,
+            None,
+            normalized,
+            eps,
+            False,
+            True,
+            None,
+            None,
+            None,
+        )
     if (
         _ENABLE_DSV4_ACCURACY_DUMPS
         and q_input.shape[0] == 8192
@@ -5046,11 +6270,11 @@ def dsv4_fused_k_norm_rope_flashmla_kunlun(
     kvcache: torch.Tensor,
     page_size: int,
     layout=None,
-    # 0.5.22 新增 q：把同一批 token 的 query heads ([B, H, head_dim]) 在这同一个
-    # launch 里就地做 RoPE（上游只有 ROCm 的 forward_with_q 走这条路，XPU 分支
-    # 直接 `assert q is None`，deepseek_v4.py:1461 也只在 HIP 上传 q）。
-    # 昆仑这里的 K 存储是 rmsnorm + rotate + store 三步拼出来的，没有融合 q 的
-    # 实现，所以显式报错而不是丢掉参数 —— 静默忽略会让 q 完全没过 RoPE。
+    # 0.5.22 adds q: apply RoPE in-place to the same batch of tokens' query heads ([B, H, head_dim]) within this same
+    # launch (upstream only ROCm's forward_with_q takes this path; the XPU branch
+    # does `assert q is None`, and deepseek_v4.py:1461 passes q only on HIP).
+    # The Kunlun K store here is assembled from three steps (rmsnorm + rotate + store) and has no fused-q
+    # implementation, so we fail explicitly instead of dropping the argument -- silently ignoring it would leave q completely unroped.
     q: Optional[torch.Tensor] = None,
 ) -> None:
     """Use the normalize/rotate/store sequence for the 0.5.14 K path."""
@@ -6282,6 +7506,82 @@ def fused_replay_state_indices(
     return out_state_indices[:total]
 
 
+def _kunlun_renorm(name: str):
+    """Fetch a renorm implementation from the Kunlun sgl_kernel shim, lazily.
+
+    Imported inside the call rather than at module scope: kernel_ops is loaded
+    very early in the plugin bootstrap, before the shim package is safe to pull
+    in.
+    """
+
+    from sglang_kunlun.kernels import sgl_kernel_kunlun  # noqa: F401
+
+    from sglang_kunlun.kernels.sgl_kernel_kunlun import sampling as _sampling
+
+    return getattr(_sampling, name)
+
+
+@register_jit_op(
+    "sglang.srt.speculative.dflash_utils",
+    "top_p_renorm_prob",
+)
+def dflash_top_p_renorm_prob_kunlun(
+    probs: torch.Tensor, top_p: torch.Tensor
+) -> torch.Tensor:
+    """Route DFlash/DSpark's top-p renorm to the Kunlun op instead of flashinfer.
+
+    ``dflash_utils.py:44-47`` binds this symbol under ``if is_cuda():`` straight
+    from ``flashinfer.sampling`` -- and Kunlun XPU answers ``is_cuda()`` with
+    True. That bypasses ``sgl_kernel_stub.install()``, which deliberately points
+    ``sgl_kernel.top_p_renorm_prob`` at the Kunlun implementation. The main
+    sampler (``srt/layers/sampler.py:40-43``) imports the ``sgl_kernel``
+    spelling and is therefore fine; this one file takes the flashinfer spelling
+    and is not.
+
+    flashinfer's version does not run on XPU. It does not raise either: it
+    returns its uninitialised ``torch.empty_like`` output buffer. Measured on a
+    real post-softmax row, ``rowsum=-1979.7``, ``max=22.8``, nothing filtered --
+    and the device context is left in a state where the next op fails with
+    ``invalid device function``. Feeding that to the verify sampler makes the
+    residual ``p - q`` meaningless, so every emitted token is drawn from what is
+    effectively a uniform distribution over the vocabulary: with
+    ``temperature=0.8, top_p=0.95`` the model answers in random multilingual
+    tokens.
+
+    The failure hides well. Whether the garbage looks wrong depends on what the
+    caching allocator last left in that block -- hand it the buffer a correct
+    call just freed and the "result" compares bit-identical to the right answer.
+
+    Only reachable with speculative decoding on: ``_accept_sampling_core``
+    routes to ``build_dflash_verify_target_probs`` (the sole caller) as soon as
+    ``need_top_p_sampling`` is set, and to ``SoftmaxTemp`` otherwise, which is
+    why plain temperature and top-k were unaffected.
+    """
+
+    return _kunlun_renorm("top_p_renorm_prob")(probs, top_p)
+
+
+@register_jit_op(
+    "sglang.srt.speculative.dflash_utils",
+    "top_k_renorm_prob",
+)
+def dflash_top_k_renorm_prob_kunlun(
+    probs: torch.Tensor, top_k: torch.Tensor
+) -> torch.Tensor:
+    """Same redirect for the top-k renorm, which sits on the same import line.
+
+    Reached on the dense branch of ``build_dflash_verify_target_probs``
+    (``dflash_utils.py:1185-1191``) -- a mixed batch is enough, since one request
+    at ``TOP_K_ALL`` pushes ``max_top_k`` to the vocabulary size and disables the
+    sparse top-k fast path for the whole batch. Note that branch passes
+    ``sampling_info.top_ks`` through unclamped, so the Kunlun op has to tolerate
+    ``TOP_K_ALL == 1 << 30``; it does, treating any k past the vocabulary as no
+    filtering.
+    """
+
+    return _kunlun_renorm("top_k_renorm_prob")(probs, top_k)
+
+
 @register_triton_op(
     "sglang.kernels.ops.speculative.dspark.commit_swa",
     "_committed_swa_locations",
@@ -6390,3 +7690,225 @@ def get_and_clear_swa_pages_kernel_kunlun(
         page_mappings_valid[:num_pages].copy_(valid)
 
     mapping[mapping_offsets.reshape(-1)] = 0
+
+
+@register_jit_op(
+    "sglang.srt.layers.attention.dsv4.sparse_prefill_utils",
+    "combine_topk_swa_indices",
+)
+def combine_topk_swa_indices_kunlun(
+    topk_indices, query_start_loc, query_pos, seq_lens, gather_lens,
+    compressed_base, swa_base, window_size, compress_ratio, topk,
+    out_indices=None, out_lens=None, swa_indices=None, swa_lengths=None,
+):
+    """Combine compressed and SWA workspace indices without a CUDA/Triton launch.
+
+    Preserve holes and scanned-prefix lengths, including explicit request-window
+    indices introduced in 0.5.22. Output buffers may be reused across layers.
+
+    Args:
+        topk_indices: Per-query compressed-token selections; negative entries are holes.
+        query_start_loc: Cumulative query offsets delimiting requests.
+        query_pos: Absolute position of each query in its request.
+        seq_lens: Total sequence length for each request.
+        gather_lens: Number of SWA tokens gathered for each request.
+        compressed_base: Per-request base offset in the compressed workspace.
+        swa_base: Per-request base offset in the SWA workspace.
+        window_size: Maximum SWA entries per query.
+        compress_ratio: Number of original tokens represented by a compressed token.
+        topk: Maximum number of compressed selections to include.
+        out_indices: Optional reusable int32 buffer for combined indices.
+        out_lens: Optional reusable int32 buffer for scanned-prefix lengths.
+        swa_indices: Optional explicit per-query indices relative to swa_base.
+        swa_lengths: Per-query window lengths required with explicit swa_indices.
+
+    Returns:
+        Combined workspace indices and scanned-prefix lengths, preserving holes.
+    """
+    assert compress_ratio >= 1 and topk_indices.shape[-1] >= topk
+    n = topk_indices.shape[0]
+    width = ((topk + window_size + 127) // 128) * 128
+    device = topk_indices.device
+    if out_indices is None:
+        out_indices = torch.empty((n, width), dtype=torch.int32, device=device)
+    if out_lens is None:
+        out_lens = torch.empty(n, dtype=torch.int32, device=device)
+    assert out_indices.shape == (n, width) and out_indices.dtype == torch.int32
+    assert out_lens.shape == (n,) and out_lens.dtype == torch.int32
+    if n == 0 or seq_lens.numel() == 0:
+        out_indices.fill_(-1)
+        out_lens.zero_()
+        return out_indices, out_lens
+    offsets = query_start_loc - query_start_loc[0]
+    rows = torch.arange(n, device=device, dtype=offsets.dtype)
+    owned = rows < offsets[-1]
+    req = (torch.searchsorted(offsets, rows, right=True) - 1).clamp(
+        0, seq_lens.numel() - 1
+    ).long()
+    pos = query_pos
+    top_lens = torch.where(
+        owned, ((pos + 1) // compress_ratio).clamp_max(topk), 0
+    )
+    if swa_indices is None:
+        window_lens = torch.where(owned, (pos + 1).clamp_max(window_size), 0)
+    else:
+        assert swa_indices.shape == (n, window_size)
+        assert swa_lengths is not None and swa_lengths.shape == (n,)
+        window_lens = torch.where(owned, swa_lengths, 0)
+    columns = torch.arange(width, device=device)[None, :]
+    in_top = columns < top_lens[:, None]
+    in_window = (columns >= top_lens[:, None]) & (
+        columns < (top_lens + window_lens)[:, None]
+    )
+    result = torch.full((n, width), -1, dtype=torch.int32, device=device)
+    if topk:
+        selected = topk_indices[:, :topk].index_select(
+            1, columns[0].clamp_max(topk - 1)
+        )
+        result = torch.where(
+            in_top & (selected >= 0),
+            selected + compressed_base[req, None],
+            result,
+        )
+    relative = columns - top_lens[:, None]
+    if swa_indices is not None and window_size:
+        window_values = swa_indices.gather(
+            1, relative.clamp(0, window_size - 1)
+        )
+        window_values = torch.where(
+            window_values >= 0, window_values + swa_base[req, None], -1
+        )
+    else:
+        start = (
+            swa_base[req] + pos - window_lens + 1
+            - (seq_lens[req] - gather_lens[req])
+        )
+        window_values = start[:, None] + relative
+    result = torch.where(in_window, window_values, result)
+    out_indices.copy_(result)
+    out_lens.copy_(top_lens + window_lens)
+    return out_indices, out_lens
+
+
+@register_jit_op(
+    "sglang.srt.layers.attention.dsv4.sparse_prefill_utils",
+    "build_swa_token_ids",
+)
+def build_swa_token_ids(
+    seq_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    full_to_swa: torch.Tensor,
+    swa_window: int,
+    total_swa: int,
+) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]":
+    """Build SWA geometry and physical token IDs with the Kunlun operator.
+
+    Args:
+        seq_lens: Total sequence length for each request.
+        extend_seq_lens: Number of query tokens added by each request.
+        req_pool_indices: Request pool rows for the batch.
+        req_to_token: Mapping from request positions to full-cache token slots.
+        full_to_swa: Mapping from full-cache slots to SWA slots.
+        swa_window: Sliding-window width used to determine gathered tokens.
+        total_swa: Total number of SWA token IDs to allocate.
+
+    Returns:
+        Physical SWA token IDs, first positions, gather lengths, and cumulative
+        offsets. An empty batch has a single zero offset.
+    """
+    num_reqs = seq_lens.shape[0]
+    device = seq_lens.device
+    swa_token_ids = torch.empty(total_swa, dtype=torch.int32, device=device)
+    swa_first_pos = torch.empty(num_reqs, dtype=torch.int32, device=device)
+    swa_gather_lens = torch.empty(num_reqs, dtype=torch.int32, device=device)
+    if num_reqs == 0:
+        # The op returns early on an empty batch, so `swa_offsets[0] == 0` — the
+        # one element upstream callers still index — has to be materialized here.
+        swa_offsets = torch.zeros(1, dtype=torch.int32, device=device)
+        return swa_token_ids, swa_first_pos, swa_gather_lens, swa_offsets
+
+    swa_offsets = torch.empty(num_reqs + 1, dtype=torch.int32, device=device)
+    torch.ops.xspeedgate_ops.build_swa_token_ids(
+        swa_token_ids,
+        swa_first_pos,
+        swa_gather_lens,
+        swa_offsets,
+        seq_lens,
+        extend_seq_lens,
+        req_pool_indices,
+        req_to_token,
+        full_to_swa,
+        swa_window,
+    )
+    return swa_token_ids, swa_first_pos, swa_gather_lens, swa_offsets
+
+
+# Width of one DSV4 KV slot: 448 nope + 64 rope, stored unpacked on Kunlun.
+DSV4_KV_DIM = 512
+
+
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.dequant_k_cache",
+    "dequantize_k_cache_paged",
+)
+def dsv4_dequantize_k_cache_paged_kunlun(
+    quant_k_cache: torch.Tensor,
+    page_table_1_flattened: torch.Tensor,
+    page_size: int,
+    out: Optional[torch.Tensor] = None,
+    layout=None,
+) -> torch.Tensor:
+    """Gather paged DSV4 KV rows into the flat sparse-prefill workspace.
+
+    Upstream this dequantises the V4 slot (448B fp8 nope + per-tile ue8m0
+    scales + 64B bf16 rope) with a Triton kernel. The Kunlun pool stores plain
+    fp16/bf16 latents -- `dsv4_quant_k_cache_kunlun` only rounds bf16 to fp16
+    and `set_k_and_s_v4` writes the row as-is -- so a slot already *is* the
+    512-wide vector the workspace wants and the dequant collapses to a gather
+    plus a dtype cast. `_assert_v4_kv_layout` keeps that assumption honest: the
+    packed V4.1 layouts have no Kunlun writer, so they cannot reach this path.
+
+    `out` is usually a slice of a larger workspace, so the gather is copied
+    into it instead of replacing it.
+
+    Args:
+        quant_k_cache: Paged cache containing plain Kunlun latent vectors.
+        page_table_1_flattened: Physical token slots to gather, in workspace order.
+        page_size: Number of latent-vector slots per cache page.
+        out: Optional destination receiving gathered rows in its own dtype.
+        layout: KV layout checked for compatibility with plain latent storage.
+
+    Returns:
+        Gathered rows shaped [tokens, 1, 512], as bf16 when out is omitted,
+        or the supplied output buffer after copying.
+    """
+    _assert_v4_kv_layout(layout, "dequantize_k_cache_paged")
+    buf = quant_k_cache.reshape(quant_k_cache.shape[0], -1)
+    width = buf.shape[1]
+    # A page is `page_size` contiguous 512-wide slots, possibly followed by
+    # padding: the compressed pools allocate the widest ratio's page and the
+    # reader slices `page_size * DSV4_KV_DIM` off the front (see the
+    # `extra_cache[:, : page_width * cache_dim]` slice in the Kunlun backend).
+    # So the page stride is the full row and only the slot stride is fixed.
+    assert width >= page_size * DSV4_KV_DIM, (
+        f"page of {width} elements cannot hold {page_size} x {DSV4_KV_DIM} slots"
+    )
+    token_ids = page_table_1_flattened.reshape(-1).to(torch.long)
+    if width == page_size * DSV4_KV_DIM:
+        gathered = buf.reshape(-1, DSV4_KV_DIM).index_select(0, token_ids)
+    else:
+        slot_start = (
+            torch.div(token_ids, page_size, rounding_mode="floor") * width
+            + (token_ids % page_size) * DSV4_KV_DIM
+        )
+        lane = torch.arange(DSV4_KV_DIM, device=buf.device)
+        gathered = buf.reshape(-1).take(
+            (slot_start.unsqueeze(1) + lane.unsqueeze(0)).reshape(-1)
+        )
+    gathered = gathered.reshape(-1, 1, DSV4_KV_DIM)
+    if out is None:
+        return gathered.to(torch.bfloat16)
+    out.copy_(gathered)
+    return out
