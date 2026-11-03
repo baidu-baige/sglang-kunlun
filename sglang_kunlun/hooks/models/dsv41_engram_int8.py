@@ -434,13 +434,23 @@ def drop_checkpoint_page_cache_kunlun(original_fn):
 class EngramEmbeddingKunlun(EngramEmbedding):
     """`EngramEmbedding` that also serves the W8A8-INT8 table layout."""
 
-    def __init__(self, num_embeddings: int, dim: int, layer_id: int):
+    def __init__(
+        self,
+        num_embeddings: int,
+        dim: int,
+        layer_id: int,
+        column_bounds: "tuple[int, ...] | None" = None,
+    ):
         """Build the checkpoint's FP8 or per-row INT8 embedding storage.
 
         Args:
             num_embeddings: Global number of embedding rows.
             dim: Number of values per row.
             layer_id: Layer identifier used for shared host storage.
+            column_bounds: 0.5.23 passes the per-shard hash column edges here;
+                the shard range comes from upstream's own ``shard_range`` rather
+                than an equal-rows split, because the two do not select the same
+                rows. ``None`` keeps the pre-0.5.23 behaviour.
 
         Returns:
             None.
@@ -448,14 +458,26 @@ class EngramEmbeddingKunlun(EngramEmbedding):
         self._int8 = engram_embed_weight_is_int8()
         if not self._int8:
             # FP8 checkpoint: keep the upstream fp8_e4m3 + e8m0 layout verbatim.
-            super().__init__(num_embeddings, dim, layer_id)
+            super().__init__(num_embeddings, dim, layer_id, column_bounds)
             return
         nn.Module.__init__(self)
         self.dim = dim
         self.tp_size = get_parallel().tp_size
         tp_rank = get_parallel().tp_rank
-        self.row_start = num_embeddings * tp_rank // self.tp_size
-        row_end = num_embeddings * (tp_rank + 1) // self.tp_size
+        # 0.5.23 added ``column_bounds`` and shards on the layer's hash-column
+        # boundaries when the column count divides evenly
+        # (``engram.shard_range``, engram.py:960) instead of the plain
+        # equal-row split. Exactly one rank owns each row either way, so the
+        # zero-fill + all-reduce lookup is bitwise independent of the choice --
+        # but the two splits assign *different* rows, so the INT8 branch has to
+        # use the same function the loader does, not a second opinion.
+        if column_bounds is not None:
+            self.row_start, row_end = engram_mod.shard_range(
+                num_embeddings, column_bounds, tp_rank, self.tp_size
+            )
+        else:
+            self.row_start = num_embeddings * tp_rank // self.tp_size
+            row_end = num_embeddings * (tp_rank + 1) // self.tp_size
         self.rows = row_end - self.row_start
         self.host_table: Optional[object] = None
         if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():

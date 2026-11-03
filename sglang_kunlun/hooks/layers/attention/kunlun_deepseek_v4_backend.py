@@ -2618,8 +2618,20 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         swa_replay_start: Optional[torch.Tensor] = None,
         num_groups: Optional[int] = None,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        # 0.5.23 addition. Upstream passes
+        # ``request_window_live_rows=num_tokens if graph_window else None``
+        # (deepseek_v4_backend.py:1634) and only reads it inside the
+        # request-window branch, to slice the rows that layout covers
+        # (``:4814``). Kunlun rejects that whole path below, so the only legal
+        # value here is None -- but the parameter has to exist or upstream's call
+        # is a TypeError at prefill graph capture.
+        request_window_live_rows: Optional[int] = None,
     ) -> KunlunDSV4AttnMetadata:
         """Build Kunlun core attention metadata for the current request."""
+        assert request_window_live_rows is None, (
+            "Kunlun has no request-window layout path, so a live-row count "
+            "cannot be honoured; see the request_window assert below"
+        )
         if dspark_block_size is not None:
             return self._make_dspark_draft_core_attn_metadata(
                 req_to_token=req_to_token,
