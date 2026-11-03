@@ -2633,6 +2633,37 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         del forward_batch, num_qo_tokens, build_snapshot
         return SharedReadEnds.UNKNOWN
 
+    def glue_target_verify_metadata(self) -> str:
+        """Refuse the 0.5.23 metadata glue graph.
+
+        `MetadataGlueGraph` (new in this release) captures the per-replay
+        attention-metadata prep into its OWN CUDA graph, on a stream it creates
+        itself (`torch.cuda.Stream()`) while the server is already serving.
+        Kunlun's graph support does not cover that: every rank logged
+        "The CUDA Graph is empty. This usually means that the graph was
+        attempted to be captured on wrong device or stream"
+        (`CUDAGraph.cpp:138`) and the recorded ops then raised
+        `cudaErrorInvalidDeviceFunction`.
+
+        Upstream does catch the capture failure and disables the glue
+        permanently -- but the CUDA error is already latched on the context, so
+        the next ordinary op on every rank dies with the same error and the
+        schedulers all exit. The symptom reads as an unrelated crash deep in
+        someone else's tensor op (`req_to_token.index_select` here,
+        `F.pad(out_cache_loc)` there), which is why the first 8-way longbench
+        batch looked like a kv-index bug rather than a graph-capture one.
+
+        The DSV4 base class allows the glue whenever its prep is host-free, and
+        on this config it is, so the refusal has to be stated here. 0.5.22 had
+        no glue graph at all, so declining it restores the baseline behaviour;
+        the cost is only the host-side dispatch saving the glue was built for.
+        """
+        return "Kunlun cannot capture the metadata prep on a side stream"
+
+    def glue_draft_metadata(self) -> str:
+        """Same refusal for the DSpark draft runner's prep, same reason."""
+        return "Kunlun cannot capture the metadata prep on a side stream"
+
     def make_core_attn_metadata(
         self,
         req_to_token: torch.Tensor,
