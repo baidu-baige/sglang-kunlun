@@ -28,44 +28,32 @@ DSV4_SCALE_BYTE_OFFSET = DSV4_VALUE_BYTES * DSV4_PAGE_SIZE
 # Padded page row: ceil((576 + 8) * 64 / 576) * 576.
 DSV4_ROW_BYTES = 37440
 
-# Staging buffers keyed by (kind, layers, item_bytes, dtype, device), grown in place and
-# reused.  The transfers run once per layer per decode step — 43 x N allocations of a
-# fresh non-contiguous temp was a measurable part of the throughput gap, and pinning the
-# host end is what turns a crossing into a DMA instead of a staged synchronous copy.
-_STAGE: dict = {}
-
-
 def _stage(
-    kind: str,
     layers: int,
     rows: int,
     item_bytes: int,
     dtype: torch.dtype,
     device,
 ) -> torch.Tensor:
-    """A reusable ``(layers, rows, item_bytes)`` staging buffer.
+    """A fresh ``(layers, rows, item_bytes)`` staging buffer.
 
-    ``device=None`` asks for pinned host memory.  Rows are over-allocated so a
-    batch that grows by one request does not reallocate every step; the returned
-    view is always exactly ``rows`` long.
+    ``device=None`` asks for pinned host memory.
+
+    An earlier version memoised these buffers in a module-level dict to avoid
+    reallocating per call.  That is new mutable global state, which this plugin
+    does not allow, and it was never what made the batched transfer faster: the
+    win is going from 86 host synchronisations per decode step to one, and that
+    holds whether or not the buffer is reused.  So allocate per call and keep the
+    module stateless.
     """
-    key = (kind, layers, item_bytes, dtype, str(device))
-    buf = _STAGE.get(key)
-    if buf is None or buf.shape[1] < rows:
-        want = max(rows, (buf.shape[1] * 2 if buf is not None else 64))
-        if device is None:
-            try:
-                buf = torch.empty(
-                    (layers, want, item_bytes), dtype=dtype, pin_memory=True
-                )
-            except Exception:
-                # No pinned memory available (some containers cap it): a plain tensor
-                # is still better than a per-call temp, it just loses the DMA path.
-                buf = torch.empty((layers, want, item_bytes), dtype=dtype)
-        else:
-            buf = torch.empty((layers, want, item_bytes), dtype=dtype, device=device)
-        _STAGE[key] = buf
-    return buf[:, :rows]
+    if device is not None:
+        return torch.empty((layers, rows, item_bytes), dtype=dtype, device=device)
+    try:
+        return torch.empty((layers, rows, item_bytes), dtype=dtype, pin_memory=True)
+    except Exception:  # noqa: BLE001 - some containers cap pinned memory
+        # Without pinning the crossing is a staged synchronous copy rather than a
+        # DMA; still one crossing, which is the part that matters here.
+        return torch.empty((layers, rows, item_bytes), dtype=dtype)
 
 
 def _as_bytes(t: torch.Tensor) -> torch.Tensor:
@@ -162,7 +150,7 @@ def _copy_all_layer_staged(src_buffers, dst_buffers, src_locs, dst_locs) -> None
     s_page = s_locs >> DSV4_PAGE_BITS
     s_off = s_locs & DSV4_PAGE_MASK
 
-    stage_dev = _stage("d2h", n_layers, n, item, torch.uint8, src0.device)
+    stage_dev = _stage(n_layers, n, item, torch.uint8, src0.device)
     for i in range(n_layers):
         s_value, s_scale = _padded_runs(_as_bytes(src_buffers[i]))
         stage_dev[i, :, :DSV4_VALUE_BYTES] = s_value[s_page, s_off]
@@ -170,7 +158,7 @@ def _copy_all_layer_staged(src_buffers, dst_buffers, src_locs, dst_locs) -> None
 
     # The one crossing.  Blocking on purpose: the host scatter below reads it,
     # and this is the single synchronisation the whole backup now costs.
-    stage_host = _stage("d2h", n_layers, n, item, torch.uint8, None)
+    stage_host = _stage(n_layers, n, item, torch.uint8, None)
     stage_host.copy_(stage_dev)
 
     d_page = dst_locs >> DSV4_PAGE_BITS
@@ -285,7 +273,7 @@ def copy_items(
 
         n = src_locs_src.numel()
         item = DSV4_VALUE_BYTES + DSV4_SCALE_BYTES
-        stage_host = _stage("h2d", 1, n, item, torch.uint8, None)[0]
+        stage_host = _stage(1, n, item, torch.uint8, None)[0]
         stage_host[:, :DSV4_VALUE_BYTES] = src_value[src_page, src_off]
         stage_host[:, DSV4_VALUE_BYTES:] = src_scale[src_page, src_off]
         stage_dev = stage_host.to(dst.device, non_blocking=True)
