@@ -4276,125 +4276,35 @@ class KunlunDeepseekV4MultiStepBackend(DeepseekV4MultiStepBackend):
                 )
 
 
-@plugin_hook(
-    "sglang.srt.layers.attention.dsv4.compressor."
-    "CompressorBackendMixin.forward_compress",
-    type=HookType.REPLACE,
-)
-def _forward_compress_zeroed_kunlun(
-    self,
-    *,
-    kv_score_buffer,
-    kv_score_input,
-    ape,
-    head_dim,
-    norm,
-    freqs_cis_cache,
-    rotate,
-    forward_batch,
-    compress_ratio,
-    is_paged=False,
-):
-    """Zero sparse-plan rows that the kernel leaves untouched before cache store."""
-    from sglang.kernels.ops.attention.dsv4.compress_old import (
-        compress_forward,
-        compress_fused_norm_rope_inplace,
-    )
-    from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
-    from sglang.srt.layers.attention.dsv4.compressor import (
-        is_overlap_compress,
-        make_compressor_plan,
-    )
-    from sglang.srt.environ import envs
-
-    assert compress_ratio in (4, 128)
-    if is_paged:
-        metadata = self.get_paged_compress_metadata(compress_ratio)
-        coff = 2 if is_overlap_compress(compress_ratio) else 1
-        if compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
-            kv_score_buffer = kv_score_buffer.view(-1, 1, head_dim * 3)
-        else:
-            last_dim = 2 * head_dim * coff
-            assert kv_score_buffer.shape[-1] == last_dim
-            kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
-    else:
-        plan = make_compressor_plan(compress_ratio, forward_batch)
-        metadata = (forward_batch.req_pool_indices.to(torch.int32), None, plan)
-    indices, extra_data, plan = metadata
-
-    out = kv_score_input.new_zeros((kv_score_input.shape[0], head_dim))
-    kv_compressed = compress_forward(
-        kv_score_buffer=kv_score_buffer,
-        kv_score_input=kv_score_input,
-        ape=ape,
-        indices=indices,
-        plan=plan,
-        compress_ratio=compress_ratio,
-        head_dim=head_dim,
-        extra_data=extra_data,
-        out=out,
-    )
-    compress_fused_norm_rope_inplace(
-        kv_compressed,
-        norm.weight,
-        norm.variance_epsilon,
-        freqs_cis_cache,
-        plan,
-    )
-    return rotate_activation(kv_compressed) if rotate else kv_compressed
-
-
-# ── CP prefill indexer: dense fp4 logits exist only in deep_gemm; route to
-# upstream's pure torch implementation ──
+# ── compressor v1 的 forward_compress hook 已删除（0.5.23）─────────────────
 #
-# Symptom: with CP enabled on P, when a **real request** arrives all 8 ranks
-# crash
+# 上游 0.5.23 把 `srt/layers/attention/dsv4/compressor.py` 里的
+# `CompressorBackendMixin` 整个删掉了（文件只剩 `Compressor`），同时删掉了
+# `kernels/ops/attention/dsv4/compress_old.py`（`compress_forward`、
+# `compress_fused_norm_rope_inplace`、`compress_plan`）。
+# 这个 REPLACE hook 的目标因此不存在，留着只会在启动日志里产生一条
+# `Failed to apply hooks`。
+#
+# 基线本来就跑 v2（`SGLANG_OPT_USE_COMPRESSOR_V2=1`），v2 的对应 hook 在
+# `hooks/layers/cp/bcg.py`：`compressor_v2.CompressorBackendMixin.forward_core_compressor`。
+# 要恢复「把稀疏 plan 没写到的行清零」这个语义到 v2 上，得在那个 hook 里做。
+
+
+# ── CP 预填索引器：0.5.23 由上游自己做能力探测，插件不再需要开关 ──────────
+#
+# 0.5.22 的问题：P 开 CP 后真实请求进来时 8 个 rank 全挂
 #     ImportError: cannot import name 'fp8_fp4_mqa_logits' from 'deep_gemm'
-# Call chain:
-#     forward_low_ratio_sources(2832) -> _forward_low_ratio_sources_cp(2902)
-#       -> _low_ratio_index_topk_dense(3313) -> _dense_fp4_mqa_logits(339)
-#         -> from deep_gemm import fp8_fp4_mqa_logits
+# 当时上游的分派读 `SGLANG_DSV41_TORCH_PREFILL_INDEXER`，而 CP 分支绕过了分派。
 #
-# Upstream already has a dispatch (`_low_ratio_index_topk`, 3200-3233):
-#     elif self._use_dense_fp4_prefill_indexer(fb) and _is_sm100_or_newer():
-#         self._low_ratio_index_topk_extend(...)   # dense fp4 (deep_gemm)
-#     else:
-#         self._low_ratio_index_topk_torch(...)    # pure torch fallback
-# `_use_dense_fp4_prefill_indexer` reads `SGLANG_DSV41_TORCH_PREFILL_INDEXER`
-# (set to 1 in the script). **But the CP branch bypasses this dispatch** and
-# calls `_low_ratio_index_topk_dense` directly, -> the switch has no effect on
-# CP, so requests inevitably hit deep_gemm.
+# 0.5.23 把这条路换成了能力探测，开关本身也从 `Envs` 删掉了：
+#     srt/layers/attention/dsv4/v41_indexer/__init__.py
+#       has_dense_fp4_indexer() = torch.cuda.is_available() and torch.version.cuda
+#                                 and hasattr(deep_gemm, "fp8_fp4_mqa_logits")
+#       is_sm100_or_newer()     = is_cuda() and device_capability[0] >= 10
+#       _use_deep_gemm_prefill() = is_sm100_or_newer() and has_dense_fp4_indexer()
+#     → `make_full_topk_indexer(use_deep_gemm_prefill=...)`
+# 昆仑的 capability major 不是 10，所以上游自己就会选 torch 索引器 —— 这正是
+# 「优先用上游认可的降级，而不是加昆仑专属开关」。插件侧原本留着的
+# `_dense_fp4_indexer_usable()` 读的是已删除的 env，且全树没有调用者，一并删掉。
 #
-# Why the 1-token warmup did not blow up: `_cp_short_prompt_needs_reference` in
-# the plugin routes degenerate batches to the Torch reference path; only real
-# prompts reach here.
-#
-# Approach: hook `_low_ratio_index_topk_dense` AROUND and, when "the switch
-# requires torch" or "deep_gemm cannot get fp8_fp4_mqa_logits", redirect to
-# upstream's own `_low_ratio_index_topk_torch`. **Do not copy any upstream
-# method** -- directly reuse that pure torch implementation. It has its own
-# tiling (`_TORCH_INDEXER_SCORE_BUDGET_BYTES` controls the `[rows, heads, lc]`
-# intermediate tensor, added to cap memory for 16k prompts), and semantically
-# it already processes per request group.
-#
-# How `req` is constructed: the dense version receives `q_lens` (tensor) and
-# `q_lens_cpu` (list) as parameters; they are the **per-request local row
-# counts** of this rank (under CP each rank only computes its own rows), from
-# which `repeat_interleave` can exactly rebuild each row's request index. The
-# torch version iterates per request via `torch.unique_consecutive(req)`, and
-# this rank's rows are naturally contiguous per request.
-#
-# The switch reuses `SGLANG_DSV41_TORCH_PREFILL_INDEXER`; additionally, when
-# deep_gemm is unavailable this path is taken automatically, so it does not
-# blow up just because someone forgot to set the switch.
-
-
-def _dense_fp4_indexer_usable() -> bool:
-    """Whether the dense fp4 indexer is usable (depends on deep_gemm's fp8_fp4_mqa_logits)."""
-    if envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get():
-        return False
-    try:
-        from deep_gemm import fp8_fp4_mqa_logits  # noqa: F401
-    except Exception:  # noqa: BLE001 - any import failure means unavailable
-        return False
-    return True
+# ⚠ 开机时要断言 `_use_deep_gemm_prefill()` 为 False（见 S2_DRIFT.md 的 I4）。

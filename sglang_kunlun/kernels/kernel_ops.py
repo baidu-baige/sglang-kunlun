@@ -340,7 +340,6 @@ def _assert_v4_kv_layout(layout, where: str) -> None:
         )
 
 
-@register_jit_op("sglang.kernels.ops.attention.dsv4.compress_old", "compress_forward")
 def dsv4_compress_forward_kunlun(
     kv_score_buffer: torch.Tensor,
     kv_score_input: torch.Tensor,
@@ -355,19 +354,22 @@ def dsv4_compress_forward_kunlun(
     seq_lens: Optional[torch.Tensor] = None,
     extend_lens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Run the compressor-v1 C4/C128 forward kernel on Kunlun."""
+    """Run the compressor-v1 C4/C128 forward kernel on Kunlun.
+
+    Unregistered since 0.5.23: upstream deleted
+    ``sglang.kernels.ops.attention.dsv4.compress_old`` together with the v1
+    compressor (``srt.layers.attention.dsv4.compressor.CompressorBackendMixin``)
+    and its ``compress_plan`` builder. The serving path runs compressor v2
+    (``SGLANG_OPT_USE_COMPRESSOR_V2=1``), so this body is reachable only with a
+    caller-supplied plan.
+    """
 
     if plan is None:
-        from sglang.kernels.ops.attention.dsv4.compress_old import compress_plan
-
-        assert seq_lens is not None
-        plan = compress_plan(
-            compress_ratio,
-            kv_score_input.shape[0],
-            seq_lens,
-            extend_lens,
-            kv_score_input.device,
+        raise NotImplementedError(
+            "compressor-v1 compress_plan was removed upstream in 0.5.23; "
+            "pass a plan or use the compressor-v2 path"
         )
+    del seq_lens, extend_lens
     assert head_dim % 128 == 0
     assert plan.compress_ratio == compress_ratio
     if out is None:
@@ -386,9 +388,6 @@ def dsv4_compress_forward_kunlun(
     return out
 
 
-@register_jit_op(
-    "sglang.kernels.ops.attention.dsv4.compress_old", "compress_fused_norm_rope_inplace"
-)
 def dsv4_compress_fused_norm_rope_inplace_kunlun(
     kv: torch.Tensor,
     weight: torch.Tensor,
@@ -396,7 +395,11 @@ def dsv4_compress_fused_norm_rope_inplace_kunlun(
     freq_cis: torch.Tensor,
     plan,
 ) -> None:
-    """Apply compressor-v1 RMSNorm and GPT-J RoPE in place on Kunlun."""
+    """Apply compressor-v1 RMSNorm and GPT-J RoPE in place on Kunlun.
+
+    Unregistered since 0.5.23 for the same reason as
+    ``dsv4_compress_forward_kunlun``: ``compress_old`` is gone upstream.
+    """
 
     import kunlun_ops
 
@@ -415,7 +418,6 @@ def dsv4_compress_fused_norm_rope_inplace_kunlun(
     )
 
 
-@register_jit_op("sglang.kernels.ops.attention.dsv4.attn", "triton_create_paged_compress_data")
 def dsv4_create_paged_compress_data_kunlun(
     *,
     compress_ratio: int,
@@ -430,7 +432,14 @@ def dsv4_create_paged_compress_data_kunlun(
     use_req_ring: bool = False,
     block: int = 128,
 ):
-    """Create compressor-v1 paged indices using the Kunlun fused op."""
+    """Create compressor-v1 paged indices using the Kunlun fused op.
+
+    Unregistered since 0.5.23: upstream removed
+    ``attention.dsv4.attn.triton_create_paged_compress_data``; the v2 path builds
+    the same metadata through
+    ``srt.layers.attention.dsv4.compressor_v2.create_paged_compressor_data``,
+    which ``hooks/layers/cp/bcg.py`` already calls.
+    """
 
     del block
     if use_req_ring:
@@ -1748,12 +1757,14 @@ def dsv4_compress_norm_rope_store_v2_kunlun(
     )
 
 
-@register_jit_op(
-    "sglang.kernels.ops.attention.dsv4.quant_k_cache",
-    "quant_to_nope_fp8_rope_bf16_pack_triton",
-)
 def dsv4_quant_k_cache_kunlun(k_bf16: torch.Tensor):
-    """Wrap a BF16 DSV4 key for the Kunlun fused cache-store operator."""
+    """Wrap a BF16 DSV4 key for the Kunlun fused cache-store operator.
+
+    No longer registered as a kernel replacement: 0.5.23 deleted
+    ``sglang.kernels.ops.attention.dsv4.quant_k_cache`` (its only caller was
+    upstream's attention test kit). The Kunlun backend calls this directly from
+    ``KunlunDeepseekV4AttnBackend.store_cache``, so the body stays.
+    """
 
     from types import SimpleNamespace
 
@@ -5606,25 +5617,6 @@ def assign_req_to_token_pool(
         out_cache_loc,
         pool_len,
         batch_size,
-    )
-
-
-@register_triton_op("sglang.kernels.ops.speculative.cache_locs", "align_evict_mask_to_page_size")
-def align_evict_mask_to_page_size(
-    seq_lens: torch.Tensor,
-    evict_mask: torch.Tensor,
-    page_size: int,
-    num_draft_tokens: int,
-    BLOCK_SIZE: int,
-) -> None:
-    """Keep partial pages from being evicted in Eagle verification."""
-
-    torch.ops.xspeedgate_ops.align_evict_mask_to_page_size(
-        seq_lens,
-        evict_mask,
-        page_size,
-        num_draft_tokens,
-        BLOCK_SIZE,
     )
 
 
