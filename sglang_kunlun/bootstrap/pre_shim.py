@@ -17,13 +17,13 @@ from __future__ import annotations
 
 import threading
 
-
 _FLOAT16_KV_PATCH_LOCK = threading.Lock()
 _GRAMMAR_BACKEND_PATCH_LOCK = threading.Lock()
 
 
 def _patch_fla_utils_if_loaded() -> None:
     import sys
+
     import torch
 
     module = sys.modules.get("sglang.srt.layers.attention.fla.utils")
@@ -46,7 +46,6 @@ def _patch_fla_utils_if_loaded() -> None:
     module.is_nvidia = True
     module.is_intel_alchemist = False
     module.is_nvidia_hopper = False
-
 
 
 def _patch_torch_cuda_symm_mem_apis() -> None:
@@ -264,7 +263,6 @@ def _patch_sglang_capability_probe() -> None:
        not run (e.g. read-only install), for environments without the import
        hook, where the setattr does take effect.
     """
-    import sys
 
     # -- 1) file patch on the installed sglang ------------------------------
     try:
@@ -318,7 +316,6 @@ def _patch_sglang_capability_probe() -> None:
         pkg.get_device_capability = get_device_capability
 
 
-
 def _kunlun_pre_shim() -> None:
     """Force triton's active driver to advertise ``backend == "cuda"``."""
     import os
@@ -359,6 +356,7 @@ def _kunlun_pre_shim() -> None:
 
     try:
         from sglang_kunlun.bootstrap import sgl_kernel_stub
+
         sgl_kernel_stub.install()
     except Exception:
         pass
@@ -413,7 +411,9 @@ def _kunlun_pre_shim() -> None:
     try:
         import torch as _torch
 
-        if hasattr(_torch, "cuda") and not getattr(_torch.cuda, "_kunlun_stubbed", False):
+        if hasattr(_torch, "cuda") and not getattr(
+            _torch.cuda, "_kunlun_stubbed", False
+        ):
             _torch.cuda.get_device_name = lambda *_a, **_kw: "Kunlun-XPU"
             _torch.cuda.get_device_capability = lambda *_a, **_kw: (8, 0)
             _torch.cuda._kunlun_stubbed = True
@@ -427,8 +427,7 @@ def _kunlun_pre_shim() -> None:
 
 
 def patch_grammar_backend_default() -> None:
-    """Default ``grammar_backend`` to ``"none"`` on Kunlun.
-    """
+    """Default ``grammar_backend`` to ``"none"`` on Kunlun."""
     from sglang.srt.server_args import ServerArgs
 
     with _GRAMMAR_BACKEND_PATCH_LOCK:

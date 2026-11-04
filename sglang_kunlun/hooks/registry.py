@@ -49,6 +49,7 @@ HOOK_MODULES = (
     "sglang_kunlun.hooks.constrained",
 )
 
+
 def _preload_kunlun_runtime() -> None:
     """Preload ``torch_xmlir/libxpuapi.so`` with ``RTLD_GLOBAL``.
 
@@ -84,8 +85,12 @@ def register_all() -> None:
     #     logger.warning("sglang-kunlun: grammar backend default patch failed: %s", exc)
 
     try:
-        from sglang_kunlun.kernels import deep_geem_hook as _deep_geem_hook  # noqa: F401
-        from sglang_kunlun.kernels import flashinfer_hook as _flashinfer_hook  # noqa: F401
+        from sglang_kunlun.kernels import (  # noqa: F401
+            deep_geem_hook as _deep_geem_hook,
+        )
+        from sglang_kunlun.kernels import (  # noqa: F401
+            flashinfer_hook as _flashinfer_hook,
+        )
         from sglang_kunlun.kernels import kernel_ops
 
         kernel_ops.install()
@@ -150,7 +155,9 @@ def register_all() -> None:
 
         patch_compressor_forward_cuda_alias()
     except Exception as exc:
-        logger.warning("sglang-kunlun: Compressor forward_cuda alias patch failed: %s", exc)
+        logger.warning(
+            "sglang-kunlun: Compressor forward_cuda alias patch failed: %s", exc
+        )
 
     try:
         from sglang_kunlun.kernels import kernel_ops as _kernel_ops
