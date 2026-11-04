@@ -650,10 +650,46 @@ def engram_commit_history_kunlun(
     args = _engram_commit_history_op_args(history, verify_ids, req_slots, commit_lens)
     if args is None:
         note_op_path("engram_commit_history", "torch")
-        _engram_commit_history_torch(history, verify_ids, req_slots, commit_lens)
-    else:
-        note_op_path("engram_commit_history", "xspeedgate:engram_commit_history")
+        _engram_commit_history_torch(
+            history, verify_ids, req_slots, commit_lens, live_rows, gate
+        )
+        return
+    note_op_path("engram_commit_history", "xspeedgate:engram_commit_history")
+    keep = _engram_commit_keep_rows(req_slots, live_rows, gate)
+    if keep is None:
         torch.ops.xspeedgate_ops.engram_commit_history(history, *args)
+        return
+    # The op has no gating parameters and writes `history` in place, so the
+    # skipped rows are put back afterwards rather than letting the op decline --
+    # declining would move the DSpark verify path, which always passes
+    # `live_rows`, onto the torch transcription for every decode step.
+    # `req_slots` is distinct by contract, so the scatter is well defined.
+    req = req_slots.to(torch.int64)
+    previous = history[req].clone()
+    torch.ops.xspeedgate_ops.engram_commit_history(history, *args)
+    history[req] = torch.where(keep.unsqueeze(-1), history[req], previous)
+
+
+def _engram_commit_keep_rows(
+    req_slots: torch.Tensor,
+    live_rows: Optional[torch.Tensor],
+    gate: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Which rows 0.5.23 wants committed, or None when no gating applies.
+
+    Rows whose `live_rows` entry is 0 are skipped, and `gate[0] == 0` skips every
+    row. Upstream keys the whole gate on `live_rows` being present
+    (`GATED=live_rows is not None`, engram_hash.py:92), so a `gate` passed on its
+    own is ignored here too. Both are device tensors and stay on device: a
+    `.item()` here would sync the decode critical path and is illegal under graph
+    capture.
+    """
+    if live_rows is None:
+        return None
+    keep = live_rows.reshape(-1)[: req_slots.numel()] != 0
+    if gate is not None:
+        keep = keep & gate.reshape(-1)[:1].to(torch.bool)
+    return keep
 
 
 def _engram_commit_history_torch(
@@ -661,6 +697,8 @@ def _engram_commit_history_torch(
     verify_ids: torch.Tensor,
     req_slots: torch.Tensor,
     commit_lens: torch.Tensor,
+    live_rows: Optional[torch.Tensor] = None,
+    gate: Optional[torch.Tensor] = None,
 ) -> None:
     """Torch transcription, used when the op declines.
 
@@ -686,12 +724,8 @@ def _engram_commit_history_torch(
         width, device=window.device
     )
     updated = window.gather(1, cols)
-    if live_rows is not None or gate is not None:
-        keep = torch.ones_like(req, dtype=torch.bool)
-        if live_rows is not None:
-            keep &= live_rows.reshape(-1)[: req.numel()] != 0
-        if gate is not None:
-            keep &= gate.reshape(-1)[:1].to(torch.bool)
+    keep = _engram_commit_keep_rows(req_slots, live_rows, gate)
+    if keep is not None:
         updated = torch.where(keep.unsqueeze(-1), updated, history[req])
     history[req] = updated
 
