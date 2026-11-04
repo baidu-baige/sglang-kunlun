@@ -8037,3 +8037,49 @@ def dsv4_dequantize_k_cache_paged_kunlun(
         return gathered.to(torch.bfloat16)
     out.copy_(gathered)
     return out
+
+
+# --- top-k / top-p probability renormalization -----------------------------
+#
+# `kernels/ops/sampling/renorm.py` resolves these two names once per platform:
+#
+#     if is_cuda():
+#         top_k_renorm_prob = LazyImport("flashinfer.sampling", "top_k_renorm_probs")
+#         top_p_renorm_prob = LazyImport("flashinfer.sampling", "top_p_renorm_probs")
+#
+# Kunlun answers `is_cuda()` True, so both resolve to precompiled CUDA kernels.
+# Nothing in the plugin covered this module: `bootstrap/sgl_kernel_stub.py` binds
+# the Kunlun implementations into the *sgl_kernel* module, which is a different
+# resolution path, so `renorm` kept the flashinfer LazyImports and a direct call
+# raises `TopPRenormProb failed with error code invalid device function`
+# (scripts/accept_kernel_probe.py).
+#
+# Measured consequence: this is the DSPARK sampling-accept path. With
+# `top_p < 1.0` the target probs for the verify step come from
+# `build_speculative_verify_target_probs`, which calls these; acceptance then
+# collapsed to `accept len: 1.00, accept rate: 0.00` while the same server at
+# `top_p = 1.0` accepted 1.88-2.99 and at temperature 0 (the greedy accept path,
+# which never calls these) accepted 2.3-3.9. One boot, five sampling shapes,
+# `accept_sampling_matrix.sh`. It reproduces identically on 0.5.22, so this is a
+# pre-existing Kunlun gap, not upgrade drift -- and it was invisible until an
+# acceptance 口径 used temperature 1.0 with top_p.
+@register_jit_op("sglang.kernels.ops.sampling.renorm", "top_k_renorm_prob")
+def top_k_renorm_prob_kunlun(
+    probs: torch.Tensor, top_k: torch.Tensor
+) -> torch.Tensor:
+    """Kunlun top-k renormalization, in place of flashinfer's CUDA kernel."""
+
+    from sglang_kunlun.kernels.sgl_kernel_kunlun.sampling import top_k_renorm_prob
+
+    return top_k_renorm_prob(probs, top_k)
+
+
+@register_jit_op("sglang.kernels.ops.sampling.renorm", "top_p_renorm_prob")
+def top_p_renorm_prob_kunlun(
+    probs: torch.Tensor, top_p: torch.Tensor
+) -> torch.Tensor:
+    """Kunlun top-p (nucleus) renormalization, in place of flashinfer's."""
+
+    from sglang_kunlun.kernels.sgl_kernel_kunlun.sampling import top_p_renorm_prob
+
+    return top_p_renorm_prob(probs, top_p)
