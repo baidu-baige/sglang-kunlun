@@ -31,53 +31,26 @@ from __future__ import annotations
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 
-def _assign_buffer_slots(dispatcher):
-    """Give each TBO sub-batch its own normal-mode DeepEP buffer.
-
-    ``MaybeTboDeepEPDispatcher`` builds one inner ``DeepEPDispatcher`` per
-    sub-batch, each with its own ``handle``, but upstream lets them share the
-    process-wide normal-mode ``Buffer``.  The Kunlun DeepEP normal port keeps
-    only the last dispatch's layout, so with the DeepSeek-V4 prefill strategy
-    (``tbo_delta_stages=0``, i.e. ``dispatch(A) -> dispatch(B) -> combine(A) ->
-    combine(B)``) the two sub-batches clobber each other.
-
-    Keyed off ``enumerate(_inners)``, which is the same ordering
-    ``MaybeTboDeepEPDispatcher._execute`` uses to route ``tbo_subbatch_index``.
-    No-op when TBO is off (a single inner dispatcher) or for a2a backends whose
-    inner dispatchers are not DeepEP.
-    """
-    from sglang_kunlun.hooks.layers.moe.token_dispatcher.deepep import DeepEPBuffer
-
-    inners = getattr(dispatcher, "_inners", None) or []
-    if len(inners) <= 1:
-        return
-    assigned = 0
-    for slot, inner in enumerate(inners):
-        setter = getattr(inner, "set_buffer_slot", None)
-        if setter is None:
-            continue
-        setter(slot)
-        assigned += 1
-    if assigned:
-        DeepEPBuffer.set_num_slots(assigned)
-
-
 @plugin_hook(
     "sglang.srt.layers.moe.fused_moe_triton.layer.create_moe_dispatcher",
     type=HookType.REPLACE,
 )
 def create_moe_dispatcher_kunlun(moe_runner_config):
     """Kunlun MoE dispatcher selection."""
-    from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
+    from sglang.srt.batch_overlap.two_batch_overlap import (
+        MaybeTboDeepEPDispatcher,
+    )
     from sglang.srt.distributed import get_tp_group
     from sglang.srt.layers.moe import get_deepep_mode, get_moe_a2a_backend
-    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
+    from sglang.srt.layers.moe.token_dispatcher.standard import (
+        StandardDispatcher,
+    )
 
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none():
         return StandardDispatcher(moe_runner_config)
     if a2a_backend.is_deepep() or a2a_backend.is_mooncake():
-        dispatcher = MaybeTboDeepEPDispatcher(
+        return MaybeTboDeepEPDispatcher(
             group=get_tp_group().device_group,
             router_topk=moe_runner_config.top_k,
             permute_fusion=True,
@@ -87,10 +60,8 @@ def create_moe_dispatcher_kunlun(moe_runner_config):
             params_dtype=moe_runner_config.params_dtype,
             deepep_mode=get_deepep_mode(),
             async_finish=True,
-            return_recv_hook=get_deepep_mode().is_normal(),  # tbo暂时不支持
+            return_recv_hook=get_deepep_mode().is_normal(), # tbo暂时不支持
         )
-        _assign_buffer_slots(dispatcher)
-        return dispatcher
     if a2a_backend.is_ascend_fuseep():
         from sglang.srt.layers.moe.token_dispatcher import NpuFuseEPDispatcher
 
@@ -104,6 +75,7 @@ def create_moe_dispatcher_kunlun(moe_runner_config):
             params_dtype=moe_runner_config.params_dtype,
         )
     raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
+
 
 
 @plugin_hook(

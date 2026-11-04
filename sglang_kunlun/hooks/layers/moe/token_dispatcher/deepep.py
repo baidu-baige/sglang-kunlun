@@ -16,7 +16,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Kunlun plugin hooks for ``sglang.srt.layers.moe.token_dispatcher.deepep``."""
-
 from __future__ import annotations
 
 import logging
@@ -26,6 +25,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -37,8 +37,18 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.moe.topk import TopKOutput
-from sglang.srt.layers.moe.utils import DeepEPMode, get_deepep_config, is_tbo_enabled
-from sglang.srt.utils import is_blackwell, load_json_config
+from sglang.srt.layers.moe.utils import (
+    DeepEPMode,
+    get_deepep_config,
+    get_moe_runner_backend,
+    is_tbo_enabled,
+)
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_blackwell,
+    load_json_config,
+)
+
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
@@ -46,7 +56,7 @@ if TYPE_CHECKING:
 try:
     from deep_ep import Config
     from deep_ep.buffer_v2 import BufferV2 as Buffer
-    from sglang.srt.layers.quantization.fp8_kernel import (  # noqa: F401
+    from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
 
@@ -58,6 +68,7 @@ from enum import Enum, IntEnum, auto
 
 import torch
 import torch.distributed as dist
+
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 logger = logging.getLogger(__name__)
@@ -138,38 +149,17 @@ assert isinstance(DeepEPLLCombineInput, CombineInput)
 
 class DeepEPDispatchMode(IntEnum):
     """DeepEPDispatchMode"""
-
     NORMAL = auto()
     LOW_LATENCY = auto()
 
 
 class DeepEPBuffer:
-    """DeepEPBuffer
-
-    Normal-mode buffers are kept per ``slot`` so that each two-batch-overlap
-    sub-batch owns one. The Kunlun DeepEP normal port keeps only the last
-    dispatch's layout, so two sub-batches sharing a single buffer clobber each
-    other as soon as both have a ``dispatch -> combine`` transaction in flight.
-
-    ``slot=0`` is the only slot used when TBO is off, and low-latency always
-    stays on slot 0: its ``return_recv_hook`` API is designed to be in flight,
-    and the low-latency buffer is expensive.
-    """
-
-    # slot -> Buffer. Process-wide, like the single buffer this replaces.
-    _buffers = {}
-    # How many normal-mode slots to keep. Set from the dispatcher construction
-    # site (``create_moe_dispatcher_kunlun``) once the sub-batch count is known.
-    _num_slots: int = 1
+    """DeepEPBuffer"""
+    _buffer = None
     _dispatch_mode: Optional[DeepEPDispatchMode] = None
     _hidden_size: Optional[int] = None
     _num_max_dispatch_tokens_per_rank: Optional[int] = None
     _num_experts: Optional[int] = None
-
-    @classmethod
-    def set_num_slots(cls, num_slots: int):
-        """Declare how many normal-mode buffers to keep (one per TBO sub-batch)."""
-        cls._num_slots = max(cls._num_slots, int(num_slots))
 
     @classmethod
     def get_deepep_buffer(
@@ -180,12 +170,10 @@ class DeepEPBuffer:
         deepep_mode: DeepEPMode,
         num_max_dispatch_tokens_per_rank: int = -1,
         num_experts: int = -1,
-        slot: int = 0,
     ):
         """get_deepep_buffer"""
-        buffer = cls._buffers.get(slot)
-        if buffer is not None:
-            return buffer
+        if cls._buffer is not None:
+            return cls._buffer
 
         cls._hidden_size = hidden_size
         cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
@@ -251,8 +239,8 @@ class DeepEPBuffer:
                 f"This may result in highly suboptimal performance. "
                 f"Consider using --deepep-config to change the behavior."
             )
-
-        cls._buffers[slot] = Buffer(
+        
+        cls._buffer = Buffer(
             group,
             num_nvl_bytes,
             num_rdma_bytes,
@@ -262,36 +250,19 @@ class DeepEPBuffer:
             allow_mnnvl=True,
             num_experts=num_experts,
         )
-
-        # ``Buffer.__init__`` runs an all_gather_object, so every rank has to
-        # build the same set of buffers at the same program point. Build the
-        # remaining sub-batch slots right here instead of lazily on their first
-        # dispatch, which would diverge across ranks and hang the collective.
-        if slot == 0 and deepep_mode.enable_normal():
-            for extra_slot in range(1, cls._num_slots):
-                cls.get_deepep_buffer(
-                    group,
-                    hidden_size,
-                    param_bytes,
-                    deepep_mode,
-                    num_max_dispatch_tokens_per_rank,
-                    num_experts,
-                    slot=extra_slot,
-                )
-
-        return cls._buffers[slot]
+        
+        return cls._buffer
 
     @classmethod
     def clean_buffer(cls):
         """clean_buffer"""
-        for buffer in cls._buffers.values():
-            if not buffer.low_latency_mode:
-                continue
-            buffer.clean_low_latency_buffer(
-                cls._num_max_dispatch_tokens_per_rank,
-                cls._hidden_size,
-                cls._num_experts,
-            )
+        if not cls._buffer.low_latency_mode:
+            return
+        cls._buffer.clean_low_latency_buffer(
+            cls._num_max_dispatch_tokens_per_rank,
+            cls._hidden_size,
+            cls._num_experts,
+        )
 
     @classmethod
     def set_dispatch_mode_as_normal(cls):
@@ -322,7 +293,6 @@ class DeepEPBuffer:
 )
 class DeepEPConfig(BaseDispatcherConfig):
     """Kunlun DeepEP dispatcher configuration."""
-
     _instance = None
 
     def __init__(self):
@@ -354,7 +324,6 @@ class DeepEPConfig(BaseDispatcherConfig):
 
 class _DeepEPDispatcherImplBase:
     """_DeepEPDispatcherImplBase"""
-
     def __init__(
         self,
         group: torch.distributed.ProcessGroup,
@@ -365,7 +334,6 @@ class _DeepEPDispatcherImplBase:
         hidden_size: int,
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
-        buffer_slot: int = 0,
     ):
         if not use_deepep:
             raise ImportError(
@@ -381,8 +349,6 @@ class _DeepEPDispatcherImplBase:
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
-        # Which normal-mode DeepEP buffer this impl uses; one per TBO sub-batch.
-        self.buffer_slot = buffer_slot
 
         self.params_bytes = 2
         # A large value will lead to large memory occupation, thus users should change it accordingly
@@ -448,7 +414,6 @@ class _DeepEPDispatcherImplBase:
 
 class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     """_DeepEPDispatcherImplNormal"""
-
     def __init__(self, async_finish: bool, **kwargs):
         super().__init__(**kwargs)
 
@@ -463,25 +428,27 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         """dispatch_a"""
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-
+        
         import kunlun_ops
-
         topk_ids = topk_ids.to(torch.int32)
         num_tokens, hidden_size = hidden_states.shape
         hidden_states_int8 = torch.empty(
-            num_tokens, hidden_size, device="cuda", dtype=torch.int8
+                num_tokens,
+                hidden_size,
+                device='cuda',
+                dtype=torch.int8
         )
         hidden_states_scale = torch.empty(
-            num_tokens,
-            1,
-            device="cuda",
-            dtype=torch.float32,
-        )  # can't be col major
+                num_tokens,
+                1,
+                device='cuda',
+                dtype=torch.float32,
+        ) # can't be col major
         if num_tokens > 0:
             kunlun_ops.quant2d(hidden_states, hidden_states_int8, hidden_states_scale)
         x_to_dispatch = (hidden_states_int8, hidden_states_scale)
         hidden_states = x_to_dispatch
-
+        
         previous_event = Buffer.capture() if self.async_finish else None
         return hidden_states, topk_ids, topk_weights, previous_event
 
@@ -523,7 +490,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         num_tokens_per_rdma_rank = None
         num_tokens_per_expert = None
         is_token_in_rank = None
-
+        
         # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
         # However, doing this would incur an unknown synchronization error, but keeping
         # `handle` as a member variable works.
@@ -607,13 +574,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
-            slot=self.buffer_slot,
         )
 
 
 class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     """_DeepEPDispatcherImplLowLatency"""
-
     def __init__(self, return_recv_hook: bool, **kwargs):
         super().__init__(**kwargs)
 
@@ -624,7 +589,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self.return_recv_hook = return_recv_hook
         self.device_module = torch.get_device_module()
         self.quant_config = {}
-        self._get_buffer()
+        buffer = self._get_buffer()
 
     def dispatch_a(
         self,
@@ -671,7 +636,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hook,
     ):
         """dispatch_b"""
-        hook() if self.return_recv_hook else ()  # event.current_stream_wait()
+        hook() if self.return_recv_hook else () #event.current_stream_wait()
 
         get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
             masked_m
@@ -701,7 +666,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         use_nvfp4 = use_fp8 = False
         input_global_scale = self.quant_config.get("input_global_scale", None)
         if input_global_scale is not None:
-            use_nvfp4 = True  # noqa: F841
+            use_nvfp4 = True
         elif not envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
             use_fp8 = True
 
@@ -745,7 +710,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         if overlap_args is not None:
             overlap_args.stream.wait_stream(self.device_module.current_stream())
 
-        hook() if self.return_recv_hook else ()  # event.current_stream_wait()
+        hook() if self.return_recv_hook else () #event.current_stream_wait()
 
         if overlap_args is not None:
             self.device_module.current_stream().wait_stream(overlap_args.stream)
@@ -805,11 +770,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             )
 
         self.packed_recv_count = self.handle = None
-        if (
-            self.params_dtype is not None
-            and isinstance(combined_hidden_states, torch.Tensor)
-            and combined_hidden_states.dtype != self.params_dtype
-        ):
+        if self.params_dtype is not None and isinstance(combined_hidden_states, torch.Tensor) \
+                and combined_hidden_states.dtype != self.params_dtype:
             combined_hidden_states = combined_hidden_states.to(self.params_dtype)
         return combined_hidden_states, hook
 
@@ -840,7 +802,6 @@ class _Stage(Enum):
 )
 class DeepEPDispatcher(BaseDispatcher):
     """Kunlun DeepEP dispatcher implementation."""
-
     def __init__(
         self,
         group: torch.distributed.ProcessGroup,
@@ -853,7 +814,6 @@ class DeepEPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
-        buffer_slot: int = 0,
     ):
         super().__init__()
 
@@ -868,7 +828,6 @@ class DeepEPDispatcher(BaseDispatcher):
             hidden_size=hidden_size,
             params_dtype=params_dtype,
             deepep_mode=deepep_mode,
-            buffer_slot=buffer_slot,
         )
 
         # KUNLUN_LL_NORMAL_FALLBACK: stash kwargs so we can lazily build the NORMAL dispatcher even when
@@ -962,18 +921,6 @@ class DeepEPDispatcher(BaseDispatcher):
                 **self._normal_common_kwargs,
             )
         return self._normal_dispatcher
-
-    def set_buffer_slot(self, slot: int):
-        """Pick which normal-mode DeepEP buffer this dispatcher uses.
-
-        Called once per TBO sub-batch from the dispatcher construction site, so
-        that the two in-flight ``dispatch -> combine`` transactions do not share
-        normal-mode buffer state. Also updates the stashed kwargs used by the
-        lazy ``_ensure_normal_dispatcher`` path.
-        """
-        self._normal_common_kwargs["buffer_slot"] = slot
-        if self._normal_dispatcher is not None:
-            self._normal_dispatcher.buffer_slot = slot
 
     def _get_impl(self) -> _DeepEPDispatcherImplBase:
         """_get_impl"""
