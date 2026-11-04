@@ -17,7 +17,9 @@ jobs:
         with:
           python-version: "3.10"
 
-      # The unit tests are hardware-free by design and run with CPU PyTorch.
+      # Runs with CPU PyTorch. Cases that need the Kunlun runtime
+      # (xspeedgate_ops / kunlun_ops) skip themselves here, so this job stays
+      # green off-device; a Kunlun runner is what actually exercises them.
       # Pin sglang to the version matching the target Kunlun runtime.
       - name: Install dependencies
         run: |
