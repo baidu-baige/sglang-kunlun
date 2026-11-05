@@ -15,6 +15,10 @@ from . import deepseek_v4  # noqa: F401
 from . import deepseek_v4_precision  # noqa: F401
 from . import deepseek_v4_nextn  # noqa: F401
 
+from . import qwen3_5_gdn  # noqa: F401
+from . import qwen3_5_fused_qk  # noqa: F401
+from . import qwen3_5_conv_norm  # noqa: F401
+
 # 以下为从 dev-kunlun-0.5.19-dsv4.1 合入的 DSV4.1 / Kimi-K3 模型 hook。
 # 它们依赖更新版本的上游 sglang（如 ``sglang.srt.layers.engram``），在当前
 # pinned 的 v0.5.19 base 上可能不存在。DSV4-Flash 本身用不到这些 hook，

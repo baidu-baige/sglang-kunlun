@@ -23,6 +23,7 @@ _kunlun_pre_shim()
 # Submodules with their own hook / setattr-time side effects.
 from . import attention_registry  # noqa: E402,F401
 from . import kunlun_deepseek_v4_backend  # noqa: E402,F401
+from . import mamba_replay_indices  # noqa: E402,F401
 from . import kunlun_vision_backend  # noqa: E402,F401
 from . import nsa  # noqa: E402,F401
 from . import dsv4  # noqa: E402,F401

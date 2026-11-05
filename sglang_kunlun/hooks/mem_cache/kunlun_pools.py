@@ -49,26 +49,26 @@ class KunlunMHATokenToKVPool(MHATokenToKVPool):
                 if self.enable_custom_mem_pool
                 else nullcontext()
             ):
+                num_pages = self.size // self.page_size
+                num_blocks_total = num_pages + 1
                 if self.head_dim == self.v_head_dim:
+                    # Standard MHA (e.g. Qwen3.5 full-attn head256): kunlun_ops
+                    # reshape_and_cache / paged attention require a 4D PAGED KV
+                    # buffer [num_blocks, num_heads, page_size, head_dim] (same
+                    # structure as the MLA-ish branch below). A 3D token-major
+                    # buffer makes reshape_and_cache raise "key_cache wrong dim!
+                    # Expected 4".
+                    k_shape = (num_blocks_total, self.head_num, self.page_size, self.head_dim)
+                    v_shape = (num_blocks_total, self.head_num, self.page_size, self.v_head_dim)
                     self.k_buffer = [
-                        torch.zeros(
-                            (self.size + self.page_size, self.head_num, self.head_dim),
-                            dtype=self.store_dtype,
-                            device=self.device,
-                        )
+                        torch.zeros(k_shape, dtype=self.store_dtype, device=self.device)
                         for _ in range(self.layer_num)
                     ]
                     self.v_buffer = [
-                        torch.zeros(
-                            (self.size + self.page_size, self.head_num, self.v_head_dim),
-                            dtype=self.store_dtype,
-                            device=self.device,
-                        )
+                        torch.zeros(v_shape, dtype=self.store_dtype, device=self.device)
                         for _ in range(self.layer_num)
                     ]
                 else:
-                    num_pages = self.size // self.page_size
-                    num_blocks_total = num_pages + 1
                     shape = (num_blocks_total, self.head_num, self.page_size, self.head_dim)
                     self.k_buffer = [
                         torch.zeros(shape, dtype=self.store_dtype, device=self.device)
@@ -199,7 +199,8 @@ class KunlunMHATokenToKVPool(MHATokenToKVPool):
     def get_cpu_copy(self, indices):
         """Copy KV cache pages from GPU to CPU in chunks."""
         torch.cuda.synchronize()
-        is_4d = self.head_dim != self.v_head_dim
+        # Both branches now allocate a 4D paged buffer [num_blocks, heads, page, hd].
+        is_4d = True  # (cpu offloading is off in this config; kept consistent)
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
@@ -223,7 +224,7 @@ class KunlunMHATokenToKVPool(MHATokenToKVPool):
     def load_cpu_copy(self, kv_cache_cpu, indices):
         """Load KV cache pages from CPU back to GPU in chunks."""
         torch.cuda.synchronize()
-        is_4d = self.head_dim != self.v_head_dim
+        is_4d = True  # both branches are 4D paged now (see _create_buffers)
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
             k_buf = self.k_buffer[layer_id]
