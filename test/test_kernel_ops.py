@@ -11,12 +11,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import importlib.util
 import sys
 import types
 import unittest
 from unittest import mock
 
+# ``sglang_kunlun.kernels.kernel_ops`` imports the Kunlun runtime at module
+# level (``xspeedgate_ops``, and ``kunlun_ops`` by way of
+# ``dsv4_torch_shim``), so it cannot be imported on a machine without that
+# runtime. Skip instead of failing collection: these cases exercise the
+# patching mechanism in ``install()`` and are meaningful wherever the runtime
+# exists.
+_KUNLUN_RUNTIME_MODULES = ("xspeedgate_ops", "kunlun_ops")
+_MISSING_RUNTIME = [
+    name for name in _KUNLUN_RUNTIME_MODULES if importlib.util.find_spec(name) is None
+]
 
+
+@unittest.skipIf(
+    _MISSING_RUNTIME,
+    "requires the Kunlun runtime, missing: " + ", ".join(_MISSING_RUNTIME),
+)
 class KernelOpsTest(unittest.TestCase):
     def tearDown(self):
         sys.modules.pop("sglang.fake_kernel_source", None)
@@ -38,9 +54,16 @@ class KernelOpsTest(unittest.TestCase):
         def replacement_kernel(*args, **kwargs):
             return "replacement"
 
-        spec = kernel_ops.KernelSpec(source_module.__name__, "fake_kernel", replacement_kernel)
-        with mock.patch.object(kernel_ops, "_TRITON_OPS", {(source_module.__name__, "fake_kernel"): spec}), mock.patch.object(
-            kernel_ops, "_JIT_OPS", {}
+        spec = kernel_ops.KernelSpec(
+            source_module.__name__, "fake_kernel", replacement_kernel
+        )
+        with (
+            mock.patch.object(
+                kernel_ops,
+                "_TRITON_OPS",
+                {(source_module.__name__, "fake_kernel"): spec},
+            ),
+            mock.patch.object(kernel_ops, "_JIT_OPS", {}),
         ):
             kernel_ops.install()
 
@@ -67,8 +90,13 @@ class KernelOpsTest(unittest.TestCase):
             replacement_kernel,
             {"call_style": "direct"},
         )
-        with mock.patch.object(kernel_ops, "_TRITON_OPS", {(source_module.__name__, "fake_kernel"): spec}), mock.patch.object(
-            kernel_ops, "_JIT_OPS", {}
+        with (
+            mock.patch.object(
+                kernel_ops,
+                "_TRITON_OPS",
+                {(source_module.__name__, "fake_kernel"): spec},
+            ),
+            mock.patch.object(kernel_ops, "_JIT_OPS", {}),
         ):
             kernel_ops.install()
 

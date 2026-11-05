@@ -50,8 +50,32 @@ HOOK_MODULES = (
 )
 
 
+def _preload_kunlun_runtime() -> None:
+    """Preload ``torch_xmlir/libxpuapi.so`` with ``RTLD_GLOBAL``.
+
+    ``xspeedgate_ops`` binds ``baidu::xpu::api::*`` symbols that only resolve
+    when libxpuapi.so is already in the global symbol scope. Scheduler
+    processes are spawned fresh, so shell-level preloads (LD_PRELOAD / a
+    one-shot ctypes CDLL in the launcher) do not carry over -- do it here, at
+    the top of ``register_all``, in every process that imports the plugin.
+    """
+    try:
+        import ctypes
+        import os
+
+        import torch_xmlir
+
+        lib = os.path.join(os.path.dirname(torch_xmlir.__file__), "libxpuapi.so")
+        if os.path.exists(lib):
+            ctypes.CDLL(lib, mode=ctypes.RTLD_GLOBAL)
+    except Exception:
+        pass
+
+
 def register_all() -> None:
     """Import every hook module so decorators register with ``HookRegistry``."""
+
+    _preload_kunlun_runtime()
 
     # from sglang_kunlun.bootstrap.pre_shim import patch_grammar_backend_default
 
@@ -60,11 +84,35 @@ def register_all() -> None:
     # except Exception as exc:
     #     logger.warning("sglang-kunlun: grammar backend default patch failed: %s", exc)
 
-    from sglang_kunlun.kernels import deep_geem_hook as _deep_geem_hook  # noqa: F401
-    from sglang_kunlun.kernels import flashinfer_hook as _flashinfer_hook  # noqa: F401
-    from sglang_kunlun.kernels import kernel_ops
+    try:
+        from sglang_kunlun.kernels import (  # noqa: F401
+            deep_geem_hook as _deep_geem_hook,
+        )
+        from sglang_kunlun.kernels import (  # noqa: F401
+            flashinfer_hook as _flashinfer_hook,
+        )
+        from sglang_kunlun.kernels import kernel_ops
 
-    kernel_ops.install()
+        kernel_ops.install()
+    except Exception as exc:
+        # A broken kernel backend (e.g. xspeedgate_ops built against a newer
+        # baidu::xpu::api than the runtime provides) must not take the whole
+        # plugin down -- the remaining hooks may still be valid.
+        logger.warning("sglang-kunlun: kernel backend install failed: %s", exc)
+
+    registered, failed = [], []
+    for module_name in HOOK_MODULES:
+        try:
+            importlib.import_module(module_name)
+            registered.append(module_name)
+        except Exception as exc:
+            # Same isolation principle: log, skip, keep the rest.
+            failed.append(module_name)
+            logger.warning(
+                "sglang-kunlun: hook module %s failed to import, skipping: %s",
+                module_name,
+                exc,
+            )
 
     # try:
     #     from sglang_kunlun.kernels.dsv4_torch_shim import patch_compress_old_prefill_plan
@@ -107,14 +155,24 @@ def register_all() -> None:
 
         patch_compressor_forward_cuda_alias()
     except Exception as exc:
-        logger.warning("sglang-kunlun: Compressor forward_cuda alias patch failed: %s", exc)
+        logger.warning(
+            "sglang-kunlun: Compressor forward_cuda alias patch failed: %s", exc
+        )
 
-    for module_name in HOOK_MODULES:
-        importlib.import_module(module_name)
+    try:
+        from sglang_kunlun.kernels import kernel_ops as _kernel_ops
+
+        triton_ops = len(_kernel_ops.registered_triton_ops())
+        jit_ops = len(_kernel_ops.registered_jit_ops())
+    except Exception:
+        triton_ops = jit_ops = 0
 
     logger.info(
-        "sglang-kunlun: %d hook modules registered, %d triton ops and %d jit ops installed",
+        "sglang-kunlun: %d/%d hook modules registered (%d skipped), "
+        "%d triton ops and %d jit ops installed",
+        len(registered),
         len(HOOK_MODULES),
-        len(kernel_ops.registered_triton_ops()),
-        len(kernel_ops.registered_jit_ops()),
+        len(failed),
+        triton_ops,
+        jit_ops,
     )

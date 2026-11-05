@@ -16,10 +16,16 @@ import sys
 import unittest
 from unittest import mock
 
+# The pre-shim rewrites Triton's active driver target, so there has to be a
+# Triton to rewrite. The CPU torch wheel the off-device job installs does not
+# ship one.
+_HAS_TRITON = importlib.util.find_spec("triton") is not None
+
 
 class KunlunPreShimTest(unittest.TestCase):
     """Validate Kunlun bootstrap compatibility patches."""
 
+    @unittest.skipUnless(_HAS_TRITON, "requires triton")
     def test_pre_shim_forces_triton_backend_and_stubs_cuda(self):
         """The pre-shim exposes CUDA-compatible device metadata."""
         from sglang_kunlun.bootstrap import _kunlun_pre_shim
@@ -43,7 +49,15 @@ class KunlunPreShimTest(unittest.TestCase):
         """Platform import runs the pre-shim before importing SGLang SRT."""
         sys.modules.pop("sglang_kunlun.platform", None)
         with mock.patch("sglang_kunlun._kunlun_pre_shim") as pre_shim:
-            importlib.import_module("sglang_kunlun.platform")
+            try:
+                importlib.import_module("sglang_kunlun.platform")
+            except ImportError as exc:
+                # The job installs ``sglang --no-deps``, so importing SRT stops
+                # at the first dependency it does not have. The ordering this
+                # case asserts is only observable with a full install.
+                raise unittest.SkipTest(
+                    f"requires a complete SGLang install: {exc}"
+                ) from exc
 
         pre_shim.assert_called_once()
 

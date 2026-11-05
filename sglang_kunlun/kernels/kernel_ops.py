@@ -24,13 +24,13 @@ import inspect
 import logging
 import sys
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Callable, Dict, Mapping, Optional, Tuple
 
 import torch
+import xspeedgate_ops  # noqa: F401  (registers torch.ops.xspeedgate_ops.*)
 
 logger = logging.getLogger(__name__)
 
-import xspeedgate_ops
 
 def _debug_tensor_meta(name: str, value: object) -> str:
     """Format tensor metadata or a generic value for debug logging."""
@@ -147,7 +147,9 @@ def _replace_imported_bindings(original: object, replacement: object) -> None:
             if value is not original:
                 continue
             setattr(module, symbol_name, replacement)
-            logger.info("kernel_ops: patched imported binding %s.%s", module_name, symbol_name)
+            logger.info(
+                "kernel_ops: patched imported binding %s.%s", module_name, symbol_name
+            )
 
 
 def _patch_symbol(spec: KernelSpec, replacement: object) -> None:
@@ -221,7 +223,9 @@ def get_last_loc_kernel(
     if prefix_lens_tensor.dtype != torch.int64:
         prefix_lens_tensor = prefix_lens_tensor.to(torch.int64)
     loc = torch.ops.xspeedgate_ops.get_last_loc(
-        req_to_token, req_pool_indices_tensor[:num_tokens], prefix_lens_tensor[:num_tokens]
+        req_to_token,
+        req_pool_indices_tensor[:num_tokens],
+        prefix_lens_tensor[:num_tokens],
     )
     result[:num_tokens].copy_(loc.to(result.dtype))
 
@@ -265,7 +269,9 @@ def seqlens_expand_kernel(
     extend_seq_lens = extend_seq_lens[:N]
     seq_lens = seq_lens[:N]
     offsets = offsets[:N]
-    token_offsets = torch.arange(output.numel(), device=output.device, dtype=output.dtype)
+    token_offsets = torch.arange(
+        output.numel(), device=output.device, dtype=output.dtype
+    )
     request_offsets = torch.repeat_interleave(offsets.to(output.dtype), extend_seq_lens)
     starts = (seq_lens - extend_seq_lens + 1).to(output.dtype)
     request_starts = torch.repeat_interleave(starts, extend_seq_lens)
@@ -295,9 +301,7 @@ def create_chunked_prefix_cache_kv_indices(
         if chunk_seq_len <= 0:
             continue
         chunk_kv_offset = int(chunk_cu_seq_lens_ptr[batch_index].item())
-        chunk_kv_indices_ptr[
-            chunk_kv_offset : chunk_kv_offset + chunk_seq_len
-        ].copy_(
+        chunk_kv_indices_ptr[chunk_kv_offset : chunk_kv_offset + chunk_seq_len].copy_(
             req_to_token_ptr[
                 req_pool_index, chunk_start : chunk_start + chunk_seq_len
             ].to(chunk_kv_indices_ptr.dtype)
@@ -357,7 +361,9 @@ def init_compression_metadata(
     c4_out_loc = torch.where(
         c4_should, raw_out_loc_i64 // 4, torch.zeros_like(raw_out_loc_i64)
     ).to(torch.int64)
-    c4_positions = (positions_i64 & (~3)).to(torch.int32)  # noqa: F841 (kernel discards)
+    c4_positions = (positions_i64 & (~3)).to(
+        torch.int32
+    )  # noqa: F841 (kernel discards)
     c4_seq_lens_raw = (seq_lens_i64 // 4).to(torch.int32)
     c4_seq_lens_clamp1 = torch.clamp(c4_seq_lens_raw, min=1).to(torch.int32)
 
@@ -373,7 +379,6 @@ def init_compression_metadata(
     c128_page_indices = None
     if compute_page_indices:
         assert page_table is not None and page_size > 0
-        bs = seq_lens_i64.shape[0]
         max_pages = page_table.shape[1]
         c128_page_size = page_size // 128
         c128_max_seq_len = c128_page_size * max_pages
@@ -383,9 +388,7 @@ def init_compression_metadata(
         offset_in_page = offsets % c128_page_size  # [L]
 
         page_valid = page_idx < max_pages
-        page_idx_clamped = torch.where(
-            page_valid, page_idx, torch.zeros_like(page_idx)
-        )
+        page_idx_clamped = torch.where(page_valid, page_idx, torch.zeros_like(page_idx))
         # gather page_table[b, page_idx] -> [bs, L]
         pt = page_table.to(torch.int64)
         gathered = pt[:, page_idx_clamped]  # [bs, L]
@@ -466,9 +469,9 @@ def silu_and_mul(
     """
     import kunlun_ops
 
-    assert expert_ids is None, (
-        "Kunlun silu_and_mul does not support expert_ids filtering"
-    )
+    assert (
+        expert_ids is None
+    ), "Kunlun silu_and_mul does not support expert_ids filtering"
     if out is None:
         out = torch.empty(
             input.shape[:-1] + (input.shape[-1] // 2,),
@@ -528,8 +531,6 @@ def grouped_topk(
     return topk_values, topk_indices
 
 
-
-
 @register_triton_op("sglang.srt.mem_cache.utils", "set_mla_kv_buffer_kernel")
 def set_mla_kv_buffer_kernel(
     kv_buffer: torch.Tensor,
@@ -570,7 +571,9 @@ def get_mla_kv_buffer_kernel(
 ) -> None:
     """Load MLA KV tensors from the paged KV buffer."""
 
-    torch.ops.xspeedgate_ops.get_mla_kv_buffer(kv_buffer, loc, cache_k_nope, cache_k_rope)
+    torch.ops.xspeedgate_ops.get_mla_kv_buffer(
+        kv_buffer, loc, cache_k_nope, cache_k_rope
+    )
 
 
 @register_triton_op("sglang.srt.mem_cache.triton_ops.allocator", "alloc_extend_kernel")
@@ -641,7 +644,7 @@ def alloc_decode_kernel(
 
     # The Kunlun kernel indexes free_pages over the whole padded range
     # [0, bs_upper) without masking, so a shorter tensor is read out of bounds
-    # It only ever consumes the first num_new_pages (<= bs) entries, 
+    # It only ever consumes the first num_new_pages (<= bs) entries,
     # so padding the tail with zeros is safe: those slots are
     # never written into out_indices. self.free_pages itself is untouched, which
     # keeps the allocator's page accounting intact.
@@ -677,7 +680,14 @@ def store_cache(
     from kunlun_ops import reshape_and_cache
 
     reshape_and_cache(
-        k.contiguous(), v.contiguous(), k_cache, v_cache, indices.to(torch.int32), None, None, 0
+        k.contiguous(),
+        v.contiguous(),
+        k_cache,
+        v_cache,
+        indices.to(torch.int32),
+        None,
+        None,
+        0,
     )
 
 
@@ -797,7 +807,9 @@ def fused_metadata_copy_cuda(
     )
 
 
-@register_jit_op("sglang.jit_kernel.fused_metadata_copy", "fused_metadata_copy_multi_cuda")
+@register_jit_op(
+    "sglang.jit_kernel.fused_metadata_copy", "fused_metadata_copy_multi_cuda"
+)
 def fused_metadata_copy_multi_cuda(
     cache_seqlens_src: torch.Tensor,
     cu_seqlens_k_src: torch.Tensor,
@@ -960,7 +972,9 @@ def assign_hidden_states_pool_triton(
     pool_capacity = req_to_hidden_states_pool.shape[0]
     active_req_pool_indices = req_pool_indices[:num_seqs].to(torch.int64)
     write_req_pool_indices = active_req_pool_indices + 1
-    valid_mask = (write_req_pool_indices >= 0) & (write_req_pool_indices < pool_capacity)
+    valid_mask = (write_req_pool_indices >= 0) & (
+        write_req_pool_indices < pool_capacity
+    )
     if not bool(valid_mask.all().item()):
         valid_req_indices = torch.nonzero(valid_mask, as_tuple=False).flatten()
         logger.debug(
@@ -969,10 +983,16 @@ def assign_hidden_states_pool_triton(
             "invalid_req_indices=%s, invalid_pool_indices=%s",
             pool_capacity,
             num_seqs,
-            torch.nonzero(~valid_mask, as_tuple=False).flatten().detach().cpu().tolist(),
+            torch.nonzero(~valid_mask, as_tuple=False)
+            .flatten()
+            .detach()
+            .cpu()
+            .tolist(),
             active_req_pool_indices[~valid_mask].detach().cpu().tolist(),
         )
-        active_req_pool_indices = active_req_pool_indices[valid_req_indices].contiguous()
+        active_req_pool_indices = active_req_pool_indices[
+            valid_req_indices
+        ].contiguous()
         write_req_pool_indices = write_req_pool_indices[valid_req_indices].contiguous()
         extend_seq_lens = extend_seq_lens[:num_seqs][valid_req_indices].contiguous()
         extend_start_loc = extend_start_loc[:num_seqs][valid_req_indices].contiguous()
@@ -1079,20 +1099,28 @@ def assign_new_state_kernel(
 
     old_ids = old_input_ids[: num_seqs * old_extend_len].view(num_seqs, old_extend_len)
     old_pos = old_positions[: num_seqs * old_extend_len].view(num_seqs, old_extend_len)
-    old_cache = old_out_cache_loc[: num_seqs * old_extend_len].view(num_seqs, old_extend_len)
+    old_cache = old_out_cache_loc[: num_seqs * old_extend_len].view(
+        num_seqs, old_extend_len
+    )
     old_hidden = old_hidden_states[: num_seqs * old_extend_len].view(
         num_seqs, old_extend_len, hidden_dim
     )
 
     new_ids = input_ids[: num_seqs * new_extend_len].view(num_seqs, new_extend_len)
     new_pos = positions[: num_seqs * new_extend_len].view(num_seqs, new_extend_len)
-    new_cache = out_cache_loc[: num_seqs * new_extend_len].view(num_seqs, new_extend_len)
+    new_cache = out_cache_loc[: num_seqs * new_extend_len].view(
+        num_seqs, new_extend_len
+    )
     new_hidden = hidden_states[: num_seqs * new_extend_len].view(
         num_seqs, new_extend_len, hidden_dim
     )
 
     new_ids[:, :old_extend_len].copy_(old_ids)
-    token_ids = next_token_ids[:num_seqs, 0] if next_token_ids.dim() > 1 else next_token_ids[:num_seqs]
+    token_ids = (
+        next_token_ids[:num_seqs, 0]
+        if next_token_ids.dim() > 1
+        else next_token_ids[:num_seqs]
+    )
     insert_pos = (old_extend_len - padding_lens[:num_seqs]).long().unsqueeze(1)
     new_ids.scatter_(1, insert_pos, token_ids.unsqueeze(1).to(new_ids.dtype))
 
@@ -1231,7 +1259,9 @@ def fill_bonus_tokens(
     )
 
 
-@register_triton_op("sglang.srt.speculative.triton_ops.eagle", "fill_accept_out_cache_loc")
+@register_triton_op(
+    "sglang.srt.speculative.triton_ops.eagle", "fill_accept_out_cache_loc"
+)
 def fill_accepted_out_cache_loc(
     accept_index: torch.Tensor,
     out_cache_loc: torch.Tensor,
@@ -1288,8 +1318,10 @@ def generate_draft_decode_kv_indices(
             seq_len = int(seq_lens[bid].item())
             token_pool = req_to_token[req_indices[bid]]
             for topk_id in range(topk):
-                kv_offset = cum_seq_len * topk + bid * iters * topk + topk_id * (
-                    seq_len + iters
+                kv_offset = (
+                    cum_seq_len * topk
+                    + bid * iters * topk
+                    + topk_id * (seq_len + iters)
                 )
                 if seq_len > 0:
                     kv_indices_row[kv_offset : kv_offset + seq_len].copy_(
@@ -1309,9 +1341,9 @@ def generate_draft_decode_kv_indices(
                         + topk_id * num_new_pages_per_topk * page_size
                         + last_page_len
                     )
-                kv_indices_row[
-                    kv_offset + seq_len : kv_offset + seq_len + iters
-                ].copy_(token_pool[start + extend_offset].to(kv_indices_row.dtype))
+                kv_indices_row[kv_offset + seq_len : kv_offset + seq_len + iters].copy_(
+                    token_pool[start + extend_offset].to(kv_indices_row.dtype)
+                )
             cum_seq_len += seq_len
 
         kv_indptr_row[0] = 0
@@ -1320,7 +1352,9 @@ def generate_draft_decode_kv_indices(
             kv_indptr_row[zid] = base + zid * iters
 
 
-@register_triton_op("sglang.srt.speculative.triton_ops.cache_locs", "assign_extend_cache_locs")
+@register_triton_op(
+    "sglang.srt.speculative.triton_ops.cache_locs", "assign_extend_cache_locs"
+)
 def assign_extend_cache_locs(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -1355,7 +1389,9 @@ def assign_extend_cache_locs(
 # the modern EAGLE v2 pipeline. No Triton kernel to replace.
 
 
-@register_triton_op("sglang.srt.speculative.triton_ops.cache_locs", "assign_req_to_token_pool")
+@register_triton_op(
+    "sglang.srt.speculative.triton_ops.cache_locs", "assign_req_to_token_pool"
+)
 @register_triton_op("sglang.srt.speculative.spec_utils", "assign_req_to_token_pool")
 def assign_req_to_token_pool(
     req_pool_indices: torch.Tensor,
@@ -1382,7 +1418,9 @@ def assign_req_to_token_pool(
     )
 
 
-@register_triton_op("sglang.srt.speculative.spec_utils", "align_evict_mask_to_page_size")
+@register_triton_op(
+    "sglang.srt.speculative.spec_utils", "align_evict_mask_to_page_size"
+)
 def align_evict_mask_to_page_size(
     seq_lens: torch.Tensor,
     evict_mask: torch.Tensor,
@@ -1401,7 +1439,9 @@ def align_evict_mask_to_page_size(
     )
 
 
-@register_jit_op("sglang.srt.speculative.triton_ops.gather_spec_extras", "gather_spec_extras")
+@register_jit_op(
+    "sglang.srt.speculative.triton_ops.gather_spec_extras", "gather_spec_extras"
+)
 def gather_spec_extras(
     indices: torch.Tensor,
     topk_p_buf: torch.Tensor,
@@ -1423,7 +1463,9 @@ def gather_spec_extras(
     return topk_p, topk_index, bonus_tokens, hidden_states
 
 
-@register_jit_op("sglang.srt.speculative.reject_sampling", "chain_speculative_sampling_triton")
+@register_jit_op(
+    "sglang.srt.speculative.reject_sampling", "chain_speculative_sampling_triton"
+)
 def chain_speculative_sampling_triton(
     predicts: torch.Tensor,
     accept_index: torch.Tensor,
@@ -1503,8 +1545,11 @@ def compute_position_kernel(
 ) -> None:
     """Compute token positions and extend start locations for a batch."""
 
-    prefix_lens = extend_prefix_lens if has_prefix else torch.empty(0, device=extend_seq_lens.device, \
-            dtype=extend_seq_lens.dtype)
+    prefix_lens = (
+        extend_prefix_lens
+        if has_prefix
+        else torch.empty(0, device=extend_seq_lens.device, dtype=extend_seq_lens.dtype)
+    )
     out_positions, out_start_loc = torch.ops.xspeedgate_ops.compute_position_kernel(
         prefix_lens, extend_seq_lens, positions.numel()
     )
@@ -1666,7 +1711,9 @@ def _per_token_quant_int8(
     kunlun_ops.quant2d(x, x_q, tmp_scales, force_sdnn=True)
     scales.copy_(tmp_scales.view_as(scales))
     if x_sum is not None:
-        raise NotImplementedError("per_token_quant_int8: cal_sum is not supported on Kunlun.")
+        raise NotImplementedError(
+            "per_token_quant_int8: cal_sum is not supported on Kunlun."
+        )
 
 
 @register_triton_op(
@@ -1703,7 +1750,9 @@ def sglang_per_token_group_quant_int8(
     enable_v2: Optional[bool] = None,
 ):
     """sglang_per_token_group_quant_int8"""
-    raise NotImplementedError("sglang_per_token_group_quant_int8 is not supported on Kunlun.")
+    raise NotImplementedError(
+        "sglang_per_token_group_quant_int8 is not supported on Kunlun."
+    )
 
 
 @register_triton_op(
@@ -1751,19 +1800,15 @@ def _w8a8_block_int8_matmul(
 # ============================================================================
 
 from sglang_kunlun.kernels.dsv4_torch_shim import (  # noqa: E402
-    _fused_q_norm_rope_torch,
-    _fused_k_norm_rope_flashmla_torch,
-    _fused_k_norm_rope_flashmla_kunlun,
-    _fused_rope_inplace_torch,
-    _fused_rope_inplace_kunlun,
-    _fused_norm_rope_inplace_torch,
-    _fused_norm_rope_inplace_kunlun,
-    _fused_q_indexer_rope_hadamard_quant_torch,
-    _fused_q_indexer_rope_hadamard_quant_kunlun,
     _compress_forward_torch,
-    _compress_norm_rope_store_torch,
     _compress_norm_rope_store_kunlun,
     _create_paged_compress_data_kunlun,
+    _fused_k_norm_rope_flashmla_kunlun,
+    _fused_k_norm_rope_flashmla_torch,
+    _fused_norm_rope_inplace_kunlun,
+    _fused_q_indexer_rope_hadamard_quant_kunlun,
+    _fused_q_norm_rope_torch,
+    _fused_rope_inplace_kunlun,
 )
 
 
@@ -1796,7 +1841,14 @@ def fused_k_norm_rope_flashmla(
     Step 2: ``xspeedgate_ops.flashinfer_rotary_embedding`` on rope part
     Step 3: ``xspeedgate_ops.set_k_and_s_v4`` (bf16) or torch FP8 quant+write
     """
-    _fused_k_norm_rope_flashmla_kunlun(kv, kv_weight, eps, freqs_cis, positions, out_loc, kvcache, page_size)
+    if kvcache.dtype in (torch.bfloat16, torch.float16):
+        _fused_k_norm_rope_flashmla_kunlun(
+            kv, kv_weight, eps, freqs_cis, positions, out_loc, kvcache, page_size
+        )
+    else:
+        _fused_k_norm_rope_flashmla_torch(
+            kv, kv_weight, eps, freqs_cis, positions, out_loc, kvcache, page_size
+        )
 
 
 @register_jit_op("sglang.jit_kernel.dsv4.elementwise", "fused_rope_inplace")
@@ -1831,7 +1883,9 @@ def fused_norm_rope_inplace(
     _fused_norm_rope_inplace_kunlun(kv, weight, eps, freq_cis, positions)
 
 
-@register_jit_op("sglang.jit_kernel.dsv4.elementwise", "fused_q_indexer_rope_hadamard_quant")
+@register_jit_op(
+    "sglang.jit_kernel.dsv4.elementwise", "fused_q_indexer_rope_hadamard_quant"
+)
 def fused_q_indexer_rope_hadamard_quant(
     q_input: torch.Tensor,
     weight: torch.Tensor,
@@ -1843,7 +1897,9 @@ def fused_q_indexer_rope_hadamard_quant(
 
     The pure-torch ``_fused_q_indexer_rope_hadamard_quant_torch`` is retained as reference.
     """
-    return _fused_q_indexer_rope_hadamard_quant_kunlun(q_input, weight, weight_scale, freqs_cis, positions)
+    return _fused_q_indexer_rope_hadamard_quant_kunlun(
+        q_input, weight, weight_scale, freqs_cis, positions
+    )
 
 
 @register_jit_op("sglang.jit_kernel.dsv4.compress", "compress_forward")
@@ -1860,8 +1916,14 @@ def compress_forward(
 ) -> torch.Tensor:
     """Pure-torch replacement: softmax-pool compress_forward."""
     return _compress_forward_torch(
-        kv_score_buffer, kv_score_input, ape, plan,
-        head_dim=head_dim, compress_ratio=compress_ratio, out=out, is_online=is_online,
+        kv_score_buffer,
+        kv_score_input,
+        ape,
+        plan,
+        head_dim=head_dim,
+        compress_ratio=compress_ratio,
+        out=out,
+        is_online=is_online,
     )
 
 
@@ -1881,10 +1943,16 @@ def compress_norm_rope_store(
 ) -> None:
     """Kunlun-native: fused norm+rope via dpsk_v4_norm_rope_gptj + store."""
     _compress_norm_rope_store_kunlun(
-        kv, plan,
-        norm_weight=norm_weight, norm_eps=norm_eps, freq_cis=freq_cis,
-        out_loc=out_loc, kvcache=kvcache, page_size=page_size,
-        use_fp4=use_fp4, bf16_store=bf16_store,
+        kv,
+        plan,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+        freq_cis=freq_cis,
+        out_loc=out_loc,
+        kvcache=kvcache,
+        page_size=page_size,
+        use_fp4=use_fp4,
+        bf16_store=bf16_store,
     )
 
 
@@ -1928,6 +1996,7 @@ def triton_create_paged_compress_data(
 # fall back to the pure-torch vectorized implementation.
 # ---------------------------------------------------------------------------
 
+
 @register_jit_op("sglang.jit_kernel.dsv4.topk", "topk_transform_512")
 def topk_transform_512(
     scores: torch.Tensor,
@@ -1952,24 +2021,35 @@ def topk_transform_512(
     ``core_metadata.c4_sparse_raw_indices``), so we can safely ignore it and
     stay on the fast xspeedgate path.
     """
-    import xspeedgate_ops  # noqa: F401
 
     # Detect the "real consumer" cases and fallback for them only.
     from sglang.srt.layers.attention.dsv4.indexer import get_global_indexer_capturer
+
     _capturer = get_global_indexer_capturer()
     _needs_raw = (out_raw_indices is not None) and (_capturer is not None)
     if _needs_raw:
         from sglang.srt.layers.attention.dsv4.indexer import (
             topk_transform_512_pytorch_vectorized,
         )
+
         topk_transform_512_pytorch_vectorized(
-            scores, seq_lens, page_tables, out_page_indices,
-            page_size, out_raw_indices,
+            scores,
+            seq_lens,
+            page_tables,
+            out_page_indices,
+            page_size,
+            out_raw_indices,
         )
         return
     torch.ops.xspeedgate_ops.topk_transform(
-        scores, seq_lens, page_tables, out_page_indices,
-        512, None, page_size, True,
+        scores,
+        seq_lens,
+        page_tables,
+        out_page_indices,
+        512,
+        None,
+        page_size,
+        True,
     )
 
 
@@ -1985,9 +2065,14 @@ def topk_transform_512_v2(
     """Kunlun-native topk (v2 signature drops raw_indices, keeps metadata for
     upstream compat; we ignore metadata since xspeedgate handles planning
     internally)."""
-    import xspeedgate_ops  # noqa: F401
 
     torch.ops.xspeedgate_ops.topk_transform(
-        scores, seq_lens, page_tables, out_page_indices,
-        512, None, page_size, True,
+        scores,
+        seq_lens,
+        page_tables,
+        out_page_indices,
+        512,
+        None,
+        page_size,
+        True,
     )
