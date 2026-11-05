@@ -780,6 +780,28 @@ def _kunlun_sparse_prefill_enabled() -> bool:
     return os.environ.get("SGLANG_KUNLUN_DSV4_SPARSE_PREFILL", "1") == "1"
 
 
+def _kunlun_sparse_prefill_capable() -> bool:
+    """Whether the installed XSpeedGate exports the ops the branch needs.
+
+    The branch routes its two hot kernels through XSpeedGate
+    (``build_swa_token_ids``, ``combine_topk_swa_indices``). A build without
+    them takes the Triton route instead, which on Kunlun is
+    ``RuntimeError: 0 compatible backends for target (cuda)`` on the first
+    extend batch -- one exception per (ATTN_CP, TP, EP) rank, after which PD
+    decode answers 503 ``No prefill workers available``. Checking capability
+    keeps the branch on where it works and falls back to
+    ``compressed_attention`` -- the path every acceptance cell before the
+    0.5.23 rebase ran -- where it does not.
+    """
+    ops = getattr(torch.ops, "xspeedgate_ops", None)
+    if ops is None:
+        return False
+    return all(
+        hasattr(ops, name)
+        for name in ("build_swa_token_ids", "combine_topk_swa_indices")
+    )
+
+
 @plugin_hook(
     "sgl_kernel.flash_mla.flash_mla_sparse_fwd",
     type=HookType.REPLACE,
@@ -3118,6 +3140,8 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         sizing, and the reference-attention debug paths must stay reachable.
         """
         if not _kunlun_sparse_prefill_enabled():
+            return None
+        if not _kunlun_sparse_prefill_capable():
             return None
         if compress_ratio not in _KUNLUN_SPARSE_PREFILL_RATIOS:
             return None
