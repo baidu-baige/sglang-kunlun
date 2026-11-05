@@ -2161,10 +2161,64 @@ def get_paged_mqa_logits_metadata_kunlun(
     )
     _dspark_require(1 <= num_sm <= 1024, op, f"num_sm must be in [1, 1024], got {num_sm}")
 
+    if not hasattr(torch.ops.xspeedgate_ops, op):
+        # The installed XSpeedGate (1.2.0+8e67128) does not export this schedule,
+        # and the upstream JIT fallback needs gcc-11 for ``std::bit_cast``. The
+        # schedule is a pure integer partition, so the torch form below is exact
+        # rather than an approximation: it is the algorithm in
+        # ``csrc/deepseek_v4/paged_mqa_metadata.cuh`` (and in the upstream test's
+        # ``paged_mqa_metadata_ref``). Returning an *empty* tensor here instead
+        # would be an accuracy change -- the schedule decides which query rows
+        # each SM scores, so a wrong table silently changes the logits.
+        return _paged_mqa_logits_metadata_torch(seq_lens, num_sm)
+
     metadata = torch.ops.xspeedgate_ops.get_paged_mqa_logits_metadata(
         seq_lens, page_size, num_sm
     )
     return metadata
+
+
+def _paged_mqa_logits_metadata_torch(
+    seq_lens: torch.Tensor, num_sm: int
+) -> torch.Tensor:
+    """Torch form of the paged-MQA SM schedule.
+
+    Each request contributes ``ceil(len / 256)`` units of work. ``num_sm``
+    workers take ``avg = total // num_sm`` units each, and the last ``ret``
+    workers take one extra (DeepGEMM's reversed remainder allocation), so
+    leading workers stay at ``q = 0`` when there is less work than workers.
+    Row ``i`` of the result is the request index ``q`` the worker starts at and
+    the unit offset into it.
+
+    Args:
+        seq_lens: Sequence lengths to partition, any shape / int dtype.
+        num_sm: Number of workers for the paged-MQA schedule.
+
+    Returns:
+        int32 tensor of shape ``[num_sm + 1, 2]``.
+    """
+    lens = seq_lens.reshape(-1).to(torch.int64)
+    work = (lens + 255) // 256
+    prefix = torch.cumsum(work, dim=0)
+    zero = torch.zeros((), dtype=torch.int64, device=lens.device)
+    total = prefix[-1] if prefix.numel() else zero
+    avg = torch.div(total, num_sm, rounding_mode="floor")
+    ret = total - avg * num_sm
+    pivot = num_sm - ret
+
+    rows = torch.arange(num_sm + 1, dtype=torch.int64, device=lens.device)
+    target = rows * avg + torch.clamp(rows - pivot, min=0)
+    # Count of prefix entries <= target, i.e. the kernel's binary-search `lo`.
+    q = torch.searchsorted(prefix, target, right=True)
+    if prefix.numel():
+        previous = torch.where(q > 0, prefix[(q - 1).clamp(min=0)], zero)
+    else:
+        previous = torch.zeros_like(target)
+    bs = torch.full_like(q, lens.numel())
+    done = q >= bs
+    column0 = torch.where(done, bs, q)
+    column1 = torch.where(done, torch.zeros_like(target), target - previous)
+    return torch.stack([column0, column1], dim=1).to(torch.int32)
 
 
 @register_jit_op(
