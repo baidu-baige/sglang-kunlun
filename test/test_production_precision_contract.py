@@ -434,13 +434,24 @@ class ProductionPrecisionContractTest(unittest.TestCase):
         )
         namespace = {
             "torch": torch,
+            "_log_lod_route": lambda *args, **kwargs: None,
             "_is_graph_extend_mode": lambda _mode: True,
             "_dsa_cp_prefill_ranks": lambda _forward_batch: None,
             "_dsa_prefill_cp_enabled": lambda: False,
         }
+        # The eager-prefill branch caches its LoD buffers through these two
+        # module-level helpers, so exec the real ones next to _make_lod.
+        prefill_aux_names = {"_alloc_prefill_lod_aux", "_get_prefill_lod_aux"}
+        prefill_aux_nodes = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in prefill_aux_names
+        ]
         exec(
             compile(
-                ast.Module(body=[make_lod_node], type_ignores=[]),
+                ast.Module(
+                    body=prefill_aux_nodes + [make_lod_node], type_ignores=[]
+                ),
                 str(BACKEND_HOOKS),
                 "exec",
             ),
@@ -475,7 +486,9 @@ class ProductionPrecisionContractTest(unittest.TestCase):
             extend_seq_lens_tensor=None,
         )
         backend = types.SimpleNamespace(
-            _attention_decode_aux={}, _attention_graph_extend_aux={}
+            _attention_decode_aux={},
+            _attention_graph_extend_aux={},
+            _attention_prefill_lod_aux={},
         )
         metadata = {}
 
@@ -665,6 +678,45 @@ class ProductionPrecisionContractTest(unittest.TestCase):
         self.assertEqual(query_lens.tolist(), [3, 3])
         self.assertEqual(kv_lens_cpu.tolist(), [2, 31])
         self.assertEqual(kv_lens.tolist(), [3, 31])
+
+    def test_eager_prefill_lod_reuses_its_buffers_per_batch_size(self):
+        """Same contract as the decode and graph-extend aux caches."""
+        source = BACKEND_HOOKS.read_text()
+        tree = ast.parse(source, filename=str(BACKEND_HOOKS))
+        helper_names = {"_alloc_prefill_lod_aux", "_get_prefill_lod_aux"}
+        helpers = ast.Module(
+            body=[
+                node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name in helper_names
+            ],
+            type_ignores=[],
+        )
+        namespace = {"torch": torch}
+        exec(compile(helpers, str(BACKEND_HOOKS), "exec"), namespace)
+
+        cache = {}
+        device = torch.device("cpu")
+        aux = namespace["_get_prefill_lod_aux"](cache, 2, device)
+        pointers = [tensor.data_ptr() for tensor in aux]
+
+        again = namespace["_get_prefill_lod_aux"](cache, 2, device)
+        self.assertIs(again, aux)
+        self.assertEqual([tensor.data_ptr() for tensor in again], pointers)
+
+        other = namespace["_get_prefill_lod_aux"](cache, 3, device)
+        self.assertIsNot(other, aux)
+        self.assertEqual(len(cache), 2)
+
+        q_lod_cpu, q_lod, kv_lens_cpu, kv_lens = aux
+        self.assertEqual(q_lod_cpu.shape, (3,))
+        self.assertEqual(q_lod.shape, (3,))
+        self.assertEqual(kv_lens_cpu.shape, (2,))
+        self.assertEqual(kv_lens.shape, (2,))
+        for tensor in aux:
+            self.assertEqual(tensor.dtype, torch.int32)
+        # q_lod_cpu[0] is never written by _make_lod; it must start at zero.
+        self.assertEqual(q_lod_cpu[0].item(), 0)
 
     def test_packed_rows_only_admit_exact_fixed_width_layouts(self):
         self.assertTrue(mtp.packed_rows_fit_fixed_width([4], 4))

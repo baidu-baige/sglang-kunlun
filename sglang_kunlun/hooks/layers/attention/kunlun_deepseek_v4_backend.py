@@ -291,6 +291,23 @@ def _get_graph_extend_aux(
     return aux
 
 
+def _alloc_prefill_lod_aux(batch_size: int, device: torch.device):
+    q_lod_cpu = torch.zeros(batch_size + 1, dtype=torch.int32)
+    q_lod = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    kv_lens_cpu = torch.zeros(batch_size, dtype=torch.int32)
+    kv_lens = torch.zeros(batch_size, dtype=torch.int32, device=device)
+    return q_lod_cpu, q_lod, kv_lens_cpu, kv_lens
+
+
+def _get_prefill_lod_aux(cache, batch_size: int, device: torch.device):
+    key = (batch_size, device)
+    aux = cache.get(key)
+    if aux is None:
+        aux = _alloc_prefill_lod_aux(batch_size, device)
+        cache[key] = aux
+    return aux
+
+
 def _verify_row_lod_enabled(forward_batch) -> bool:
     """eager 的 TARGET_VERIFY 必须用 per-row LoD，和 sglang 0.5.8 一致。
 
@@ -907,6 +924,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         self._verify_row_lod_aux = {}
         self._attention_decode_aux = {}
         self._attention_graph_extend_aux = {}
+        self._attention_prefill_lod_aux = {}
         self._c4_decode_aux = {}
 
     def get_swa_page_indices(self, seq_lens_casual, req_pool_indices_repeated):
@@ -1472,6 +1490,27 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
                 raise ValueError("cannot derive Kunlun DSV4 extend lengths")
             lengths = [num_queries // batch_size] * batch_size
         batch_size = len(lengths)
+        if not _dsa_prefill_cp_enabled():
+            # Same shape contract as the decode and graph-extend branches
+            # above: every tensor here is sized by ``batch_size`` alone, so
+            # cache the buffers and refill them in place. CP is excluded
+            # because the ``pad_rows`` concatenation below also depends on
+            # ``num_queries``. ``q_lod_cpu[0]`` keeps the 0 it was allocated
+            # with; only ``[1:]`` is ever written.
+            q_lod_cpu, q_lod, kv_lens_cpu, kv_lens = _get_prefill_lod_aux(
+                self._attention_prefill_lod_aux, batch_size, device
+            )
+            if batch_size:
+                torch.cumsum(
+                    torch.tensor(lengths, dtype=torch.int32), 0, out=q_lod_cpu[1:]
+                )
+            kv_lens.copy_(forward_batch.seq_lens[:batch_size])
+            if forward_batch.seq_lens_cpu is not None:
+                kv_lens_cpu.copy_(forward_batch.seq_lens_cpu[:batch_size])
+            else:
+                kv_lens_cpu.copy_(kv_lens)
+            q_lod.copy_(q_lod_cpu)
+            return q_lod_cpu, q_lod, kv_lens_cpu, kv_lens
         q_lod_cpu = torch.zeros(batch_size + 1, dtype=torch.int32)
         if batch_size:
             torch.cumsum(torch.tensor(lengths, dtype=torch.int32), 0, out=q_lod_cpu[1:])
