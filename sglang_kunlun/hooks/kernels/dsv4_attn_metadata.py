@@ -57,23 +57,18 @@ implementations of the three kernels in ``sglang_kunlun/kernels/kernel_ops.py``
 alongside the ops already registered there; this hook is the smaller step that
 makes the model runnable without new kernels.
 
-The module moved between releases, so resolve the path instead of hard-coding
-one: a hard-coded miss would make ``apply_hooks`` log a full traceback on every
-start, which reads like a defect.
+The module has moved between releases, so both known paths are listed and a
+version bump needs no change here. Only the paths the build actually has get
+registered: registering an absent one makes ``apply_hooks`` log a traceback at
+every start, which reads like a defect.
 """
 
 from __future__ import annotations
 
 import importlib.util
-import logging
-import sys
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
-logger = logging.getLogger(__name__)
-
-# Newest layout first. 0.5.17 shipped the flat name; it later moved under
-# ``dsv4/``.
 _CANDIDATE_MODULES = (
     "sglang.kernels.ops.attention.dsv4.attn_metadata_kernels",
     "sglang.kernels.ops.attention.dsv4_attn_metadata_kernels",
@@ -86,33 +81,18 @@ def force_torch_metadata_dispatch(original_fn, *args, **kwargs) -> bool:
     return False
 
 
-def _resolve_module() -> str | None:
-    """Name of whichever candidate module this SGLang build actually has."""
-    for name in _CANDIDATE_MODULES:
-        if name in sys.modules:
-            return name
-    for name in _CANDIDATE_MODULES:
-        try:
-            if importlib.util.find_spec(name) is not None:
-                return name
-        except (AttributeError, ImportError, ValueError):
-            continue
-    return None
-
-
-_module_name = _resolve_module()
-
-if _module_name is None:
-    logger.debug(
-        "sglang-kunlun: no DSV4 attention-metadata kernel module found "
-        "(looked for %s); nothing to hook",
-        ", ".join(_CANDIDATE_MODULES),
-    )
-else:
-    plugin_hook(f"{_module_name}._inputs_on_cuda", type=HookType.AROUND)(
+def _hook_if_present(module: str) -> bool:
+    """Register the hook on *module* when this SGLang build ships it."""
+    try:
+        if importlib.util.find_spec(module) is None:
+            return False
+    except ImportError:
+        return False
+    plugin_hook(f"{module}._inputs_on_cuda", type=HookType.AROUND)(
         force_torch_metadata_dispatch
     )
-    logger.debug(
-        "sglang-kunlun: routing DSV4 attention metadata in %s to the torch path",
-        _module_name,
-    )
+    return True
+
+
+for _module in _CANDIDATE_MODULES:
+    _hook_if_present(_module)

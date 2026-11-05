@@ -13,8 +13,6 @@
 # limitations under the License.
 """Hardware-free tests for the DSV4 attention-metadata dispatch hook."""
 
-import sys
-import types
 import unittest
 from unittest import mock
 
@@ -48,46 +46,45 @@ class ForceTorchDispatchTest(unittest.TestCase):
             hook.force_torch_metadata_dispatch(boom, 1, 2)
 
 
-class ResolveModuleTest(unittest.TestCase):
+class HookRegistrationTest(unittest.TestCase):
     def test_candidates_cover_both_known_layouts(self):
         self.assertEqual(hook._CANDIDATE_MODULES, (NEW_LAYOUT, OLD_LAYOUT))
 
-    def test_prefers_an_already_imported_module(self):
-        with mock.patch.dict(
-            sys.modules, {OLD_LAYOUT: types.ModuleType(OLD_LAYOUT)}, clear=False
+    def test_registers_a_module_the_build_ships(self):
+        with (
+            mock.patch.object(hook.importlib.util, "find_spec", return_value=object()),
+            mock.patch.object(hook, "plugin_hook") as plugin_hook,
         ):
-            sys.modules.pop(NEW_LAYOUT, None)
-            self.assertEqual(hook._resolve_module(), OLD_LAYOUT)
+            self.assertIs(hook._hook_if_present(NEW_LAYOUT), True)
 
-    def test_prefers_the_newer_layout_when_both_are_present(self):
-        with mock.patch.dict(
-            sys.modules,
-            {
-                NEW_LAYOUT: types.ModuleType(NEW_LAYOUT),
-                OLD_LAYOUT: types.ModuleType(OLD_LAYOUT),
-            },
-            clear=False,
+        plugin_hook.assert_called_once_with(
+            f"{NEW_LAYOUT}._inputs_on_cuda", type=hook.HookType.AROUND
+        )
+        plugin_hook.return_value.assert_called_once_with(
+            hook.force_torch_metadata_dispatch
+        )
+
+    def test_skips_a_module_the_build_lacks(self):
+        """Registering an absent path would log a traceback at every start."""
+        with (
+            mock.patch.object(hook.importlib.util, "find_spec", return_value=None),
+            mock.patch.object(hook, "plugin_hook") as plugin_hook,
         ):
-            self.assertEqual(hook._resolve_module(), NEW_LAYOUT)
+            self.assertIs(hook._hook_if_present(OLD_LAYOUT), False)
 
-    def test_returns_none_when_no_candidate_exists(self):
-        with mock.patch.dict(sys.modules, {}, clear=False):
-            for name in hook._CANDIDATE_MODULES:
-                sys.modules.pop(name, None)
-            with mock.patch.object(hook.importlib.util, "find_spec", return_value=None):
-                self.assertIsNone(hook._resolve_module())
+        plugin_hook.assert_not_called()
 
     def test_survives_an_unimportable_candidate(self):
         """An SGLang build without the DSV4 kernels must not break startup."""
-        with mock.patch.dict(sys.modules, {}, clear=False):
-            for name in hook._CANDIDATE_MODULES:
-                sys.modules.pop(name, None)
-            with mock.patch.object(
-                hook.importlib.util,
-                "find_spec",
-                side_effect=ImportError("no triton"),
-            ):
-                self.assertIsNone(hook._resolve_module())
+        with (
+            mock.patch.object(
+                hook.importlib.util, "find_spec", side_effect=ImportError("no triton")
+            ),
+            mock.patch.object(hook, "plugin_hook") as plugin_hook,
+        ):
+            self.assertIs(hook._hook_if_present(OLD_LAYOUT), False)
+
+        plugin_hook.assert_not_called()
 
 
 if __name__ == "__main__":
