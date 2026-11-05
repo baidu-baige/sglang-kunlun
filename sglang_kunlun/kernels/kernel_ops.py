@@ -8008,6 +8008,23 @@ def build_swa_token_ids(
         swa_offsets = torch.zeros(1, dtype=torch.int32, device=device)
         return swa_token_ids, swa_first_pos, swa_gather_lens, swa_offsets
 
+    if not hasattr(torch.ops.xspeedgate_ops, "build_swa_token_ids"):
+        # The installed XSpeedGate (1.2.0+8e67128) does not export this op, and
+        # without a fallback the first extend batch of a PD prefill dies with
+        # `AttributeError: '_OpNamespace' 'xspeedgate_ops'`. The same geometry is
+        # already implemented in torch for the older call site above
+        # (`sparse_prefill_kernels.build_swa_token_ids`), which is what this
+        # build was serving before the 0.5.23 rebase.
+        return build_swa_token_ids_kunlun(
+            seq_lens,
+            extend_seq_lens,
+            req_pool_indices,
+            req_to_token,
+            full_to_swa,
+            swa_window,
+            total_swa,
+        )
+
     swa_offsets = torch.empty(num_reqs + 1, dtype=torch.int32, device=device)
     torch.ops.xspeedgate_ops.build_swa_token_ids(
         swa_token_ids,
