@@ -7,6 +7,7 @@ stores only request geometry, never projected queries, keys or scores.
 from __future__ import annotations
 
 import os
+import logging
 from contextvars import ContextVar
 
 import torch
@@ -16,6 +17,130 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 _BACKEND = "sglang.srt.layers.attention.deepseek_v4_backend.DeepseekV4AttnBackend."
 _ACTIVE_BACKEND = ContextVar("kunlun_prefill_indexer_backend", default=None)
 _CACHE_ATTR = "_kunlun_lri_prep"
+logger = logging.getLogger(__name__)
+_LOGGED_FUSED_PREFILL = False
+
+
+@plugin_hook(
+    "sglang.srt.layers.attention.dsv4.v41_indexer.has_dense_fp4_indexer",
+    type=HookType.AROUND,
+)
+def dense_fp4_indexer_layout_guard(original_fn):
+    """The 0522 factory must not send int8 rows to a packed FP4 reader."""
+    from sglang_kunlun.hooks.mem_cache.common import low_ratio_index_k_int8_enabled
+
+    return False if low_ratio_index_k_int8_enabled() else original_fn()
+
+
+@plugin_hook(
+    "sglang.srt.layers.attention.dsv4.v41_indexer.full_topk.FullTopKIndexer.topk_prefill",
+    type=HookType.AROUND,
+)
+def full_topk_prefill_fused_kunlun(original_fn, self, inputs):
+    """Pack 0519's fused logits/top-k at the 0522 full-top-k boundary.
+
+    Candidate publishers and consumers have separate entrypoints in 0522 and
+    retain their upstream semantics. CP supplies per-request local row counts.
+    """
+    if _full_topk_prefill_fused(self, inputs):
+        return None
+    return original_fn(self, inputs)
+
+
+def _full_topk_prefill_fused(self, inputs) -> bool:
+    if os.environ.get("SGLANG_KUNLUN_DSV41_FUSED_PREFILL_TOPK", "0") != "1":
+        return False
+    if not hasattr(torch.ops.xspeedgate_ops, "dsv4_low_ratio_index_topk_prefill"):
+        return False
+    indexer = inputs.indexer
+    if indexer.is_candidate_source or indexer.uses_candidates:
+        return False
+    rows = inputs.x.shape[0]
+    topk = int(indexer.index_topk)
+    if rows == 0 or topk <= 0 or inputs.positions.numel() != rows:
+        return False
+    raw, page = inputs.out_raw_indices, inputs.out_page_indices
+    if raw.shape[0] < rows or raw.shape[1] < topk:
+        return False
+    if page is not None and (page.shape[0] < rows or page.shape[1] < topk):
+        return False
+
+    req = inputs.req_rows
+    if req is None:
+        counts = inputs.rows_per_request
+        if (
+            counts is None or len(counts) != inputs.req_pool_indices.numel()
+            or any(n < 0 for n in counts) or sum(counts) != rows
+        ):
+            return False
+        pairs = [(r, n) for r, n in zip(inputs.req_pool_indices.tolist(), counts) if n]
+        req_ids, row_counts = [r for r, _ in pairs], [n for _, n in pairs]
+    else:
+        if req.numel() != rows:
+            return False
+        ids, counts = torch.unique_consecutive(req, return_counts=True)
+        req_ids, row_counts = ids.tolist(), counts.tolist()
+        if len(set(req_ids)) != len(req_ids):
+            return False
+    if not req_ids or len(req_ids) > 64:
+        return False
+    ratio = inputs.compress_ratio
+    pos = inputs.positions
+    visible = ((pos + 1) // ratio).to(torch.int32)
+    lengths, slots, start = [], [], 0
+    for request, count in zip(req_ids, row_counts):
+        length = int(visible[start:start + count].max().item())
+        if length < 0 or length * ratio > self.req_to_token.shape[1]:
+            return False
+        lengths.append(length)
+        if length:
+            columns = torch.arange(length, device=pos.device)
+            slots.append(self.req_to_token[request, columns * ratio].to(torch.int64) // ratio)
+        start += count
+    if not slots:
+        inputs.reset_outputs()
+        return True
+    slots = torch.cat(slots)
+    keys = self.token_to_kv_pool.get_low_ratio_index_k_dequant(inputs.layer_id, slots)
+    q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
+    weights = indexer.head_weights(inputs.x)
+    from sglang_kunlun.hooks.layers.attention.dsv41_sparse import _fused_logits_usable
+
+    if not _fused_logits_usable(q, keys, weights):
+        return False
+
+    def offsets(counts):
+        values = [0]
+        for count in counts:
+            values.append(values[-1] + count)
+        return torch.tensor(values, device=pos.device, dtype=torch.int32)
+
+    sizes = [n * length for n, length in zip(row_counts, lengths)]
+    # Both vendor kernels address logits with int32 offsets.
+    if sum(sizes) > 2**31 - 1:
+        return False
+    qo, ko, lo = offsets(row_counts), offsets(lengths), offsets(sizes)
+    logits = torch.empty(sum(sizes), device=pos.device, dtype=torch.float32)
+    w_op = weights if weights.dtype in (torch.bfloat16, torch.float32) else weights.float()
+    torch.ops.xdll_ops.dsv4_low_ratio_index_logits(
+        q.to(torch.bfloat16).contiguous(), keys.to(torch.bfloat16).contiguous(),
+        w_op.contiguous(), qo, ko, visible.contiguous(), logits, lo,
+    )
+    selected_page, selected_raw = torch.ops.xspeedgate_ops.dsv4_low_ratio_index_topk_prefill(
+        logits, lo, qo, ko, visible.contiguous(), slots.contiguous(), topk,
+    )
+    inputs.reset_outputs()
+    raw[:rows, :topk] = selected_raw
+    if page is not None:
+        page[:rows, :topk] = selected_page
+    global _LOGGED_FUSED_PREFILL
+    if not _LOGGED_FUSED_PREFILL:
+        _LOGGED_FUSED_PREFILL = True
+        logger.info(
+            "Low-ratio prefill: fused logits + top-k (%d requests, %d rows)",
+            len(req_ids), rows,
+        )
+    return True
 
 
 @plugin_hook(_BACKEND + "_low_ratio_index_topk", type=HookType.AROUND)

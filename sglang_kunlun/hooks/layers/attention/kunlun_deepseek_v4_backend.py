@@ -780,6 +780,31 @@ def _kunlun_sparse_prefill_enabled() -> bool:
     return os.environ.get("SGLANG_KUNLUN_DSV4_SPARSE_PREFILL", "1") == "1"
 
 
+def _resolve_flash_mla_sparse_fwd():
+    """Return the ``flash_mla_sparse_fwd`` entrypoint, whichever module carries it.
+
+    Newer builds moved this entrypoint out of kunlun_ops into chen_ops, so take
+    whichever module actually carries it instead of assuming either.
+    """
+    import kunlun_ops
+
+    sparse_fwd = getattr(kunlun_ops, "flash_mla_sparse_fwd", None)
+    if sparse_fwd is None:
+        try:
+            import chen_ops
+        except ImportError as exc:
+            raise AttributeError(
+                "flash_mla_sparse_fwd is missing from kunlun_ops and chen_ops "
+                "is not installed"
+            ) from exc
+        sparse_fwd = getattr(chen_ops, "flash_mla_sparse_fwd", None)
+        if sparse_fwd is None:
+            raise AttributeError(
+                "flash_mla_sparse_fwd is missing from both kunlun_ops and chen_ops"
+            )
+    return sparse_fwd
+
+
 @plugin_hook(
     "sgl_kernel.flash_mla.flash_mla_sparse_fwd",
     type=HookType.REPLACE,
@@ -827,7 +852,7 @@ def flash_mla_sparse_fwd_kunlun(
     Returns:
         Attention output, maximum logits, and log-sum-exp tensors.
     """
-    import kunlun_ops
+    sparse_fwd = _resolve_flash_mla_sparse_fwd()
 
     if q.dim() != 3:
         raise ValueError(f"q must be [s_q, h_q, d_qk], got {tuple(q.shape)}")
@@ -869,7 +894,7 @@ def flash_mla_sparse_fwd_kunlun(
     # positional masking means nothing to them (same reason the cu_seqlens stay
     # None).
     if _sparse_mla_allocates_outputs():
-        out, max_logits, lse, _ = kunlun_ops.flash_mla_sparse_fwd(
+        out, max_logits, lse, _ = sparse_fwd(
             q_arg,
             kv_arg,
             indices_arg,
@@ -888,7 +913,7 @@ def flash_mla_sparse_fwd_kunlun(
         out = torch.empty((tokens, heads, d_v), dtype=q_arg.dtype, device=q_arg.device)
         max_logits = torch.empty((tokens, heads), dtype=torch.float32, device=q_arg.device)
         lse = torch.empty_like(max_logits)
-        status = kunlun_ops.flash_mla_sparse_fwd(
+        status = sparse_fwd(
             q=q_arg, kv=kv_arg, indices=indices_arg.squeeze(1),
             o=out, max_logits=max_logits, lse=lse,
             qlod_cpu=None, qlod_xpu=None, kvlod_cpu=None, kvlod_xpu=None,
@@ -922,9 +947,13 @@ def flash_mla_sparse_fwd_kunlun(
 
 @functools.cache
 def _sparse_mla_allocates_outputs() -> bool:
-    import kunlun_ops
-
-    return "d_v" in inspect.signature(kunlun_ops.flash_mla_sparse_fwd).parameters
+    sparse_fwd = _resolve_flash_mla_sparse_fwd()
+    try:
+        return "d_v" in inspect.signature(sparse_fwd).parameters
+    except (ValueError, TypeError):
+        # pybind11 builtins (e.g. the chen_ops build) may not expose a
+        # signature; those follow the allocating ABI.
+        return True
 
 
 # ``get_paged_mqa_logits_metadata`` used to be replaced here with an empty
@@ -1736,6 +1765,10 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         """Low-ratio decode/verify indexer top-k via the fused XSpeedGate
         ``dsv41_low_ratio_indexer`` kernel on Kunlun.
         """
+        from sglang_kunlun.hooks.mem_cache.common import low_ratio_index_k_int8_enabled
+
+        use_int8 = low_ratio_index_k_int8_enabled()
+        op_name = "dsv41_low_ratio_indexer_int8" if use_int8 else "dsv41_low_ratio_indexer"
         ratio = layer.compress_ratio
         indexer = layer.indexer
         core = self.forward_metadata.core_metadata
@@ -1758,6 +1791,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             metadata.max_compressed_seq_len,
             self.req_to_token.shape[1] // ratio,
         )
+        window = (window // 512) * 512
         # 0519 aligned window downward to a multiple of block_size here; the
         # migration dropped this line and replaced it with a modulo-window bail
         # condition. Measured window=262411 block_size=8 (remainder 3), so decode
@@ -1777,7 +1811,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             or window < block_size
             or k < 1
             or k > 512
-            or not hasattr(torch.ops.xspeedgate_ops, "dsv41_low_ratio_indexer")
+            or not hasattr(torch.ops.xspeedgate_ops, op_name)
         )
         if _bail:
             return self._low_ratio_index_topk_sm90_decode_native(
@@ -1791,7 +1825,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         q = indexer.queries(q_lora, layer.freqs_cis[pos]).contiguous()  # [R,32,128]
         head_w = indexer.head_weights(x).contiguous()  # [R,32]
         k_pool = pool.get_index_k_with_scale_buffer(layer.layer_id)
-        fp4_lut = self._low_ratio_fp4_lut(q.device)
+        layout_args = () if use_int8 else (self._low_ratio_fp4_lut(q.device),)
 
         req_i = req.to(torch.int32).contiguous()
         pos_i = pos.to(torch.int32).contiguous()
@@ -1819,11 +1853,11 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             # Ignored when `is_consume` is False, but the op still type-checks it.
             cand_mask = torch.zeros((rows, window), dtype=torch.bool, device=q.device)
 
-        page_out, published = torch.ops.xspeedgate_ops.dsv41_low_ratio_indexer(
+        page_out, published = getattr(torch.ops.xspeedgate_ops, op_name)(
             q,
             head_w,
             k_pool,
-            fp4_lut,
+            *layout_args,
             req_to_token,
             req_i,
             pos_i,
@@ -4391,6 +4425,10 @@ def _forward_compress_zeroed_kunlun(
 
 def _dense_fp4_indexer_usable() -> bool:
     """Whether the dense fp4 indexer is usable (depends on deep_gemm's fp8_fp4_mqa_logits)."""
+    from sglang_kunlun.hooks.mem_cache.common import low_ratio_index_k_int8_enabled
+
+    if low_ratio_index_k_int8_enabled():
+        return False
     if envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get():
         return False
     try:

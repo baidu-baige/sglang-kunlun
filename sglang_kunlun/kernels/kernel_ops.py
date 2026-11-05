@@ -3182,22 +3182,17 @@ def markov_greedy_step_triton(
     type=HookType.REPLACE,
 )
 def markov_sample_step_execute_kunlun(cls, **kwargs):
-    """Keep the DSpark draft sampler on its own torch reference.
+    """Use exact greedy reduction, retaining the torch sampling reference.
 
-    0.5.22 replaced the 0.5.19 online sampler (``sample_step_tokens`` plus the
-    ``_online_partial_kernel`` / ``_online_combine_kernel`` /
-    ``_build_step_local_kernel`` triton kernels this plugin used to replace one by
-    one) with ``MarkovSampleStep``, a single Philox Gumbel-max kernel. Its
-    ``execute`` dispatches on ``inputs_on_cuda(**kwargs)``, which is true on
-    Kunlun because the platform reuses the CUDA dispatch key, so every draft step
-    would try to compile ``_markov_sample_partial_kernel``.
-
-    ``MarkovSampleStep.torch`` is upstream's own reference for the same math
-    (same Philox stream, same rounding through ``step_dtype``), so routing there
-    is an upstream-sanctioned degradation rather than a Kunlun-only code path.
+    Kunlun reuses the CUDA dispatch key but cannot compile the upstream Triton
+    sampler. The greedy helper preserves fp32 addition, step-dtype rounding,
+    and the current collective layout. Sampling and kept logits still use
+    ``MarkovSampleStep.torch`` with its original Philox stream.
     """
 
-    return cls.torch(**kwargs)
+    from sglang_kunlun.kernels.markov_greedy import markov_greedy_step
+
+    return markov_greedy_step(cls, **kwargs)
 
 
 @register_triton_op(
@@ -4193,21 +4188,15 @@ def _moe_gate_sqrtsoftplus_log1p(
         )
     ranking = activated + row_bias
     ranking = torch.where(torch.isnan(ranking), float("inf"), ranking)
-    ids = torch.arange(experts, device=scores.device)[None, :]
-    remaining = torch.ones_like(ranking, dtype=torch.bool)
     weights = torch.empty((rows, topk), dtype=torch.float32, device=scores.device)
     indices = torch.empty((rows, topk), dtype=torch.int32, device=scores.device)
-    # Explicit argmax/min-id avoids topk's unspecified tie order, including
-    # all -inf rows. Keep remaining separately so no expert is selected twice.
-    for slot in range(routed):
-        maximum = ranking.max(dim=1, keepdim=True).values
-        winner = torch.where(remaining & (ranking == maximum), ids, experts).min(
-            dim=1, keepdim=True
-        ).values
-        weights[:, slot:slot + 1] = activated.gather(1, winner)
-        indices[:, slot:slot + 1] = winner.to(torch.int32)
-        remaining = remaining & (ids != winner)
-        ranking = ranking.masked_fill(~remaining, -float("inf"))
+    if rows == 0:
+        return weights, indices
+    # Preserve lowest-ID ties, including NaNs promoted to +inf, with one sort
+    # instead of repeated full-width max/min reductions for every expert.
+    winners = torch.argsort(ranking, dim=1, descending=True, stable=True)[:, :routed]
+    weights[:, :routed] = activated.gather(1, winners)
+    indices[:, :routed] = winners.to(torch.int32)
     routed_sum = weights[:, :routed].sum(dim=1, keepdim=True)
     if num_fused_shared_experts:
         weights[:, routed:] = routed_sum / scale

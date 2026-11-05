@@ -4,6 +4,8 @@ from . import capture_align  # noqa: F401
 from . import model_runner_kv_cache_mixin  # noqa: F401
 from . import forward_batch_info  # noqa: F401
 from . import cp_mm_embeds  # noqa: F401
+from . import cp_reduce_scatter  # noqa: F401
+from . import cp_bounded_replay  # noqa: F401
 
 import torch
 

@@ -11,6 +11,7 @@ def _install_import_stub(names: tuple[str, ...]) -> None:
     """Replace ``names`` with empty stub modules in ``sys.modules``."""
     import sys
     import types
+    import importlib.machinery
 
     for name in list(sys.modules):
         for root in names:
@@ -21,6 +22,7 @@ def _install_import_stub(names: tuple[str, ...]) -> None:
     for name in names:
         stub = types.ModuleType(name)
         stub.__path__ = []  # namespace-like so submodule imports fail cleanly
+        stub.__spec__ = importlib.machinery.ModuleSpec(name, None, is_package=True)
         stub._kunlun_stub = True
         sys.modules[name] = stub
 

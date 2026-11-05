@@ -15,6 +15,11 @@ from sglang.srt.utils import get_num_new_pages, next_power_of_2
 logger = logging.getLogger(__name__)
 
 
+def low_ratio_index_k_int8_enabled() -> bool:
+    """Select the int8 low-ratio index cache consistently for sizing and IO."""
+    return os.environ.get("DSV4_LOW_RATIO_INDEX_KCACHE", "fp4").lower() == "int8"
+
+
 @plugin_hook(
     "sglang.srt.mem_cache.kv_cache_dtype.configure_kv_cache_dtype",
     type=HookType.AROUND,
@@ -216,7 +221,17 @@ def dsv4_pool_configurator_kv_bytes_kunlun(result, self, kvc):
     which stopped matching the formula in 0.5.22.
     """
     del kvc
+    if low_ratio_index_k_int8_enabled():
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            get_dsv4_indexer_bytes_per_token,
+        )
+
+        self.low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
+            self.indexer_head_dim, use_fp4_indexer=False
+        )
     if not _kunlun_half_cache_applies(self):
+        if low_ratio_index_k_int8_enabled():
+            self.bytes_per_full_token = self._get_bytes_per_full_token() * self._spec_infl
         return result
 
     old_kv_bytes = self.kv_bytes
@@ -242,6 +257,49 @@ def dsv4_pool_configurator_kv_bytes_kunlun(result, self, kvc):
         self.bytes_per_full_token,
     )
     return result
+
+
+@plugin_hook(
+    "sglang.srt.mem_cache.deepseek_v4_memory_pool.DeepSeekV4IndexerPool.__init__",
+    type=HookType.AROUND,
+)
+def dsv4_indexer_pool_init_kunlun(original_fn, self, *args, **kwargs):
+    """Use 132-byte int8 rows for explicitly forced low-ratio pools.
+
+    C4 leaves use_fp4_indexer unspecified in 0.5.22 and retains its own layout.
+    Bind the signature to support both positional and keyword callers.
+    """
+    import inspect
+
+    bound = inspect.signature(original_fn).bind(self, *args, **kwargs)
+    self.index_k_int8 = (
+        low_ratio_index_k_int8_enabled()
+        and bound.arguments.get("use_fp4_indexer") is True
+    )
+    if self.index_k_int8:
+        bound.arguments["use_fp4_indexer"] = False
+    result = original_fn(*bound.args, **bound.kwargs)
+    if self.index_k_int8:
+        logger.info("Low-ratio index-K cache: int8, %d B/token", self.get_bytes_per_token())
+    return result
+
+
+@plugin_hook(
+    "sglang.srt.mem_cache.deepseek_v4_memory_pool.DeepSeekV4IndexerPool.get_index_k_dequant",
+    type=HookType.AROUND,
+)
+def dsv4_indexer_pool_index_k_dequant_kunlun(original_fn, self, layer_id, slots=None):
+    """Read int8 payloads and fp32 scales without FP4 reinterpretation."""
+    if not getattr(self, "index_k_int8", False):
+        return original_fn(self, layer_id, slots)
+    from sglang_kunlun.kernels.dsv41_low_ratio import load_index_k_cache_int8
+
+    buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+    if slots is None:
+        slots = torch.arange(self.size, device=buf.device)
+    return load_index_k_cache_int8(
+        buf, slots, page_size=self.page_size, dim=self.index_head_dim
+    )
 
 
 @plugin_hook(

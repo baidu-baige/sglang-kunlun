@@ -642,3 +642,24 @@ def allow_vision_with_cp(original_fn, self, *args, **kwargs):
     finally:
         _dsv4.get_parallel = real_get_parallel
         _dsv4.get_moe_a2a_backend = real_get_a2a
+
+
+@plugin_hook(
+    "sglang.srt.models.deepseek_v4.DeepseekV4ForCausalLM.get_image_feature",
+    type=HookType.AROUND,
+)
+def get_image_feature_unwrap_shm_kunlun(original_fn, self, items):
+    """Materialize warmup image features that bypass the request receiver."""
+    from sglang.srt.managers.mm_utils import ShmPointerMMData
+
+    def unwrap(value):
+        if isinstance(value, ShmPointerMMData):
+            return value.materialize()
+        if isinstance(value, (tuple, list)):
+            return type(value)(unwrap(item) for item in value)
+        return value
+
+    for item in items:
+        if getattr(item, "feature", None) is not None:
+            item.feature = unwrap(item.feature)
+    return original_fn(self, items)

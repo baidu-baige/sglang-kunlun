@@ -28,10 +28,14 @@ upstream_speculative.dflash_info_v2 = importlib.import_module(
 # pkgutil.resolve_name 能解析到。
 importlib.import_module("sglang.kernels.ops.speculative.reject_sampling")
 importlib.import_module("sglang.kernels.ops.speculative.dspark.dspark_accept")
+importlib.import_module(
+    "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend"
+)
 
 from . import dflash_info_v2  # noqa: E402,F401
 from . import draft_utils  # noqa: E402,F401
 from . import dspark_draft_backend  # noqa: E402,F401
+from . import dspark_greedy_graph  # noqa: E402,F401
 from . import dspark_precision  # noqa: E402,F401
 from . import dspark_torch_dispatch  # noqa: E402,F401
 from . import eagle_worker_v2  # noqa: E402,F401
