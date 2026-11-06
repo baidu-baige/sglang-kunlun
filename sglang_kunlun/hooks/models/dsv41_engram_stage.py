@@ -105,6 +105,25 @@ class EngramHostStager:
         self._stage: List[torch.Tensor] = []
         # Pinned host staging so the H2D can be async on the current stream.
         self._pinned: List[torch.Tensor] = []
+        # int8-row staging for the device-side dequant: the host then only has
+        # to gather `dim` bytes per row instead of running the fp32 dequant.
+        self._pin_rows: List[torch.Tensor] = []
+        self._pin_scales: List[torch.Tensor] = []
+        self._dev_rows: List[torch.Tensor] = []
+        self._dev_scales: List[torch.Tensor] = []
+        self._device_dequant = os.environ.get(
+            "SGLANG_KUNLUN_ENGRAM_STAGE_DEVICE_DEQUANT", "1"
+        ).strip().lower() not in ("0", "false", "no")
+        # The row gather itself is random access over the 92 GiB mmap and stays
+        # on the host; >1 splits it across the shared pool (index_select drops
+        # the GIL). 4 matches the prefill path's default and measured
+        # 4482 -> 4522 tok/s at 220 concurrency on 206.
+        try:
+            self._gather_threads = max(
+                1, int(os.environ.get("SGLANG_KUNLUN_ENGRAM_STAGE_GATHER_THREADS", 4))
+            )
+        except ValueError:
+            self._gather_threads = 4
         self._in_capture = False
         self._prepared_tokens = 0
         self._ready = False
@@ -188,6 +207,18 @@ class EngramHostStager:
             )
             self._pinned.append(
                 torch.zeros(rows, self._dim, dtype=torch.bfloat16).pin_memory()
+            )
+            self._pin_rows.append(
+                torch.zeros(rows, self._dim, dtype=torch.int8).pin_memory()
+            )
+            self._pin_scales.append(
+                torch.zeros(rows, 1, dtype=torch.bfloat16).pin_memory()
+            )
+            self._dev_rows.append(
+                torch.zeros(rows, self._dim, dtype=torch.int8, device=device)
+            )
+            self._dev_scales.append(
+                torch.zeros(rows, 1, dtype=torch.bfloat16, device=device)
             )
         self._max_rows = rows
         self._ready = True
@@ -278,6 +309,8 @@ class EngramHostStager:
             return False
         for slot, (hidx, embed) in enumerate(self._layers):
             flat = ids_host[:, hidx, :].reshape(-1)
+            if self._device_dequant and self._stage_on_device(slot, embed, flat):
+                continue
             self._gather_into_pinned(embed, flat, self._pinned[slot][:rows])
             self._stage[slot][:rows].copy_(self._pinned[slot][:rows], non_blocking=True)
         self._prepared_tokens = num_tokens
@@ -320,6 +353,69 @@ class EngramHostStager:
             return hash_ids
         except Exception as e:
             raise RuntimeError("engram stage: pre-replay hash failed; replay denied") from e
+
+    def _stage_on_device(self, slot: int, embed, flat_rows: torch.Tensor) -> bool:
+        """Gather the raw int8 rows and dequantize them on the XPU.
+
+        `_gather_into_pinned` runs the whole dequant on the CPU:
+        `weight[idx].float() * scale[idx].float() -> bf16` makes four full passes
+        over `[rows, dim]` and two fp32 temporaries. Measured on 206 at bs=32
+        that is 5.7 ms of `aten::copy_`/`aten::_to_copy` per decode round, and
+        it is 2.3x slower on Hygon than on the Intel reference host, so it is
+        the single largest host-side item in the round.
+
+        Here the host only gathers `dim` int8 bytes plus one bf16 scale per row
+        (half the H2D bytes of the bf16 stage) and the multiply happens on the
+        device. The arithmetic is unchanged: int8 -> bf16 is exact, the scale is
+        already bf16, and a bf16 multiply rounds once, so the result is bitwise
+        equal to the fp32 host expression (verified over 890k random elements in
+        `debug/engram_dequant_bitcmp.py`).
+
+        Returns:
+            True when the stage slot was filled; False for a table layout this
+            path does not handle, leaving the CPU dequant to run as before.
+        """
+        weight = embed.weight.data
+        scale = getattr(embed, "weight_scale", None)
+        if scale is None:
+            return False
+        scale = scale.data
+        if weight.dtype is not torch.int8 or scale.dtype is not torch.bfloat16:
+            return False
+        if weight.device.type != "cpu" or scale.device.type != "cpu":
+            return False
+        n = flat_rows.numel()
+        if n > self._pin_rows[slot].shape[0]:
+            return False
+        idx = flat_rows.clamp_(0, weight.shape[0] - 1)
+        pin_rows = self._pin_rows[slot][:n]
+        pin_scales = self._pin_scales[slot][:n]
+        threads = self._gather_threads if n >= 256 * self._gather_threads else 1
+        if threads > 1:
+            from sglang_kunlun.hooks.models.dsv41_engram_int8 import _gather_pool
+
+            def gather(bound):
+                """Fill one disjoint row slice of both pinned buffers."""
+                lo, hi = bound
+                part = idx[lo:hi]
+                torch.index_select(weight, 0, part, out=pin_rows[lo:hi])
+                torch.index_select(scale, 0, part, out=pin_scales[lo:hi])
+
+            bounds = [
+                (i * n // threads, (i + 1) * n // threads) for i in range(threads)
+            ]
+            list(_gather_pool(threads).map(gather, bounds))
+        else:
+            torch.index_select(weight, 0, idx, out=pin_rows)
+            torch.index_select(scale, 0, idx, out=pin_scales)
+        dev_rows = self._dev_rows[slot][:n]
+        dev_scales = self._dev_scales[slot][:n]
+        dev_rows.copy_(pin_rows, non_blocking=True)
+        dev_scales.copy_(pin_scales, non_blocking=True)
+        torch.mul(
+            dev_rows.to(torch.bfloat16), dev_scales, out=self._stage[slot][:n]
+        )
+        return True
 
     @staticmethod
     def _gather_into_pinned(embed, flat_rows: torch.Tensor, dst: torch.Tensor) -> None:

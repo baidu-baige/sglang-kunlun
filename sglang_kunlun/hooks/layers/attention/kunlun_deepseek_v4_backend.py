@@ -1718,16 +1718,19 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             )
         self._low_ratio_index_topk_sm90_decode(layer, x, q_lora, req, pos)
         if layer.indexer.is_candidate_source and self.candidate_masks is not None:
+            # The fused op publishes and consumes the row mask directly, and the
+            # only reader of this metadata is the `decode_mask` branch above, so
+            # the block ids the upstream scheme derives from the mask (pad ->
+            # any -> top-k) are dead work: measured 16 ms per decode round at
+            # bs=32. Publish the mask with an empty id table instead of wrong
+            # ids, so a future reader fails loudly rather than silently.
             mask = self.candidate_masks["rows"]
-            block_size = layer.indexer.candidate_block_size
-            padding = (-mask.shape[1]) % block_size
-            blocked = torch.nn.functional.pad(mask, (0, padding)).unflatten(
-                -1, (-1, block_size)
-            ).any(-1)
-            count = min(layer.indexer.candidate_topk_blocks, blocked.shape[1])
-            values, ids = blocked.to(torch.int32).topk(count, dim=-1)
-            ids = ids.to(torch.int32).masked_fill(values == 0, -1)
-            self._publish_candidate_metadata(BlockIds(blocks=ids, decode_mask=mask))
+            self._publish_candidate_metadata(
+                BlockIds(
+                    blocks=mask.new_empty((mask.shape[0], 0), dtype=torch.int32),
+                    decode_mask=mask,
+                )
+            )
 
     def _low_ratio_fp4_lut(self, device) -> torch.Tensor:
         """Device-resident E2M1 fp4 code->value table for the fused indexer op.

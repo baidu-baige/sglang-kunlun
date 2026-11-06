@@ -149,6 +149,80 @@ def _get_numa_cores(node: int) -> List[int]:
         return list(range(psutil.cpu_count(logical=False)))
 
 
+def _contiguous_ranges(cores: List[int]) -> List[List[int]]:
+    """Split a sorted core list into its contiguous blocks (SMT halves stay apart)."""
+    blocks: List[List[int]] = []
+    for c in sorted(cores):
+        if blocks and c == blocks[-1][-1] + 1:
+            blocks[-1].append(c)
+        else:
+            blocks.append([c])
+    return blocks
+
+
+def _topo_cpu_affinity_strings():
+    """``{gpu_id: cpu_affinity_string}`` from a single ``xpu-smi topo -m`` call."""
+    out = {}
+    try:
+        result = subprocess.run(
+            ["xpu-smi", "topo", "-m"], capture_output=True, text=True, check=True
+        )
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if not parts or not parts[0].startswith("XPU"):
+                continue
+            try:
+                gid = int(parts[0][3:])
+            except ValueError:
+                continue
+            out[gid] = parts[-2]
+    except Exception as e:  # noqa: BLE001 - topology is advisory
+        logger.warning("Failed to read XPU topology for affinity split: %s", e)
+    return out
+
+
+def _split_shared_numa(gpu_id: int, cores: List[int]) -> List[int]:
+    """Give each XPU sharing a NUMA node its own slice of that node's cores.
+
+    `xpu-smi topo -m` reports the whole NUMA-local core list per XPU, so on a
+    host where two XPUs hang off one node (measured on the Hygon C86 P455 box:
+    8 XPUs over 4 nodes, DP0/DP1 both pinned to `16-31,144-159`) both schedulers
+    get the same 16 physical cores and fight over them. Decode is a lockstep
+    collective, so that contention shows up as arrival skew inside the deepep
+    dispatch/combine kernels -- measured `mean-min` 6.36 ms/step on Hygon versus
+    2.90 ms on the Intel reference, with isolated 10 ms spikes.
+
+    The slice keeps each contiguous block (physical cores and their SMT
+    siblings are separate blocks) split in the same proportion, so a process
+    keeps whole SMT pairs, and it never widens the binding past the node, so no
+    cross-NUMA traffic is introduced. Measured on 206 at 256 concurrency over
+    three runs each: 4921.7 tok/s mean (spread 4908-4948) with the split versus
+    4841.2 (spread 4756-4932) sharing, i.e. +1.7% mean and 4x tighter spread;
+    220 concurrency is a wash (4479.8 vs 4489.2). Set the env to 0 to restore
+    the shared binding.
+    """
+    if os.environ.get(
+        "SGLANG_KUNLUN_SPLIT_NUMA_AFFINITY", "1"
+    ).strip().lower() in ("0", "false", "no"):
+        return cores
+    topo = _topo_cpu_affinity_strings()
+    mine = topo.get(gpu_id)
+    if mine is None:
+        return cores
+    peers = sorted(g for g, a in topo.items() if a == mine)
+    if len(peers) <= 1 or gpu_id not in peers:
+        return cores
+    k, r = len(peers), peers.index(gpu_id)
+    sliced: List[int] = []
+    for block in _contiguous_ranges(cores):
+        n = len(block)
+        if n < k:
+            sliced.extend(block)
+            continue
+        sliced.extend(block[r * n // k : (r + 1) * n // k])
+    return sliced or cores
+
+
 @plugin_hook(
     "sglang.srt.utils.common.set_gpu_proc_affinity",
     type=HookType.REPLACE,
@@ -175,6 +249,7 @@ def set_gpu_proc_affinity_kunlun(gpu_id: int):
     gpu_numa_node, bind_cores = _get_gpu_topo_affinity(gpu_id)
     if not bind_cores:
         bind_cores = _get_numa_cores(gpu_numa_node or 0)
+    bind_cores = _split_shared_numa(gpu_id, bind_cores)
 
     p.cpu_affinity(bind_cores)
     logger.info(
