@@ -46,6 +46,9 @@ ARG XSPEEDGATE_OPS_ADDR=https://aihc-private-hcd.bj.bcebos.com/zhangchi/xsg/xspe
 ARG COCOPOD_ADDR=https://aihc-private-hcd.bj.bcebos.com/zhz/cocopod-1.7.0%2Bf98939a.torch29.dev-cp312-cp312-linux_x86_64.whl
 ARG DEEPEP_ADDR=https://klx-sdk-release-public.su.bcebos.com/xccl/release/3.2.8.0/deep_ep-cp312-cp312-linux_x86_64_cuda12.tar.gz
 ARG XMOONCAKE_ADDR=https://aihc-private-hcd.bj.bcebos.com/tangshiwen/kvcache/mooncake_transfer_engine-0.3.12.post1-cp312-cp312-manylinux_2_31_x86_64.whl
+# hydrax (Hydra): MegaMoE 的融合 MoE 算子。xpytorch 的 .run 里自带一个旧版，
+# 这里要用 daily 包覆盖它，见下面单独那一步。
+ARG HYDRAX_ADDR=https://klx-sdk-release-public.su.bcebos.com/Hydra/daily/20261105/hydrax_py312_torch290.tar.gz
 ARG XTRITON_ADDR=https://su.bcebos.com/v1/klx-sdk-release-public/DS_PD/xtriton/20250624/output.tar.gz
 ARG XFLASH_MLA_ADDR=https://su.bcebos.com/v1/klx-sdk-release-public/DS_PD/flash_mla/20250529/output.tar.gz
 
@@ -305,6 +308,28 @@ RUN set -eux; \
     for so in libapiinfer.so libinnerinfer.so; do \
         ln -sf "${sp}/kunlun_ops/${so}" "${sp}/torch_xmlir/${so}"; \
     done
+
+# hydrax (Hydra) daily：MegaMoE 的融合 MoE 算子（`int8_int4_mega_moe`）。
+#
+# 必须单独一步、必须 --force-reinstall：上面那个 xpytorch 的 .run 已经装过一个
+# hydrax，版本偏旧、没有我们要用的 MegaMoE 入口。普通 `pip install` 看到
+# 版本号相同就直接跳过，所以只有 --force-reinstall 才能盖掉。
+#
+# --no-deps 不能省：--force-reinstall 会连依赖一起强制重装，而 hydrax 声明了
+# torch。那会把上面钉死的 torch 2.9.0+cu129（xpytorch 配套的那份）换成 PyPI 的
+# 普通构建，整个昆仑后端随之报废。两个参数必须一起给。
+#
+# 这个 tarball 里只有一个 cp312 的 whl（`hydrax_py312_torch290/hydrax-*.whl`），
+# 所以没套上面那个跳过非 cp312 的循环。
+RUN set -eux; \
+    cd /tmp; \
+    curl -fsSL --retry 5 -o hydrax.tar.gz "${HYDRAX_ADDR}"; \
+    mkdir -p unpack && tar -xzf hydrax.tar.gz -C unpack; \
+    whl="$(find unpack -name 'hydrax-*cp312*.whl' | head -n 1)"; test -n "${whl}"; \
+    pip install --no-deps --force-reinstall --retries 5 "${whl}"; \
+    python -c "from hydrax.xaccelerator.mega_moe_fusion import int8_int4_mega_moe, get_symm_buffer; import hydrax; print('hydrax', hydrax.__version__)"; \
+    rm -rf unpack hydrax.tar.gz /root/.cache/pip; \
+    echo "hydrax=${HYDRAX_ADDR}" >> /versions
 
 # SGLang and this plugin are used from source through PYTHONPATH, so only the
 # plugin is installed (for its entry points) and SGLang itself is not.

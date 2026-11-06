@@ -225,6 +225,16 @@ class KunlunCompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 f"{self.strategy}"
             )
 
+        from sglang_kunlun.hooks.layers.moe import mega_moe
+
+        if mega_moe.mega_moe_enabled() and mega_moe.convert_layer_weights(layer):
+            # MegaMoE wants gate/up interleaved by 256, moe_fc_v3 wants them
+            # contiguous. The expert weights are far too large to keep both, so
+            # a converted layer commits to the MegaMoE layout and its forward
+            # must go through MegaMoE. `convert_layer_weights` returns False for
+            # the DSPARK draft model, which stays on DeepEP.
+            return
+
         for weight_name, scale_name in (
             ("w13_weight_packed", "w13_weight_scale"),
             ("w2_weight_packed", "w2_weight_scale"),
