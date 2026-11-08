@@ -107,3 +107,101 @@ def get_mhc_ops_kunlun():
         mhc_post=mhc_module._mhc_post_torch,
         fused_hc_head=dsv4.hc_head_torch,
     )
+
+
+@plugin_hook(
+    "sglang.kernels.ops.layernorm.mhc.mhc_pre",
+    type=HookType.REPLACE,
+)
+def mhc_pre_kunlun(
+    residual,
+    fn,
+    hc_scale,
+    hc_base,
+    rms_eps,
+    hc_pre_eps,
+    hc_sinkhorn_eps,
+    hc_post_mult_value,
+    sinkhorn_repeat,
+    n_splits=1,
+    n_splits_pre=32,
+    *,
+    norm_weight=None,
+    norm_eps=None,
+    eps_outside_sqrt=False,
+):
+    """Torch-native replacement for the TileLang public ``mhc_pre``."""
+    import torch.nn.functional as F
+
+    from sglang.kernels.ops.layernorm import mhc as mhc_module
+
+    post_mix, comb_mix, layer_input = mhc_module._mhc_pre_torch(
+        residual=residual,
+        fn=fn,
+        hc_scale=hc_scale,
+        hc_base=hc_base,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
+        hc_post_mult_value=hc_post_mult_value,
+        sinkhorn_repeat=sinkhorn_repeat,
+    )
+    if norm_weight is not None:
+        # Same spelling as ``exact_rms_norm`` (F.rms_norm, eps inside the sqrt) so the
+        # fused path is bit-for-bit the non-fused ``exact_rms_norm(layer_input, norm)``.
+        layer_input = F.rms_norm(
+            layer_input, (layer_input.shape[-1],), norm_weight, norm_eps
+        )
+    return post_mix, comb_mix, layer_input
+
+
+@plugin_hook(
+    "sglang.kernels.ops.layernorm.mhc.mhc_post",
+    type=HookType.REPLACE,
+)
+def mhc_post_kunlun(x, residual, post_layer_mix, comb_res_mix):
+    """Torch-native replacement for the TileLang public ``mhc_post``."""
+    from sglang.kernels.ops.layernorm import mhc as mhc_module
+
+    return mhc_module._mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
+
+
+@plugin_hook(
+    "sglang.kernels.ops.layernorm.mhc_head.fused_hc_head",
+    type=HookType.REPLACE,
+)
+def fused_hc_head_kunlun(
+    x,
+    hc_fn,
+    hc_scale,
+    hc_base,
+    norm_eps,
+    hc_eps,
+    eps_outside_sqrt=False,
+):
+    """Torch-native replacement for the Triton ``fused_hc_head``.
+
+    ERNIE 5.5's ``Ernie5_5HcHead.forward`` (mHC stream collapse) calls the public
+    ``fused_hc_head`` (``mhc_head.py``), a Triton kernel (``_hc_head_kernel[grid]``)
+    that is a bare stub on Kunlun. The module docstring carries the exact torch
+    reference; this reproduces it, honoring ``eps_outside_sqrt`` (ERNIE passes
+    True, i.e. ``1/(sqrt(mean_sq)+eps)`` like ``mhc_pre``; the DSV4 inline
+    ``hc_head`` uses eps-inside ``rsqrt``). ``x`` is ``[T, hc_mult, hidden]`` and
+    the output is ``[T, hidden]`` in x's dtype.
+    """
+    import torch.nn.functional as F
+
+    shape = x.shape  # [T, hc_mult, hidden]
+    dtype = x.dtype
+    if shape[0] == 0:
+        return x.new_empty((0, shape[-1]))
+    xf = x.flatten(1).float()
+    mean_sq = xf.square().mean(-1, keepdim=True)
+    if eps_outside_sqrt:
+        norm = 1.0 / (torch.sqrt(mean_sq) + norm_eps)
+    else:
+        norm = torch.rsqrt(mean_sq + norm_eps)
+    mixes = F.linear(xf, hc_fn) * norm
+    pre = torch.sigmoid(mixes * hc_scale + hc_base) + hc_eps
+    y = torch.sum(pre.unsqueeze(-1) * xf.view(shape), dim=1)
+    return y.to(dtype)

@@ -97,6 +97,7 @@ def tree_speculative_sampling_target_only(
         retrive_next_token.to(torch.int32),
         retrive_next_sibling.to(torch.int32),
         uniform_samples,
+        uniform_samples_for_final_sampling,
         target_probs,
         batch_size,
         num_spec_step,

@@ -20,9 +20,15 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
-from sglang.srt.layers.attention.dsa.utils import (
-    is_dsa_prefill_cp_round_robin_split,
-)
+try:
+    from sglang.srt.layers.attention.dsa.utils import (
+        is_dsa_prefill_cp_round_robin_split,
+    )
+except ImportError:  # 0.5.23 的 DSA prefill-CP 换成了 interleave 口径，删掉了 round-robin split
+
+    def is_dsa_prefill_cp_round_robin_split() -> bool:
+        """0.5.23 prefill-CP no longer exposes the round-robin split mode."""
+        return False
 
 try:
     from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
@@ -444,11 +450,11 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
         # sparse kernel has no sink input, and upstream itself rejects sinks on
         # every dsa_impl except flashmla_sparse, so refuse explicitly instead of
         # dropping them and silently computing a different softmax.
-        if attn_sink is not None:
-            raise NotImplementedError(
-                "KunlunDSAAttnBackend.forward_extend: learnable attention sinks "
-                "(attn_sink) are not supported by the Kunlun sparse kernel"
-            )
+        # 0.5.22 appended `attn_sink` (per-head learnable sinks). The Kunlun
+        # sparse kernel has no sink input, but the sink is a softmax-denominator
+        # term we can fold in post-hoc from the kernel's natural-log `lse`
+        # (see end of this method). MHA_ONE_SHOT has no such lse here, so only
+        # that path still refuses a sink.
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -470,6 +476,11 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
 
         # Use MHA kernel if in MHA_ONE_SHOT mode
         if self.use_mha:
+            if attn_sink is not None:
+                raise NotImplementedError(
+                    "KunlunDSAAttnBackend: attn_sink not supported on the "
+                    "MHA_ONE_SHOT path"
+                )
             assert k is not None and v is not None
             assert q_rope is None, "MHA_ONE_SHOT path should not pass q_rope"
             assert (
@@ -613,6 +624,16 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
         # Defensive: replace NaN with 0 (e.g. when kv_lod has 0-length padding)
         o_ = torch.nan_to_num(o_, nan=0.0)
 
+        if attn_sink is not None:
+            # Fold the learnable per-head sink (a virtual value-0 key, natural-log
+            # bias) into the output: o *= Z/(Z+exp(sink-m)) = sigmoid(lse - sink),
+            # with lse = m + ln(Z) the kernel's natural-log normalizer. Matches the
+            # bmu reference (torch.logaddexp(lse, sink)). o_:[rows,head,vdim],
+            # lse:[rows,head], sink:[head].
+            sink = attn_sink.to(lse.dtype).reshape(-1)
+            o_ = o_ * torch.sigmoid(lse - sink).unsqueeze(-1)
+            o_ = torch.nan_to_num(o_, nan=0.0)
+
         del max_logits
         del lse
         return o_
@@ -637,11 +658,8 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
         """Decode through the Kunlun sparse kernel."""
         # Same 0.5.22 `attn_sink` tail as forward_extend; the Kunlun sparse
         # decode kernel has no sink input either.
-        if attn_sink is not None:
-            raise NotImplementedError(
-                "KunlunDSAAttnBackend.forward_decode: learnable attention sinks "
-                "(attn_sink) are not supported by the Kunlun sparse kernel"
-            )
+        # See forward_extend: fold the per-head sink in post-hoc from the
+        # decode kernel's max_logits + p_sums (lse = max_logits + ln(p_sums)).
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -711,6 +729,14 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
             kv_lod_xpu=metadata.cache_seqlens_int32,
             max_seq_kv=metadata.max_seq_len_k,
         )
+        if attn_sink is not None:
+            # lse = max_logits + ln(p_sums); o *= sigmoid(lse - sink).
+            # o_:[bs,qlen,head,vdim], max_logits/p_sums:[bs,qlen,head], sink:[head].
+            lse = max_logits + torch.log(p_sums.clamp_min(1e-20))
+            sink = attn_sink.to(lse.dtype).reshape(-1)
+            o_ = o_ * torch.sigmoid(lse - sink).unsqueeze(-1)
+            o_ = torch.nan_to_num(o_, nan=0.0)
+
         del max_logits
         del p_sums
         return o_

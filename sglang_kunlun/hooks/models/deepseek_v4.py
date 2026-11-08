@@ -162,41 +162,48 @@ def mqa_forward_prepare_kunlun(
         kv, _ = self.wkv(x_linear)
 
     q_lora = self.q_norm(q_lora)
-    q, _ = self.wq_b(q_lora)
-    q = q.view(-1, self.n_local_heads, self.head_dim)
-    # Per-head weightless RMSNorm on Q is V4-specific. Upstream controls it with
-    # `config.q_head_norm` (the `fused_q_norm_rope` branch of `_compute_q_b`);
-    # V4 is True, **V4.1 is False**. The reference implementation shipped with
-    # the checkpoint also only normalizes the low-rank q_lora and never touches
-    # per-head Q. Doing it unconditionally normalizes every layer's Q one extra
-    # time (layer 0 measured |Q|max 31.4 → 11.1), leaving all outputs wrong
-    # while the magnitude looks normal.
-    if getattr(self, "q_head_norm", True):
-        import kunlun_ops
-
-        q_normalized = torch.empty_like(q)
-        kunlun_ops.rmsnorm(
-            q,
-            None,
-            q_normalized,
-            self.eps,
-            False,
-            True,
-            None,
-            None,
-            None,
-        )
-        q = q_normalized
-    kv = self.kv_norm(kv)
 
     from sglang.srt.models.deepseek_v4 import fused_rope_inplace
 
-    fused_rope_inplace(
-        q[..., -self.qk_rope_head_dim :],
-        kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
-        self.freqs_cis,
-        positions,
-    )
+    if getattr(self, "q_up_local_size", None) is not None:
+        q = self._compute_q_b(q_lora, positions)
+        kv = self.kv_norm(kv)
+        fused_rope_inplace(
+            kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
+            None,
+            self.freqs_cis,
+            positions,
+        )
+    else:
+        q, _ = self.wq_b(q_lora)
+        q = q.view(-1, self.n_local_heads, self.head_dim)
+        # Per-head weightless RMSNorm on Q is V4-specific. Upstream controls it
+        # with `config.q_head_norm` (the `fused_q_norm_rope` branch of
+        # `_compute_q_b`); V4 is True, **V4.1 is False**.
+        if getattr(self, "q_head_norm", True):
+            import kunlun_ops
+
+            q_normalized = torch.empty_like(q)
+            kunlun_ops.rmsnorm(
+                q,
+                None,
+                q_normalized,
+                self.eps,
+                False,
+                True,
+                None,
+                None,
+                None,
+            )
+            q = q_normalized
+        kv = self.kv_norm(kv)
+
+        fused_rope_inplace(
+            q[..., -self.qk_rope_head_dim :],
+            kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
+            self.freqs_cis,
+            positions,
+        )
     _store_kv_to_swa_cache_direct(self, kv, forward_batch, attn_backend)
 
     # V4.1 low ratios own a different source pipeline: `DeepseekV41Compressor` /

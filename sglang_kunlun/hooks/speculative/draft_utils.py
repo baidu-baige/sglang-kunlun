@@ -91,10 +91,30 @@ def _create_backend_kunlun(
             cls(self.draft_model_runner, skip_prefill=False),
         )
 
+    def _make_ernie55_backend():
+        """Build the Kunlun ERNIE 5.5 draft backend (EAGLE self-draft via NextN)."""
+        from sglang_kunlun.hooks.layers.attention.kunlun_ernie55_backend import (
+            KunlunErnie55AttnBackend,
+            KunlunErnie55MultiStepBackend,
+        )
+
+        if is_decode_multistep:
+            return (
+                "ernie55",
+                KunlunErnie55MultiStepBackend(
+                    self.draft_model_runner, self.topk, self.speculative_num_steps
+                ),
+            )
+        return (
+            "ernie55",
+            KunlunErnie55AttnBackend(self.draft_model_runner, skip_prefill=False),
+        )
+
     factory = {
         "kunlun_compressed": _make_compressed_backend,
         "dsa": _make_dsa_backend,
         "nsa": _make_dsa_backend,
+        "ernie55": _make_ernie55_backend,
         "kunlun": _make_platform_backend,
     }.get(backend_type)
     if factory is not None:

@@ -341,9 +341,6 @@ def select_experts_kunlun(
                 scoring_func=scoring_func,
             )
     else:
-        assert (
-            num_token_non_padded is None
-        ), "num_token_non_padded is not yet supported in custom_routing_function"
         assert expert_location_dispatch_info is None
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         topk_weights, topk_ids = custom_routing_function(
@@ -366,3 +363,51 @@ def select_experts_kunlun(
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
+
+
+@plugin_hook(
+    "sglang.kernels.ops.moe.multi_router.multi_router_topk",
+    type=HookType.REPLACE,
+)
+def multi_router_topk_kunlun(
+    logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    per_expert_scale: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    *,
+    num_routers: int,
+):
+    """Torch-native replacement for the Triton ERNIE 5.5 multi-router top-k.
+
+    Base launches ``_multi_router_topk_kernel[(num_tokens,)]`` which is a plain
+    stub on Kunlun ('function' object is not subscriptable). ERNIE 5.5's MoE gate
+    (``ernie55.py::_route`` -> ``multi_router_topk``) sums the per-router sigmoids
+    over the same experts, top-ks ``scores + correction_bias``, takes the *scores*
+    (not the biased values) at those ids, optionally renormalizes, then scales by
+    ``per_expert_scale[id]``. ``logits`` is ``[T, num_routers * E]`` router-major
+    with inner stride 1. Returns ``(weights fp32 [T, topk], ids int32 [T, topk])``.
+    """
+    num_tokens, width = logits.shape
+    num_experts = width // num_routers
+    weights = torch.empty(
+        num_tokens, topk, dtype=torch.float32, device=logits.device
+    )
+    ids = torch.empty(num_tokens, topk, dtype=torch.int32, device=logits.device)
+    if num_tokens == 0:
+        return weights, ids
+    # scores = sum_r sigmoid(logits[:, r*E:(r+1)*E]), accumulated in fp32.
+    scores = (
+        torch.sigmoid(logits.to(torch.float32).view(num_tokens, num_routers, num_experts))
+        .sum(dim=1)
+    )
+    biased = scores + correction_bias.to(torch.float32)
+    _, top_ids = torch.topk(biased, topk, dim=1)
+    top_scores = torch.gather(scores, 1, top_ids)
+    if renormalize:
+        denom = top_scores.sum(dim=1, keepdim=True)
+        top_scores = top_scores / torch.where(
+            denom != 0, denom, torch.ones_like(denom)
+        )
+    top_scores = top_scores * per_expert_scale.to(torch.float32)[top_ids]
+    return top_scores.to(torch.float32), top_ids.to(torch.int32)

@@ -42,6 +42,8 @@ def build_ragged_draft_extend_metadata_kunlun(
     *,
     max_seq_len_override=None,
     use_prefill_cuda_graph: bool = False,
+    real_num_tokens=None,
+    **_extra_kwargs,
 ):
     """Build compact per-token metadata for eager ragged Draft Extend."""
     if not getattr(forward_batch, "_kunlun_ragged_draft_extend", False):
@@ -50,6 +52,8 @@ def build_ragged_draft_extend_metadata_kunlun(
             forward_batch,
             max_seq_len_override=max_seq_len_override,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
+            real_num_tokens=real_num_tokens,
+            **_extra_kwargs,
         )
 
     from sglang.srt.layers.attention import deepseek_v4_backend as upstream
@@ -61,6 +65,8 @@ def build_ragged_draft_extend_metadata_kunlun(
             forward_batch,
             max_seq_len_override=max_seq_len_override,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
+            real_num_tokens=real_num_tokens,
+            **_extra_kwargs,
         )
     if use_prefill_cuda_graph:
         raise ValueError("ragged Draft Extend metadata cannot use a fixed-width graph")

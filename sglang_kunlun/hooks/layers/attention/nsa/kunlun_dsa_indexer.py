@@ -95,10 +95,8 @@ def dsa_weights_proj_bf16_in_fp32_out_kunlun(self, x: torch.Tensor) -> torch.Ten
 # surface between the Kunlun indexer and upstream.
 REQUIRED_INDEXER_ATTRS = (
     "_get_k_bf16",
-    "_should_chunk_mqa_logits",
     "alt_stream",
     "block_size",
-    "cp_size",
     "head_dim",
     "index_topk",
     "k_norm",
@@ -549,8 +547,24 @@ def _get_topk_ragged(
     token_nums, _, _ = q_fp8.shape
     device = q_fp8.device
 
-    # Check if we need to chunk to avoid OOM
-    need_chunk, free_mem = indexer._should_chunk_mqa_logits(q_offset, k_offset, device)
+    # Check if we need to chunk to avoid OOM.
+    # 0.5.23 drift: the indexer method ``_should_chunk_mqa_logits(q,k,device)``
+    # became the free function ``mqa_logits_should_chunk`` (keyword-only,
+    # budget supplied by a callable). On XPU ``mqa_logits_budget_bytes`` never
+    # syncs (it early-outs for ``is_xpu()``), so ``allow_sync=True`` is safe.
+    from sglang.srt.layers.attention.mqa_logits_utils import (
+        mqa_logits_budget_bytes,
+        mqa_logits_should_chunk,
+    )
+
+    need_chunk, free_mem = mqa_logits_should_chunk(
+        num_rows=q_offset,
+        num_cols=k_offset,
+        get_budget_bytes=lambda: mqa_logits_budget_bytes(
+            device_index=device.index, allow_sync=True
+        ),
+        rocm=False,
+    )
     if need_chunk:
         import logging
         logging.warning(f"[NSA] chunk path triggered: q_offset={q_offset}, \
@@ -884,6 +898,7 @@ def _get_q_k_bf16(
         # for kunlun ops
         query, _ = indexer.wq_b(q_lora)
         query = rearrange(query, "l (h d) -> l h d", d=indexer.head_dim)
+        query = query.to(torch.bfloat16)  # fp16 model -> bf16 for rotate/DSA
         q_rope, _ = torch.split(
             query,
             [indexer.rope_head_dim, indexer.head_dim - indexer.rope_head_dim],
@@ -892,7 +907,7 @@ def _get_q_k_bf16(
         with torch.cuda.stream(indexer.alt_stream):
             # TODO we should also put DeepGEMM half SM here?
             key, _ = indexer.wk(x)
-            key = indexer.k_norm(key)
+            key = indexer.k_norm(key).to(torch.bfloat16)
 
             k_rope, _ = torch.split(
                 key,
@@ -904,11 +919,15 @@ def _get_q_k_bf16(
     else:
         query, _ = indexer.wq_b(q_lora)
         query = rearrange(query, "l (h d) -> l h d", d=indexer.head_dim)
+        # fp16 model: the unquantized q/k projections emit fp16; the downstream
+        # rotate / DSA kernels want bf16 (this helper is named _bf16). No-op when
+        # already bf16.
+        query = query.to(torch.bfloat16)
         q_rope, _ = torch.split(
             query, [indexer.rope_head_dim, indexer.head_dim - indexer.rope_head_dim], dim=-1
         )
         key, _ = indexer.wk(x)
-        key = indexer.k_norm(key)
+        key = indexer.k_norm(key).to(torch.bfloat16)
         k_rope, _ = torch.split(
             key, [indexer.rope_head_dim, indexer.head_dim - indexer.rope_head_dim], dim=-1
         )
@@ -942,9 +961,12 @@ def _get_q_k_bf16(
         # "set_k_and_s_triton: k_num != loc_num".
         key = get_cp_strategy().materialize_full_indexer_k_cache(key, forward_batch)
     elif dsa_use_prefill_cp(forward_batch):
+        from sglang.srt.runtime_context import get_parallel
+
+        # 0.5.23 drift: CP size moved off the indexer onto the parallel context.
         key = cp_all_gather_rerange_output(
             key.contiguous(),
-            indexer.cp_size,
+            get_parallel().attn_cp_size,
             forward_batch,
             torch.cuda.current_stream(),
         )

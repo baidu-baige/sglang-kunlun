@@ -130,6 +130,20 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
         if getattr(server_args, "page_size", None) is None:
             server_args.page_size = 128
 
+        # ERNIE 5.5: allow an fp16 KV cache. The in-tree override's validator
+        # only lists auto/fp8_e4m3/bfloat16; Kunlun also serves fp16 (faster than
+        # bf16), so widen the allow-list. No-op unless --kv-cache-dtype fp16.
+        try:
+            from sglang.srt.arg_groups.model_overrides import ernie55 as _ernie55_ov
+
+            if "fp16" not in _ernie55_ov._SUPPORTED_KV_CACHE_DTYPES:
+                _ernie55_ov._SUPPORTED_KV_CACHE_DTYPES = (
+                    *_ernie55_ov._SUPPORTED_KV_CACHE_DTYPES,
+                    "fp16",
+                )
+        except Exception:
+            pass
+
         # The device-side swap-in has landed: ``move_cold_pool_to_device``
         # re-homes the hisparse cold pool onto the XPU, so planning, LRU and the
         # copy are all plain device indexing and the decode graph can capture
@@ -202,6 +216,12 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
 
     def get_default_attention_backend(self) -> str:
         return "kunlun"
+
+    def supports_speculative_algorithm(self, algorithm) -> bool:
+        """Allow the EAGLE family on Kunlun.
+        """
+        name = getattr(algorithm, "name", algorithm)
+        return str(name).upper() in ("EAGLE", "EAGLE3", "NEXTN")
 
     def get_quantization_config(self, quantization: str):
         """Route ``compressed-tensors`` to the Kunlun config subclass.

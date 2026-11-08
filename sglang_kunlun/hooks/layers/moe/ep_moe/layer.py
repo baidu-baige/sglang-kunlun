@@ -46,7 +46,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang_kunlun.compat import server_arg
 from sglang.srt.utils import get_bool_env_var, dispose_tensor
-from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -453,11 +453,21 @@ class DeepEPMoE(FusedMoE):
             self.use_w4afp8 = False
 
         self.deepep_mode = get_deepep_mode()
-        self.act_fn = SiluAndMul()
+        _activation = str(
+            getattr(self.moe_runner_config, "activation", None) or "silu"
+        ).lower()
         # DSV4 routed-expert SwiGLU swiglu_limit clamp (see _DSV4ClampedSiluAndMul).
         _swiglu_limit = getattr(self.moe_runner_config, "swiglu_limit", None)
-        if _swiglu_limit is not None:
+        if _activation == "situ":
+            _beta = float(getattr(self.moe_runner_config, "gemm1_alpha", None) or 1.0)
+            self.act_fn = SituAndMul(
+                beta=_beta,
+                linear_beta=getattr(self.moe_runner_config, "gemm1_clamp_limit", None),
+            )
+        elif _swiglu_limit is not None:
             self.act_fn = _DSV4ClampedSiluAndMul(_swiglu_limit)
+        else:
+            self.act_fn = SiluAndMul()
         # Same clamp for the mask-aware kunlun_ops activations, which take the
         # limit as an argument (<= 0.0 disables it).
         self.swiglu_limit = 0.0 if _swiglu_limit is None else float(_swiglu_limit)
@@ -498,7 +508,7 @@ class DeepEPMoE(FusedMoE):
         output.zero_()
 
     a2a_forward_with_output = eager_on_graph(
-        True, capture_stub=_a2a_forward_capture_stub
+        True, on_capture=_a2a_forward_capture_stub
     )(_a2a_forward_with_output_impl)
 
     def forward(
@@ -1186,7 +1196,7 @@ class DeepEPMoE(FusedMoE):
         """
         hidden_states, hidden_states_scale, _, _, masked_m, expected_m = dispatch_output
         assert self.quant_method is not None
-        assert self.moe_runner_config.activation == "silu"
+        assert self.moe_runner_config.activation in ("silu", "situ")
         assert hidden_states_scale is not None, (
             "W4A8 DeepEP low-latency needs INT8 dispatch; unset "
             "SGLANG_DEEPEP_BF16_DISPATCH or run W4A16 instead."

@@ -6419,10 +6419,18 @@ def dsv4_fused_q_norm_rope_kunlun(
         normalized = q_input
     else:
         normalized = torch.empty_like(q_input)
+        # ``kunlun_ops.rmsnorm`` only accepts a 2D ``[rows, hidden]`` tensor, but
+        # the per-head q-norm feeds q as ``[tokens, n_local_heads, head_dim]``
+        # (ERNIE 5.5 gated-q via ``_gated_q_norm_rope``, and DSV4 proper with
+        # ``q_head_norm=True``). Flatten the leading dims so the norm runs per
+        # ``(token, head)`` over ``head_dim`` -- the same contract as the CUDA
+        # warp-per-(token, head) kernel. 2D inputs pass through unchanged.
+        q_input_2d = q_input.reshape(-1, q_input.shape[-1])
+        normalized_2d = normalized.view(-1, normalized.shape[-1])
         kunlun_ops.rmsnorm(
-            q_input,
+            q_input_2d,
             None,
-            normalized,
+            normalized_2d,
             eps,
             False,
             True,
@@ -8047,7 +8055,16 @@ DSV4_KV_DIM = 512
 
 @register_jit_op(
     "sglang.kernels.ops.attention.dsv4.dequant_k_cache",
-    "dequantize_k_cache_paged",
+    # Upstream 0.5.23 renamed the paged-dequant helper
+    # `dequantize_k_cache_paged` -> `dequantize_k_cache_paged_dsv4` (the V4.1
+    # layouts split off into `dequantize_k_cache_paged_v41`). The old op name no
+    # longer exists, so `_patch_symbol` logged "not found" and the Triton
+    # launcher stayed live; the sparse-prefill path then hit
+    # `_dequantize_k_cache_paged_kernel[grid]` and failed ('function' object is
+    # not subscriptable, triton absent). Target the drifted name so
+    # `_replace_imported_bindings` also rebinds the by-name import captured in
+    # `deepseek_v4_backend` (its `_forward_prefill_sparse` call site).
+    "dequantize_k_cache_paged_dsv4",
 )
 def dsv4_dequantize_k_cache_paged_kunlun(
     quant_k_cache: torch.Tensor,
