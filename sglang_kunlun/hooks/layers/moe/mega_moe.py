@@ -125,6 +125,39 @@ def _interleave_gate_up(t: torch.Tensor, gran: int = INTERLEAVE_GRANULARITY):
     return torch.stack([g, u], 2).reshape(t.shape[0], two_f, *tail).contiguous()
 
 
+def mega_moe_reachable() -> Tuple[bool, str]:
+    """Whether this process's MoE forward will actually reach `forward()`.
+
+    The forward hook lives in `hooks/layers/moe/ep_moe/layer.py: forward_impl`,
+    which only runs for the DeepEP MoE. With `--moe-a2a-backend none` -- the
+    sglang default, and what `launch_server_p.sh` uses -- the layer is a
+    different class, so `process_weights_after_loading` would convert the
+    weights and then `moe_fc_v3` would compute with the MegaMoE layout:
+    **silently wrong output, no error**. That is exactly what happened on the
+    P node once MegaMoE became default-on -- fluent but nonsense tokens, while
+    the log only showed `MegaMoE skips a 128-expert layer` for the draft.
+
+    Prefill mode is refused for a different reason: its chunked-prefill call is
+    far larger than `num_max_tokens_per_rank`, so `forward` would raise on the
+    first request.
+    """
+    from sglang_kunlun.compat import server_arg
+
+    backend = str(server_arg("moe_a2a_backend", None) or "none")
+    if backend != "deepep":
+        return False, (
+            f"moe_a2a_backend={backend!r}，MegaMoE 的 forward 钩子只挂在 DeepEP "
+            "的 forward_impl 上，转了权重就没人用，会静默算错"
+        )
+    mode = str(server_arg("disaggregation_mode", None) or "null")
+    if mode == "prefill":
+        return False, (
+            "disaggregation_mode='prefill'，一次 chunked prefill 的 token 数远超 "
+            f"symmetric buffer 的 {max_tokens_per_rank()}，forward 会直接抛错"
+        )
+    return True, ""
+
+
 def convert_layer_weights(layer) -> bool:
     """Rewrite one MoE layer's expert weights into the MegaMoE layout, in place.
 
@@ -139,6 +172,13 @@ def convert_layer_weights(layer) -> bool:
     Returns:
         True when the layer was converted, False when it stays on DeepEP.
     """
+    ok, why = mega_moe_reachable()
+    if not ok:
+        logger.warning(
+            "MegaMoE 不转换权重（保持 moe_fc_v3 布局）：%s", why
+        )
+        return False
+
     num_experts = int(getattr(layer, "num_experts", 0) or 0)
     if num_experts < min_experts_for_mega():
         logger.info(
