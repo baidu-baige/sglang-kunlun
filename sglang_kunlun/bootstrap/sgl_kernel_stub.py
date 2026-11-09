@@ -241,6 +241,8 @@ def install() -> None:
         module.fused_add_rmsnorm = _fused_add_rmsnorm  # type: ignore[attr-defined]
         module.rmsnorm = _rmsnorm  # type: ignore[attr-defined]
         module.silu_and_mul = _silu_and_mul  # type: ignore[attr-defined]
+        module.gemma_rmsnorm = _gemma_rmsnorm  # type: ignore[attr-defined]
+        module.gemma_fused_add_rmsnorm = _gemma_fused_add_rmsnorm  # type: ignore[attr-defined]
 
     # Bind the non-owning tensor alias used by breakable CUDA graph (and the
     # piecewise backends) to keep capture-pool blocks recyclable.
