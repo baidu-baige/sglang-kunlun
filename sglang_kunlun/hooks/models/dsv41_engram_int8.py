@@ -103,6 +103,14 @@ def _host_gather_batched_sharded(embed, indices: torch.Tensor):
     Same math as the shared path, plus the shard contract upstream relies on:
     ids outside `[row_start, row_start + rows)` must come back as zero rows, and
     the caller's TP all-reduce then reassembles the full lookup.
+
+    Only this rank's own rows are moved. Under prefill CP the caller looks up the
+    CP group's whole token range, so with `tp=8` about 1/8 of the ids fall in this
+    shard; gathering all of them and zeroing the rest afterwards (what this used
+    to do) cost a `n * 8`-byte id D2H, an `n * dim`-byte pinned staging + H2D and
+    a device `masked_fill` for eight times the rows the shard owns. Compacting
+    first makes every one of those proportional to the owned count instead.
+    Disable with `SGLANG_KUNLUN_ENGRAM_COMPACT_OWNED=0`.
     """
     if os.environ.get(
         "SGLANG_KUNLUN_ENGRAM_BATCH_GATHER_SHARDED", "1"
@@ -120,6 +128,12 @@ def _host_gather_batched_sharded(embed, indices: torch.Tensor):
     if weight.shape[0] != int(embed.rows):
         return None
     device = indices.device
+    if os.environ.get("SGLANG_KUNLUN_ENGRAM_COMPACT_OWNED", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    ):
+        return _owned_only_gather(embed, indices, weight, scale, device)
     local = (indices.reshape(-1) - int(embed.row_start)).to("cpu", torch.int64)
     owned = (local >= 0) & (local < int(embed.rows))
     local = local.masked_fill(~owned, 0).contiguous()
@@ -132,6 +146,45 @@ def _host_gather_batched_sharded(embed, indices: torch.Tensor):
     values = _dequant_on_device(rows, scales, embed.dim)
     values = values.masked_fill(~owned.to(device).unsqueeze(-1), 0)
     return values.view(*indices.shape, embed.dim)
+
+
+def _owned_only_gather(embed, indices: torch.Tensor, weight, scale, device):
+    """Gather just the ids this shard owns and scatter them into a zero buffer.
+
+    `positions` stays on the device -- it is only needed to place the gathered
+    rows back -- so the sole host crossing is the owned row ids, 1/8 of the ids
+    the CP lookup passes in. `nonzero` already reports its own output length, so
+    the compaction costs no extra synchronization beyond the one this path has
+    always paid for the id D2H.
+
+    Compacting on the host instead (`local.to("cpu")` first, then a CPU
+    `masked_select`) removes the `nonzero` stream drain, but the drain was only
+    ever waiting for work the device still owed: measured on the 64K P-side step
+    it bought nothing and the CPU pass over one chunk's 393216 ids added ~2.5 ms
+    of serial host time per engram layer, which came straight out of TTFT
+    (11.0 s -> 11.1 s). Keep the compaction on the device.
+    """
+    n = indices.numel()
+    out = torch.zeros(n, embed.dim, dtype=torch.bfloat16, device=device)
+    if n == 0:
+        return out.view(*indices.shape, embed.dim)
+    local = indices.reshape(-1) - int(embed.row_start)
+    owned = (local >= 0) & (local < int(embed.rows))
+    positions = torch.nonzero(owned, as_tuple=True)[0]
+    owned_rows = local[positions].to("cpu", torch.int64)
+    k = owned_rows.numel()
+    if k == 0:
+        return out.view(*indices.shape, embed.dim)
+    min_rows = _env_int("SGLANG_KUNLUN_ENGRAM_GATHER_MIN_ROWS", 8192)
+    if k >= min_rows:
+        rows, scales = _pipelined_host_gather(
+            weight, scale, owned_rows, embed.dim, device
+        )
+    else:
+        rows = weight[owned_rows].to(device, non_blocking=True)
+        scales = scale[owned_rows].to(device, non_blocking=True)
+    out.index_copy_(0, positions, _dequant_on_device(rows, scales, embed.dim))
+    return out.view(*indices.shape, embed.dim)
 
 
 def _identity_ids(n: int, device) -> torch.Tensor:

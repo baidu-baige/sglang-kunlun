@@ -345,3 +345,51 @@ def get_device_name_kunlun(device_id: int = 0) -> str:
     """Stable identifier used for cache keys & logs."""
     return "Kunlun-XPU"
 
+
+# ---------------------------------------------------------------------------
+# async_h2d → stage the small host vectors through pinned memory
+# ---------------------------------------------------------------------------
+
+
+@plugin_hook(
+    "sglang.srt.utils.common.async_h2d",
+    type=HookType.REPLACE,
+)
+def async_h2d_kunlun(args, *, dtype, device):
+    """Enqueue the list copy instead of draining the stream for it.
+
+    Upstream only stages through pinned memory when
+    ``current_platform.is_pin_memory_available()`` says so, and
+    ``KunlunDeviceMixin`` inherits the ``DeviceMixin`` default of ``False``.
+    That turns every call into ``torch.tensor(args).to(device)`` -- a pageable,
+    host-blocking copy that first waits for everything already queued on the
+    stream. Measured on this deployment: 31 ms per call behind a loaded queue,
+    and the P-side 64K prefill step pays it nine times (once per compressed
+    layer in ``_make_low_ratio_prefill_indexer_inputs``, plus
+    ``get_tail_row_indices``) -- ~212 ms of an 838 ms step with the host
+    stalled and the device draining.
+
+    Pinned staging makes the same copy asynchronous (0.06 ms behind the same
+    queue) and leaves the values bit-identical; it is what the CUDA platform
+    does. The staging buffer is kept alive on the returned tensor so it cannot
+    be recycled while the copy is still in flight.
+
+    Pinned host memory is only unavailable on this platform for the multi-GB
+    registrations that fail with vendor error 712 (see
+    ``hooks/hisparse.py:_skip_host_register_for_hisparse_cold_pool``); these
+    vectors are a few hundred bytes. ``SGLANG_KUNLUN_ASYNC_H2D=0`` restores the
+    blocking pageable copy.
+    """
+    import torch
+
+    if os.environ.get("SGLANG_KUNLUN_ASYNC_H2D", "1").strip().lower() in (
+        "0",
+        "false",
+        "no",
+    ):
+        return torch.tensor(args, dtype=dtype).to(device)
+    host = torch.tensor(args, dtype=dtype, pin_memory=True)
+    out = host.to(device, non_blocking=True)
+    out._kunlun_h2d_staging = host
+    return out
+
