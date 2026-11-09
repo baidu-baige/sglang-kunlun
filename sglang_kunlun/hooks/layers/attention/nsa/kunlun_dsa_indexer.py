@@ -141,7 +141,9 @@ def xspeedgate_hadamard_transform(
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     """Rotate activations with a scaled Hadamard transform."""
 
-    assert x.dtype == torch.bfloat16
+    # XSpeedGate hadamard_transform registers both half types, so keep the
+    # model dtype (ERNIE fp16 or bf16) instead of forcing bf16.
+    assert x.dtype in (torch.bfloat16, torch.float16), x.dtype
     hidden_size = x.size(-1)
     assert (
         hidden_size & (hidden_size - 1)
@@ -267,6 +269,28 @@ def _require_continuous_index_k(pool, where: str) -> None:
         "onto get_index_k_scale_buffer()/IndexKeyCache.get_k_and_scale() "
         "before using DSA ragged prefill or CP prefill on this build."
     )
+
+
+def _index_k_continuous(pool, layer_id, seq_len, page_indices):
+    """Per-request index-K continuous view (K, scale), replacing the dropped
+    0.5.22 ``get_index_k_continuous``/``get_index_k_scale_continuous`` with the
+    retained ``get_index_k_with_scale_buffer``: each buffer row is one
+    ``index_page_size`` page laid out as
+    ``[head_dim bytes K][head_dim // quant_block_size * 4 bytes scale]``."""
+    # XPU index_select rejects (uint8, int64); view int8 (same itemsize, bit
+    # identical), which is also what the downstream I8_mqa_logits expects.
+    buf = pool.get_index_k_with_scale_buffer(layer_id).view(torch.int8)
+    head_dim = pool.index_head_dim
+    item_bytes = head_dim + head_dim // pool.quant_block_size * 4
+    page_size = pool.index_page_size
+    num_pages = (seq_len + page_size - 1) // page_size
+    pages = page_indices[:num_pages].to(torch.int64)
+    rows = buf.index_select(0, pages).reshape(-1, item_bytes)
+    # .contiguous() required: downstream .view() cannot reinterpret the strided
+    # row slice.
+    k = rows[:seq_len, :head_dim].contiguous()
+    k_scale = rows[:seq_len, head_dim:].contiguous()
+    return k, k_scale
 
 
 def _align_rows_to_q(tensor, extend_lens: List[int], q_offset: int):
@@ -466,7 +490,6 @@ def _get_topk_ragged(
     metadata: "BaseIndexerMetadata",
     topk_result: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    _require_continuous_index_k(get_token_to_kv_pool(), "_get_topk_ragged")
     """Kunlun ragged indexer.
 
     ``enable_dual_stream`` / ``topk_result`` exist for upstream 0.5.14 signature
@@ -505,21 +528,17 @@ def _get_topk_ragged(
     for i in range(batch_size):
         seq_len = indexer_seq_lens_cpu[i].item()
         assert isinstance(seq_len, int)
-        # Use fused Triton kernel to get both K and scale in a single call
-        k_fp8 = get_token_to_kv_pool().get_index_k_continuous(
-            layer_id,
-            seq_len,
-            block_tables[i],
-        )
-        k_scale = get_token_to_kv_pool().get_index_k_scale_continuous(
-            layer_id,
-            seq_len,
-            block_tables[i],
+        # 0.5.22 index-K API port: gather this request's K + scale from the
+        # retained get_index_k_with_scale_buffer (see _index_k_continuous).
+        k_fp8, k_scale = _index_k_continuous(
+            get_token_to_kv_pool(), layer_id, seq_len, block_tables[i]
         )
 
         k_fp8_list.append(k_fp8)
         k_scale_list.append(k_scale)
     
+    # _index_k_continuous already views the uint8 buffer to int8, so the cat is
+    # int8 (matches 0.5.19's bare torch.cat).
     k_fp8 = torch.cat(k_fp8_list, dim=0)
     k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
     if q_fp8.dtype is torch.int8:
@@ -565,10 +584,10 @@ def _get_topk_ragged(
         ),
         rocm=False,
     )
-    if need_chunk:
-        import logging
-        logging.warning(f"[NSA] chunk path triggered: q_offset={q_offset}, \
-            k_offset={k_offset}, free_mem={free_mem:.0f}")
+    # if need_chunk:
+    #     import logging
+    #     logging.warning(f"[NSA] chunk path triggered: q_offset={q_offset}, \
+    #         k_offset={k_offset}, free_mem={free_mem:.0f}")
 
     context_q_lens_xpu = metadata.get_cu_seqlens_q()
     context_q_lens_cpu = metadata.get_cu_seqlens_q_cpu()
@@ -898,7 +917,7 @@ def _get_q_k_bf16(
         # for kunlun ops
         query, _ = indexer.wq_b(q_lora)
         query = rearrange(query, "l (h d) -> l h d", d=indexer.head_dim)
-        query = query.to(torch.bfloat16)  # fp16 model -> bf16 for rotate/DSA
+        # keep model dtype (fp16/bf16); rotate_activation accepts both
         q_rope, _ = torch.split(
             query,
             [indexer.rope_head_dim, indexer.head_dim - indexer.rope_head_dim],
@@ -907,7 +926,7 @@ def _get_q_k_bf16(
         with torch.cuda.stream(indexer.alt_stream):
             # TODO we should also put DeepGEMM half SM here?
             key, _ = indexer.wk(x)
-            key = indexer.k_norm(key).to(torch.bfloat16)
+            key = indexer.k_norm(key)
 
             k_rope, _ = torch.split(
                 key,
@@ -919,15 +938,12 @@ def _get_q_k_bf16(
     else:
         query, _ = indexer.wq_b(q_lora)
         query = rearrange(query, "l (h d) -> l h d", d=indexer.head_dim)
-        # fp16 model: the unquantized q/k projections emit fp16; the downstream
-        # rotate / DSA kernels want bf16 (this helper is named _bf16). No-op when
-        # already bf16.
-        query = query.to(torch.bfloat16)
+        # keep model dtype (fp16/bf16); rotate_activation accepts both halves
         q_rope, _ = torch.split(
             query, [indexer.rope_head_dim, indexer.head_dim - indexer.rope_head_dim], dim=-1
         )
         key, _ = indexer.wk(x)
-        key = indexer.k_norm(key).to(torch.bfloat16)
+        key = indexer.k_norm(key)
         k_rope, _ = torch.split(
             key, [indexer.rope_head_dim, indexer.head_dim - indexer.rope_head_dim], dim=-1
         )
