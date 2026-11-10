@@ -1742,6 +1742,28 @@ def dsv4_compress_norm_rope_store_v2_kunlun(
         else freq_cis
     ).float()
 
+    # The Kunlun compressed-KV pool is a plain bf16 half cache, 512 bf16 per
+    # token (1024 B), while upstream ``compressor_v2`` only sets
+    # ``bf16_store=True`` on the unified-KV path and leaves it False here,
+    # carrying the layout in ``kv_layout`` instead. With it False the operator
+    # writes the V4 fp8+scale byte layout, and ``get_extra_key_buffer`` reads
+    # the same bytes back as bf16: one buffer, two layouts. Derive the store
+    # width from the page geometry instead.
+    #
+    # The slot of a plain half cache is as wide as the latent the call carries:
+    # one bf16 per lane of ``kv``, which is ``qk_nope_head_dim +
+    # qk_rope_head_dim`` (see ``_kunlun_paged_kv_bytes_per_token`` in
+    # hooks/mem_cache/common.py). Scaling by ``element_size`` lets a uint8 byte
+    # pool and a typed bf16/fp16 pool both report bytes -- comparing raw
+    # ``shape`` would read a typed pool as half its byte width and drop it back
+    # onto the fp8 path. The packed V4 layout is 584 B/token, so it stays False.
+    _store_bf16 = bf16_store
+    if not _store_bf16 and page_size > 0 and kvcache.numel() and kv.ndim >= 2:
+        _elems_per_page = kvcache.numel() // kvcache.shape[0]
+        _bytes_per_token = (_elems_per_page // page_size) * kvcache.element_size()
+        if _bytes_per_token == kv.shape[-1] * 2:
+            _store_bf16 = True
+
     torch.ops.xspeedgate_ops.dsv4_compress_norm_rope_store_v2(
         kv,
         plan_raw,
@@ -1753,7 +1775,7 @@ def dsv4_compress_norm_rope_store_v2_kunlun(
         plan.is_decode,
         plan.compress_ratio,
         page_size,
-        bf16_store,
+        _store_bf16,
     )
 
 
