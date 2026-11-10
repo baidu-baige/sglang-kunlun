@@ -296,6 +296,18 @@ def moe_apply_kunlun(
     gemm1_limit = getattr(self.moe_runner_config, "gemm1_clamp_limit", None)
     interleaved = getattr(self.moe_runner_config, "interleaved", False)
     swiglu_limit = self.moe_runner_config.swiglu_limit
+    activation = str(
+        getattr(self.moe_runner_config, "activation", None) or "silu"
+    ).lower()
+    # ``gemm1_alpha`` / ``gemm1_clamp_limit`` carry the parameters of two
+    # different gated activations: SwiGLU-OAI (MiniMax-M3) and SiTU (ERNIE
+    # 5.5). They share the signature, so dispatching on the parameters alone
+    # silently runs OAI
+    #     clamp(g, <=limit) * sigmoid(alpha*g) * (clamp(u, +-limit) + 1)
+    # where the model asks for SiTU
+    #     alpha*tanh(g/alpha) * sigmoid(g) * (limit*tanh(u/limit))
+    # which is a different function of the same two scalars.  Read the
+    # activation name, as the upstream Triton runner does.
     fused_act_quant = (
         _resolve_clamp_swiglu_dynamic_quant()
         if (gemm1_alpha is None and swiglu_limit is not None)
@@ -310,7 +322,19 @@ def moe_apply_kunlun(
             gate_up.reshape(num_tokens * top_k, -1), float(swiglu_limit)
         )
     else:
-        if gemm1_alpha is not None:
+        if activation == "situ":
+            # Matches the upstream Triton runner's situ branch
+            # (moe/moe_runner/triton_utils/fused_moe.py).
+            half = gate_up.shape[-1] // 2
+            situ_beta = float(gemm1_alpha) if gemm1_alpha is not None else 4.0
+            gate = gate_up[..., :half].float()
+            up = gate_up[..., half:].float()
+            gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
+            if gemm1_limit is not None:
+                limit = float(gemm1_limit)
+                up = limit * torch.tanh(up / limit)
+            activated = (gate * up).to(gate_up.dtype)
+        elif gemm1_alpha is not None:
             if gemm1_limit is None:
                 raise AssertionError("gemm1_limit is required when gemm1_alpha is set")
             if interleaved:
