@@ -12,7 +12,7 @@ The problem with import side effects: timing drifts with import order and the bl
 wqkv_a.weight_scale mismatched and was dropped). It is now moved
 to just before the two upstream consumption points (BEFORE hooks), positioned uniformly by HookRegistry at startup:
 
-* ``sglang.srt.utils.hf_transformers.config.get_config``
+* ``sglang.srt.hf_transformers.config.get_config``
     -- fix GLM's ``attribute_map`` (head_dim redirect) before config parsing.
 * ``sglang.srt.model_loader.loader._get_quantization_config``
     -- inject before the quant config is built and before mapper / packed_modules_mapping are read.
@@ -78,7 +78,7 @@ def _ensure_glm_attribute_map() -> None:
 
 
 @plugin_hook(
-    "sglang.srt.utils.hf_transformers.config.get_config",
+    "sglang.srt.hf_transformers.config.get_config",
     type=HookType.BEFORE,
 )
 def ensure_glm_attribute_map_kunlun(*args, **kwargs):

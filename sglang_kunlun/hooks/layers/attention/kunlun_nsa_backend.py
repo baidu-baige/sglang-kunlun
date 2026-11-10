@@ -538,9 +538,12 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
 
         # sparse_prefill_fwd_opt takes explicit q/kv lods and needs preallocated
         # output buffers.
+        # out must match q's dtype (the kernel requires out.dtype == q.dtype;
+        # registrations cover both bf16 and fp16). Hardcoding bf16 breaks the
+        # fp16-latent path, so follow q_all.dtype.
         o_ = torch.zeros(
             [q_all.shape[0], layer.tp_q_head_num, layer.v_head_dim],
-            dtype=torch.bfloat16,
+            dtype=q_all.dtype,
             device=q_all.device,
         )
         max_logits = torch.zeros(
@@ -704,7 +707,7 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
         bs = forward_batch.batch_size
         o_ = torch.zeros(
             [bs, reshape_q.shape[1], layer.tp_q_head_num, layer.v_head_dim],
-            dtype=torch.bfloat16,
+            dtype=q_all.dtype,
             device=q_all.device,
         )
         max_logits = torch.zeros(
@@ -768,7 +771,7 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
 
         o_ = torch.empty(
             [q.shape[0], layer.tp_q_head_num, layer.v_head_dim],
-            dtype=torch.bfloat16,
+            dtype=q.dtype,
             device=q.device,
         )
         ds_alpha = layer.scaling * math.sqrt(layer.head_dim)

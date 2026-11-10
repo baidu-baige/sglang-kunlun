@@ -76,7 +76,7 @@ if TYPE_CHECKING:
 # Kunlun kernel. The replacement lives in ``kernel_ops``; only the registration
 # belongs here.
 @plugin_hook(
-    target="sglang.srt.layers.attention.dsa.dsa_indexer.Indexer._weights_proj_bf16_in_fp32_out", type=HookType.REPLACE
+    target="sglang.srt.layers.attention.dsa.dsa_indexer.Indexer._project_head_gates", type=HookType.REPLACE
 )
 def dsa_weights_proj_bf16_in_fp32_out_kunlun(self, x: torch.Tensor) -> torch.Tensor:
     """Project the DSA indexer head gates to fp32 without ``aten::mm.dtype``.
@@ -88,7 +88,11 @@ def dsa_weights_proj_bf16_in_fp32_out_kunlun(self, x: torch.Tensor) -> torch.Ten
     """
 
     weights, _ = self.weights_proj(x.to(self.weights_proj.weight.dtype))
-    return weights.float()
+    # Mirror base _project_head_gates' two _is_cuda branches while avoiding
+    # aten::mm.dtype: bf16 head-gate models keep bf16, else upcast to fp32.
+    # Both current W4A8 checkpoints lack index_bf16_head_gate, so this stays
+    # the fp32 path for them; the branch only activates for a bf16-gate model.
+    return weights if self.bf16_head_gate else weights.float()
 
 
 # Attributes we read off the upstream Indexer instance. This is the full coupling
@@ -274,22 +278,41 @@ def _require_continuous_index_k(pool, where: str) -> None:
 def _index_k_continuous(pool, layer_id, seq_len, page_indices):
     """Per-request index-K continuous view (K, scale), replacing the dropped
     0.5.22 ``get_index_k_continuous``/``get_index_k_scale_continuous`` with the
-    retained ``get_index_k_with_scale_buffer``: each buffer row is one
-    ``index_page_size`` page laid out as
-    ``[head_dim bytes K][head_dim // quant_block_size * 4 bytes scale]``."""
-    # XPU index_select rejects (uint8, int64); view int8 (same itemsize, bit
-    # identical), which is also what the downstream I8_mqa_logits expects.
-    buf = pool.get_index_k_with_scale_buffer(layer_id).view(torch.int8)
-    head_dim = pool.index_head_dim
-    item_bytes = head_dim + head_dim // pool.quant_block_size * 4
+    retained ``get_index_k_with_scale_buffer``.
+    """
+    if getattr(pool, "use_fp4_indexer", False):
+        raise NotImplementedError(
+            "index-K continuous view: fp4 index keys not supported on Kunlun"
+        )
+    if getattr(pool, "index_kpool", 1) != 1:
+        raise NotImplementedError(
+            "index-K continuous view: pooled index keys (index_kpool != 1) need "
+            "token regrouping, not implemented on Kunlun"
+        )
+
+    key_bytes = pool.index_head_dim          # int8 K bytes/token (non-fp4)
+    scale_bytes = pool.index_head_dim // pool.quant_block_size * 4  # fp32 scale/token
     page_size = pool.index_page_size
+    # XPU index_select rejects (uint8, int64); view int8 (same itemsize, bit
+    # identical), which is also what the downstream I8_mqa_logits consumes.
+    buf = pool.get_index_k_with_scale_buffer(layer_id).view(torch.int8)
+    expected_row = page_size * (key_bytes + scale_bytes)
+    if buf.shape[1] != expected_row:
+        raise NotImplementedError(
+            "index-K continuous view: buffer row %d B != page_size*"
+            "index_bytes_per_token %d B; layout changed"
+            % (buf.shape[1], expected_row)
+        )
+    key_block = page_size * key_bytes  # K bytes for the whole page
     num_pages = (seq_len + page_size - 1) // page_size
     pages = page_indices[:num_pages].to(torch.int64)
-    rows = buf.index_select(0, pages).reshape(-1, item_bytes)
-    # .contiguous() required: downstream .view() cannot reinterpret the strided
-    # row slice.
-    k = rows[:seq_len, :head_dim].contiguous()
-    k_scale = rows[:seq_len, head_dim:].contiguous()
+    rows = buf.index_select(0, pages)  # [num_pages, page_size*index_bytes_per_token]
+    # Split the page into its K block and scale block, then de-page to tokens.
+    k = rows[:, :key_block].reshape(-1, key_bytes)  # [num_pages*page_size, key_bytes]
+    k_scale = rows[:, key_block:].reshape(-1, scale_bytes)
+    # .contiguous() required: downstream .view() cannot reinterpret a strided slice.
+    k = k[:seq_len].contiguous()
+    k_scale = k_scale[:seq_len].contiguous()
     return k, k_scale
 
 

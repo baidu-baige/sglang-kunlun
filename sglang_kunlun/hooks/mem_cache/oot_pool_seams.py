@@ -123,6 +123,28 @@ def _install_kunlun_ernie_mla_subpool() -> None:
         _kunlun_int8_index = True
         index_k_with_scale_buffer_dtype = torch.int8
 
+        def __init__(self, *args, **kwargs):
+            # Honor --kv-cache-dtype for the MLA latent sub-pool. Base hardcodes
+            # bf16 here (it only branches fp8-vs-bf16 and ignores fp16), so under
+            # ``--kv-cache-dtype fp16`` the latent silently stayed bf16. The
+            # DSA/MLA kernels register both bf16 and fp16 (fwd_kvcache_mla_v2,
+            # sparse_prefill_fwd_opt: out.dtype==q.dtype), so follow the request:
+            # fp16 -> fp16, bfloat16 -> bf16, fp8/auto -> unchanged.
+            import torch
+
+            if kwargs.get("dtype") == torch.bfloat16:
+                try:
+                    from sglang.srt.runtime_context import get_server_args
+
+                    kv = str(
+                        getattr(get_server_args(), "kv_cache_dtype", "") or ""
+                    ).lower()
+                except Exception:
+                    kv = ""
+                if kv in ("fp16", "float16", "half"):
+                    kwargs["dtype"] = torch.float16
+            super().__init__(*args, **kwargs)
+
     ernie_mp._LayerSubsetDSATokenToKVPool = _KunlunLayerSubsetDSATokenToKVPool
     logger.info(
         "sglang-kunlun: ERNIE 5.5 MLA sub-pool uses an int8 index-K buffer "
