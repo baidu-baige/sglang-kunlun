@@ -30,6 +30,13 @@ from sglang_kunlun.kernels.kernel_ops import (
     register_jit_op,
 )
 
+try:  # soft dependency: when xdll_ops is missing the torch reference below is used
+    import xdll_ops  # noqa: F401  registers the torch.ops.xdll_ops namespace
+
+    _XDLL_HC_MIX_STATS = hasattr(torch.ops.xdll_ops, "hc_mix_stats")
+except Exception:  # noqa: BLE001 - any import failure means it is unavailable
+    _XDLL_HC_MIX_STATS = False
+
 
 @register_jit_op("sglang.kernels.ops.layernorm.mhc", "hc_mix_stats")
 def hc_mix_stats_kunlun(
@@ -37,22 +44,32 @@ def hc_mix_stats_kunlun(
 ) -> torch.Tensor:
     """``F.linear(x_flat.float(), hc_fn) * rsqrt(mean(x_flat**2) + eps)``, fp32.
 
-    The XSpeedGate op fuses the same two stages as upstream's Triton kernel (a
-    split-K partial producing `[sumsq, dot...]` per k-block, then a per-token
-    reduce applying the RMS scale), so it keeps the fp32 accumulation and the
-    fp32 `[m, mix]` output. It reads `x_flat` in its own dtype, which drops the
-    separate fp32 materialization the torch body needed. `mix` is 24 here, well
-    inside the op's `mix <= 32`; `hc_fn` is already fp32, as the torch
-    `F.linear` above also required.
+    The XDLL op (``xdll_ops::hc_mix_stats``) fuses the two upstream Triton
+    stages (a split-K partial producing `[sumsq, dot...]` per k-block, then a
+    per-token reduce applying the RMS scale), keeping the fp32 accumulation and
+    the fp32 `[m, mix]` output. It reads `x_flat` in its own dtype, so the
+    separate fp32 materialization disappears. `mix` is 24 here, inside the op's
+    `mix <= 32`; `hc_fn` is already fp32, as the upstream `F.linear` requires.
 
-    The enter/exit pair proves the op both ran and returned: an XPU kernel that
-    faults inside takes the process down with no Python traceback, so a lone
-    `enter` line localizes the crash to the op itself.
+    The op enforces its dtype/shape contract with TORCH_CHECKs that throw
+    before the launch, so a rejected call leaves nothing half-written and the
+    torch reference below is a safe fallback. Images without ``xdll_ops`` still
+    run, just without the fused kernel.
     """
     x_flat = x_flat.contiguous()
     hc_fn = hc_fn.contiguous()
-    mixes = torch.ops.xspeedgate_ops.hc_mix_stats(x_flat, hc_fn, eps)
-    return mixes
+    op = "hc_mix_stats"
+    reason = "xdll_ops.hc_mix_stats is unavailable"
+    if _XDLL_HC_MIX_STATS:
+        try:
+            return torch.ops.xdll_ops.hc_mix_stats(x_flat, hc_fn, eps)
+        except RuntimeError as exc:
+            reason = f"xdll: {exc}"
+
+    _dspark_warn_fallback(op, reason)
+    x = x_flat.float()
+    mixes = torch.nn.functional.linear(x, hc_fn)
+    return mixes * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
 
 
 @register_jit_op("sglang.kernels.ops.layernorm.mhc", "hc_combine")

@@ -3,7 +3,7 @@
 Two image definitions live here, kept side by side on purpose while we decide which one to keep. Everything below this section describes `Dockerfile.xpu`.
 
 - **`Dockerfile.xpu`** — Python 3.10 / cp310 wheels, built from `ubuntu:20.04` in 6 stages, no Kunlun base image. Component URLs also live in `kunlun-components.env`.
-- **`Dockerfile`** — Python 3.12 / cp312 wheels, built **from** the Kunlun base image `xpytorch:torch29-py312-ubuntu20.04-v0.45`, two stages, flattened to a single layer by a trailing `FROM scratch`. Migrated from `dev-kunlun-0.5.19-dsv4.1`; its wheels (`xspeedgate_ops 1.6.0+daf4291`, `xdll_ops 1.0.0+0b9542f`) are the ones the int8 low-ratio index-K cache needs. **Not yet built or run against 0.5.22.**
+- **`Dockerfile`** — Python 3.12 / cp312 wheels, built **from** the Kunlun base image `xpytorch:torch29-py312-ubuntu20.04-v0.45`, two stages, flattened to a single layer by a trailing `FROM scratch`. Migrated from `dev-kunlun-0.5.19-dsv4.1`; its wheels (`xspeedgate_ops 1.6.0+d3d0ba2`, `xdll_ops 1.0.0+80958d8`) are the ones the int8 low-ratio index-K cache needs. **Not yet built or run against 0.5.22.**
 
 ```bash
 # py3.12 image -- same two-sibling context as below, different -f
