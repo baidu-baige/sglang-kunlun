@@ -1570,6 +1570,64 @@ def dsv4_compress_forward_v2_kunlun(
         plan_w,
         compress_ratio,
     )
+    _oracle_trigger = os.environ.get("SGLANG_KUNLUN_COMPRESS_ORACLE_TRIGGER", "")
+    if os.environ.get("SGLANG_KUNLUN_COMPRESS_ORACLE", "0") == "1" and (
+        not _oracle_trigger or os.path.exists(_oracle_trigger)
+    ):
+        # ``_dsv4_compress_rows_torch`` implements the same weighted-pooling
+        # contract in Torch: members the call carries come from
+        # ``kv_score_input`` and the rest from the state ring, selected by the
+        # plan's ``buffer_len``. Comparing it against the operator on identical
+        # inputs separates a wrong kernel from a wrong plan / unwritten ring.
+        try:
+            reference = _dsv4_compress_rows_torch(
+                kv_score_buffer,
+                kv_score_input,
+                ape,
+                plan,
+                head_dim,
+                compress_ratio,
+            )
+            # Norms run on the host: the XPU eager kernel for
+            # linalg_vector_norm rejects fp64, and the dumps are small.
+            a = out.detach().float().cpu().double()
+            b = reference.detach().float().cpu().double()
+            diff = (a - b).abs()
+            denom = float((b * b).sum().sqrt())
+            rel_l2 = float(((a - b) * (a - b)).sum().sqrt()) / denom if denom else float("nan")
+            flat_a, flat_b = a.reshape(-1), b.reshape(-1)
+            na = float((flat_a * flat_a).sum().sqrt())
+            nb = float((flat_b * flat_b).sum().sqrt())
+            cos = float(flat_a @ flat_b) / (na * nb) if na and nb else float("nan")
+            rows_a = (a.abs().amax(dim=-1) > 0).nonzero().flatten()[:8].tolist()
+            rows_b = (b.abs().amax(dim=-1) > 0).nonzero().flatten()[:8].tolist()
+            logger.warning(
+                "[compress-oracle] cr=%d is_decode=%s rows=%d "
+                "op_absmax=%.6g ref_absmax=%.6g rel_l2=%.3e cos=%.6f "
+                "max_abs_diff=%.6g nz_rows_op=%s nz_rows_ref=%s",
+                compress_ratio,
+                plan.is_decode,
+                a.shape[0],
+                a.abs().max().item() if a.numel() else 0.0,
+                b.abs().max().item() if b.numel() else 0.0,
+                rel_l2,
+                cos,
+                diff.max().item() if diff.numel() else 0.0,
+                rows_a,
+                rows_b,
+            )
+            raw = plan_c.view(torch.int32).cpu()
+            logger.warning(
+                "[compress-oracle]   plan pos=%s buflen=%s page0=%s page1=%s",
+                raw[:4, 0].tolist(),
+                (raw[:4, 1].bitwise_right_shift(16) & 0xFFFF).tolist()
+                if raw.shape[1] > 1
+                else [],
+                raw[:4, 2].tolist() if raw.shape[1] > 2 else [],
+                raw[:4, 3].tolist() if raw.shape[1] > 3 else [],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[compress-oracle] comparison failed: %r", exc)
     return out
 
 
