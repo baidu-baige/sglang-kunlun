@@ -141,8 +141,8 @@ aiak_sglang_dir="/workspace/aiak_sglang"
 function install_base_env() {
     rm -rf /etc/apt/sources.list && cp ${plugin_dir}/dockerfile/sources.list /etc/apt/sources.list
     # 设置时区
-    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install tzdata && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
-    apt-get install net-tools -y
+    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y tzdata && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+    apt-get install -y curl wget net-tools patch git
     apt-get install lsof -y
     apt-get install libarchive-dev zlib1g-dev -y
     apt-get install bc tree pwgen nodejs -y
@@ -606,14 +606,22 @@ PYCODE
 }
 
 function install_performance_tool() {
-    local performance_tool_download_addr=$1
-    pip3 install ${performance_tool_download_addr}
+    local performance_tool_download_addr="${1:-}"
+    if [[ -z "${performance_tool_download_addr}" || "${performance_tool_download_addr}" == "NA" ]]; then
+        echo "performance_tool_download_addr not set; skip"
+        return 0
+    fi
+    pip3 install "${performance_tool_download_addr}"
     echo "performance_tool=${performance_tool_download_addr}" >> /versions
 }
 
 function install_aiak_ds_tool() {
-    local aiak_ds_tool_download_addr=$1
-    pip3 install ${aiak_ds_tool_download_addr}
+    local aiak_ds_tool_download_addr="${1:-}"
+    if [[ -z "${aiak_ds_tool_download_addr}" || "${aiak_ds_tool_download_addr}" == "NA" ]]; then
+        echo "aiak_ds_tool_download_addr not set; skip"
+        return 0
+    fi
+    pip3 install "${aiak_ds_tool_download_addr}"
     echo "aiak_ds_tool_download_addr=${aiak_ds_tool_download_addr}" >> /versions
 }
 
@@ -660,6 +668,9 @@ if [ "$engine_type" == "aiak_sglang" ]; then
     file_soft_chain
     install_sglang_kunlun_plugin
     apply_engine_patches
+else
+    echo "Error: unsupported engine_type '${engine_type}' (expected aiak_sglang)" >&2
+    exit 1
 fi
 
 ############################################################# 基础环境结束 ###########################################################
