@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 
 @plugin_hook(
-    "sglang.srt.layers.attention.dsv4.quant_k_cache."
+    "sglang.kernels.ops.attention.dsv4.quant_k_cache."
     "quant_to_nope_fp8_rope_bf16_pack_triton",
     type=HookType.REPLACE,
 )

@@ -35,6 +35,7 @@ import logging
 import os
 
 import torch
+
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 logger = logging.getLogger(__name__)
@@ -135,6 +136,7 @@ def compress_state_alloc_kunlun(original_fn, self, **kwargs):
     self.kv_score_buffer = KVAndScore(_alloc_2m_aligned(shape, dtype, device))
 
 
+
 @plugin_hook(
     "sglang.srt.mem_cache.deepseek_v4_memory_pool.DeepSeekV4UnifiedKVPool.__init__",
     type=HookType.AROUND,
@@ -154,7 +156,6 @@ def unified_kv_init_kunlun(original_fn, self, *args, **kwargs):
         del b
         _empty_cache()
         bufs[i] = _alloc_2m_aligned(shape, dtype, device)
-
 
 logger.info(
     "sglang-kunlun: 2MB-aligned KV/indexer/compress-state realloc hooks registered"

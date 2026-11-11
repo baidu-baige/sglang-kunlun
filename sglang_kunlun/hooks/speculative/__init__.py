@@ -18,3 +18,7 @@
 """speculative attention"""
 from . import draft_utils  # noqa: F401
 from . import multi_layer_eagle_worker_v2  # noqa: F401
+from . import dspark_graph  # noqa: F401
+from . import dspark_metadata_torch  # noqa: F401
+from . import dspark_accept_torch  # noqa: F401
+from . import draft_backend  # noqa: F401

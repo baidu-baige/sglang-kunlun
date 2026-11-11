@@ -38,8 +38,20 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
     type=HookType.AROUND,
 )
 def configure_kv_cache_dtype_kunlun(original_fn, self):
-    """Resolve ``float16`` / ``half`` to ``torch.float16``."""
+    """Resolve ``float16`` / ``half`` to ``torch.float16``.
+
+    [kunlun-adapt] 上游实现改从 get_model() config bag 读 dtype，并在解析后
+    设置 ``self.kv_cache_dtype_str``（attention backend 直接读取）。float16 不在
+    上游白名单内，因此用 bag.override(**kw) 作用域内把 bag 伪装成 bfloat16 走完整解析（上游
+    已封印 config 直写），随后覆盖结果为 float16。
+    """
     if self.server_args.kv_cache_dtype in ("float16", "half"):
+        from sglang.srt.runtime_context import get_model
+
+        bag = get_model()
+        with bag.override(kv_cache_dtype="bfloat16"):
+            original_fn(self)
         self.kv_cache_dtype = torch.float16
+        self.kv_cache_dtype_str = "float16"
         return
     return original_fn(self)

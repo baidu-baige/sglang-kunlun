@@ -173,7 +173,10 @@ def _fused_k_norm_rope_flashmla_torch(
         kv_out = torch.cat([kv_nope, kv_rope_rot], dim=-1).to(kvcache.dtype).contiguous()  # [B,512]
         _np = kvcache.shape[0]
         _mx = _np * page_size - 1
-        _loc = out_loc.to(torch.int64).clamp(min=0, max=_mx)
+        # out_loc is already int64 on this path; the unconditional cast was a
+        # no-op ``aten::to`` dispatch per layer (80 per prefill step).
+        _loc = out_loc if out_loc.dtype is torch.int64 else out_loc.to(torch.int64)
+        _loc = _clamp_loc_i64(_loc, _mx)
         torch.ops.xspeedgate_ops.set_k_and_s_v4(kvcache, _loc, kv_out, page_size)
         return
 
@@ -232,6 +235,51 @@ def _fused_k_norm_rope_flashmla_torch(
         kvcache_u8.view(-1)[scale_start:scale_start + nope_warp_groups].copy_(scales_b)
 
 
+# [host-diet r85] ``out_loc.clamp()`` below is one int64 allocation + one kernel
+# per layer (80 per prefill forward) whose result dies with the next call, so it
+# writes into a scratch instead.
+#
+# [rel-7th qps-oom] r85 那版按 ``(numel, device)`` 缓存：QPS 流量下每个不同的 B
+# 各留一份 ``int64[numel]``（8·numel 字节）且永不释放，和 attention 的
+# ``_attn_aux`` 是同一种无界增长（9 分钟约 370 个不同 B），会挤掉大请求里
+# ``dsv41_cp_indexer._expand()`` 需要的连续大块（实测 ``torch.OutOfMemoryError``）。
+# 改成**每个 device 一块 grow-only 缓冲**：按需从头部切出 n 元素的连续视图，
+# 容量只增不减，稳定态只有一块 ``int64[max_numel]``。
+_CLAMP_I64_CACHE: dict = {}
+_CLAMP_OUT = os.environ.get("KL_CLAMP_OUT", "1").lower() not in (
+    "0",
+    "",
+    "false",
+    "off",
+    "none",
+)
+
+
+def _grow_cap(old: int, need: int) -> int:
+    """grow-only 容量：够用即可，否则按 1.25 倍留余量（别让每个新 B 都重分配）。"""
+    return need if old <= 0 else max(need, (old * 5 + 3) // 4)
+
+
+def _clamp_loc_i64(loc: torch.Tensor, upper: int) -> torch.Tensor:
+    if not _CLAMP_OUT:
+        return loc.clamp(min=0, max=upper)
+    # 只有一个逻辑 tag（clamp 输出），key 就只留 device，沿用原来的 ``str(device)``。
+    key = str(loc.device)
+    n = loc.numel()
+    buf = _CLAMP_I64_CACHE.get(key)
+    if buf is None or buf.numel() < n:
+        old = 0 if buf is None else buf.numel()
+        # 先放掉旧缓冲的引用再分配：峰值是「一块」而不是「两块」。
+        buf = None
+        _CLAMP_I64_CACHE.pop(key, None)
+        buf = torch.empty(_grow_cap(old, n), dtype=torch.int64, device=loc.device)
+        _CLAMP_I64_CACHE[key] = buf
+    # 连续前缀视图：1-D、stride 1，与旧的 ``torch.empty(n)`` 形状/步长完全一致。
+    out = buf[:n]
+    torch.clamp(loc, min=0, max=upper, out=out)
+    return out
+
+
 def _fused_k_norm_rope_flashmla_kunlun(
     kv: torch.Tensor,        # [B, head_dim=512] or [B, q_lora_rank+head_dim]
     kv_weight: torch.Tensor, # [head_dim]
@@ -269,23 +317,28 @@ def _fused_k_norm_rope_flashmla_kunlun(
 
 
     # --- Step 2: RoPE on rope part (reuse _apply_rope_xspeedgate) ---
-    kv_nope = kv_normed[:, :nope_dim]   # [B, 448]
-    kv_rope = kv_normed[:, nope_dim:]   # [B, 64]
+    kv_rope = kv_normed[:, nope_dim:]   # [B, 64] view of the normed row
 
     # flashinfer_rotary_embedding requires 3D query [B, H, rope_dim];
-    # unsqueeze to [B, 1, 64] then squeeze back.  Pass key=None; use q_out.
-    kv_rope_rot, _ = _apply_rope_xspeedgate(
-        kv_rope.unsqueeze(1), None, freqs_cis, positions, inverse=False,
+    # unsqueeze to [B, 1, 64].  Pass key=None.  ``inplace`` rotates the tail of
+    # ``kv_normed`` directly (it is a private rmsnorm output), so no cat is
+    # needed below: ``kv_normed`` already *is* the [B, 512] rope-applied row.
+    _apply_rope_xspeedgate(
+        kv_rope.unsqueeze(1), None, freqs_cis, positions, inverse=False, inplace=True,
     )
-    kv_rope_rot = kv_rope_rot.squeeze(1)  # [B, 64]
 
 
     # --- Step 3: store to paged cache ---
     if kvcache.dtype in (torch.bfloat16, torch.float16):
-        kv_out = torch.cat([kv_nope, kv_rope_rot], dim=-1).to(kvcache.dtype).contiguous()
+        kv_out = kv_normed if kv_normed.dtype == kvcache.dtype else kv_normed.to(kvcache.dtype)
+        if not kv_out.is_contiguous():
+            kv_out = kv_out.contiguous()
         _np = kvcache.shape[0]
         _mx = _np * page_size - 1
-        _loc = out_loc.to(torch.int64).clamp(min=0, max=_mx)
+        # out_loc is already int64 on this path; the unconditional cast was a
+        # no-op ``aten::to`` dispatch per layer (80 per prefill step).
+        _loc = out_loc if out_loc.dtype is torch.int64 else out_loc.to(torch.int64)
+        _loc = _clamp_loc_i64(_loc, _mx)
         torch.ops.xspeedgate_ops.set_k_and_s_v4(kvcache, _loc, kv_out, page_size)
         return
 
@@ -340,6 +393,247 @@ def _fused_rope_inplace_torch(
         _apply(k, freqs, inverse)
 
 
+# ---------------------------------------------------------------------------
+# q_rope_store
+# Upstream: sglang.kernels.ops.attention.dsv4.q_rope_store.q_rope_store (Triton)
+# Rotates the rope-part (last 64 dims) of each 512-wide Q head while copying the
+# nope-part, writing into a (possibly padded) output buffer. The Triton kernel
+# does not compile on the XPU Triton backend, so run it in pure torch.
+# ---------------------------------------------------------------------------
+
+def _q_rope_store_torch(
+    q: torch.Tensor,           # [num_tokens, num_heads, 512]
+    output: torch.Tensor,      # [num_tokens, num_heads, 512], same shape as q
+    freqs_cis: torch.Tensor,   # [max_pos, 32] complex64
+    positions: torch.Tensor,   # [num_tokens] int32/int64
+) -> None:
+    """Forward RoPE on the last 64 dims of each 512-wide head, nope copied.
+
+    Mirrors the interleaved (adjacent-pair) rotation of the Triton
+    ``_q_rope_store`` kernel:
+        out[2i]   = x[2i]*cos_i - x[2i+1]*sin_i
+        out[2i+1] = x[2i]*sin_i + x[2i+1]*cos_i
+    applied to dims [448, 512); dims [0, 448) are copied through unchanged.
+    """
+    rope_dim = 64
+    nope_dim = q.shape[-1] - rope_dim  # 448
+    aliased = output.data_ptr() == q.data_ptr()
+
+    if q.shape[0] == 0:
+        if not aliased:
+            output.copy_(q)
+        return
+
+    x_rope = q[..., nope_dim:]  # [T, H, 64]
+    x_c = x_rope.float().reshape(*x_rope.shape[:-1], rope_dim // 2, 2)
+    xr = x_c[..., 0]  # [T, H, 32]
+    xi = x_c[..., 1]
+
+    freqs = freqs_cis[positions.long()]  # [T, 32] complex64
+    f_r = freqs.real.to(torch.float32).unsqueeze(1)  # [T, 1, 32]
+    f_i = freqs.imag.to(torch.float32).unsqueeze(1)
+
+    o_r = xr * f_r - xi * f_i
+    o_i = xr * f_i + xi * f_r
+    rotated = torch.stack([o_r, o_i], dim=-1).reshape(x_rope.shape)
+
+    # ``rotated`` is a fresh tensor, so writing into an output that aliases q
+    # is safe. Skip the redundant nope self-copy in the in-place case.
+    if not aliased:
+        output[..., :nope_dim].copy_(q[..., :nope_dim])
+    output[..., nope_dim:].copy_(rotated.to(output.dtype))
+
+
+# ---------------------------------------------------------------------------
+# rope_tail_fake_quant_fp4
+# Upstream: sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant
+#           .rope_tail_fake_quant_fp4 (Triton, uses libdevice + fp8 casts)
+# The DSV4.1 fp4 indexer's fused RoPE-on-tail + fp4 fake-quant round-trip. The
+# Triton kernel does not compile on the XPU backend (make_ttxir SIGSEGV). This
+# mirrors exactly the non-CUDA branch of dsv41_sparse._rope_fq4:
+# ``fake_quant_fp4(rope_tail(x, freqs, rope_dim))`` (or the compressed-KV
+# variant) — sglang's own numerically-matched torch references.
+# ---------------------------------------------------------------------------
+
+def _round_positive_to_e4m3_fp32(v: torch.Tensor) -> torch.Tensor:
+    """Round a positive fp32 tensor to the E4M3FN grid without the fp8 dtype.
+
+    XPU has no ``float8_e4m3fn`` copy kernel (torch_xmlir NOT_IMPLEMENTED), so
+    emulate ``x.to(torch.float8_e4m3fn).float()`` for the compressed-KV scale,
+    which the caller has already clamped into E4M3FN's positive finite range
+    [2**-9, 448]. E4M3 has 3 mantissa bits; per binade the step is 2**(e-3),
+    with subnormals (e < -6) sharing the min-normal exponent -6 (step 2**-9).
+    Uses round-half-to-even (torch.round) to match the fp8 cast.
+    """
+    e = torch.floor(torch.log2(v)).clamp_min(-6.0)
+    step = torch.exp2(e - 3.0)
+    return (torch.round(v / step) * step).clamp(max=448.0)
+
+
+def _fake_quant_compressed_kv_no_fp8(x: torch.Tensor) -> torch.Tensor:
+    """``fake_quant_compressed_kv`` with the E4M3 scale rounding emulated in
+    fp32 (the upstream ``.to(torch.float8_e4m3fn)`` is NOT_IMPLEMENTED on XPU).
+    Per-16 block; one E4M3 scale per block; e2m1 fp4 round-trip; zero-preserving.
+    """
+    from sglang.kernels.ops.attention.dsv4.torch_quant import round_fp4
+
+    fp4_max = 6.0
+    blocks = x.float().unflatten(-1, (-1, 16))
+    amax = blocks.abs().amax(dim=-1, keepdim=True)
+    scale = (amax * (1.0 / fp4_max)).clamp(min=2.0**-9, max=448.0)
+    scale = _round_positive_to_e4m3_fp32(scale)
+    scaled = (blocks / scale).clamp(-fp4_max, fp4_max)
+    deq = round_fp4(scaled) * scale
+    return deq.flatten(-2).to(x.dtype)
+
+
+def _rope_tail_fake_quant_fp4_torch(
+    x: torch.Tensor,
+    freqs: torch.Tensor,
+    rope_dim: int,
+    inverse: bool = False,
+    block_size: int = 32,
+    *,
+    compressed_kv: bool = False,
+) -> torch.Tensor:
+    """Pure-torch RoPE-tail + fp4 fake-quant, reusing sglang's torch references.
+
+    The non-compressed path delegates to sglang's ``fake_quant_fp4`` (ue8m0, no
+    fp8). The compressed-KV path reimplements ``fake_quant_compressed_kv`` with
+    an fp8-free E4M3 scale rounding because XPU lacks the fp8 copy kernel.
+    """
+    from sglang.srt.layers.attention.dsv4.dsv41_sparse import rope_tail
+    from sglang.kernels.ops.attention.dsv4.torch_quant import fake_quant_fp4
+
+    rotated = rope_tail(x, freqs, rope_dim, inverse=inverse)
+    if compressed_kv:
+        return _fake_quant_compressed_kv_no_fp8(rotated)
+    return fake_quant_fp4(rotated, block_size)
+
+
+# ---------------------------------------------------------------------------
+# c2_decode_pool
+# Upstream: sglang.kernels.ops.attention.dsv4.c2_decode_pool.c2_decode_pool
+#           (Triton, uses libdevice.exp/div_rn; make_ttxir SIGSEGV on XPU).
+# Ratio-2 decode pair-pooling: softmax-weighted merge of the current row with
+# its partner held in the compress-state ring, updating the ring in place.
+# Bitwise-faithful torch reimplementation (all fp32; read partner state before
+# writing, matching the kernel's load-then-store ordering).
+# ---------------------------------------------------------------------------
+
+def _c2_decode_pool_torch(
+    kv: torch.Tensor,
+    score: torch.Tensor,
+    pos: torch.Tensor,
+    raw_out_loc: torch.Tensor,
+    out_loc: torch.Tensor,
+    req: torch.Tensor,
+    state_kv: torch.Tensor,
+    state_score: torch.Tensor,
+    pad_row: int,
+    *,
+    ring_size: int = 0,
+):
+    assert kv.dtype == torch.float32 and score.dtype == torch.float32
+    pos_l = pos.long()
+    req_l = req.long()
+    odd = (pos_l % 2) == 1  # [n]
+
+    pad = torch.full_like(req_l, pad_row)
+    if ring_size:
+        r = torch.where(
+            (raw_out_loc == 0) | (pos_l == 0),
+            pad,
+            req_l * ring_size + (pos_l - 1) % ring_size,
+        )
+    else:
+        r = torch.where(raw_out_loc == 0, pad, req_l)
+    r = r.long()
+
+    # Read partner state BEFORE any write (advanced indexing returns a copy).
+    p_kv = state_kv[r]
+    p_score = state_score[r]
+
+    if ring_size:
+        write_row = (req_l * ring_size + pos_l % ring_size).long()
+        wmask = raw_out_loc != 0
+        if bool(wmask.any()):
+            wr = write_row[wmask]
+            state_kv[wr] = kv[wmask]
+            state_score[wr] = score[wmask]
+    else:
+        odd_col = odd[:, None]
+        state_kv[r] = torch.where(odd_col, p_kv, kv)
+        state_score[r] = torch.where(odd_col, p_score, score)
+
+    # Softmax-weighted pair merge, fp32 (libdevice.exp/div_rn -> torch exp/div).
+    m = torch.maximum(p_score, score)
+    e0 = torch.exp(p_score - m)
+    e1 = torch.exp(score - m)
+    denom = e0 + e1
+    pooled = p_kv * (e0 / denom) + kv * (e1 / denom)
+
+    group_pos = torch.where(odd, pos_l - 1, pos_l).to(pos.dtype)
+    slots = torch.where(out_loc >= 0, out_loc, torch.zeros_like(out_loc))
+    return pooled, group_pos, slots
+
+
+# ---------------------------------------------------------------------------
+# fp4_index_logits_decode
+# Upstream: sglang.kernels.ops.attention.dsv4.fp4_indexer.fp4_index_logits_decode
+#           (Triton; make_ttxir SIGSEGV on XPU).
+# Decode-path indexer logits: dequant the fp4 index-K cache rows at `slots`,
+# then s[b,l] = sum_h relu(q[b,h].K[b,l]) * weights[b,h], -inf beyond lens[b].
+# Reuses the exact fp4 dequant of pool.get_index_k_dequant and indexer.scores.
+# ---------------------------------------------------------------------------
+
+def _fp4_index_logits_decode_torch(
+    q: torch.Tensor,        # [B, H, 128] bf16 (rope'd, fp4-rounded)
+    weights: torch.Tensor,  # [B, H] bf16 (softmax_scale folded in)
+    slots: torch.Tensor,    # [B, L] int, page pool slots (already //ratio, masked)
+    lens: torch.Tensor,     # [B] int, visible compressed positions
+    table: torch.Tensor,    # [num_pages, page_size*68] index-K fp4 cache buffer
+    page_size: int,
+) -> torch.Tensor:
+    """Chunked over L to bound peak memory: the fused kernel streams the fp4 K
+    cache, so materializing the full [B, L, 128] K OOMs when the KV pool has
+    already claimed most HBM. Process the visible positions in blocks."""
+    from sglang.srt.layers.quantization.fp8 import DSV4_DEQUANT_FP4_TABLE
+
+    dev = table.device
+    B, H, _ = q.shape
+    L = slots.shape[1]
+    p = page_size
+    lut = DSV4_DEQUANT_FP4_TABLE.to(dev).float()  # [16]
+    qf = q.float()                                 # [B, H, 128]
+    wf = weights.float().unsqueeze(-1)             # [B, H, 1]
+    slots64 = slots.to(torch.int64)
+    ar64 = torch.arange(64, device=dev)
+    ar4 = torch.arange(4, device=dev)
+    out = torch.empty(B, L, dtype=torch.float32, device=dev)
+
+    chunk = 1024
+    for c0 in range(0, L, chunk):
+        c1 = min(c0 + chunk, L)
+        sc = slots64[:, c0:c1]                     # [B, C]
+        page = (sc // p).unsqueeze(-1)             # [B, C, 1]
+        off = sc % p                               # [B, C]
+        payload_cols = (off * 64).unsqueeze(-1) + ar64       # [B, C, 64]
+        scale_cols = (p * 64 + off * 4).unsqueeze(-1) + ar4  # [B, C, 4]
+        u = table[page, payload_cols].view(torch.uint8)      # [B, C, 64]
+        lo = lut[(u & 0x0F).long()]                # [B, C, 64]
+        hi = lut[((u >> 4) & 0x0F).long()]         # [B, C, 64]
+        vals = torch.stack([lo, hi], dim=-1).flatten(2)      # [B, C, 128]
+        exps = table[page, scale_cols].to(torch.int32) & 0xFF  # [B, C, 4]
+        scales = torch.exp2(exps.float() - 127).repeat_interleave(32, dim=-1)  # [B,C,128]
+        k = vals * scales                          # [B, C, 128] fp32
+        s = torch.einsum("bhd,bcd->bhc", qf, k)    # [B, H, C]
+        out[:, c0:c1] = (s.relu() * wf).sum(dim=1)  # [B, C]
+
+    ar = torch.arange(L, device=dev)
+    return out.masked_fill(ar[None, :] >= lens.to(torch.int64)[:, None], float("-inf"))
+
+
 _FREQS_REAL_CACHE: dict = {}
 
 
@@ -355,9 +649,13 @@ def _get_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
     cached = _FREQS_REAL_CACHE.get(key)
     if cached is not None:
         return cached
-    real_part = torch.real(freqs_cis)
-    imag_part = torch.imag(freqs_cis)
-    freqs_real = torch.cat([real_part, imag_part], dim=-1).contiguous()
+    # XMLIR's complex view handling requires a normal versioned tensor.
+    # DSpark builds its frequencies under inference_mode, unlike the target.
+    with torch.inference_mode(False):
+        normal_freqs = freqs_cis.clone()
+        real_part = torch.real(normal_freqs)
+        imag_part = torch.imag(normal_freqs)
+        freqs_real = torch.cat([real_part, imag_part], dim=-1).contiguous()
     _FREQS_REAL_CACHE[key] = freqs_real
     return freqs_real
 
@@ -368,21 +666,41 @@ def _apply_rope_xspeedgate(
     freqs_cis: torch.Tensor,   # [max_pos, rope_dim//2] complex64
     positions: torch.Tensor,   # [B] int32/int64
     inverse: bool = False,
+    inplace: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Apply GPT-J RoPE via ``xspeedgate_ops.flashinfer_rotary_embedding``.
 
-    Returns ``(q_out, k_out)`` as new tensors (non-in-place).
-    Shared by ``_fused_rope_inplace_kunlun`` and ``_fused_k_norm_rope_flashmla_kunlun``.
+    ``inplace=True`` lets q/k be non-contiguous views (e.g. ``q[..., -64:]`` of a
+    ``[B, H, 512]`` tensor): the op takes ``token_stride``/``head_stride`` from
+    the view and writes back into the *view's own storage*, so neither the
+    ``.contiguous()`` copy in nor a copy back is needed. The caller must own that
+    storage (or accept mutating it) -- the same in-place contract the op has
+    always had; ``inplace=False`` keeps the old copy-for-you behaviour.
+
+    Returns ``(q_out, k_out)``; with ``inplace=True`` these are the arguments
+    themselves (the kernel already wrote into them).
     """
+    if q.shape[0] == 0:
+        return q, k
     freqs_real = _get_cos_sin_cache(freqs_cis)
     rotary_dim = q.shape[-1]
-    q_input = q.contiguous() if not q.is_contiguous() else q
-    k_input = k.contiguous() if (k is not None and not k.is_contiguous()) else k
-    # The Kunlun rotary kernel misbehaves (reads out-of-range positions) when a
-    # single launch carries many tokens, which happens on the NSA prefill
-    # context-parallel path for long prompts. RoPE is per-token independent, so
-    # chunking the launch is numerically identical.
-    chunk = int(os.environ.get("KL_ROPE_CHUNK", "256"))
+    if inplace:
+        q_input = q
+        k_input = k
+    else:
+        q_input = q.contiguous() if not q.is_contiguous() else q
+        k_input = k.contiguous() if (k is not None and not k.is_contiguous()) else k
+    # The 256-token launch chunking was a workaround for a reported out-of-range
+    # position read ("single launch carries many tokens"). Standalone validation
+    # shows the op is correct and fault-free in one launch for n_tok up to 131072
+    # (bit-exact vs chunked over n_tok {2048..131072} x H {1,8,64,128}), and the
+    # chunking otherwise fires ~3200 launches per 16k step plus a cat. RoPE is
+    # per-token independent, so a single launch is numerically identical.
+    # ``KL_ROPE_CHUNK`` restores chunking for bisection if a vendor build regresses.
+    # Chunking is incompatible with ``inplace`` (it returns concatenated copies,
+    # so nothing would reach the caller's storage); it is a bisection escape
+    # hatch only, so it is ignored on that path.
+    chunk = 0 if inplace else int(os.environ.get("KL_ROPE_CHUNK", "0"))
     n_tok = q_input.shape[0]
     if chunk <= 0 or n_tok <= chunk:
         return torch.ops.xspeedgate_ops.flashinfer_rotary_embedding(
@@ -428,14 +746,14 @@ def _fused_rope_inplace_kunlun(
     """Kunlun-native fused GPT-J RoPE via ``xspeedgate_ops.flashinfer_rotary_embedding``.
 
     Mirrors aiak's ``fused_rope_kunlun``: converts complex ``freqs_cis`` into a
-    real ``[cos | sin]`` cache (cached), forces contiguous inputs, then copies
-    the returned tensors back into ``q``/``k`` to preserve in-place semantics.
+    real ``[cos | sin]`` cache (cached), then rotates q/k **in place**.  q/k are
+    normally non-contiguous tail views (``q[..., -64:]``); the op runs on the
+    view's strides and writes back into the caller's storage, so the old
+    ``.contiguous()`` + ``copy_`` round trip (2 extra passes over the rope slice
+    per call) is gone.
     """
 
-    q_out, k_out = _apply_rope_xspeedgate(q, k, freqs_cis, positions, inverse)
-    q.copy_(q_out)
-    if k is not None:
-        k.copy_(k_out)
+    _apply_rope_xspeedgate(q, k, freqs_cis, positions, inverse, inplace=True)
 
 
 # ---------------------------------------------------------------------------
@@ -911,6 +1229,9 @@ def _compress_norm_rope_store_torch(
     page_size: int,
     use_fp4: bool = False,
     bf16_store: bool = False,
+    kvcache_scale: torch.Tensor = None,  # [kunlun-adapt] 上游新增；fp16/bf16 KV 下不参与
+    rope_cache=None,  # [kunlun-adapt] 上游新增（HIP FP4）；忽略
+    fp4_k_write_metadata=None,  # [kunlun-adapt] 上游新增（FP4 写元数据）；忽略
 ) -> None:
     """Apply rmsnorm + RoPE then scatter to paged cache.
 
@@ -965,7 +1286,7 @@ def _compress_norm_rope_store_torch(
 
     # Use the HIP-style quant+pack path if available, otherwise raw copy
     try:
-        from sglang.srt.layers.attention.dsv4.quant_k_cache import (
+        from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
             quant_to_nope_fp8_rope_bf16_pack_triton,
         )
         pack = quant_to_nope_fp8_rope_bf16_pack_triton(kv_out.bfloat16())
@@ -988,6 +1309,9 @@ def _compress_norm_rope_store_kunlun(
     page_size: int,
     use_fp4: bool = False,
     bf16_store: bool = False,
+    kvcache_scale: torch.Tensor = None,  # [kunlun-adapt] 上游新增；fp16/bf16 KV 下不参与
+    rope_cache=None,  # [kunlun-adapt] 上游新增（HIP FP4）；忽略
+    fp4_k_write_metadata=None,  # [kunlun-adapt] 上游新增（FP4 写元数据）；忽略
 ) -> None:
     """Kunlun-native fused rmsnorm + RoPE + store to compress kvcache.
 
@@ -1040,7 +1364,7 @@ def _compress_norm_rope_store_kunlun(
         return
 
     try:
-        from sglang.srt.layers.attention.dsv4.quant_k_cache import (
+        from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
             quant_to_nope_fp8_rope_bf16_pack_triton,
         )
         pack = quant_to_nope_fp8_rope_bf16_pack_triton(kv_out.bfloat16())
@@ -1238,182 +1562,3 @@ def _compress_forward_c4_torch(
         out = torch.where(is_bnd, out, torch.zeros_like(out))
 
     return out.to(kv_score_input.dtype)
-
-
-# ===========================================================================
-# Prefill compress-plan generators.
-# Restore symbols that hooks/jit_kernel/dsv4/compress.py::_prefill_plan_generate_torch
-# imports from this module for CompressorPrefillPlan.generate. The decode-plan
-# analogues live in compress.py; these prefill counterparts are host-side plan
-# builders (run at prefill prepare, outside CUDA-graph capture).
-# ===========================================================================
-def _make_prefill_plan_torch(
-    compress_ratio: int,
-    req_pool_indices: torch.Tensor,   # [bs] int64
-    seq_lens: torch.Tensor,           # [bs] int64
-    extend_lens: torch.Tensor,        # [bs] int64
-    req_to_token: torch.Tensor,       # [num_reqs, max_seq] int32
-    full_to_swa: torch.Tensor,        # [num_full_slots] int64
-    swa_page_size: int,
-    ring_size: int,
-    num_q_tokens: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Pure-Python reimplementation of plan_compress_prefill.
-
-    Returns (plan_c, plan_w) where:
-      plan_c: [num_c, 16] uint8  (CompressPlan layout)
-      plan_w: [num_w, 8] uint8   (WritePlan layout)
-
-    CompressPlan (16 bytes):
-      uint32  seq_len
-      uint16  ragged_id
-      uint16  buffer_len  (not used here, set 0)
-      int32   read_page_0
-      int32   read_page_1  (not used, set 0 or -1)
-
-    WritePlan (8 bytes):
-      uint32  ragged_id  (packed: batch_id<<16 | ragged_id, but we set just ragged_id)
-      int32   write_loc
-    """
-    device = seq_lens.device
-    cr = compress_ratio
-    bs = int(seq_lens.shape[0])
-
-    compress_entries = []  # list of (seq_len, ragged_id, state_loc)
-    write_entries = []     # list of (ragged_id, state_loc)
-
-    ragged_offset = 0  # running offset across all tokens in all requests
-    for b in range(bs):
-        seq_len = int(seq_lens[b].item())
-        extend_len = int(extend_lens[b].item())
-        prefix_len = seq_len - extend_len
-        rid = int(req_pool_indices[b].item())
-        # See _make_prefill_plan_c4_torch: the state pool is a paged ring, so only
-        # the tail tokens that later steps still read are written (no overlap for
-        # this layout, hence first_w_pos == last compress position).
-        first_w_pos = (seq_len // cr) * cr
-
-        for j in range(extend_len):
-            tok_pos = prefix_len + j  # position within the full sequence
-            ragged_id = ragged_offset + j
-
-            # Compress entry: only at boundary positions
-            pos_in_seq = tok_pos + 1  # 1-indexed position after this token
-            if pos_in_seq % cr == 0 and pos_in_seq > 0:
-                # This token is at the last position of a compress group
-                token_loc_abs = int(req_to_token[rid, tok_pos].item())
-                swa_loc = int(full_to_swa[token_loc_abs].item())
-                swa_page = swa_loc // swa_page_size
-                state_loc = (swa_page * ring_size + (swa_loc % ring_size)) // cr
-                compress_entries.append((pos_in_seq, ragged_id, state_loc))
-                if tok_pos >= first_w_pos:
-                    write_entries.append((ragged_id, state_loc))
-
-        ragged_offset += extend_len
-
-    num_c = len(compress_entries)
-    num_w = len(write_entries)
-    plan_c = torch.zeros(max(num_c, 1), 16, dtype=torch.uint8, device=device)
-    plan_w = torch.zeros(max(num_w, 1), 8, dtype=torch.uint8, device=device)
-
-    if num_c > 0:
-        pc_i32 = plan_c.view(torch.int32)  # [num_c, 4]
-        for i, (sl, rid, sloc) in enumerate(compress_entries):
-            pc_i32[i, 0] = sl     # seq_len
-            pc_i32[i, 1] = rid    # ragged_id (low 16) + buffer_len (high 16) = 0
-            pc_i32[i, 2] = sloc   # read_page_0
-            pc_i32[i, 3] = 0
-
-    if num_w > 0:
-        pw_i32 = plan_w.view(torch.int32)  # [num_w, 2]
-        for i, (rid, sloc) in enumerate(write_entries):
-            pw_i32[i, 0] = rid    # ragged_id
-            pw_i32[i, 1] = sloc   # write_loc
-
-    # Trim to actual sizes
-    plan_c = plan_c[:num_c]
-    plan_w = plan_w[:num_w]
-    return plan_c, plan_w
-
-
-def _make_prefill_plan_c4_torch(
-    compress_ratio,
-    req_pool_indices,
-    seq_lens,
-    extend_lens,
-    req_to_token,
-    full_to_swa,
-    swa_page_size,
-    ring_size,
-    num_q_tokens,
-):
-    """c4 CompressPlan/[num_c,16] + WritePlan/[num_w,8].
-    Writes EVERY extend token to the state pool so overlap pages are populated.
-    """
-    device = seq_lens.device
-    cr = int(compress_ratio)
-    sps = int(swa_page_size)
-    rs = int(ring_size)
-    bs = int(seq_lens.shape[0])
-
-    def cl(x):
-        return (x // sps) * rs + (x % rs)
-
-    comp = []  # (seq_len, ragged_id, read_page_0, read_page_1)
-    wr = []    # (ragged_id, write_loc)
-    ragged_off = 0
-    for b in range(bs):
-        seq_len = int(seq_lens[b].item())
-        ext = int(extend_lens[b].item())
-        pl = seq_len - ext
-        rid = int(req_pool_indices[b].item())
-        # The state pool is a paged ring: only ``ring_size`` slots exist per SWA
-        # page, so writing every extend token (as this used to do) makes the
-        # tokens of one page overwrite each other and leaves the pool holding
-        # whichever token happened to land last. The native plan only writes the
-        # tokens that later steps still need: the tail of the sequence and, for
-        # the overlap (c4) layout, the last ``cr`` tokens of every SWA page.
-        last_c_pos = (seq_len // cr) * cr
-        first_w_pos = last_c_pos - cr
-        for j in range(ext):
-            pos = pl + j
-            ragged_id = ragged_off + j
-            do_write = pos >= first_w_pos or (pos % sps) >= (sps - cr)
-            if do_write:
-                raw = int(req_to_token[rid, pos].item())
-                swa = int(full_to_swa[raw].item())
-                wr.append((ragged_id, cl(swa)))
-            if (pos + 1) % cr == 0:
-                pos1 = pos
-                pos0 = max(pos1 - cr, 0)
-                r1 = int(req_to_token[rid, pos1].item())
-                r0 = int(req_to_token[rid, pos0].item())
-                s1 = int(full_to_swa[r1].item())
-                s0 = int(full_to_swa[r0].item())
-                comp.append((pos + 1, ragged_id, cl(s0) // cr, cl(s1) // cr))
-        ragged_off += ext
-
-    # Long prompts make several extend tokens map onto the same state-pool slot
-    # (the pool is a paged ring) and a scatter with duplicate indices has
-    # undefined behaviour. Keep the sequential last-token-wins semantics of the
-    # native kernel by dropping the earlier writers here on the host: the device
-    # path then needs no index-validating dedup, which is illegal during CUDA
-    # graph capture (the recorded indices are not materialised yet).
-    if wr:
-        wr = list({wl: (rid, wl) for rid, wl in wr}.values())
-
-    num_c = len(comp)
-    num_w = len(wr)
-    plan_c = torch.zeros(max(num_c, 1), 16, dtype=torch.uint8, device=device)
-    plan_w = torch.zeros(max(num_w, 1), 8, dtype=torch.uint8, device=device)
-    pc = plan_c.view(torch.int32)
-    pw = plan_w.view(torch.int32)
-    for i, (sl, rid, rp0, rp1) in enumerate(comp):
-        pc[i, 0] = sl
-        pc[i, 1] = rid
-        pc[i, 2] = rp0
-        pc[i, 3] = rp1
-    for i, (rid, wl) in enumerate(wr):
-        pw[i, 0] = rid
-        pw[i, 1] = wl
-    return plan_c[:num_c], plan_w[:num_w]

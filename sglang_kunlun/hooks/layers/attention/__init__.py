@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 def _redirect_nsa_backend() -> None:
     """Substitute upstream nsa_backend module with our Kunlun impl."""
-    target = "sglang.srt.layers.attention.nsa_backend"
+    target = "sglang.srt.layers.attention.dsa_backend"
     if target in sys.modules:
         # Upstream already imported — too late to redirect cleanly.
         logger.warning(
@@ -46,11 +46,25 @@ def _redirect_nsa_backend() -> None:
         return
     try:
         from . import _nsa_backend_impl  # noqa: F401
-
-        sys.modules[target] = _nsa_backend_impl
-        logger.info("Redirected %s -> sglang_kunlun._nsa_backend_impl", target)
+    except ImportError as e:
+        # [kunlun-adapt] The Kunlun NSA backend is written against the older dsa
+        # CP API (``round_robin_split``); upstream renamed those symbols (e.g.
+        # ``is_dsa_prefill_cp_round_robin_split`` -> ``..._interleave``) and
+        # dropped the split helpers.  The redirect cannot apply, so we keep the
+        # upstream ``dsa_backend`` — a supported, working fallback.  Not fatal:
+        # report once at INFO without a traceback.
+        logger.info(
+            "[kunlun-adapt] NSA backend redirect skipped (upstream CP API "
+            "changed: %s); using upstream %s",
+            e,
+            target,
+        )
+        return
     except Exception as e:  # pragma: no cover
         logger.exception("Failed to redirect nsa_backend: %s", e)
+        return
+    sys.modules[target] = _nsa_backend_impl
+    logger.info("Redirected %s -> sglang_kunlun._nsa_backend_impl", target)
 
 # 把 Triton active driver 的 get_current_target().backend 伪装成 "cuda"，避免crash
 _kunlun_pre_shim()
@@ -61,3 +75,4 @@ from . import attention_registry  # noqa: E402,F401
 from . import nsa  # noqa: E402,F401
 from . import fla  # noqa: E402,F401
 from . import deepseek_v4_backend  # noqa: E402,F401
+from . import flashinfer_compat  # noqa: E402,F401

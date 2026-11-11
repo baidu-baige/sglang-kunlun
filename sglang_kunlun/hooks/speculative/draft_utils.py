@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
     "sglang.srt.speculative.draft_utils.DraftBackendFactory._create_backend",
     type=HookType.AROUND,
 )
-def _create_backend_kunlun(original_fn, self, backend_name, backend_map, error_template):
+def _create_backend_kunlun(original_fn, self, backend_name, backend_map, error_template, stamps_children: bool = False):
     """Route the ``kunlun`` draft attention backend through the platform.
 
     ``backend_name`` is the ServerArgs attribute consulted for the backend
@@ -56,13 +56,19 @@ def _create_backend_kunlun(original_fn, self, backend_name, backend_map, error_t
     for the draft-extend backend. We replicate the upstream resolution order to
     decide whether the effective backend is ``"kunlun"``.
     """
-    backend_type = (
-        self.draft_attn_backend
-        if self.draft_attn_backend
-        else getattr(self.server_args, backend_name)
-    )
+    backend_type = self.draft_attn_backend
     if backend_type is None:
-        backend_type = self.server_args.attention_backend
+        # [kunlun-adapt] Upstream DraftBackendFactory no longer holds
+        # server_args; resolve the effective backend exactly like the stock
+        # _create_backend does, via runtime_context.attention_backends().
+        from sglang.srt.runtime_context import attention_backends
+
+        prefill_backend, decode_backend = attention_backends()
+        backend_type = (
+            decode_backend
+            if backend_name == "decode_attention_backend"
+            else prefill_backend
+        )
 
     if backend_type == "kunlun_dsv4":
         from sglang_kunlun.hooks.layers.attention.deepseek_v4_backend import (

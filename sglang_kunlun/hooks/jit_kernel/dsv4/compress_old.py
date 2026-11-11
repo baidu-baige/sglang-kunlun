@@ -55,7 +55,7 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 
 @plugin_hook(
-    "sglang.jit_kernel.dsv4.compress_old.CompressorPrefillPlan.generate",
+    "sglang.kernels.ops.attention.dsv4.compress_old.CompressorPrefillPlan.generate",
     type=HookType.REPLACE,
 )
 def _prefill_plan_generate_v1_kunlun(
@@ -67,7 +67,7 @@ def _prefill_plan_generate_v1_kunlun(
     use_cuda_graph=False,
 ):
     """Build the v1 prefill plan via ``xspeedgate_ops.plan_compress_prefill``."""
-    from sglang.jit_kernel.dsv4.compress_old import CompressorPrefillPlan
+    from sglang.kernels.ops.attention.dsv4.compress_old import CompressorPrefillPlan
 
     assert seq_lens.device == extend_lens.device
     if seq_lens.dtype != torch.int64:
@@ -108,7 +108,7 @@ def _prefill_plan_generate_v1_kunlun(
 # ---------------------------------------------------------------------------
 
 @plugin_hook(
-    "sglang.jit_kernel.dsv4.compress_old.compress_forward",
+    "sglang.kernels.ops.attention.dsv4.compress_old.compress_forward",
     type=HookType.REPLACE,
 )
 def _compress_forward_v1_kunlun(
@@ -126,7 +126,7 @@ def _compress_forward_v1_kunlun(
     extend_lens=None,
 ):
     """Compress via ``xspeedgate_ops.compress_forward_fast``."""
-    from sglang.jit_kernel.dsv4.compress_old import (
+    from sglang.kernels.ops.attention.dsv4.compress_old import (
         CompressorDecodePlan,
         compress_plan as _compress_plan_v1,
     )
@@ -172,7 +172,7 @@ def _compress_forward_v1_kunlun(
 
 
 @plugin_hook(
-    "sglang.jit_kernel.dsv4.compress_old.compress_fused_norm_rope_inplace",
+    "sglang.kernels.ops.attention.dsv4.compress_old.compress_fused_norm_rope_inplace",
     type=HookType.REPLACE,
 )
 def _compress_fused_norm_rope_inplace_v1_kunlun(
@@ -183,7 +183,7 @@ def _compress_fused_norm_rope_inplace_v1_kunlun(
     plan,
 ):
     """RMSNorm + GPT-J RoPE in place via ``kunlun_ops.dpsk_v4_norm_rope_gptj``."""
-    from sglang.jit_kernel.dsv4.compress_old import CompressorPrefillPlan
+    from sglang.kernels.ops.attention.dsv4.compress_old import CompressorPrefillPlan
 
     if isinstance(plan, CompressorPrefillPlan):
         handle = plan.compress_plan.view(torch.int32)  # uint8 bytes -> int32

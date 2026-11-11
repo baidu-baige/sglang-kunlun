@@ -67,7 +67,7 @@ def alloc_extend_kunlun(
     out_indices = torch.empty(
         (extend_num_tokens,), dtype=torch.int64, device=self.device
     )
-    from sglang.srt.mem_cache.triton_ops.allocator import alloc_extend_kernel
+    from sglang.kernels.ops.memory.allocator import alloc_extend_kernel
 
     alloc_extend_kernel[(bs,)](
         prefix_lens,
@@ -84,3 +84,31 @@ def alloc_extend_kunlun(
 
     self.free_pages = self.free_pages[num_new_pages:]
     return out_indices
+
+
+@plugin_hook(
+    "sglang.srt.mem_cache.common.maybe_cache_unfinished_req",
+    type=HookType.AROUND,
+)
+def maybe_cache_unfinished_req_chunk_kunlun(original_fn, req, tree_cache, **kwargs):
+    """Restore chunked-prefill prefix advancement under the fake bootstrap.
+
+    ``Req.skip_radix_cache_insert`` is set whenever ``bootstrap_host ==
+    FAKE_BOOTSTRAP_HOST`` (the ``2.2.2.2`` probe bootstrap) so a benchmark
+    cannot inflate throughput through cross-request prefix reuse. But
+    ``maybe_cache_unfinished_req`` is also the *within-request* bookkeeping
+    that advances ``req.prefix_indices`` to the end of the chunk just
+    prefilled. Skipping it makes every chunked-prefill step restart at token 0
+    (``#cached-token: 0`` forever): each step re-allocates the same KV and the
+    pool grows monotonically until the engine wedges with
+    ``pool memory leak detected``. A chunk cache has no prefix tree to pollute,
+    so the skip intent does not apply to its bookkeeping -- run it.
+    """
+    if (
+        kwargs.get("chunked")
+        and getattr(req, "skip_radix_cache_insert", False)
+        and tree_cache.is_chunk_cache()
+    ):
+        tree_cache.cache_unfinished_req(req, **kwargs)
+        return None
+    return original_fn(req, tree_cache, **kwargs)

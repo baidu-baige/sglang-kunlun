@@ -148,7 +148,10 @@ def moe_apply_kunlun(
     num_tokens = x.shape[0]
     device = x.device
 
-    cache: Any = torch.empty(
+    # EP masks off-rank expert routes.  Kunlun moe_fc writes only rows for
+    # locally represented experts, so empty buffers leak undefined values into
+    # the subsequent SwiGLU/down path and can surface as a later device fault.
+    cache: Any = torch.zeros(
         num_tokens * top_k * max(gateup_output_n, hidden_size),
         device=device,
         dtype=torch.bfloat16,
@@ -162,6 +165,21 @@ def moe_apply_kunlun(
     sorted_tokens_idx = torch.empty(
         num_tokens * top_k, dtype=torch.int32, device=device
     )
+    # Expert-parallel routing masks off-rank experts to -1 in topk_ids; the
+    # kunlun moe_sorted_topk_idx rejects negative ids (ret=2 -> illegal memory
+    # access). Clamp masked slots to expert 0 and zero their routing weight so
+    # they contribute nothing (real experts are reassembled across ranks by the
+    # MoE combine / all-reduce).
+    # [KUNLUN CG-SAFE] The branch must NOT be data-dependent: `bool(...any())`
+    # forces a device->host sync, which freezes the taken branch at graph
+    # capture time. Capture dummy batches have no -1 ids, so the clamp branch
+    # is never recorded - at replay real EP-masked -1 ids reach
+    # moe_sorted_topk_idx and fault the device (infer_moe_sorted_topk_idx
+    # kernel exception). Apply the clamp UNCONDITIONALLY as capturable ops.
+    if topk_ids.numel():
+        _mask = topk_ids < 0
+        topk_weights = topk_weights.masked_fill(_mask, 0.0)
+        topk_ids = topk_ids.masked_fill(_mask, 0).to(torch.int32).contiguous()
     kunlun_ops.moe_sorted_topk_idx(
         topk_ids,
         topk_ids.shape[0],
@@ -195,12 +213,27 @@ def moe_apply_kunlun(
     )
 
     # act
-    intermediate_cache2 = torch.empty(
+    intermediate_cache2 = torch.zeros(
         (num_tokens, top_k, gateup_output_n // 2),
         dtype=torch.bfloat16,
         device=device,
     )
-    kunlun_ops.swiglu(intermediate_cache1, intermediate_cache2)
+    # kunlun_ops.swiglu receives a 3-D (num_tokens, top_k, N) view here; the
+    # deployed XPU binary can return a non-zero code for rank-3 input
+    # ("Check 0 == r failed ... infer::swiglu failed"). Feed a 2-D contiguous
+    # view, and fall back to a pure-torch swiglu (split-halves: silu(gate)*up)
+    # if the native kernel still refuses the shape. This call site passes no
+    # clamp (limit=0), so the torch path applies none either.
+    if num_tokens > 0:
+        _ic1_2d = intermediate_cache1.reshape(-1, gateup_output_n)
+        _ic2_2d = intermediate_cache2.reshape(-1, gateup_output_n // 2)
+        try:
+            kunlun_ops.swiglu(_ic1_2d, _ic2_2d)
+        except (ValueError, RuntimeError):
+            _d = _ic1_2d.shape[-1] // 2
+            _gate = torch.nn.functional.silu(_ic1_2d[:, :_d].float())
+            _up = _ic1_2d[:, _d:].float()
+            _ic2_2d.copy_((_gate * _up).to(_ic2_2d.dtype))
 
     # quant intermediate
     intermediate_cache2_q = torch.empty(
@@ -237,7 +270,7 @@ def moe_apply_kunlun(
         sort_mode=False,
     )
 
-    out = torch.empty(
+    out = torch.zeros(
         (num_tokens, hidden_size), dtype=torch.bfloat16, device=device
     )
     kunlun_ops.reduce_sum(intermediate_cache3, 1, out)

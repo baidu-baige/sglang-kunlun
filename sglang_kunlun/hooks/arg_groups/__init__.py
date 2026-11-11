@@ -19,4 +19,6 @@
 
 from __future__ import annotations
 
+from . import asradix_hook  # noqa: F401
 from . import deepseek_v4_hook  # noqa: F401
+from . import speculative_hook  # noqa: F401

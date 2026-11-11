@@ -45,7 +45,7 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 
 @plugin_hook(
-    "sglang.srt.parser.reasoning_parser._DeepSeekV3Detector.detect_and_parse",
+    "sglang.srt.parser.reasoning_parser.DeepSeekV4Detector.detect_and_parse",
     type=HookType.AROUND,
 )
 def detect_and_parse_kunlun(original_fn, self, text):

@@ -158,31 +158,189 @@ def _patch_flashinfer_optional_symbols() -> None:
             setattr(module, symbol_name, _unsupported)
 
 
-def _disable_xgrammar_import() -> None:
-    """Prevent optional xgrammar from loading its CUDA extension on Kunlun."""
-    import importlib.machinery
-    import sys
-    import types
-    from typing import Any
+def _rewrite_legacy_cli_argv() -> None:
+    """Map legacy CLI flags in ``sys.argv`` to their renamed/split upstream
+    equivalents, so stage launch configs keep working after the sglang
+    arg-group refactor (flag meaning unchanged). No-op if none are present::
 
-    if "xgrammar" in sys.modules:
+        --cuda-graph-max-bs N        -> --cuda-graph-max-bs-decode N
+                                        --cuda-graph-max-bs-prefill N
+        --enable-nsa-prefill-context-parallel -> --enable-prefill-cp
+        --nsa-prefill-cp-mode round-robin-split -> --cp-strategy interleave
+    """
+    import sys
+
+    argv = sys.argv[1:]
+    out = []
+    i, n = 0, len(argv)
+    while i < n:
+        tok = argv[i]
+        if tok == "--cuda-graph-max-bs" and i + 1 < n:
+            val = argv[i + 1]
+            out += ["--cuda-graph-max-bs-decode", val,
+                    "--cuda-graph-max-bs-prefill", val]
+            i += 2
+        elif tok == "--enable-nsa-prefill-context-parallel":
+            out.append("--enable-prefill-cp")
+            i += 1
+        elif tok == "--nsa-prefill-cp-mode" and i + 1 < n:
+            val = argv[i + 1]
+            out += ["--cp-strategy",
+                    "interleave" if val == "round-robin-split" else val]
+            i += 2
+        else:
+            out.append(tok)
+            i += 1
+    if out != argv:
+        sys.argv[1:] = out
+
+
+def _widen_kunlun_kv_cache_dtype_choices() -> None:
+    """Re-add ``float16`` / ``half`` to the ``--kv-cache-dtype`` argparse
+    choices. DeepSeek V4 on Kunlun runs a float16 KV cache, but the upgraded
+    sglang arg-group parser only lists bf16/fp8/fp4 variants and rejects
+    float16 at parse time. The actual float16 KV handling still lives in the
+    arg_groups / model_runner hooks; this only unblocks CLI parsing."""
+    import argparse
+
+    if getattr(argparse.ArgumentParser, "_kunlun_kv_dtype_patched", False):
+        return
+    _orig_add_argument = argparse.ArgumentParser.add_argument
+
+    def add_argument(self, *args, **kwargs):
+        if "--kv-cache-dtype" in args and kwargs.get("choices") is not None:
+            choices = list(kwargs["choices"])
+            for dtype in ("float16", "half"):
+                if dtype not in choices:
+                    choices.append(dtype)
+            kwargs["choices"] = choices
+        return _orig_add_argument(self, *args, **kwargs)
+
+    argparse.ArgumentParser.add_argument = add_argument
+    argparse.ArgumentParser._kunlun_kv_dtype_patched = True
+
+
+
+def _preload_kunlun_cuda_compat() -> None:
+    """Preload the Kunlun CUDA-compat ``libcudart.so.11.0`` (RTLD_GLOBAL).
+
+    Mooncake's ``engine.so`` / ``store.so`` (the PD KV transfer engine) are
+    linked against ``libcudart.so.11.0``. The Kunlun image ships a compat build
+    under ``/usr/local/xpu/so`` but that directory is not on the loader path, so
+    ``from mooncake.engine import TransferEngine`` fails with
+    ``libcudart.so.11.0: cannot open shared object file``. Loading it globally
+    here (before SGLang imports the transfer engine) satisfies the dependency."""
+    import ctypes
+    import os
+
+    lib = "/usr/local/xpu/so/libcudart.so.11.0"
+    if os.path.exists(lib):
+        try:
+            ctypes.CDLL(lib, mode=ctypes.RTLD_GLOBAL)
+        except OSError:
+            pass
+
+
+def _pin_nccl_port_via_argv() -> None:
+    """Pin ``nccl_port`` for dp-attention servers by injecting ``--nccl-port``.
+
+    dp-attention startup races the DataParallelController for the ephemeral
+    port SGLang picks for ``nccl_port`` (EADDRINUSE on the rank-0 TCPStore). The
+    plugin used to pin it after resolution, but the upgraded resolver seals
+    post-resolution writes, so pin it as an *input*: pick a free port below the
+    ephemeral range (no ephemeral bind can land there) and add it to argv.
+    No-op unless dp-attention is on and the operator did not set it."""
+    import socket
+    import sys
+
+    argv = sys.argv[1:]
+    if "--enable-dp-attention" not in argv or "--nccl-port" in argv:
+        return
+    reserved = set()
+    for flag in ("--port", "--disaggregation-bootstrap-port"):
+        if flag in argv:
+            try:
+                reserved.add(int(argv[argv.index(flag) + 1]))
+            except (ValueError, IndexError):
+                pass
+    try:
+        with open("/proc/sys/net/ipv4/ip_local_port_range") as fh:
+            floor = int(fh.read().split()[0])
+    except Exception:
+        floor = 32768
+    for port in range(floor - 1, 1024, -1):
+        if port in reserved:
+            continue
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind(("", port))
+            except OSError:
+                continue
+        sys.argv += ["--nccl-port", str(port)]
         return
 
-    module = types.ModuleType("xgrammar")
-    module.__file__ = "<kunlun-xgrammar-disabled>"
-    module.__path__ = []
-    module.__spec__ = importlib.machinery.ModuleSpec(
-        "xgrammar", loader=None, is_package=True
-    )
-    # These names are imported by optional function-call parsing paths.  The
-    # actual xgrammar backend remains unavailable and is never selected.
-    module.StructuralTag = Any
-    module.get_model_structural_tag = None
-    sys.modules["xgrammar"] = module
+
+
+def _disable_xpu_unsupported_argv() -> None:
+    """Opt out of features that need a PyNCCL communicator, which Kunlun (BKCL,
+    no NCCL/NVML) cannot provide. ``enable_tp_lm_head_all_to_all`` auto-enables
+    for DSV4 + dp-attention and then aborts CUDA-graph capture with 'requires an
+    available PyNCCL communicator'. Setting it as an input keeps the resolver's
+    default pass from turning it on."""
+    import sys
+
+    argv = sys.argv[1:]
+    if ("--enable-tp-lm-head-all-to-all" not in argv
+            and "--no-enable-tp-lm-head-all-to-all" not in argv):
+        sys.argv.append("--no-enable-tp-lm-head-all-to-all")
+
+
+def _ensure_deep_gemm_module() -> None:
+    """Seed an empty ``deep_gemm`` placeholder before SGLang is imported.
+
+    Upgraded sglang ``srt/layers/attention/dsa_backend.py`` runs a bare
+    ``import deep_gemm`` at module-import time (under the CUDA-masquerade path),
+    which happens while the plugin's own ``kernels.deep_geem_hook`` is still
+    being imported -- so the hook cannot install its stub in time and the whole
+    ``register_all`` plugin load aborts. Placing an empty module in
+    ``sys.modules`` early lets that import resolve; ``deep_geem_hook`` then fills
+    in the Kunlun symbols (``get_num_sms`` etc.) on the same module object."""
+    import sys
+    import types
+
+    if "deep_gemm" in sys.modules:
+        return
+    try:
+        import deep_gemm  # noqa: F401
+    except Exception:
+        sys.modules["deep_gemm"] = types.ModuleType("deep_gemm")
+
+
+def _default_bkcl_stream_sync_env() -> None:
+    """Default BKCL to ordering its collectives against the compute stream.
+
+    libbkcl does not order collectives against the caller's compute stream, so a
+    downstream kernel can read an all-reduce / all-to-all buffer before the
+    communication kernel has landed. The symptom is per-request non-determinism:
+    the same prompt at temperature=0 returns several different completions, which
+    is how it was first measured on DSV4-Flash (deterministic only with these two
+    set).
+
+    These are plain runtime environment variables, not server args, so a
+    deployment that never exports them silently runs without the ordering. Default
+    them on here -- ``setdefault`` keeps an explicit value from the launch script
+    winning, which is the opt-out.
+    """
+    import os
+
+    os.environ.setdefault("BKCL_SYNC_OP", "1")
+    os.environ.setdefault("BKCL_FORCE_SYNC", "1")
 
 
 def _kunlun_pre_shim() -> None:
-    """Force triton's active driver to advertise ``backend == "cuda"``."""
+    """Kunlun pre-import shims applied before SGLang is imported (deep_gemm
+    placeholder, CLI/argv normalization, mooncake libcudart preload, torch
+    device-capability stubs). Does NOT force triton's target to CUDA."""
     import os
     import sys
 
@@ -195,12 +353,42 @@ def _kunlun_pre_shim() -> None:
         return
 
     try:
-        _patch_torch_cuda_symm_mem_apis()
+        _default_bkcl_stream_sync_env()
     except Exception:
         pass
 
     try:
-        _disable_xgrammar_import()
+        _ensure_deep_gemm_module()
+    except Exception:
+        pass
+
+    try:
+        _preload_kunlun_cuda_compat()
+    except Exception:
+        pass
+
+    try:
+        _rewrite_legacy_cli_argv()
+    except Exception:
+        pass
+
+    try:
+        _pin_nccl_port_via_argv()
+    except Exception:
+        pass
+
+    try:
+        _disable_xpu_unsupported_argv()
+    except Exception:
+        pass
+
+    try:
+        _widen_kunlun_kv_cache_dtype_choices()
+    except Exception:
+        pass
+
+    try:
+        _patch_torch_cuda_symm_mem_apis()
     except Exception:
         pass
 
@@ -215,53 +403,12 @@ def _kunlun_pre_shim() -> None:
     except Exception:
         pass
 
-    try:
-        import triton.runtime.driver as _driver_cfg
-    except Exception:
-        return
-
-    _driver_mod = sys.modules.get("triton.runtime.driver")
-    if _driver_mod is None or not hasattr(_driver_mod, "_create_driver"):
-        return
-
-    class _CudaTarget:
-        backend = "cuda"
-
-    def _patch_driver(drv):
-        try:
-            drv.get_current_target = lambda: _CudaTarget()
-        except Exception:
-            pass
-        return drv
-
-    try:
-        if not getattr(_driver_mod, "_kunlun_create_wrapped", False):
-            _orig_create = _driver_mod._create_driver
-
-            def _wrapped_create():
-                return _patch_driver(_orig_create())
-
-            _driver_mod._create_driver = _wrapped_create
-            _driver_mod._kunlun_create_wrapped = True
-
-            try:
-                active = _driver_cfg.active
-                if active is not None and getattr(active, "_obj", None) is None:
-                    active._init_fn = _wrapped_create
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    try:
-        active = _driver_cfg.active
-        if active is not None:
-            active.get_current_target = lambda: _CudaTarget()
-            if getattr(active, "_obj", None) is not None:
-                _patch_driver(active._obj)
-    except Exception:
-        pass
-
+    # NOTE: do NOT masquerade triton's target as CUDA. This image's triton
+    # ships a real ``xpu`` backend (triton/backends/xpu); forcing
+    # target.backend="cuda" makes upstream triton kernels (dsv4 attn
+    # metadata, expand_prefill_causally, page_table_positions, ...) abort
+    # make_backend with '0 compatible backends for target (cuda)'. Leaving
+    # the real xpu target lets them compile on Kunlun.
     try:
         import torch as _torch
 
@@ -280,20 +427,28 @@ def _kunlun_pre_shim() -> None:
 
 def patch_grammar_backend_default() -> None:
     """Default ``grammar_backend`` to ``"none"`` on Kunlun.
+
+    Upstream moved this default out of ``ServerArgs._handle_grammar_backend``
+    (now gone) into the arg-group resolver
+    ``sglang.srt.arg_groups.serving_hook.handle_grammar_backend``, which
+    declares ``"xgrammar"`` when the field is unset.  Replace that resolver
+    step so an unset ``grammar_backend`` still resolves to ``"none"``.  The
+    resolver imports the function locally at resolution time (after plugin
+    load), so the replacement is picked up.
     """
-    from sglang.srt.server_args import ServerArgs
+    from sglang.srt.arg_groups import serving_hook
+    from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
 
     with _GRAMMAR_BACKEND_PATCH_LOCK:
-        if getattr(ServerArgs, "_kunlun_grammar_backend_patched", False):
+        if getattr(serving_hook, "_kunlun_grammar_backend_patched", False):
             return
 
-        original_handle_grammar_backend = ServerArgs._handle_grammar_backend
+        def handle_grammar_backend(server_args):
+            cfg = resolving_view(server_args)
+            if cfg.grammar_backend is None:
+                declare_resolution(
+                    server_args, "_handle_grammar_backend", grammar_backend="none"
+                )
 
-        def _handle_grammar_backend(self):
-            if self.grammar_backend is None:
-                self.grammar_backend = "none"
-                return
-            return original_handle_grammar_backend(self)
-
-        ServerArgs._handle_grammar_backend = _handle_grammar_backend
-        ServerArgs._kunlun_grammar_backend_patched = True
+        serving_hook.handle_grammar_backend = handle_grammar_backend
+        serving_hook._kunlun_grammar_backend_patched = True

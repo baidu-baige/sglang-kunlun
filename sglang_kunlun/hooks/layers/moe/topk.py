@@ -54,18 +54,14 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 import kunlun_ops
 
 
-class StandardTopKOutput(NamedTuple):
-    """Standard top-k output format."""
-
-    topk_weights: torch.Tensor
-    topk_ids: torch.Tensor
-    router_logits: torch.Tensor
-    block_statistic: torch.Tensor
-
-    @property
-    def format(self) -> TopKOutputFormat:
-        """TopKOutputFormat"""
-        return TopKOutputFormat.STANDARD
+# [kunlun-adapt] 上游 StandardTopKOutput 为 3 字段 NamedTuple（topk_weights/
+# topk_ids/router_logits），框架 10+ 处消费点按 3 元组位置解包，且
+# TopKOutputChecker.format_is_standard 用 isinstance 判定。插件原 4 字段
+# （含 block_statistic）会破坏该契约——改为直接复用上游类；block_statistic
+# 由 MoE 方法按需经 kunlun_ops.gen_block_statistic 重算（见 unquant hook）。
+from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput as _UpstreamStandardTopKOutput,
+)
 
 
 # NOTE: the JIT replacement for ``sglang.jit_kernel.grouped_topk.grouped_topk``
@@ -87,6 +83,7 @@ def select_experts_kunlun(
     layer_id: Optional[int] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    dynamic_expert_bias: Optional[torch.Tensor] = None,
 ) -> StandardTopKOutput:
     """select_experts"""
     top_k = topk_config.top_k
@@ -96,7 +93,11 @@ def select_experts_kunlun(
     renormalize = topk_config.renormalize
     num_fused_shared_experts = topk_config.num_fused_shared_experts
     custom_routing_function = topk_config.custom_routing_function
-    correction_bias = topk_config.correction_bias
+    correction_bias = (
+        topk_config.correction_bias
+        if dynamic_expert_bias is None
+        else dynamic_expert_bias
+    )
     torch_native = topk_config.torch_native
     routed_scaling_factor = topk_config.routed_scaling_factor
     apply_routed_scaling_factor_on_output = (
@@ -221,4 +222,4 @@ def select_experts_kunlun(
 
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
 
-    return StandardTopKOutput(topk_weights, topk_ids, router_logits, block_statistic)
+    return _UpstreamStandardTopKOutput(topk_weights, topk_ids, router_logits)

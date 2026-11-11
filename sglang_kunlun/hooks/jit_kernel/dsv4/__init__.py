@@ -26,3 +26,5 @@ from . import moe  # noqa: F401
 from . import gemm  # noqa: F401
 from . import attn  # noqa: F401
 from . import compress_old  # noqa: F401
+from . import attn_metadata  # noqa: F401
+from . import c128_cleanup  # noqa: F401

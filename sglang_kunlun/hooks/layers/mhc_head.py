@@ -36,7 +36,7 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 
 @plugin_hook(
-    "sglang.srt.layers.mhc_head.fused_hc_head",
+    "sglang.kernels.ops.layernorm.mhc_head.fused_hc_head",
     type=HookType.REPLACE,
 )
 def _fused_hc_head_kunlun(x, hc_fn, hc_scale, hc_base, norm_eps, hc_eps):

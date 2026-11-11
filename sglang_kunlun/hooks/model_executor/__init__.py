@@ -18,3 +18,7 @@
 """ model executor hooks """
 from . import model_runner_kv_cache_mixin  # noqa: F401
 from . import model_runner  # noqa: F401
+from . import preload_weights  # noqa: F401
+from . import forward_batch_pad  # noqa: F401
+from . import decode_graph_engram  # noqa: F401
+from . import cp_mm  # noqa: F401

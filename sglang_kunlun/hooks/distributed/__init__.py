@@ -19,3 +19,4 @@
 
 from . import parallel_state  # noqa: F401
 from . import device_communicators  # noqa: F401
+from . import mlp_sync_cpu  # noqa: F401

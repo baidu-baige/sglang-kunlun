@@ -66,12 +66,16 @@ def _assign_buffer_slots(dispatcher):
     "sglang.srt.layers.moe.fused_moe_triton.layer.create_moe_dispatcher",
     type=HookType.REPLACE,
 )
-def create_moe_dispatcher_kunlun(moe_runner_config):
+def create_moe_dispatcher_kunlun(moe_runner_config, quant_method=None):
     """Kunlun MoE dispatcher selection."""
-    from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
-    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.batch_overlap.two_batch_overlap import (
+        MaybeTboDeepEPDispatcher,
+    )
+    from sglang.srt.distributed.parallel_state import get_tp_group
     from sglang.srt.layers.moe import get_deepep_mode, get_moe_a2a_backend
-    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
+    from sglang.srt.layers.moe.token_dispatcher.standard import (
+        StandardDispatcher,
+    )
 
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none():
@@ -87,12 +91,15 @@ def create_moe_dispatcher_kunlun(moe_runner_config):
             params_dtype=moe_runner_config.params_dtype,
             deepep_mode=get_deepep_mode(),
             async_finish=True,
-            return_recv_hook=get_deepep_mode().is_normal(),  # tbo暂时不支持
+            return_recv_hook=get_deepep_mode().is_normal(), # tbo暂时不支持
         )
         _assign_buffer_slots(dispatcher)
         return dispatcher
     if a2a_backend.is_ascend_fuseep():
-        from sglang.srt.layers.moe.token_dispatcher import NpuFuseEPDispatcher
+        try:
+            from sglang.srt.layers.moe.token_dispatcher import NpuFuseEPDispatcher
+        except ImportError:  # [kunlun-adapt] 上游已移除 NPU FuseEP dispatcher
+            return None
 
         return NpuFuseEPDispatcher(
             group=get_tp_group().device_group,
@@ -104,6 +111,7 @@ def create_moe_dispatcher_kunlun(moe_runner_config):
             params_dtype=moe_runner_config.params_dtype,
         )
     raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
+
 
 
 @plugin_hook(

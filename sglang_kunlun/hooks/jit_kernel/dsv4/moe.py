@@ -45,9 +45,12 @@ import torch
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
+# None = not probed yet; the out variant exists in wheel >= xsGops20261021r.
+_silu_out_ok = None
+
 
 @plugin_hook(
-    "sglang.jit_kernel.dsv4.moe.silu_and_mul_clamp",
+    "sglang.kernels.ops.attention.dsv4.moe.silu_and_mul_clamp",
     type=HookType.REPLACE,
 )
 def _silu_and_mul_clamp_kunlun(
@@ -58,7 +61,30 @@ def _silu_and_mul_clamp_kunlun(
     """Native xspeedgate fused op.
 
     Schema: ``silu_and_mul_with_swiglu_limit(Tensor gate_up, float limit) -> Tensor``
+
+    [r40] The functional form allocates a fresh ``[T, d]`` result per call and
+    then copies it into ``output`` (a second full-size kernel, ~0.6 ms/step over
+    the 40 layers).  The wheel also ships the out variant
+    ``silu_and_mul_with_swiglu_limit_out(Tensor gate_up, Tensor(a!) out, float
+    limit) -> ()`` -- same kernel and dispatch logic, documented bit-identical
+    -- so write straight into the caller's buffer.  Wheels without it, and
+    non-contiguous/mismatched buffers, keep the copy path.
     """
+    global _silu_out_ok
+    if _silu_out_ok is None:
+        _silu_out_ok = hasattr(
+            torch.ops.xspeedgate_ops, "silu_and_mul_with_swiglu_limit_out"
+        )
+    if (
+        _silu_out_ok
+        and output.is_contiguous()
+        and output.dtype is input.dtype
+        and output.device == input.device
+    ):
+        torch.ops.xspeedgate_ops.silu_and_mul_with_swiglu_limit_out(
+            input, output, float(swiglu_limit)
+        )
+        return
     result = torch.ops.xspeedgate_ops.silu_and_mul_with_swiglu_limit(
         input, float(swiglu_limit)
     )
@@ -66,7 +92,7 @@ def _silu_and_mul_clamp_kunlun(
 
 
 @plugin_hook(
-    "sglang.jit_kernel.dsv4.moe.hash_topk",
+    "sglang.kernels.ops.attention.dsv4.moe.hash_topk",
     type=HookType.REPLACE,
 )
 def _hash_topk_torch(
@@ -136,16 +162,31 @@ def _hash_topk_torch(
     return topk_weights, topk_ids
 
 
+# row-count -> [rows, 1] int32 arange; the row counts are static (padded batch
+# sizes), so this is a handful of tiny tensors.
+_ROW_INDEX: dict = {}
+
+
 @plugin_hook(
-    "sglang.jit_kernel.dsv4.moe.mask_topk_ids",
+    "sglang.kernels.ops.attention.dsv4.moe.mask_topk_ids",
     type=HookType.REPLACE,
 )
 def _mask_topk_ids_torch(
     topk_ids: torch.Tensor,
     num_token_non_padded: torch.Tensor,
 ) -> None:
-    """Set rows >= ``num_token_non_padded`` to -1, in-place and graph-capturable."""
-    idx = torch.arange(topk_ids.shape[0], device=topk_ids.device).unsqueeze(-1)
-    new = torch.where(idx < num_token_non_padded, topk_ids,
-                      torch.full_like(topk_ids, -1))
-    topk_ids.copy_(new)
+    """Set rows >= ``num_token_non_padded`` to -1, in-place and graph-capturable.
+
+    [r39] The previous form materialised three tensors per call (``arange``,
+    ``full_like`` and the ``where`` output, then copied it back): ~7 kernels and
+    a full [rows, topk] allocation, 40x per step (2.27 ms/step).  The row index
+    only depends on the (static) row count, so it is cached, and the fill is
+    done in place: ``masked_fill_`` writes the same -1 into the same rows, so the
+    result is bit-identical, with 2 kernels and no temp allocation.
+    """
+    rows = topk_ids.shape[0]
+    idx = _ROW_INDEX.get((rows, topk_ids.device.index))
+    if idx is None:
+        idx = torch.arange(rows, device=topk_ids.device, dtype=torch.int32).unsqueeze(-1)
+        _ROW_INDEX[(rows, topk_ids.device.index)] = idx
+    topk_ids.masked_fill_(idx >= num_token_non_padded, -1)

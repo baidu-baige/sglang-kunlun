@@ -19,3 +19,9 @@
 from . import common  # noqa: F401
 from . import deepseek_v4_memory_pool  # noqa: F401
 from . import deepseek_v4_compress_state  # noqa: F401
+
+# AttentionStore (asradix) secondary KV cache. The pool hook imports first: the
+# cache hook reaches into it for the pool-sizing stash.
+from . import asradix_pool_hook  # noqa: F401
+from . import asradix_cache_hook  # noqa: F401
+from . import asradix_alloc_hook  # noqa: F401

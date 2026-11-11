@@ -107,7 +107,7 @@ class KunlunMHATokenToKVPool(MHATokenToKVPool):
         """Set KV cache buffer using the kunlun_ops reshape_and_cache kernel."""
         from kunlun_ops import reshape_and_cache
 
-        loc, _ = unwrap_write_loc(loc_info)
+        loc = unwrap_write_loc(loc_info)[0]  # [kunlun-adapt] 上游返回 (loc, swa_loc, full_loc)
 
         if self.head_dim != self.v_head_dim:
             cache_v = F.pad(cache_v, pad=(0, 64), mode="constant", value=0)
@@ -120,7 +120,7 @@ class KunlunMHATokenToKVPool(MHATokenToKVPool):
                 cache_k.div_(k_scale)
             if v_scale is not None:
                 cache_v.div_(v_scale)
-            if not self.enable_int8_kv_cache:
+            if not getattr(self, "enable_int8_kv_cache", False):  # [kunlun-adapt] 上游已移除该属性
                 cache_k = cache_k.to(self.dtype)
                 cache_v = cache_v.to(self.dtype)
 
@@ -223,11 +223,17 @@ class KunlunMHATokenToKVPool(MHATokenToKVPool):
 class KunlunMLATokenToKVPool(MLATokenToKVPool):
     """Kunlun MLA KV pool with custom KV buffer set/get operations."""
 
-    def set_mla_kv_buffer(self, layer, loc, cache_k_nope, cache_k_rope):
-        """Set MLA KV buffer using the kunlun_ops triton kernel."""
+    def set_mla_kv_buffer(self, layer, loc, cache_k_nope, cache_k_rope, layer_id_override=None):
+        """Set MLA KV buffer using the kunlun_ops triton kernel.
+
+        [kunlun-adapt] 上游新增 layer_id_override 且 SWA 路径以 layer=None 调用。
+        """
         from kunlun_ops import set_mla_kv_buffer_triton
 
-        layer_id = layer.layer_id
+        if layer_id_override is not None:
+            layer_id = layer_id_override
+        else:
+            layer_id = layer.layer_id if layer is not None else 0
         if cache_k_nope.dtype != self.dtype:
             cache_k_nope = cache_k_nope.to(self.dtype)
             cache_k_rope = cache_k_rope.to(self.dtype)

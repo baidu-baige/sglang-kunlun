@@ -27,7 +27,7 @@ math is expressed via ``torch.compile(dynamic=True)`` to mirror mimo.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from einops import rearrange
@@ -36,7 +36,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+    try:
+        from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+    except ImportError:  # [kunlun-adapt] 上游已移除 NSA 专用 KV pool
+        NSATokenToKVPool = None
 
 logger = logging.getLogger(__name__)
 
@@ -449,179 +452,6 @@ def _get_topk_ragged(
 
 
 @plugin_hook(
-    target="sglang.srt.layers.attention.dsa.dsa_indexer.Indexer._get_topk_ragged_with_cp",
-    type=HookType.REPLACE,
-)
-def _get_topk_ragged_with_cp(
-    self,
-    forward_batch: ForwardBatch,
-    layer_id: int,
-    q_fp8: torch.Tensor,
-    weights: torch.Tensor,
-    metadata,
-    kv_len: int,
-    actual_seq_q: int,
-    cp_index: List[Tuple[int, int, int]] = None,
-) -> torch.Tensor:
-    """_get_topk_ragged_with_cp Kunlun replacement."""
-    import kunlun_ops
-
-    if TYPE_CHECKING:
-        assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
-    page_size = forward_batch.token_to_kv_pool.page_size
-    assert page_size == 64, "only support page size 64"
-    if len(weights.shape) == 3:
-        weights = weights.squeeze(-1)
-    k_fp8_list = []
-    k_scale_list = []
-    ks_list = []
-    ke_offset_list = []
-    offset = 0
-    actual_seq_q_list = []
-    batch_idx_list = []
-
-    block_tables = metadata.get_page_table_64()
-    assert (
-        forward_batch.seq_lens_cpu is not None
-        and forward_batch.extend_seq_lens_cpu is not None
-    )
-    if cp_index is not None:
-        for batch_idx, start_seq_position, end_seq_position in cp_index:
-            pre_chunk_offset = (
-                forward_batch.seq_lens_cpu[batch_idx].item()
-                - forward_batch.extend_seq_lens_cpu[batch_idx]
-            )
-            start_seq_position += pre_chunk_offset
-            end_seq_position += pre_chunk_offset
-            if offset == 0 and batch_idx != 0:
-                offset += forward_batch.extend_seq_lens_cpu[batch_idx - 1]
-            k_fp8 = forward_batch.token_to_kv_pool.get_index_k_continuous(
-                layer_id, end_seq_position, block_tables[batch_idx]
-            )
-            k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_continuous(
-                layer_id, end_seq_position, block_tables[batch_idx]
-            )
-            extend_seq_len = end_seq_position - start_seq_position
-            ks = torch.full(
-                (extend_seq_len,), offset, dtype=torch.int32, device="cuda"
-            )
-            k_fp8_list.append(k_fp8)
-            k_scale_list.append(k_scale)
-            ks_list.append(ks)
-            ke_offset = torch.arange(
-                start_seq_position + 1,
-                end_seq_position + 1,
-                dtype=torch.int32,
-                device="cuda",
-            )
-            ke_offset_list.append(ke_offset)
-            actual_seq_q_t = torch.tensor(
-                [extend_seq_len], dtype=torch.int32, device="cuda"
-            )
-            actual_seq_q_list.append(actual_seq_q_t)
-            batch_idx_list.append(batch_idx)
-
-        k_fp8 = torch.cat(k_fp8_list, dim=0)
-        k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
-        k_scale /= 127
-        ks = torch.cat(ks_list, dim=0)
-        ke_offset = torch.cat(ke_offset_list, dim=0)
-        actual_seq_q = torch.cat(actual_seq_q_list, dim=0)
-
-        context_q_lens_xpu = torch.tensor(
-            [0, q_fp8.shape[0]], dtype=torch.int32, device="cuda"
-        )
-        context_q_lens_cpu = torch.tensor(
-            [0, q_fp8.shape[0]], dtype=torch.int32, device="cpu"
-        )
-        context_k_lens_xpu = torch.tensor(
-            [0, k_fp8.shape[0]], dtype=torch.int32, device="cuda"
-        )
-        context_k_lens_cpu = torch.tensor(
-            [0, k_fp8.shape[0]], dtype=torch.int32, device="cpu"
-        )
-        logits = torch.zeros(
-            (q_fp8.shape[0], k_fp8.shape[0]), dtype=torch.float32, device=q_fp8.device
-        )
-        kunlun_ops.I8_mqa_logits(
-            q=q_fp8,
-            fused_kv_cache=(k_fp8.contiguous(), k_scale.contiguous()),
-            weights=weights,
-            context_q_lens=(context_q_lens_cpu, context_q_lens_xpu),
-            context_k_lens=(context_k_lens_cpu, context_k_lens_xpu),
-            logits=logits,
-            clean_logits=True,
-            use_xfa_boost=False,
-        )
-        topk_result = metadata.topk_transform(
-            logits,
-            self.index_topk,
-            ks=ks,
-            cu_seqlens_q=actual_seq_q,
-            ke_offset=ke_offset,
-            batch_idx_list=batch_idx_list,
-        )
-    else:
-        kv_len = (
-            forward_batch.seq_lens_cpu[0].item()
-            - forward_batch.extend_seq_lens_cpu[0]
-            + kv_len
-        )
-        k_fp8 = forward_batch.token_to_kv_pool.get_index_k_continuous(
-            layer_id, kv_len, block_tables[0]
-        )
-        k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_continuous(
-            layer_id, kv_len, block_tables[0]
-        )
-        k_scale = k_scale.view(torch.float32).squeeze(-1)
-        ks = torch.full((actual_seq_q,), offset, dtype=torch.int32, device="cuda")
-        ke_offset = torch.arange(
-            (kv_len - actual_seq_q) + 1,
-            kv_len + 1,
-            dtype=torch.int32,
-            device="cuda",
-        )
-        context_q_lens_xpu = torch.tensor(
-            [0, q_fp8.shape[0]], dtype=torch.int32, device="cuda"
-        )
-        context_q_lens_cpu = torch.tensor(
-            [0, q_fp8.shape[0]], dtype=torch.int32, device="cpu"
-        )
-        context_k_lens_xpu = torch.tensor(
-            [0, k_fp8.shape[0]], dtype=torch.int32, device="cuda"
-        )
-        context_k_lens_cpu = torch.tensor(
-            [0, k_fp8.shape[0]], dtype=torch.int32, device="cpu"
-        )
-        logits = torch.zeros(
-            (q_fp8.shape[0], k_fp8.shape[0]), dtype=torch.float32, device=q_fp8.device
-        )
-        kunlun_ops.I8_mqa_logits(
-            q=q_fp8,
-            fused_kv_cache=(k_fp8.contiguous(), k_scale.contiguous()),
-            weights=weights,
-            context_q_lens=(context_q_lens_cpu, context_q_lens_xpu),
-            context_k_lens=(context_k_lens_cpu, context_k_lens_xpu),
-            logits=logits,
-            clean_logits=True,
-            use_xfa_boost=False,
-        )
-        # Synchronous H2D: see _make_cu_seqlens_from_lens for why non_blocking
-        # copies of temporary host tensors are unsafe here.
-        actual_seq_q = torch.tensor([actual_seq_q], dtype=torch.int32).to(
-            device="cuda"
-        )
-        topk_result = metadata.topk_transform(
-            logits,
-            self.index_topk,
-            ks=ks,
-            cu_seqlens_q=actual_seq_q,
-            ke_offset=ke_offset,
-        )
-    return topk_result
-
-
-@plugin_hook(
     target="sglang.srt.layers.attention.dsa.dsa_indexer.Indexer._get_q_k_bf16",
     type=HookType.REPLACE,
 )
@@ -762,7 +592,7 @@ def forward_cuda(
 ) -> Optional[torch.Tensor]:
     """forward_cuda Kunlun replacement."""
     import kunlun_ops
-    from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
+    from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 
     if TYPE_CHECKING:
         assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
@@ -881,42 +711,6 @@ def forward_cuda(
         or forward_batch.forward_mode.is_draft_extend(include_v2=True)
     ):
         return self._get_topk_paged(forward_batch, layer_id, q_fp8, weights, metadata)
-
-    from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
-
-    if (
-        forward_batch.nsa_cp_metadata is not None
-        and is_nsa_prefill_cp_in_seq_split()
-    ):
-        kv_len_prev = forward_batch.nsa_cp_metadata.kv_len_prev
-        kv_len_next = forward_batch.nsa_cp_metadata.kv_len_next
-        actual_seq_q_prev = forward_batch.nsa_cp_metadata.actual_seq_q_prev
-        actual_seq_q_next = forward_batch.nsa_cp_metadata.actual_seq_q_next
-        q_fp8_prev, q_fp8_next = torch.split(
-            q_fp8, (q_fp8.shape[0] + 1) // 2, dim=0
-        )
-        weights_prev, weights_next = torch.split(
-            weights, (weights.shape[0] + 1) // 2, dim=0
-        )
-        topk_result_prev = self._get_topk_ragged_with_cp(
-            forward_batch,
-            layer_id,
-            q_fp8_prev,
-            weights_prev,
-            metadata,
-            kv_len_prev,
-            actual_seq_q_prev,
-        )
-        topk_result_next = self._get_topk_ragged_with_cp(
-            forward_batch,
-            layer_id,
-            q_fp8_next,
-            weights_next,
-            metadata,
-            kv_len_next,
-            actual_seq_q_next,
-        )
-        return torch.cat([topk_result_prev, topk_result_next], dim=0)
 
     return self._get_topk_ragged(forward_batch, layer_id, q_fp8, weights, metadata)
 

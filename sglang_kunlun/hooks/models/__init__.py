@@ -20,3 +20,8 @@
 from . import deepseek_v4  # noqa: F401
 from . import deepseek_v4_nextn  # noqa: F401
 
+from . import dsv41_engram_host_table_int8  # noqa: F401
+
+from . import deepseek_v4_vl  # noqa: F401
+
+from . import deepseek_v4_dspark  # noqa: F401

@@ -65,12 +65,23 @@ def add_cli_args_kunlun(original_fn, parser):
 
 
 @plugin_hook(
-    "sglang.srt.server_args.ServerArgs._set_default_dsa_kv_cache_dtype",
+    "sglang.srt.arg_groups.overrides._dsa_kv_cache_dtype_default",
     type=HookType.AROUND,
 )
-def _set_default_dsa_kv_cache_dtype_kunlun(original_fn, self, major, quantization):
-    """Accept float16 instead of asserting on the bf16/fp8_e4m3 whitelist."""
-    if self.kv_cache_dtype in _FLOAT16_ALIASES:
-        self.kv_cache_dtype = "float16"
-        return
-    return original_fn(self, major, quantization)
+def _dsa_kv_cache_dtype_default_kunlun(original_fn, view):
+    """Accept float16 instead of asserting on the bf16/fp8_e4m3 whitelist.
+
+    Upstream 0.5.14 moved this logic from
+    ``ServerArgs._set_default_dsa_kv_cache_dtype`` to
+    ``sglang.srt.arg_groups.overrides._dsa_kv_cache_dtype_default(view)``.
+
+    For float16/half we skip ``original_fn`` entirely: its only effects are the
+    auto-default, the ``bf16``→``bfloat16`` normalization (neither applies to an
+    explicit float16) and the whitelist assert (which is exactly what we bypass).
+    Returning ``{}`` keeps ``view.kv_cache_dtype`` untouched, so "float16"
+    survives to the KV-pool creation path. Also avoids mutating ``view`` in
+    case the post-process pass hands us a read-only view object.
+    """
+    if view.kv_cache_dtype in _FLOAT16_ALIASES:
+        return {}
+    return original_fn(view)

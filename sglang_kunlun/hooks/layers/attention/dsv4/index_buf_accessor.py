@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 
 
 @plugin_hook(
-    "sglang.srt.layers.attention.dsv4.index_buf_accessor.NopeFp8RopeBf16Pack",
+    "sglang.kernels.ops.attention.dsv4.index_buf_accessor.NopeFp8RopeBf16Pack",
     type=HookType.REPLACE,
 )
 @dataclasses.dataclass
@@ -91,7 +91,7 @@ class NopeFp8RopeBf16PackKunlun:
 
 
 @plugin_hook(
-    "sglang.srt.layers.attention.dsv4.index_buf_accessor._set_k_and_s_triton",
+    "sglang.kernels.ops.attention.dsv4.index_buf_accessor._set_k_and_s_triton",
     type=HookType.REPLACE,
 )
 def set_k_and_s_triton_kunlun(buf, loc, nope_fp8_rope_bf16_pack, page_size):

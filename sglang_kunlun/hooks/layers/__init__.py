@@ -24,8 +24,35 @@ from . import linear  # noqa: F401
 from . import quantization  # noqa: F401
 from . import moe  # noqa: F401
 from . import rotary_embedding  # noqa: F401,E402
+from . import vocab_parallel_embedding  # noqa: F401,E402
 from . import mhc  # noqa: F401,E402
 from . import mhc_head  # noqa: F401,E402
+from . import engram  # noqa: F401,E402
+from . import dsa_cp  # noqa: F401,E402
+from . import dsv41_cp_indexer  # noqa: F401,E402
+from . import dsv41_wo_a  # noqa: F401,E402
+from . import dsv41_topk_sort  # noqa: F401,E402
+from . import dsv41_pool_pairs  # noqa: F401,E402
+from . import attn_tp_gather  # noqa: F401,E402
 
 # Must be imported before upstream resolves attention backend modules.
 from . import attention  # noqa: F401,E402
+
+from . import zcp_gather_chunked  # noqa: F401,E402 round-10 chunked CP gather
+
+# NOTE: ``dsv41_idx_mask`` (round-12/18 int32 + fp16 dense-indexer epilogue) is
+# intentionally NOT imported in this build.  It monkey-patches
+# ``dsv41_cp_indexer._dense_bf16_mqa_logits_torch`` with a full reimplementation
+# that does not call ``_fused_mqa_epilogue``, so enabling it here would drop the
+# native ``mqa_logits_sum_heads`` path (operator §7/§21, +25%).  Its int32 tail
+# is moot once the epilogue runs inside that kernel; the fp16 score chain still
+# needs to be ported into ``dsv41_cp_indexer`` and A/B'd on top of the native
+# epilogue before it can ship.
+
+# NOTE: ``dsv41_hc_mix_fast`` (round-13 pure-torch hc_mix_stats) is intentionally
+# NOT imported.  ``mhc.py`` already REPLACEs the same target with the larger-M
+# "vendor GEMM + stats-only inv-rms" split (bf16 matmul, no fp32 upcast); a later
+# REPLACE registration here would silently override it and undo that split.
+# Import it explicitly only on a build whose wheel lacks the ``mix == 0`` mode.
+
+from . import dp_attention  # noqa: F401,E402

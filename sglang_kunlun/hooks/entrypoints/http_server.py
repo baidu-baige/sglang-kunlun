@@ -56,6 +56,7 @@ from fastapi import Request
 from fastapi.responses import Response
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+from sglang.srt.arg_groups.serving_hook import ssl_verify_of
 
 logger = logging.getLogger(__name__)
 
@@ -331,7 +332,7 @@ def long_context_prefill_warmup(server_args) -> None:
         json=payload,
         headers=headers,
         timeout=1800,
-        verify=server_args.ssl_verify(),
+        verify=ssl_verify_of(server_args),
     )
     logger.info(
         "sglang-kunlun: long-context warmup (%d tokens) -> %s in %.1fs",
@@ -364,7 +365,7 @@ def start_long_context_warmup(server_args) -> None:
         while time.time() < deadline:
             try:
                 res = requests.get(
-                    url + "/health_generate", timeout=60, verify=server_args.ssl_verify()
+                    url + "/health_generate", timeout=60, verify=ssl_verify_of(server_args)
                 )
                 if res.status_code == 200:
                     break

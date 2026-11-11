@@ -49,7 +49,7 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 
 @plugin_hook(
-    "sglang.srt.layers.attention.dsv4.metadata_kernel.init_compression_metadata",
+    "sglang.kernels.ops.attention.dsv4.metadata_kernel.init_compression_metadata",
     type=HookType.AROUND,
 )
 def init_compression_metadata_kunlun(original_fn, *args, **kwargs):
