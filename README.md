@@ -142,30 +142,30 @@ DeepSeek-V4.1-Flash is served with the EPD topology described in
 [DeepSeek-V4.1-Flash Support](#deepseek-v41-flash-support-sglang-0521): an
 encoder role, a language-only prefill role and a disaggregated decode role.
 
-The validated launch scripts, including the per-role environment files, are in
-[`examples/deepseek-v4.1-epd/`](examples/deepseek-v4.1-epd/README.md):
+The validated launch scripts are in
+[`examples/deepseek-v4.1-epd/`](examples/deepseek-v4.1-epd/):
 
 ```bash
 export MODEL_PATH=/path/to/DeepSeek-V4.1-Flash-W4A8
 export PREFILL_IP=<prefill-ip>
-export DECODE_IP=<decode-ip>
 export ENCODER_URLS="http://<encoder-ip>:8000 ... http://<encoder-ip>:8007"
 
 bash examples/deepseek-v4.1-epd/start_encoder.sh   # encoder host
 bash examples/deepseek-v4.1-epd/start_prefill.sh   # prefill host
 bash examples/deepseek-v4.1-epd/start_decode.sh    # decode host
-bash examples/deepseek-v4.1-epd/start_router.sh    # router host
 ```
 
 > **Note**: These scripts are the validated 8xKunlun3 P800 configuration and
 > must run inside the image built from [`dockerfile/`](dockerfile/README.md).
 > IPs, RDMA device names, memory budgets and parallelism must match the target
-> machine. See the example README for the full variable list.
+> machine. Put `sglang-router` in front of the prefill and decode endpoints to
+> serve OpenAI-compatible requests.
 
 ### Send a Request
 
 List the model identifier exposed by the running server before sending a chat
-request (the router listens on the prefill side):
+request (through `sglang-router`, which fronts the prefill and decode
+endpoints):
 
 ```bash
 curl http://localhost:8101/v1/models
