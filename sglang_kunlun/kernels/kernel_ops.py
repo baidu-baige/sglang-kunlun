@@ -1757,8 +1757,27 @@ def dsv4_compress_norm_rope_store_v2_kunlun(
     # pool and a typed bf16/fp16 pool both report bytes -- comparing raw
     # ``shape`` would read a typed pool as half its byte width and drop it back
     # onto the fp8 path. The packed V4 layout is 584 B/token, so it stays False.
+    # dtype gate: force bf16-store ONLY when the KV pool is bf16. Under
+    # --kv-cache-dtype fp16 the pool is an fp16 half cache (oot_pool_seams
+    # overrides it) yet the latent ``kv`` handed in is still bf16, so ``kv.dtype``
+    # cannot tell them apart. 
+    _pool_is_fp16 = False
+    try:
+        from sglang.srt.runtime_context import get_server_args
+
+        _kvdt = str(getattr(get_server_args(), "kv_cache_dtype", "") or "").lower()
+        _pool_is_fp16 = _kvdt in ("fp16", "float16", "half")
+    except Exception:
+        _kvdt = "<unavailable>"
+        _pool_is_fp16 = False
     _store_bf16 = bf16_store
-    if not _store_bf16 and page_size > 0 and kvcache.numel() and kv.ndim >= 2:
+    if (
+        not _store_bf16
+        and not _pool_is_fp16
+        and page_size > 0
+        and kvcache.numel()
+        and kv.ndim >= 2
+    ):
         _elems_per_page = kvcache.numel() // kvcache.shape[0]
         _bytes_per_token = (_elems_per_page // page_size) * kvcache.element_size()
         if _bytes_per_token == kv.shape[-1] * 2:
