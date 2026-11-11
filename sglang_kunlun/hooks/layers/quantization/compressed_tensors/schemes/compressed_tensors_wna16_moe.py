@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 
 import torch
@@ -17,10 +18,13 @@ from sglang.srt.utils import set_weight_attrs
 from ..utils import (
     INT4_SIGNED_SCALE_MULT,
     check_standard_routed_moe_layer,
+    dynamic_quantize_int8,
     moe_fc,
     moe_post,
     moe_pre_sorted,
+    quantize_before_sort_enabled,
     scale_to_kernel_max,
+    sorted_row_scales,
 )
 
 # SwiGLU clamping for routed experts: the fused op vs "2 clamp_ + swiglu".
@@ -30,6 +34,12 @@ from ..utils import (
 # two passes of large-tensor reads/writes. Set DSV4_MOE_SWIGLU_CLAMP_FUSION=0 to switch
 # back to the fallback path for comparison.
 _FUSED_SWIGLU_CLAMP = os.environ.get("DSV4_MOE_SWIGLU_CLAMP_FUSION", "1") == "1"
+
+logger = logging.getLogger(__name__)
+
+# Log the activation-quantization placement once per process, so a benchmark can be
+# attributed to the path that actually ran.
+_LOGGED_QUANT_PLACEMENT = False
 
 
 __all__ = ["KunlunCompressedTensorsWNA16MoE"]
@@ -266,13 +276,35 @@ class KunlunCompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         top_k = topk_ids.shape[1]
         index_have_neg = getattr(layer, "moe_ep_size", 1) > 1
         num_experts = layer.w13_weight_packed.shape[0]
+
+        # Quantize before the expand when the GEMM wants INT8 activations anyway: a
+        # token's top_k copies share one per-token scale, so sorting int8 rows and
+        # scattering the scales is bit-identical to sorting fp16 and quantizing the
+        # [m*top_k, n] result, while never materializing the fp16 expanded tensor.
+        sorted_scale = None
+        pre_quantize = self.quantize_activations and quantize_before_sort_enabled()
+        global _LOGGED_QUANT_PLACEMENT
+        if not _LOGGED_QUANT_PLACEMENT:
+            _LOGGED_QUANT_PLACEMENT = True
+            logger.info(
+                "[kunlun] MoE activation quant %s the expand "
+                "(quantize_activations=%s, DSV4_MOE_QUANT_BEFORE_SORT=%s)",
+                "BEFORE" if pre_quantize else "AFTER",
+                self.quantize_activations,
+                quantize_before_sort_enabled(),
+            )
+        presort_in = x
+        if pre_quantize:
+            presort_in, x_scale = dynamic_quantize_int8(x, keepdim=True)
         sorted_x, sorted_tokens_idx, sorted_tokens_num_lod = moe_pre_sorted(
-            x,
+            presort_in,
             topk_ids,
             num_experts,
             index_have_neg=index_have_neg,
             block_statistic=getattr(topk_output, "block_statistic", None),
         )
+        if pre_quantize:
+            sorted_scale = sorted_row_scales(x_scale, sorted_tokens_idx, top_k)
 
         num_tokens = x.shape[0]
         gate_up = moe_fc(
@@ -286,6 +318,7 @@ class KunlunCompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             x.dtype,
             quantize_input=self.quantize_activations,
             packed_int4=True,
+            x_scale=sorted_scale,
         )
 
         limit = (

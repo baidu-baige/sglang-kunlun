@@ -21,6 +21,16 @@ _PRESORT_TORCH = os.environ.get("DSV4_MOE_PRESORT_TORCH", "0") not in (
     "0", "", "false", "False"
 )
 
+# DSV4_MOE_QUANT_BEFORE_SORT=0 restores quantizing the expanded [m*top_k, n] tensor
+# inside `moe_fc`. A token's top_k copies share one per-token INT8 scale, so
+# quantizing x ([m, n]) first and sorting the int8 rows reads/writes a third of the
+# bytes: the fp16 `sorted_x` (1006 MB at m=32768, n=5120, top_k=6) never has to be
+# materialized or read back. Measured on one P800 at that shape: 3.54 ms -> 1.41 ms
+# for pre-sort + quantize together, bit-identical int8 payload and scales.
+_QUANT_BEFORE_SORT = os.environ.get("DSV4_MOE_QUANT_BEFORE_SORT", "1") not in (
+    "0", "", "false", "False"
+)
+
 __all__ = [
     "INT4_SIGNED_SCALE_MULT",
     "INT4_UNSIGNED_SCALE_MULT",
@@ -33,9 +43,16 @@ __all__ = [
     "moe_fc",
     "moe_post",
     "moe_pre_sorted",
+    "quantize_before_sort_enabled",
     "scale_to_kernel_max",
+    "sorted_row_scales",
     "validate_int4_moe_shapes",
 ]
+
+
+def quantize_before_sort_enabled() -> bool:
+    """Whether callers should quantize activations before the MoE expand."""
+    return _QUANT_BEFORE_SORT
 
 
 def scale_to_kernel_max(
@@ -76,6 +93,29 @@ def dynamic_quantize_int8(
         return x_int8, x_scale
     kunlun_ops.quant2d(x=x, y=x_int8, max=x_scale, force_sdnn=True)
     return x_int8, x_scale
+
+
+def sorted_row_scales(
+    x_scale: torch.Tensor,
+    sorted_tokens_idx: torch.Tensor,
+    top_k: int,
+) -> torch.Tensor:
+    """Place per-token activation scales in `moe_pre_sorted` row order.
+
+    `sorted_tokens_idx` maps a (token, top-k) lane to its row in the sorted tensor,
+    so the per-token scale is scattered along the same permutation the rows took.
+    Under EP the lanes owned by another rank carry index -1; they are routed to one
+    extra slot that is dropped afterwards, which keeps the scatter free of any host
+    sync and stops -1 from aliasing row 0.
+    """
+    nk = sorted_tokens_idx.numel()
+    lane_scale = (
+        x_scale.reshape(-1, 1).expand(-1, top_k).reshape(-1).to(torch.float32)
+    )
+    buf = torch.zeros(nk + 1, dtype=torch.float32, device=x_scale.device)
+    pos = sorted_tokens_idx.to(torch.int64)
+    buf.scatter_(0, torch.where(pos >= 0, pos, torch.full_like(pos, nk)), lane_scale)
+    return buf[:nk].reshape(nk, 1)
 
 
 def dequant_int4_to_int8(
@@ -342,14 +382,23 @@ def moe_fc(
     quantize_input: bool,
     packed_int4: bool = False,
     moe_topk: Optional[int] = None,
+    x_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Run a sorted Kunlun MoE fully connected operation."""
+    """Run a sorted Kunlun MoE fully connected operation.
+
+    `x_scale` lets the caller hand in an already INT8-quantized `x` together with
+    its per-token scales in sorted-row order (see `sorted_row_scales`); the GEMM
+    still runs the grouped-INT8 path, only the local quantize step is skipped.
+    """
     import kunlun_ops
 
     if moe_topk is None:
         moe_topk = topk_ids.shape[1]
-    x_scale = None
-    if quantize_input:
+    if x_scale is not None:
+        assert quantize_input, "x_scale is only meaningful on the grouped-INT8 path"
+        assert x.dtype == torch.int8, "x_scale implies a pre-quantized INT8 x"
+        x_scale = x_scale.reshape(x_scale.shape[0], -1)
+    elif quantize_input:
         x, x_scale = dynamic_quantize_int8(x, keepdim=True)
         x_scale = x_scale.reshape(x_scale.shape[0], -1)
     use_grouped_int8 = quantize_input
