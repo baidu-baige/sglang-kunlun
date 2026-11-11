@@ -30,12 +30,22 @@ exactly the engram layer.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 logger = logging.getLogger(__name__)
+
+# Whether the batch being executed can carry image tokens, published by the
+# CP-extend hook below and read by `vision_topk_text_only_kunlun` at the bottom
+# of this file. Defaults to True so that any forward path which does not go
+# through that hook keeps the upstream behaviour: assume images are possible and
+# pay for the VL bias. Failing "open" matters -- failing closed would silently
+# route image tokens with the text bias.
+_BATCH_HAS_MM = contextvars.ContextVar("kunlun_dsv41_batch_has_mm", default=True)
+
 
 # managers/schedule_batch.py:160: the hash value filled into mm placeholder rows is always >= this threshold
 _MM_PAD_SHIFT_VALUE = 1_000_000
@@ -68,6 +78,21 @@ def cp_extend_with_mm_embeds(original_fn, self, forward_batch, kwargs):
     Returns:
         The wrapped runner's output; incompatible MM inputs raise ValueError.
     """
+    # Publishing the flag has to wrap the whole body, and the body has several
+    # early returns, so it lives in `_cp_extend_with_mm_embeds` below and this
+    # function is only the set/reset frame. ContextVar rather than a module
+    # global on purpose: `reset` in `finally` is exception-safe, and a value set
+    # here is invisible to other threads, so a forward that somehow runs off
+    # this thread reads the safe default instead of a stale False.
+    token = _BATCH_HAS_MM.set(_has_mm_items(forward_batch))
+    try:
+        return _cp_extend_with_mm_embeds(original_fn, self, forward_batch, kwargs)
+    finally:
+        _BATCH_HAS_MM.reset(token)
+
+
+def _cp_extend_with_mm_embeds(original_fn, self, forward_batch, kwargs):
+    """Body of the hook above; see its docstring for the contract."""
     global _warned
 
     model = self.model_runner.model
@@ -158,3 +183,45 @@ def _with_mm_ids_remapped(original_fn, self, forward_batch, kwargs, model):
         return original_fn(self, forward_batch, kwargs)
     finally:
         forward_batch.input_ids = ids
+
+
+@plugin_hook(
+    "sglang.srt.multimodal.dsv41.vl_routing.vision_topk",
+    type=HookType.AROUND,
+)
+def vision_topk_text_only_kunlun(original_fn, moe, logits, input_ids, *args, **kwargs):
+    """Skip the VL bias machinery on batches that cannot contain image tokens.
+
+    `deepseek_v2.py:1004` enables VL routing from a *weight* test
+    (`e_score_correction_bias_vl is not None`), which this checkpoint satisfies
+    on every layer, so text-only requests take it too. Upstream already narrows
+    it with a *batch* test one line later -- but only on HIP
+    (`_hip_moe.batch_has_images`). This is that narrowing for Kunlun, applied
+    one level down because `vl_routing.vision_topk` is upstream code we do not
+    edit.
+
+    Passing `input_ids=None` is what the downstream contract already uses to
+    mean "no alternative bias needed", and it is exact rather than an
+    approximation: with no row matching `image_token_id`,
+    `torch.where(all_false, bias_alt, bias) == bias`, so both implementations
+    produce bit-identical results on the cheap branch.
+
+    What it saves per full 16384-token prefill chunk (21 MoE layers see the full
+    chunk):
+      * native gate override: `use_alt` goes False, so
+        `kunlun_ops.moe_fused_gate_dsv4` runs once per layer instead of once per
+        bias vector. The second run's output is selected away in full by
+        `torch.where(all_false, ...)`, i.e. ~10.5ms/step of provably discarded
+        work (0.503ms per [16384,384] call).
+      * torch reference path, if it is ever re-enabled: the per-row bias blend
+        stops materialising a [16384,384] fp32 table (25.2MB) per layer,
+        ~2.75ms/step, and the following add becomes a broadcast.
+
+    The flag is only published on the CP-extend path, which is where prefill
+    goes when `--enable-prefill-cp` is set. Anything else reads the default True
+    and behaves exactly as before.
+    """
+
+    if input_ids is not None and not _BATCH_HAS_MM.get():
+        input_ids = None
+    return original_fn(moe, logits, input_ids, *args, **kwargs)

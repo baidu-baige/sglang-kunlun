@@ -4223,6 +4223,25 @@ def _moe_gate_sqrtsoftplus_log1p(
     return weights, indices
 
 
+_LOGGED_GATE_PATH = False
+
+
+def _log_gate_path(which: str, scores, bias_alt) -> None:
+    """Report, once per process, which V4.1 MoE gate implementation is live."""
+
+    global _LOGGED_GATE_PATH
+    if _LOGGED_GATE_PATH:
+        return
+    _LOGGED_GATE_PATH = True
+    logger.info(
+        "[kunlun] V4.1 MoE gate -> %s (rows=%d experts=%d bias_alt=%s)",
+        which,
+        scores.shape[0],
+        scores.shape[1],
+        bias_alt is not None,
+    )
+
+
 @register_jit_op("sglang.kernels.ops.moe.moe_fused_gate", "moe_fused_gate")
 def moe_fused_gate_dsv4_kunlun(
     scores: torch.Tensor,
@@ -4274,12 +4293,27 @@ def moe_fused_gate_dsv4_kunlun(
             "Kunlun fused gate"
         )
     if sqrtsoftplus_log1p and scoring_func.lower() == "sqrtsoftplus":
-        return _moe_gate_sqrtsoftplus_log1p(
-            scores, bias, topk, num_fused_shared_experts, renormalize,
-            routed_scaling_factor, apply_routed_scaling_factor_on_output,
-            bias_alt, input_ids, bias_alt_token_id, num_token_non_padded,
-            renormalize_epsilon,
-        )
+        # Deliberately NOT honoured: run the native fused op anyway. This is the
+        # dev-kunlun-0.5.19-dsv4.1 behaviour (which did it silently, via
+        # ``del sqrtsoftplus_log1p``), restored because the faithful torch
+        # transcription below costs 1.522ms per [16384,384] call against the
+        # native op's 0.503ms -- about 21ms per full 16384-token prefill chunk
+        # once the 21 MoE layers that see the full chunk are summed.
+        #
+        # The flag asks for two things: sqrtsoftplus evaluated as
+        # ``sqrt(log1p(exp(x)))`` with an x>20 passthrough, and NaN logits ranked
+        # FIRST rather than last. Measured against
+        # ``_moe_gate_sqrtsoftplus_log1p`` on this checkpoint's layer-0 bias over
+        # seven [16384,384] input families -- gaussian at scale 0.5/1/2/5/10,
+        # 8-level quantisation giving ~48-way exact ties, 1% scattered NaN,
+        # all-NaN rows, 1% +-Inf, and fp16 overflow -- every one gave 0 rows with
+        # a differing routed top-k set, weights within one fp32 ulp (<=1.19e-07),
+        # and identical NaN propagation. Both forms rank NaN first in practice.
+        #
+        # ``_moe_gate_sqrtsoftplus_log1p`` is kept as the reference
+        # implementation for that comparison. It is no longer on any hot path;
+        # do not remove it as dead code.
+        _log_gate_path("native kunlun_ops.moe_fused_gate_dsv4", scores, bias_alt)
 
     import kunlun_ops
 
