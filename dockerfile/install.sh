@@ -547,8 +547,16 @@ function install_aiak_sglang() {
         # 旧版 aiak_sglang 自带真实的 sgl-kernel/ 目录，需覆盖它的编译产物；
         # 新版社区 sglang 不再 vendor 该目录，插件完全靠 sgl_kernel_stub.py 在运行期打桩替代，目录不存在时跳过拷贝。
         if [[ -d "${aiak_sglang_dir}/sgl-kernel/python/sgl_kernel" ]]; then
-            cp ${plugin_dir}/dockerfile/vendor/common_ops.cpython-310-x86_64-linux-gnu.so ${aiak_sglang_dir}/sgl-kernel/python/sgl_kernel/common_ops.cpython-310-x86_64-linux-gnu.so
-            rm ${plugin_dir}/dockerfile/vendor/common_ops.cpython-310-x86_64-linux-gnu.so
+            # The prebuilt common_ops blob is not shipped in the open-source
+            # tree (`.gitignore` excludes *.so); without it the plugin falls
+            # back to sgl_kernel_stub.py at runtime.
+            local common_ops="${plugin_dir}/dockerfile/vendor/common_ops.cpython-310-x86_64-linux-gnu.so"
+            if [[ -f "${common_ops}" ]]; then
+                cp "${common_ops}" "${aiak_sglang_dir}/sgl-kernel/python/sgl_kernel/common_ops.cpython-310-x86_64-linux-gnu.so"
+                rm "${common_ops}"
+            else
+                echo "vendor common_ops not shipped; relying on sgl_kernel_stub at runtime"
+            fi
         else
             echo "sgl-kernel/python/sgl_kernel not found in engine source (community sglang no longer vendors it); skip common_ops copy, relying on sgl_kernel_stub at runtime"
         fi

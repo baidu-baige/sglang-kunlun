@@ -17,7 +17,7 @@ The open-source release ships this build recipe instead of a prebuilt image.
 | `xpu_requirements.env` | Pinned Kunlun runtime component versions. |
 | `pip.conf` / `sources.list` | Build-time package mirrors. |
 | `vendor/requirements.txt` | Python dependencies of the engine wheel. |
-| `vendor/sgl_kernel-*.whl`, `vendor/common_ops*.so` | Prebuilt `sgl-kernel` pieces the runtime needs. |
+| `vendor/sgl_kernel-*.whl` | Prebuilt `sgl-kernel` wheel the runtime needs. |
 
 ## Build
 
