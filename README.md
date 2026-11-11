@@ -141,107 +141,26 @@ override arguments.
 DeepSeek-V4.1-Flash is served with the EPD topology described in
 [DeepSeek-V4.1-Flash Support](#deepseek-v41-flash-support-sglang-0521): an
 encoder role, a language-only prefill role and a disaggregated decode role.
-Set the model path and the per-role addresses first:
+
+The validated launch scripts, including the per-role environment files, are in
+[`examples/deepseek-v4.1-epd/`](examples/deepseek-v4.1-epd/README.md):
 
 ```bash
 export MODEL_PATH=/path/to/DeepSeek-V4.1-Flash-W4A8
-export MODEL_ID=DeepSeek-V4.1-Flash
+export PREFILL_IP=<prefill-ip>
+export DECODE_IP=<decode-ip>
+export ENCODER_URLS="http://<encoder-ip>:8000 ... http://<encoder-ip>:8007"
 
-export HOST_IP=$(hostname -i)            # prefill pod IP
-export PREFILL_IP=$HOST_IP               # encoder registration target
-export POD_IP=$(hostname -i)             # decode pod IP
-export ENCODER_URLS="http://<enc-ip>:8000 ... http://<enc-ip>:8007"
-export IB_DEVICES=mlx5_0,mlx5_1          # RDMA devices for mooncake KV transfer
+bash examples/deepseek-v4.1-epd/start_encoder.sh   # encoder host
+bash examples/deepseek-v4.1-epd/start_prefill.sh   # prefill host
+bash examples/deepseek-v4.1-epd/start_decode.sh    # decode host
+bash examples/deepseek-v4.1-epd/start_router.sh    # router host
 ```
 
-Common runtime variables:
-
-```bash
-export SGLANG_PLATFORM=kunlun SGLANG_USE_XPU=1 SGLANG_PLUGINS=kunlun_hooks
-export SGLANG_HACK_FLASHMLA_BACKEND=kunlun
-export SGLANG_IS_FLASHINFER_AVAILABLE=False
-export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
-export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=True
-export SGLANG_OPT_USE_JIT_NORM=True SGLANG_OPT_USE_TOPK_V2=False
-export SGLANG_TOPK_TRANSFORM_512_TORCH=True
-export SGLANG_OPT_USE_FUSED_STORE_CACHE=1 SGLANG_KUNLUN_INDEXER_FP32=1
-export SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1
-export XMLIR_FORCE_USE_XPU_GRAPH=1 XMLIR_ENABLE_FAST_FC=1
-export XPU_USE_FAST_SWIGLU=1 XPU_USE_DEFAULT_CTX=1
-export CUDA_GRAPH_OPTIMIZE_STREAM=1
-export MOONCAKE_USE_RDMA=TRUE
-```
-
-Encoder role (one worker per XPU; the validated pose starts eight workers on
-ports 8000-8007):
-
-```bash
-python3 -u -m sglang.launch_server \
-    --model-path "$MODEL_PATH" --served-model-name "$MODEL_ID" \
-    --host 0.0.0.0 --port 8000 --trust-remote-code \
-    --tp 1 --dp 1 --dtype float16 \
-    --encoder-only --mm-attention-backend sdpa \
-    --image-processor-backend pil \
-    --encoder-transfer-backend zmq_to_scheduler \
-    --encoder-register-urls "http://$PREFILL_IP:8997" \
-    --max-running-requests 32
-```
-
-Prefill role (8 XPUs, CP interleave, language-only; sends KV over mooncake):
-
-```bash
-python3 -u -m sglang.launch_server \
-    --model-path "$MODEL_PATH" --served-model-name "$MODEL_ID" \
-    --host "$HOST_IP" --port 8000 --dist-init-addr "$HOST_IP":7788 \
-    --tp 8 --ep 8 --trust-remote-code \
-    --dtype float16 --kv-cache-dtype float16 \
-    --chunked-prefill-size 32768 --context-length 114688 \
-    --max-total-tokens 250000 --max-prefill-tokens 250000 \
-    --max-running-requests 4 --mem-fraction-static 0.85 \
-    --swa-full-tokens-ratio 0.5 \
-    --disable-radix-cache --disable-cuda-graph \
-    --attention-backend kunlun_dsv4 \
-    --reasoning-parser deepseek-v41 --tool-call-parser deepseekv41 \
-    --moe-a2a-backend deepep --deepep-mode normal \
-    --enable-prefill-cp --cp-strategy interleave \
-    --enable-decoder-swa-bounded-replay \
-    --language-only --image-processor-backend pil \
-    --encoder-urls $ENCODER_URLS --encoder-bootstrap-port 8997 \
-    --disaggregation-mode prefill --disaggregation-bootstrap-port 8200 \
-    --disaggregation-transfer-backend mooncake \
-    --disaggregation-ib-device "$IB_DEVICES" \
-    --load-balance-method round_robin --enable-metrics
-```
-
-Decode role (8 XPUs, disaggregated, low-latency DeepEP with CUDA graphs):
-
-```bash
-export XSHMEM_SYMMETRIC_SIZE=536870912
-
-python3 -u -m sglang.launch_server \
-    --model-path "$MODEL_PATH" --served-model-name "$MODEL_ID" \
-    --host "$POD_IP" --port 8000 --trust-remote-code \
-    --tp 8 --ep 8 --dtype float16 --kv-cache-dtype float16 \
-    --mem-fraction-static 0.90 \
-    --chunked-prefill-size 8192 --context-length 114688 \
-    --max-total-tokens 1048576 --max-prefill-tokens 250000 \
-    --max-running-requests 8 --swa-full-tokens-ratio 0.1 \
-    --disable-radix-cache --disable-overlap-schedule \
-    --cuda-graph-backend-prefill disabled \
-    --cuda-graph-max-bs 16 --cuda-graph-bs-decode 8 \
-    --attention-backend compressed \
-    --reasoning-parser deepseek-v41 --tool-call-parser deepseekv41 \
-    --moe-a2a-backend deepep --deepep-mode low_latency \
-    --disaggregation-mode decode --disaggregation-bootstrap-port 8200 \
-    --disaggregation-transfer-backend mooncake \
-    --disaggregation-ib-device "$IB_DEVICES" --enable-metrics
-```
-
-> **Note**: The commands above are the validated 8×Kunlun3 P800 configuration.
-> `MODEL_PATH`, IPs, RDMA device names, memory budgets and parallelism must
-> match the target machine. The encoder role is not routed: start
-> `sglang-router` next to the prefill role and register the prefill and decode
-> endpoints with it.
+> **Note**: These scripts are the validated 8xKunlun3 P800 configuration and
+> must run inside the image built from [`dockerfile/`](dockerfile/README.md).
+> IPs, RDMA device names, memory budgets and parallelism must match the target
+> machine. See the example README for the full variable list.
 
 ### Send a Request
 
@@ -316,77 +235,6 @@ role behind `sglang-router`.
 
 Accuracy and performance results depend on the hardware and model; validate
 them on the target machine before using this topology in production.
-
----
-
-## Measured Tuning Notes: DeepSeek-V4-Flash on P900
-
-Findings from a parameter sweep on Kunlunxin P900, contributed for reference.
-These are measurements, not a recommended configuration: the absolute values are
-specific to our hardware and model, so treat them as starting points and the
-mechanisms as the transferable part. See the version note at the end of the
-section before quoting any percentage.
-
-### 1. Per-rank decode batch has a knee around 80
-
-Raising the per-rank decode batch from 32 to 80 gave **+25.7% output tok/s and
--32% J/output-token**. Past the knee the return collapses: 128 added only about
-4% more throughput while TPOT worsened by 53%. If you are sizing
-`--cuda-graph-max-bs-decode` and `--max-running-requests` for throughput rather
-than for single-stream latency, the useful range ends near the knee.
-
-### 2. A measured expert layout is worth a few percent
-
-`--init-expert-location` defaults to `trivial`. Replacing it with a layout
-derived from observed expert load gave **+3-7% prefill input tok/s** (median
-about 5%, same sign across three rounds).
-
-### 3. `--chunked-prefill-size` is a per-attention-DP-rank budget
-
-With data-parallel attention enabled, the value you pass is not the global chunk
-size: it is divided across attention DP ranks, and the startup log prints the
-per-rank number, not the number you typed. Upstream states the same unit in its
-own validation message ("tokens per attention DP rank"). So to land on a target
-global chunk, pass `target * dp_size`, and keep the per-rank quotient a whole
-number of pages.
-
-### 4. `--mem-fraction-static` has to be chosen per phase
-
-On our 4-card configuration (84.90 GB of weights per card) the workable window
-was narrow and phase-dependent:
-
-| Value | Result |
-| --- | --- |
-| below 0.88 | the static pool cannot hold the weights |
-| 0.90 | what we used for pure-prefill workloads |
-| 0.92 | fine for decode, but a pure-prefill run hit OOM on its first real prefill, in the normal-mode MoE buffer |
-| above 0.94 | the DeepEP buffer cannot get memory |
-
-A value that is stable in decode is therefore not automatically safe for a
-prefill-heavy deployment.
-
-### 5. Pass `--kv-cache-dtype` explicitly
-
-The default `auto` is rewritten to `fp8_e4m3` by the upstream DeepSeek-V4
-override, and this plugin's pack kernel rejects it
-(`NotImplementedError: Only support bf16/fp16 by now.`). Pass `bfloat16`,
-`float16`, or `half`.
-
-### Version note for the numbers above
-
-The percentages in items 1 and 2 were measured on
-`hac_test/aiak-inference-sglang:p800_wangzhihui07_20260817_095734` and have
-**not** been re-measured on SGLang 0.5.17 or later. Method: 20 s warmup plus
-30 s measurement per cell, throughput taken as an explicit windowed difference
-of `generation_tokens_total` in the steady-state middle of the run, power
-sampled over exactly the same window, three repeats per cell, `retract` zero
-throughout.
-
-One caveat on combining them: enabling the measured expert layout and two-batch
-overlap together was measured at +14.7% (95% CI +11.4-18.0%). Both the linear
-sum (+11.3%) and the compounded product (+16.6%) fall inside that interval, so
-the data cannot distinguish the two. **Do not multiply ratios measured in
-different deployments** - quote them separately.
 
 ---
 
