@@ -28,6 +28,11 @@ the SGLang source tree.
 
 ## Latest News 🔥
 
+- [2026/11] 🚀 **DeepSeek-V4.1-Flash support on SGLang 0.5.21** — New
+  `v0.5.21-dev` branch: EPD three-role serving (encoder-only / language-only
+  prefill / disaggregated decode), CP prefill with multimodal inputs, the
+  DSA/compressed-attention backend, Engram, mHC and fp4 index-K store. See
+  [DeepSeek-V4.1-Flash Support](#deepseek-v41-flash-support-sglang-0521)
 - [2026/09] ✨ **Open-source engineering** — Added governance and community
   files (code of conduct, security policy, DCO, issue/PR templates,
   pre-commit, and pytest configuration) aligned with industry-standard
@@ -65,7 +70,12 @@ available, the plugin activates `KunlunSRTPlatform`; otherwise it returns
   KV-cache allocator.
 - **MoE and quantization hooks** — Includes Kunlun paths for fused MoE,
   token dispatch, and INT8/W8A8-related operations.
-- **Speculative decoding** — Includes EAGLE and multi-layer EAGLE hooks.
+- **Speculative decoding** — Includes EAGLE, multi-layer EAGLE and DSpark
+  draft hooks.
+- **DeepSeek-V4.1-Flash** — Dedicated prefill and decode paths: CP prefill with
+  multimodal inputs, DSA compressed attention, Engram, mHC, fp4 index-K store,
+  and the EPD encoder/language-only role split. See
+  [DeepSeek-V4.1-Flash Support](#deepseek-v41-flash-support-sglang-0521).
 - **Disaggregation hooks** — Includes integration points for Prefill/Decode
   disaggregation and Mooncake/RDMA-based KV transfer. Validate this path in
   the target runtime before using it in production.
@@ -101,77 +111,150 @@ YOUR_PATH=/path/to/your/workspace
 pip install -e "${YOUR_PATH}/sglang-kunlun"
 ```
 
+### Build the Container Image
+
+The open-source release ships the container build recipe instead of a prebuilt
+image. [`dockerfile/`](dockerfile/README.md) contains the Dockerfile, the install
+script, the engine patches required by DeepSeek-V4.1 EPD on SGLang 0.5.21, and
+the pinned Kunlun runtime versions. The build context must be the parent
+directory of this checkout:
+
+```bash
+# from the directory that contains sglang-kunlun/
+docker build -f sglang-kunlun/dockerfile/Dockerfile \
+    -t sglang-kunlun:0.5.21 .
+```
+
+The image downloads the community `sglang==0.5.21` wheel from PyPI, verifies its
+sha256, applies `dockerfile/patches/*.patch`, installs the runtime versions from
+`dockerfile/xpu_requirements.env`, and installs this plugin. See
+[`dockerfile/README.md`](dockerfile/README.md) for the source-build route and the
+override arguments.
+
 ---
 
 ## Quick Start 🚀
 
-### Start an OpenAI-Compatible API Server
+### Start a DeepSeek-V4.1-Flash EPD Deployment
 
-Configure the Kunlun runtime environment first. The following values are the
-startup configuration for the current MiMo-V2-Flash W8A8 INT8 example.
-Adjust device visibility and model-specific kernel options for your
-deployment.
+DeepSeek-V4.1-Flash is served with the EPD topology described in
+[DeepSeek-V4.1-Flash Support](#deepseek-v41-flash-support-sglang-0521): an
+encoder role, a language-only prefill role and a disaggregated decode role.
+Set the model path and the per-role addresses first:
 
 ```bash
-YOUR_PATH=/path/to/your/workspace
+export MODEL_PATH=/path/to/DeepSeek-V4.1-Flash-W4A8
+export MODEL_ID=DeepSeek-V4.1-Flash
 
-unset XPU_DUMMY_EVENT
-export PYTHONPATH="${YOUR_PATH}/sglang-kunlun:${YOUR_PATH}/aiak_sglang/python:${YOUR_PATH}/aiak_sglang/sgl-kernel/python"
+export HOST_IP=$(hostname -i)            # prefill pod IP
+export PREFILL_IP=$HOST_IP               # encoder registration target
+export POD_IP=$(hostname -i)             # decode pod IP
+export ENCODER_URLS="http://<enc-ip>:8000 ... http://<enc-ip>:8007"
+export IB_DEVICES=mlx5_0,mlx5_1          # RDMA devices for mooncake KV transfer
+```
+
+Common runtime variables:
+
+```bash
+export SGLANG_PLATFORM=kunlun SGLANG_USE_XPU=1 SGLANG_PLUGINS=kunlun_hooks
+export SGLANG_HACK_FLASHMLA_BACKEND=kunlun
 export SGLANG_IS_FLASHINFER_AVAILABLE=False
 export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
-export SGLANG_SET_CPU_AFFINITY=1
-export XMLIR_FORCE_USE_XPU_GRAPH=1
-export XPU_USE_FAST_SWIGLU=1
-export XPU_USE_DEFAULT_CTX=1
-export XMLIR_ENABLE_FAST_FC=1
-export XMLIR_CUDNN_ENABLED=1
+export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=True
+export SGLANG_OPT_USE_JIT_NORM=True SGLANG_OPT_USE_TOPK_V2=False
+export SGLANG_TOPK_TRANSFORM_512_TORCH=True
+export SGLANG_OPT_USE_FUSED_STORE_CACHE=1 SGLANG_KUNLUN_INDEXER_FP32=1
+export SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1
+export XMLIR_FORCE_USE_XPU_GRAPH=1 XMLIR_ENABLE_FAST_FC=1
+export XPU_USE_FAST_SWIGLU=1 XPU_USE_DEFAULT_CTX=1
 export CUDA_GRAPH_OPTIMIZE_STREAM=1
-
-# The standard launcher discovers Kunlun through the installed entry points.
-# Do not set these before Python starts; sitecustomize bootstraps XPU too early.
-unset SGLANG_PLATFORM SGLANG_USE_XPU
+export MOONCAKE_USE_RDMA=TRUE
 ```
 
-Then start the server:
+Encoder role (one worker per XPU; the validated pose starts eight workers on
+ports 8000-8007):
 
 ```bash
-SGLANG_ENABLE_SPEC_V2=1
 python3 -u -m sglang.launch_server \
-    --model-path /home/models/MiMo-V2-Flash-W8A8-INT8-Dynamic-official \
-    --speculative-algorithm EAGLE \
-    --quantization w8a8_int8 \
-    --max-total-tokens 650000 \
-    --disable-radix-cache \
-    --decode-log-interval 1 \
-    --host 0.0.0.0 \
-    --port 8806 \
-    --trust-remote-code \
-    --tp-size 8 \
-    --max-running-requests 64 \
-    --disable-overlap-schedule \
-    --attention-backend fa3 \
-    --disable-cuda-graph \
-    --mem-fraction-static 0.85
+    --model-path "$MODEL_PATH" --served-model-name "$MODEL_ID" \
+    --host 0.0.0.0 --port 8000 --trust-remote-code \
+    --tp 1 --dp 1 --dtype float16 \
+    --encoder-only --mm-attention-backend sdpa \
+    --image-processor-backend pil \
+    --encoder-transfer-backend zmq_to_scheduler \
+    --encoder-register-urls "http://$PREFILL_IP:8997" \
+    --max-running-requests 32
 ```
 
-> **Note**: The command above is an example deployment configuration.
-> `--model-path`, `--tp-size`, memory allocation, attention backend, and
-> speculative-decoding settings must match the model and Kunlun runtime
-> installed on the target machine.
+Prefill role (8 XPUs, CP interleave, language-only; sends KV over mooncake):
+
+```bash
+python3 -u -m sglang.launch_server \
+    --model-path "$MODEL_PATH" --served-model-name "$MODEL_ID" \
+    --host "$HOST_IP" --port 8000 --dist-init-addr "$HOST_IP":7788 \
+    --tp 8 --ep 8 --trust-remote-code \
+    --dtype float16 --kv-cache-dtype float16 \
+    --chunked-prefill-size 32768 --context-length 114688 \
+    --max-total-tokens 250000 --max-prefill-tokens 250000 \
+    --max-running-requests 4 --mem-fraction-static 0.85 \
+    --swa-full-tokens-ratio 0.5 \
+    --disable-radix-cache --disable-cuda-graph \
+    --attention-backend kunlun_dsv4 \
+    --reasoning-parser deepseek-v41 --tool-call-parser deepseekv41 \
+    --moe-a2a-backend deepep --deepep-mode normal \
+    --enable-prefill-cp --cp-strategy interleave \
+    --enable-decoder-swa-bounded-replay \
+    --language-only --image-processor-backend pil \
+    --encoder-urls $ENCODER_URLS --encoder-bootstrap-port 8997 \
+    --disaggregation-mode prefill --disaggregation-bootstrap-port 8200 \
+    --disaggregation-transfer-backend mooncake \
+    --disaggregation-ib-device "$IB_DEVICES" \
+    --load-balance-method round_robin --enable-metrics
+```
+
+Decode role (8 XPUs, disaggregated, low-latency DeepEP with CUDA graphs):
+
+```bash
+export XSHMEM_SYMMETRIC_SIZE=536870912
+
+python3 -u -m sglang.launch_server \
+    --model-path "$MODEL_PATH" --served-model-name "$MODEL_ID" \
+    --host "$POD_IP" --port 8000 --trust-remote-code \
+    --tp 8 --ep 8 --dtype float16 --kv-cache-dtype float16 \
+    --mem-fraction-static 0.90 \
+    --chunked-prefill-size 8192 --context-length 114688 \
+    --max-total-tokens 1048576 --max-prefill-tokens 250000 \
+    --max-running-requests 8 --swa-full-tokens-ratio 0.1 \
+    --disable-radix-cache --disable-overlap-schedule \
+    --cuda-graph-backend-prefill disabled \
+    --cuda-graph-max-bs 16 --cuda-graph-bs-decode 8 \
+    --attention-backend compressed \
+    --reasoning-parser deepseek-v41 --tool-call-parser deepseekv41 \
+    --moe-a2a-backend deepep --deepep-mode low_latency \
+    --disaggregation-mode decode --disaggregation-bootstrap-port 8200 \
+    --disaggregation-transfer-backend mooncake \
+    --disaggregation-ib-device "$IB_DEVICES" --enable-metrics
+```
+
+> **Note**: The commands above are the validated 8×Kunlun3 P800 configuration.
+> `MODEL_PATH`, IPs, RDMA device names, memory budgets and parallelism must
+> match the target machine. The encoder role is not routed: start
+> `sglang-router` next to the prefill role and register the prefill and decode
+> endpoints with it.
 
 ### Send a Request
 
 List the model identifier exposed by the running server before sending a chat
-request:
+request (the router listens on the prefill side):
 
 ```bash
-curl http://localhost:8806/v1/models
+curl http://localhost:8101/v1/models
 ```
 
 Then send a request using the model identifier returned by that endpoint:
 
 ```bash
-curl http://localhost:8806/v1/chat/completions \
+curl http://localhost:8101/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "<model-id-from-v1-models>",
@@ -179,6 +262,65 @@ curl http://localhost:8806/v1/chat/completions \
     "max_tokens": 512
   }'
 ```
+
+---
+
+## DeepSeek-V4.1-Flash Support (SGLang 0.5.21)
+
+The `v0.5.21-dev` branch adds DeepSeek-V4.1-Flash support on top of the
+community SGLang 0.5.21 release. The validated deployment is an EPD topology:
+one encoder role, one language-only prefill role, and a disaggregated decode
+role behind `sglang-router`.
+
+### Validated environment
+
+| Component | Version / setting |
+| --- | --- |
+| SGLang (core) | `0.5.21` community release (PyPI wheel) |
+| PyTorch | `2.9.0+cu129` |
+| XSpeedGate operator library | `1.7.0+cbe2814.torch29` |
+| Model | DeepSeek-V4.1-Flash, W4A8 checkpoint |
+| Model dtype / KV-cache dtype | `float16` / `float16` |
+
+> Upstream SGLang 0.5.21 does not carry DeepSeek-V4.1 EPD support. This
+> release is validated with a small set of engine-side patches applied when
+> the container image is built: the encoder / language-only split, float16 KV
+> cache for `DeepseekV4*`, the language-only + CP guard, the prefill weight
+> skip that avoids loading the ViT / aligner / image modules, and a Triton-3.0
+> `small_copy` bypass. The code in this branch is the `sglang_kunlun` side of
+> that delivery.
+
+### Deployment topology
+
+| Role | Parallelism / flags | Notes |
+| --- | --- | --- |
+| Encoder (E) | 8 single-card workers in one Pod, ports 8000-8007; `--encoder-only --mm-attention-backend sdpa --image-processor-backend pil` | `pil` avoids the wheel's Rust image extension, which is built against a different torch ABI |
+| Prefill (P) | tp8 / ep8 / cp8; `--language-only`; `--chunked-prefill-size 32768` | CP interleave; does not build the ViT / aligner / image modules; sends KV over mooncake |
+| Decode (D) | tp8 / ep8; `--deepep-mode low_latency --cuda-graph-bs-decode 8 --max-running-requests 8` | `XSHMEM_SYMMETRIC_SIZE=536870912` |
+| Router | `sglang-router 0.3.2` | Start it inside the prefill container on port 8101 and keep its `--prometheus-port` off the engine ports |
+
+### Validation results
+
+| Check | Result |
+| --- | --- |
+| EPD text / image / encoder-split smoke | Pass (text `5`; image `42`, 189 image tokens) |
+| GSM8K canary | 99/100 on the smoke run; the full opencompass sweep is still in progress |
+| Prefill, 110K input, 1 output token, chunk 32768 | 32,462.7 tok/s (median of 3 runs, EP-fake dispatch) |
+| Decode, 110K input / 1000 output | Not validated: normal / eager DeepEP hits XPU error `-705` at 110K, and the 0.5.21 low-latency + CUDA-graph decode path is still being ported |
+
+Notes:
+
+- The prefill number is a performance ceiling measured with the fake EP-dispatch
+  algorithm, which skips expert routing cost; it is not a production dispatch
+  number. Same-pose real-dispatch reference: 33,143.6 tok/s.
+- The plugin keeps the V1.6 prefill optimization set. DSpark draft hooks are
+  present but DSpark is **not** enabled in the validated serving pose.
+- The candidate-based indexer path is not ported on 0.5.21: the CP dense
+  indexer falls back to the plugin's torch scoring / top-k, which selects an
+  exact full-window top-k.
+- The decode side currently runs with `--deepep-mode low_latency` and CUDA
+  graphs; text and image smoke requests pass, but the 110K / 1000-output
+  decode sweep is pending.
 
 ---
 
@@ -263,8 +405,9 @@ is not a complete compatibility matrix.
 
 | Model or path | Evidence in this repository | Notes |
 | --- | --- | --- |
-| MiMo-V2-Flash | Current W8A8 INT8 launch example | Use the example only with a matching model/runtime environment. |
+| DeepSeek-V4.1-Flash | `hooks/models/deepseek_v4.py`, `hooks/models/deepseek_v4_vl.py`, the `dsv41_*` layer hooks, the EPD encoder/language-only paths and the DSpark draft hooks | Validated on SGLang 0.5.21 with the EPD topology above (W4A8 weights, float16 KV cache). |
 | DeepSeek-V4 | DeepSeek-V4 model and KV-cache compatibility hooks | Runtime acceptance must be verified with the target SGLang/Kunlun versions. |
+| MiMo-V2-Flash | General W8A8 INT8 paths | Use only with a matching model/runtime environment. |
 | Other SGLang models | General platform, attention, KV-cache, MoE, and quantization hooks | Validate each model family and quantization mode separately. |
 
 ---
@@ -274,8 +417,10 @@ is not a complete compatibility matrix.
 | Component | Version or branch | Source |
 | --- | --- | --- |
 | `sglang-kunlun` | `0.1.0` | [`pyproject.toml`](pyproject.toml) |
-| Development code | `main` | Current repository branch |
-| SGLang and Kunlun runtime | Deployment-specific | Must match the current plugin branch |
+| Release branch | `v0.5.21-dev` | This branch |
+| SGLang | `0.5.21` community release | Validated engine for the DeepSeek-V4.1-Flash EPD topology |
+| PyTorch | `2.9.0+cu129` | Validated runtime |
+| XSpeedGate operator library | `1.7.0+cbe2814.torch29` | Validated operator wheel |
 
 ---
 
@@ -287,14 +432,15 @@ sglang-kunlun/
 │   ├── platform/              # Kunlun device and SGLang platform entry point
 │   ├── bootstrap/             # Import-order, runtime, and compatibility shims
 │   ├── hooks/
-│   │   ├── layers/             # Attention, MoE, linear, rotary, and quantization hooks
-│   │   ├── mem_cache/          # Kunlun KV pools and paged allocator
-│   │   ├── model_executor/     # Model-runner and KV-cache integration
-│   │   ├── models/             # Model-specific hooks, including DeepSeek-V4
-│   │   ├── speculative/        # EAGLE and multi-layer EAGLE hooks
+│   │   ├── layers/             # Attention, MoE, linear, rotary, quantization and DSV4.1 hooks
+│   │   ├── mem_cache/          # Kunlun KV pools, paged allocator and asradix cache hooks
+│   │   ├── model_executor/     # Model-runner, KV-cache and CP multimodal integration
+│   │   ├── models/             # Model-specific hooks, including DeepSeek-V4.1-Flash
+│   │   ├── speculative/        # EAGLE, multi-layer EAGLE and DSpark hooks
+│   │   ├── managers/           # Scheduler-side helpers
 │   │   ├── disaggregation/     # Prefill/Decode and KV-transfer hooks
 │   │   └── entrypoints/        # HTTP server integration hooks
-│   ├── kernels/                # Kunlun kernel shims and operator replacements
+│   ├── kernels/                # Kunlun kernel shims and DSV4 operator replacements
 │   ├── models/                 # External model package registration
 │   └── launch.py               # Explicit Kunlun launcher
 ├── test/                       # Unit and contract tests

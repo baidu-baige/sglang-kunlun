@@ -1,0 +1,381 @@
+diff --git a/python/sglang/srt/arg_groups/pd_disaggregation_hook.py b/python/sglang/srt/arg_groups/pd_disaggregation_hook.py
+index e8c50177aa..710985dc9e 100644
+--- a/python/sglang/srt/arg_groups/pd_disaggregation_hook.py
++++ b/python/sglang/srt/arg_groups/pd_disaggregation_hook.py
+@@ -280,9 +280,17 @@ def handle_encoder_disaggregation(server_args: Any):
+         "KimiK3ForConditionalGeneration",
+         "MiMoV2ForCausalLM",
+         "Glm5NextForConditionalGeneration",
++        # [epd-dsv41] DeepSeek-V4.1 EPD: the checkpoint declares
++        # DeepseekV41ForCausalLM while DeepseekV41Config rewrites
++        # architectures[0] to DeepseekV4ForCausalLM at load time. Admit both
++        # spellings so this gate does not depend on which side of that rewrite
++        # it observes.
++        "DeepseekV4ForCausalLM",
++        "DeepseekV41ForCausalLM",
+     ]:
+         raise ValueError(
+             f"Model type {model_arch} is not supported for encoder disaggregation. "
+             f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, "
+-            f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2, GLM5Next."
++            f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2, GLM5Next, "
++            f"DeepSeek-V4/V4.1."
+         )
+diff --git a/python/sglang/srt/disaggregation/encoder/preprocessor.py b/python/sglang/srt/disaggregation/encoder/preprocessor.py
+index 2fca0d7981..b6c3552751 100644
+--- a/python/sglang/srt/disaggregation/encoder/preprocessor.py
++++ b/python/sglang/srt/disaggregation/encoder/preprocessor.py
+@@ -911,6 +911,37 @@ class EncoderPreprocessor:
+                 and modality == Modality.IMAGE
+             ):
+                 return self._kimi_tokens_from_patch_grid(grid)
++            if (
++                # [epd-dsv41] DeepSeek-V4.1 ships no HF image processor, so the
++                # generic `patches / merge_size**2` count below is wrong for it.
++                # This is the single token-count path: the real /encode request
++                # and the /health dummy encode both go through
++                # EncoderPreprocessor.process_mm_items, so the counts here and
++                # the language-only span rebuild in
++                # multimodal/processors/deepseek_v41.py.get_mm_data agree by
++                # construction -- n_llm_h*(n_llm_w+1)+2 with
++                # n_llm = ceil(n_vit / vision_downsample_ratio).
++                self.model_type == "deepseek_v41"
++                and modality == Modality.IMAGE
++            ):
++                from sglang.srt.multimodal.deepseek_v41_image_processing import (
++                    num_image_tokens,
++                )
++
++                r = (
++                    getattr(self.model_config.hf_config, "vision_downsample_ratio", 3)
++                    or 3
++                )
++                t, h, w = int(grid[0]), int(grid[1]), int(grid[2])
++                if t != 1:
++                    # Only still images are validated for this model and the
++                    # per-frame layout is undefined, so refuse instead of
++                    # returning a silently wrong count.
++                    raise ValueError(
++                        "DeepSeek-V4.1 EPD supports still images only "
++                        f"(grid time dim must be 1, got {t})"
++                    )
++                return num_image_tokens((h + r - 1) // r, (w + r - 1) // r)
+             merge_size = getattr(self.image_processor, "merge_size", 2)
+             return self.get_num_patches(grid, modality) // (merge_size**2)
+ 
+diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
+index a3b8b61023..8e3db430d2 100644
+--- a/python/sglang/srt/models/deepseek_v4.py
++++ b/python/sglang/srt/models/deepseek_v4.py
+@@ -4863,6 +4863,8 @@ class DeepseekV4ForCausalLM(nn.Module):
+         self.quant_config = quant_config
+         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
+         self.determine_num_fused_shared_experts()
++        # [epd-dsv41] ModelConfig copies --encoder-only onto the HF config.
++        self.encoder_only = bool(getattr(config, "encoder_only", False))
+         self.vision = None
+         if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+             if (
+@@ -4880,6 +4882,29 @@ class DeepseekV4ForCausalLM(nn.Module):
+             self.image_start = nn.Parameter(torch.empty(config.hidden_size))
+             self.image_end = nn.Parameter(torch.empty(config.hidden_size))
+             self.image_newline = nn.Parameter(torch.empty(config.hidden_size))
++        elif self.encoder_only:
++            # [epd-dsv41] Only the encode role can reach this: a vision-less
++            # checkpoint would leave the encoder pod with nothing to run.
++            raise ValueError(
++                "DeepSeek-V4.1 encoder-only mode requires a vision-capable "
++                "checkpoint (model_type=deepseek_v41 with vision_n_layers > 0)."
++            )
++
++        if self.encoder_only:
++            # [epd-dsv41] New EPD encode role: build only the vision tower,
++            # aligner and image delimiter embeddings. The MoE decoder, lm_head
++            # and logits path are never constructed, so one XPU holds the ~2GB
++            # vision subgraph instead of allocating the full model (which OOMs).
++            self.pp_group = get_parallel().pp_group
++            self.model = None
++            self.lm_head = None
++            self.logits_processor = None
++            self.capture_aux_hidden_states = False
++            self._routed_experts_weights_of_layer = LazyValue(lambda: {})
++            self.start_layer = 0
++            self.end_layer = 0
++            self._mhc_prewarmed_at_load = False
++            return
+         self.model = DeepseekV4Model(
+             config, quant_config, prefix=add_prefix("model", prefix)
+         )
+@@ -4986,6 +5011,64 @@ class DeepseekV4ForCausalLM(nn.Module):
+             input_ids, mm_inputs
+         )
+ 
++    # [epd-dsv41] Encoder-side (New EPD) image preprocessing hook. The EPD
++    # encode server calls this instead of an HF image processor, which V4.1
++    # does not ship.
++    def preprocess_mm_for_encoder(self, mm_data, modality, config):
++        """Encoder-side (New EPD) image preprocessing for DeepSeek-V4.1.
++
++        V4.1 ships no Hugging Face image processor, so the generic encoder
++        preprocessing path has nothing to call. The already-loaded images are
++        patchified here with the same CPU planner the monolithic tokenizer uses
++        (plan_image_grid / patchify_image), one MultimodalDataItem per image so
++        the vision-DP owner assignment stays per-image, which get_image_feature
++        requires. The returned dict carries image_grid_thw for the generic grid
++        bookkeeping; the LLM-token span is rebuilt from n_vit_h/n_vit_w on the
++        get_image_feature side exactly as in the non-disaggregated path.
++
++        No materialize_local_items callback is passed: the reference encode
++        role is one single-XPU container per server (--tp 1), so the whole
++        image set belongs to this rank and there is no owner split to defer.
++        """
++        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
++        from sglang.srt.multimodal.deepseek_v41_image_processing import patchify_image
++        from sglang.srt.multimodal.encoder_preprocessing import (
++            EncoderPreprocessOutput,
++            hash_raw_encoder_item,
++        )
++
++        if modality != Modality.IMAGE:
++            raise ValueError("DeepSeek-V4.1 encoder mode supports image input only")
++
++        items, grids = [], []
++        for record in mm_data:
++            image = (
++                record["image"]
++                if isinstance(record, dict) and "image" in record
++                else record
++            )
++            patches, n_vit_h, n_vit_w, _n_llm_h, _n_llm_w = patchify_image(
++                image, self.config
++            )
++            item = MultimodalDataItem(
++                modality=Modality.IMAGE,
++                feature=patches,
++                model_specific_data={"n_vit_h": n_vit_h, "n_vit_w": n_vit_w},
++            )
++            # Identity from the raw image, matching the tokenizer-side item.
++            item.set_hash(hash_raw_encoder_item(image))
++            items.append(item)
++            grids.append([1, n_vit_h, n_vit_w])
++
++        return EncoderPreprocessOutput(
++            {
++                "pixel_values": [item.feature for item in items],
++                "image_grid_thw": torch.tensor(grids, dtype=torch.int64),
++            },
++            mm_items=items,
++            item_sizes=[grid[1] * grid[2] for grid in grids],
++        )
++
+     def get_image_feature(self, items):
+         """Return complete spans for the shared MM cache and chunk scheduler."""
+ 
+@@ -5012,6 +5095,15 @@ class DeepseekV4ForCausalLM(nn.Module):
+             span[types == 2] = self.image_newline
+             span[types == 3] = self.image_end
+             spans.append(span)
++        if self.encoder_only:
++            # [epd-dsv41] The New EPD encode server consumes one [tokens,
++            # hidden] tensor per forward (it calls mm_embedding.cpu() and then
++            # MMEncoder.slice_embedding on the result), not the per-item list
++            # the monolithic chunk scheduler expects. Concatenating in item
++            # order keeps rows aligned with the per-item token_counts computed
++            # by EncoderPreprocessor.get_num_tokens.
++            flat = [s.reshape(-1, s.shape[-1]) for s in spans]
++            return flat[0] if len(flat) == 1 else torch.cat(flat, dim=0)
+         return spans
+ 
+     def _prepare_mm_embeddings(self, input_ids, forward_batch):
+@@ -5086,6 +5178,14 @@ class DeepseekV4ForCausalLM(nn.Module):
+         input_embeds: Optional[torch.Tensor] = None,
+         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+     ) -> torch.Tensor:
++        if self.encoder_only:
++            # [epd-dsv41] The encode role serves get_image_feature directly and
++            # never builds the language decoder, so a forward here is a bug, not
++            # a request to serve.
++            raise RuntimeError(
++                "DeepSeek-V4.1 encoder-only has no language model; call "
++                "get_image_feature instead of forward()."
++            )
+         if (
+             self.vision is not None
+             and not forward_batch.forward_mode.is_decode()
+@@ -5201,6 +5301,10 @@ class DeepseekV4ForCausalLM(nn.Module):
+                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
+ 
+     def post_load_weights(self, is_nextn=False, weight_names=None):
++        if self.encoder_only:
++            # [epd-dsv41] Decoder-only fixups (FP8 wo_a scales, compressor APE
++            # hotfix, mHC norm caches) have no modules in the encode role.
++            return
+         if self.wo_a_fp8:
+             self._setup_fp8_wo_a_scales(is_nextn)
+ 
+@@ -5360,10 +5464,50 @@ class DeepseekV4ForCausalLM(nn.Module):
+             time.perf_counter() - tic - compile_secs,
+         )
+ 
++    # [epd-dsv41] Vision-only weight loading for the encode role.
++    def _load_encoder_only_weights(
++        self,
++        weights: Iterable[Tuple[str, torch.Tensor]],
++        params_dict: dict,
++    ) -> None:
++        """Load only the vision tower, aligner and image delimiter embeddings.
++
++        The New EPD encode role never builds the MoE decoder, so decoder tensors
++        are skipped by name before their data is materialized. Safetensors slices
++        are lazy, so unmatched shards are never read off disk.
++
++        The uninitialised-parameter check below is deliberately still run: a
++        small encoder footprint is not evidence that the vision weights loaded.
++        """
++        loaded_params: Set[str] = set()
++        for name, loaded_weight in weights:
++            name = self.remap_weight_name_to_dpsk_hf_format(name)
++            if not name.startswith(("vision.", "aligner.", "image_")):
++                continue
++            if name not in params_dict:
++                logger.warning(f"{name} not found in params_dict.")
++                continue
++            param = params_dict[name]
++            weight_loader = getattr(param, "weight_loader", default_weight_loader)
++            weight_loader(param, loaded_weight)
++            loaded_params.add(name)
++
++        unloaded_params = params_dict.keys() - loaded_params
++        if unloaded_params:
++            logger.warning(
++                "Some encoder weights are not initialized from checkpoints: "
++                f"{unloaded_params}"
++            )
++
+     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+         params_dict = dict(self.named_parameters())
+         loaded_params: Set[str] = set()
+ 
++        if self.encoder_only:
++            # [epd-dsv41] Encoder tier loads only what it built.
++            self._load_encoder_only_weights(weights, params_dict)
++            return
++
+         if is_nextn:
+             if hasattr(self.config, "num_nextn_predict_layers"):
+                 num_nextn_layers = self.config.num_nextn_predict_layers
+diff --git a/python/sglang/srt/multimodal/processors/deepseek_v41.py b/python/sglang/srt/multimodal/processors/deepseek_v41.py
+index dc18812f2f..19673adbc5 100644
+--- a/python/sglang/srt/multimodal/processors/deepseek_v41.py
++++ b/python/sglang/srt/multimodal/processors/deepseek_v41.py
+@@ -125,3 +125,110 @@ class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
+             mm_items=self._prepare_mm_items_for_transport(items),
+             im_token_id=self.image_token_id,
+         )
++
++    # [epd-dsv41] Language-only side of New EPD: rebuild the encoder's spans.
++    def get_mm_data(self, prompt, embeddings, **kwargs):
++        """Rebuild the image spans for embeddings received from an encoder.
++
++        The base implementation derives a span length from a patch grid, which
++        does not describe V4.1: an image occupies ``n_llm_h * (n_llm_w + 1) + 2``
++        tokens -- the aligner grid in reading order plus one IMAGE_NEW_LINE per
++        row and the two delimiters. The encoder returns that whole span (see
++        DeepseekV4ForCausalLM.get_image_feature), so span length and embedding
++        rows match one-to-one here.
++
++        ``img_grid_thw`` arrives from the receiver, which fills one entry per
++        encoder part and concatenates them in global part order; the rows are
++        therefore in prompt image order, one per ``image_token_id``
++        placeholder. The part ids themselves (``<rid>_local_part_<idx>``) are
++        consumed by the receiver before this point and are not needed here.
++        """
++        grid = kwargs.get("img_grid_thw")
++        if grid is None:
++            raise ValueError("DeepSeek-V4.1 EPD requires img_grid_thw per image")
++        grid = torch.as_tensor(grid).reshape(-1, 3)
++
++        if isinstance(prompt, (list, tuple)):
++            ids = list(prompt)
++        else:
++            ids = self._processor.encode(prompt)
++        num_placeholders = ids.count(self.image_token_id)
++        if num_placeholders != grid.shape[0]:
++            raise ValueError(
++                f"{num_placeholders} image placeholders for {grid.shape[0]} "
++                "encoder grids"
++            )
++
++        # Mirror the encoder-side guard (encoder/preprocessor.get_num_tokens) so a
++        # missing or zero ratio cannot turn the ceil-division below into a crash;
++        # both sides must read the same ratio or the span lengths would diverge.
++        r = getattr(self.hf_config, "vision_downsample_ratio", 3) or 3
++        image_embeddings = embeddings.get(Modality.IMAGE)
++        if image_embeddings is None:
++            raise ValueError(
++                "DeepSeek-V4.1 EPD received no IMAGE embeddings from the encoder"
++            )
++        tokens, items, consumed, index = [], [], 0, 0
++        for token in ids:
++            if token != self.image_token_id:
++                tokens.append(token)
++                continue
++            _, n_vit_h, n_vit_w = (int(value) for value in grid[index])
++            n_llm_h = -(-n_vit_h // r)
++            n_llm_w = -(-n_vit_w // r)
++            count = len(image_token_types(n_llm_h, n_llm_w))
++            if consumed + count > len(image_embeddings):
++                raise ValueError(
++                    f"DeepSeek-V4.1 EPD: encoder returned {len(image_embeddings)} "
++                    f"embedding rows but image {index} needs rows "
++                    f"[{consumed}:{consumed + count}]"
++                )
++            start = len(tokens)
++            tokens.extend([self.image_token_id] * count)
++            items.append(
++                MultimodalDataItem(
++                    modality=Modality.IMAGE,
++                    offsets=[(start, start + count - 1)],
++                    precomputed_embeddings=image_embeddings[
++                        consumed : consumed + count
++                    ],
++                    model_specific_data={"n_vit_h": n_vit_h, "n_vit_w": n_vit_w},
++                )
++            )
++            consumed += count
++            index += 1
++
++        if consumed != len(image_embeddings):
++            raise ValueError(
++                f"DeepSeek-V4.1 EPD: consumed {consumed} embedding rows but the "
++                f"encoder returned {len(image_embeddings)}"
++            )
++
++        # [epd-dsv41] Evidence line for the E->P hop: both sides of the row
++        # accounting are real measurements from this request (rows the encoder
++        # pushed, tokens the language-only span rebuild consumed). The finite /
++        # scale part is what distinguishes "the encoder pushed a wrong embedding"
++        # from "the language side consumed it wrongly": a NaN/inf or a wildly
++        # out-of-range max here means the encoder's ViT forward itself blew up.
++        _emb = image_embeddings.reshape(-1, image_embeddings.shape[-1])
++        logger.info(
++            "[epd-dsv41] ep_transfer rid=%s images=%d embedding_rows=%d "
++            "image_tokens=%d matched=%s dtype=%s finite=%s absmax=%.4f "
++            "mean=%.4f std=%.4f",
++            kwargs.get("rid", "n/a"),
++            int(grid.shape[0]),
++            len(image_embeddings),
++            consumed,
++            consumed == len(image_embeddings),
++            str(_emb.dtype),
++            bool(torch.isfinite(_emb).all()),
++            float(_emb.abs().max()),
++            float(_emb.float().mean()),
++            float(_emb.float().std()),
++        )
++
++        return MultimodalProcessorOutput(
++            input_ids=tokens,
++            mm_items=items,
++            im_token_id=self.image_token_id,
++        )
