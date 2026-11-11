@@ -299,28 +299,15 @@ role behind `sglang-router`.
 | Decode (D) | tp8 / ep8; `--deepep-mode low_latency --cuda-graph-bs-decode 8 --max-running-requests 8` | `XSHMEM_SYMMETRIC_SIZE=536870912` |
 | Router | `sglang-router 0.3.2` | Start it inside the prefill container on port 8101 and keep its `--prometheus-port` off the engine ports |
 
-### Validation results
+### Notes
 
-| Check | Result |
-| --- | --- |
-| EPD text / image / encoder-split smoke | Pass (text `5`; image `42`, 189 image tokens) |
-| GSM8K canary | 99/100 on the smoke run; the full opencompass sweep is still in progress |
-| Prefill, 110K input, 1 output token, chunk 32768 | 32,462.7 tok/s (median of 3 runs, EP-fake dispatch) |
-| Decode, 110K input / 1000 output | Not validated: normal / eager DeepEP hits XPU error `-705` at 110K, and the 0.5.21 low-latency + CUDA-graph decode path is still being ported |
-
-Notes:
-
-- The prefill number is a performance ceiling measured with the fake EP-dispatch
-  algorithm, which skips expert routing cost; it is not a production dispatch
-  number. Same-pose real-dispatch reference: 33,143.6 tok/s.
 - The plugin keeps the V1.6 prefill optimization set. DSpark draft hooks are
   present but DSpark is **not** enabled in the validated serving pose.
 - The candidate-based indexer path is not ported on 0.5.21: the CP dense
   indexer falls back to the plugin's torch scoring / top-k, which selects an
   exact full-window top-k.
-- The decode side currently runs with `--deepep-mode low_latency` and CUDA
-  graphs; text and image smoke requests pass, but the 110K / 1000-output
-  decode sweep is pending.
+- Accuracy and performance results are environment-specific; validate them on
+  the target machine before using this topology in production.
 
 ---
 
