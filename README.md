@@ -30,8 +30,8 @@ the SGLang source tree.
 
 - [2026/11] 🚀 **DeepSeek-V4.1-Flash support on SGLang 0.5.21** — New
   `v0.5.21-dev` branch: EPD three-role serving (encoder-only / language-only
-  prefill / disaggregated decode), CP prefill with multimodal inputs, the
-  DSA/compressed-attention backend, Engram, mHC and fp4 index-K store. See
+  prefill / disaggregated decode), context-parallel prefill with image
+  inputs, and optimized attention, MoE and indexer kernels. See
   [DeepSeek-V4.1-Flash Support](#deepseek-v41-flash-support-sglang-0521)
 - [2026/09] ✨ **Open-source engineering** — Added governance and community
   files (code of conduct, security policy, DCO, issue/PR templates,
@@ -70,11 +70,12 @@ available, the plugin activates `KunlunSRTPlatform`; otherwise it returns
   KV-cache allocator.
 - **MoE and quantization hooks** — Includes Kunlun paths for fused MoE,
   token dispatch, and INT8/W8A8-related operations.
-- **Speculative decoding** — Includes EAGLE, multi-layer EAGLE and DSpark
-  draft hooks.
-- **DeepSeek-V4.1-Flash** — Dedicated prefill and decode paths: CP prefill with
-  multimodal inputs, DSA compressed attention, Engram, mHC, fp4 index-K store,
-  and the EPD encoder/language-only role split. See
+- **Speculative decoding** — Includes EAGLE, multi-layer EAGLE and the
+  DeepSeek-V4 draft-model hooks.
+- **DeepSeek-V4.1-Flash** — Dedicated prefill and decode paths with
+  context-parallel prefill for image inputs, a compressed long-context
+  attention backend, optimized MoE / Engram layers, and the EPD
+  encoder/language-only role split. See
   [DeepSeek-V4.1-Flash Support](#deepseek-v41-flash-support-sglang-0521).
 - **Disaggregation hooks** — Includes integration points for Prefill/Decode
   disaggregation and Mooncake/RDMA-based KV transfer. Validate this path in
@@ -278,7 +279,7 @@ role behind `sglang-router`.
 | --- | --- |
 | SGLang (core) | `0.5.21` community release (PyPI wheel) |
 | PyTorch | `2.9.0+cu129` |
-| XSpeedGate operator library | `1.7.0+cbe2814.torch29` |
+| XSpeedGate operator library (`xspeedgate_ops`) | `1.7.0+cbe2814.torch29` |
 | Model | DeepSeek-V4.1-Flash, W4A8 checkpoint |
 | Model dtype / KV-cache dtype | `float16` / `float16` |
 
@@ -299,15 +300,22 @@ role behind `sglang-router`.
 | Decode (D) | tp8 / ep8; `--deepep-mode low_latency --cuda-graph-bs-decode 8 --max-running-requests 8` | `XSHMEM_SYMMETRIC_SIZE=536870912` |
 | Router | `sglang-router 0.3.2` | Start it inside the prefill container on port 8101 and keep its `--prometheus-port` off the engine ports |
 
-### Notes
+### Optimized paths in this release
 
-- The plugin keeps the V1.6 prefill optimization set. DSpark draft hooks are
-  present but DSpark is **not** enabled in the validated serving pose.
-- The candidate-based indexer path is not ported on 0.5.21: the CP dense
-  indexer falls back to the plugin's torch scoring / top-k, which selects an
-  exact full-window top-k.
-- Accuracy and performance results are environment-specific; validate them on
-  the target machine before using this topology in production.
+- **Context-parallel prefill** — splits long prompts across the eight XPUs,
+  including image inputs.
+- **Compressed / DSA attention** — a faster long-context attention path backed
+  by the compressed KV index.
+- **Engram and mHC layers** — fused Kunlun kernels for the Engram lookup and
+  the mHC normalization.
+- **FP4 index-K quantization** — quantizes and stores index-K in FP4 with a
+  native kernel instead of the PyTorch fallback.
+- **Indexer top-k** — exact full-window top-k selection on Kunlun kernels.
+- **Cast and fusion clean-up** — native fp16/bf16 casts plus fused
+  hc_mix / hc_combine, removing per-layer copies.
+
+Accuracy and performance results depend on the hardware and model; validate
+them on the target machine before using this topology in production.
 
 ---
 
@@ -392,7 +400,7 @@ is not a complete compatibility matrix.
 
 | Model or path | Evidence in this repository | Notes |
 | --- | --- | --- |
-| DeepSeek-V4.1-Flash | `hooks/models/deepseek_v4.py`, `hooks/models/deepseek_v4_vl.py`, the `dsv41_*` layer hooks, the EPD encoder/language-only paths and the DSpark draft hooks | Validated on SGLang 0.5.21 with the EPD topology above (W4A8 weights, float16 KV cache). |
+| DeepSeek-V4.1-Flash | DeepSeek-V4.1 model, KV-cache, attention and EPD hooks | Validated on SGLang 0.5.21 with the EPD topology above (W4A8 weights, float16 KV cache). |
 | DeepSeek-V4 | DeepSeek-V4 model and KV-cache compatibility hooks | Runtime acceptance must be verified with the target SGLang/Kunlun versions. |
 | MiMo-V2-Flash | General W8A8 INT8 paths | Use only with a matching model/runtime environment. |
 | Other SGLang models | General platform, attention, KV-cache, MoE, and quantization hooks | Validate each model family and quantization mode separately. |
@@ -407,7 +415,7 @@ is not a complete compatibility matrix.
 | Release branch | `v0.5.21-dev` | This branch |
 | SGLang | `0.5.21` community release | Validated engine for the DeepSeek-V4.1-Flash EPD topology |
 | PyTorch | `2.9.0+cu129` | Validated runtime |
-| XSpeedGate operator library | `1.7.0+cbe2814.torch29` | Validated operator wheel |
+| XSpeedGate operator library (`xspeedgate_ops`) | `1.7.0+cbe2814.torch29` | Validated operator wheel |
 
 ---
 
@@ -419,11 +427,11 @@ sglang-kunlun/
 │   ├── platform/              # Kunlun device and SGLang platform entry point
 │   ├── bootstrap/             # Import-order, runtime, and compatibility shims
 │   ├── hooks/
-│   │   ├── layers/             # Attention, MoE, linear, rotary, quantization and DSV4.1 hooks
-│   │   ├── mem_cache/          # Kunlun KV pools, paged allocator and asradix cache hooks
+│   │   ├── layers/             # Attention, MoE, linear, rotary, quantization and DeepSeek-V4 hooks
+│   │   ├── mem_cache/          # Kunlun KV pools, paged allocator and cache hooks
 │   │   ├── model_executor/     # Model-runner, KV-cache and CP multimodal integration
 │   │   ├── models/             # Model-specific hooks, including DeepSeek-V4.1-Flash
-│   │   ├── speculative/        # EAGLE, multi-layer EAGLE and DSpark hooks
+│   │   ├── speculative/        # EAGLE, multi-layer EAGLE and DeepSeek-V4 draft hooks
 │   │   ├── managers/           # Scheduler-side helpers
 │   │   ├── disaggregation/     # Prefill/Decode and KV-transfer hooks
 │   │   └── entrypoints/        # HTTP server integration hooks
