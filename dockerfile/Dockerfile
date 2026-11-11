@@ -38,7 +38,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 # https://ku.baidu-int.com/knowledge/HFVrC7hq1Q/BeQck0ZK7s/wsEROHhNNf/_mpWzFJuSciXhX
 ARG XRE_ADDR=https://klx-sdk-release-public.su.bcebos.com/xre/kl3-release/5.45.0.0/peermem/xre-Linux-x86_64-5.45.0.0.tar.gz
 ARG XCCL_ADDR=https://su.bcebos.com/v1/klx-sdk-release-public/xccl/release/3.1.8.1/xccl_Linux_x86_64_cuda12.tar.gz
-ARG XDLL_ADDR=https://aihc-private-hcd.bj.bcebos.com/zhangchi/xdll/xdll_ops-1.0.0%2Bcd6faa9.torch29-cp312-cp312-linux_x86_64.whl
+ARG XDLL_ADDR=https://aihc-private-hcd.bj.bcebos.com/zhangchi/xdll/xdll_ops-1.0.0%2B8bf033d.torch29-cp312-cp312-linux_x86_64.whl
 ARG XPYTORCH_ADDR=https://klx-sdk-release-public.su.bcebos.com/kunlun2jituan/20260930/xpytorch-cp312-torch290-ubuntu2004-x64.run
 ARG KUNLUN_OPS_ADDR=https://klx-sdk-release-public.su.bcebos.com/kunlun2jituan/20260930/kunlun_ops-0.1.265%2B46489a34-cp312-cp312-linux_x86_64.whl
 ARG CHEN_OPS_ADDR=https://aihc-private-hcd.bj.bcebos.com/zhz/chen_ops-0.2.0%2Bflashmla.20261028-cp312-cp312-linux_x86_64.whl
