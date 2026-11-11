@@ -8212,3 +8212,26 @@ def top_p_renorm_prob_kunlun(
     from sglang_kunlun.kernels.sgl_kernel_kunlun.sampling import top_p_renorm_prob
 
     return top_p_renorm_prob(probs, top_p)
+
+
+# ``logprob_processor``'s Triton streaming logsumexp cannot compile here, so
+# every ``return_logprob`` request died with ``'_CudaTarget' object has no
+# attribute 'arch'``. torch's reduction is numerically the same (both subtract
+# the row max).
+@register_triton_op("sglang.srt.layers.logsumexp", "_row_logsumexp_kernel")
+def row_logsumexp_kernel_torch(
+    x: torch.Tensor,
+    out_max: torch.Tensor,
+    out_log_sum: torch.Tensor,
+    row_stride: int,
+    col_stride: int,
+    num_cols: int,
+    BLOCK_N: int = 0,
+    **_,
+) -> None:
+    """Write ``(row max, log sum exp(x - max))`` the way the Triton kernel does."""
+    rows = out_max.shape[0]
+    view = x.as_strided((rows, num_cols), (row_stride, col_stride)).float()
+    m = view.amax(dim=-1)
+    out_max.copy_(m)
+    out_log_sum.copy_(torch.log(torch.exp(view - m[:, None]).sum(dim=-1)))
