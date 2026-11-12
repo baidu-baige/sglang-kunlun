@@ -5,3 +5,4 @@ Importing this package registers the dsv4 component hooks.
 
 from . import indexer  # noqa: F401
 from . import compressor  # noqa: F401
+from . import metadata  # noqa: F401

@@ -6025,7 +6025,8 @@ def _plain_copy(t: torch.Tensor) -> torch.Tensor:
     """
     if not t.is_inference():
         return t if t.is_contiguous() else t.contiguous()
-    out = torch.empty(t.shape, dtype=t.dtype, device=t.device)
+    with torch.inference_mode(False):
+        out = torch.empty(t.shape, dtype=t.dtype, device=t.device)
     out.copy_(t)
     return out
 
@@ -6055,15 +6056,16 @@ def _dsv4_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
         # fluent for the first few high-confidence tokens and then collapsed into
         # repeated punctuation.
         if freqs_cis.is_complex():
-            parts = torch.view_as_real(_plain_copy(freqs_cis))
-            half = parts.shape[-2]
-            cached = torch.empty(
-                parts.shape[:-2] + (half * 2,),
-                dtype=parts.dtype,
-                device=parts.device,
-            )
-            cached[..., :half].copy_(parts[..., 0])
-            cached[..., half:].copy_(parts[..., 1])
+            with torch.inference_mode(False):
+                parts = torch.view_as_real(_plain_copy(freqs_cis))
+                half = parts.shape[-2]
+                cached = torch.empty(
+                    parts.shape[:-2] + (half * 2,),
+                    dtype=parts.dtype,
+                    device=parts.device,
+                )
+                cached[..., :half].copy_(parts[..., 0])
+                cached[..., half:].copy_(parts[..., 1])
         else:
             # Already real-valued: the real/imag split is an identity.
             cached = _plain_copy(freqs_cis)
@@ -6088,10 +6090,10 @@ def _dsv4_rotate_gptj_tail(
 
     freqs_real = _dsv4_cos_sin_cache(freqs_cis)
     rope_dim = freqs_real.shape[-1]
-    rope_tail = value[..., -rope_dim:].contiguous()
+    rope_tail = value[..., -rope_dim:]
     rope_shape = rope_tail.shape
     rope_tail_3d = rope_tail.reshape(rope_shape[0], -1, rope_dim)
-    rotated, _ = torch.ops.xspeedgate_ops.flashinfer_rotary_embedding(
+    torch.ops.xspeedgate_ops.flashinfer_rotary_embedding(
         positions=positions.flatten(),
         rotary_dim=rope_dim,
         head_size=rope_dim,
@@ -6102,9 +6104,7 @@ def _dsv4_rotate_gptj_tail(
         offsets=None,
         inverse=False,
     )
-    result = value.clone()
-    result[..., -rope_dim:].copy_(rotated.reshape(rope_shape))
-    return result
+    return value
 
 @register_jit_op(
     "sglang.kernels.ops.attention.dsv4.elementwise", "fused_rope_inplace"
@@ -6124,15 +6124,16 @@ def dsv4_fused_rope_inplace_kunlun(
     freqs_real = _dsv4_cos_sin_cache(freqs_cis)
     rotary_dim = q.shape[-1]
     q_shape = q.shape
-    q_input = q.contiguous().reshape(q_shape[0], -1, rotary_dim)
+    # flashinfer_rotary_embedding rewrites query/key in place (same data_ptr) and
+    # accepts a non-contiguous view whose last dim is stride-1, so reshape without
+    # a contiguous copy and skip the copy-back.
+    q_input = q.reshape(q_shape[0], -1, rotary_dim)
 
     k_shape = k.shape if k is not None else None
     k_input = (
-        k.contiguous().reshape(k_shape[0], -1, rotary_dim)
-        if k is not None
-        else None
+        k.reshape(k_shape[0], -1, rotary_dim) if k is not None else None
     )
-    q_rotated, k_rotated = torch.ops.xspeedgate_ops.flashinfer_rotary_embedding(
+    torch.ops.xspeedgate_ops.flashinfer_rotary_embedding(
         positions=positions.flatten(),
         rotary_dim=rotary_dim,
         head_size=rotary_dim,
@@ -6143,9 +6144,6 @@ def dsv4_fused_rope_inplace_kunlun(
         offsets=None,
         inverse=inverse,
     )
-    q.copy_(q_rotated.reshape(q_shape))
-    if k is not None:
-        k.copy_(k_rotated.reshape(k_shape))
 
 
 @register_jit_op(
