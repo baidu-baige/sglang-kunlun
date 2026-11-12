@@ -13,6 +13,8 @@ from __future__ import annotations
 import logging
 import math
 
+import torch
+
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 logger = logging.getLogger(__name__)
@@ -92,6 +94,77 @@ def _align_global_num_tokens(self) -> None:
             aligned,
         )
     self.global_num_tokens_cpu = aligned
+
+
+_LOGGED_COMPUTE_POSITION_FALLBACK = False
+
+
+@plugin_hook(
+    "sglang.srt.model_executor.forward_batch_info.compute_position",
+    type=HookType.REPLACE,
+)
+def _compute_position_kunlun(
+    attn_backend: str,
+    extend_prefix_lens,
+    extend_seq_lens,
+    extend_seq_lens_sum: int,
+):
+    """Build the extend positions with the vendor fused kernel.
+
+    0.5.8 replaced the Triton body of ``compute_position_triton`` with
+    ``torch.ops.xspeedgate_ops.compute_position_kernel``
+    (``sgl_kernel/patch/model_executor/forward_batch_info.py:17-27``); the
+    baseline prefill trace launches it as
+    ``xinfer3::compute_position_kernel<int>`` from
+    ``forward_batch_info.py:1007 compute_position``.
+
+    The plugin already registers that same replacement for the Triton symbol
+    (``kernels/kernel_ops.py:6715`` -> ``sglang.kernels.ops.attention.position``
+    ``compute_position_kernel``), but it is unreachable: upstream only calls
+    ``compute_position_triton`` when ``support_triton()`` is true
+    (``forward_batch_info.py:2384``), and that reads
+    ``current_platform.capabilities.supports_triton``
+    (``utils/common.py:1484``), which this platform sets to False
+    (``platform/srt.py:59``). So 0.5.23 silently takes
+    ``compute_position_torch``, a per-request ``arange`` + ``cat``. Replacing the
+    dispatcher instead of the Triton kernel is what makes the vendor op reachable
+    without touching the capability flag, which other torch fallbacks depend on.
+    """
+    global _LOGGED_COMPUTE_POSITION_FALLBACK
+
+    try:
+        batch_size = extend_seq_lens.shape[0]
+        # Upstream derives ``has_prefix`` the same way
+        # (``kernels/ops/attention/position.py:11``); the vendor op takes an
+        # empty prefix tensor to mean "no prefix", as the registered Triton
+        # replacement already does (``kernel_ops.py:6728``).
+        prefix_lens = extend_prefix_lens
+        if prefix_lens is None or prefix_lens.shape[0] != batch_size:
+            prefix_lens = torch.empty(
+                0, device=extend_seq_lens.device, dtype=extend_seq_lens.dtype
+            )
+        positions, extend_start_loc = torch.ops.xspeedgate_ops.compute_position_kernel(
+            prefix_lens, extend_seq_lens, extend_seq_lens_sum
+        )
+        # The op is templated on the index dtype, so it mirrors the input dtype;
+        # upstream's contract is int64 positions and int32 start locs.
+        if extend_start_loc.dtype != torch.int32:
+            extend_start_loc = extend_start_loc.to(torch.int32)
+        return positions.to(torch.int64), extend_start_loc
+    except Exception as exc:  # noqa: BLE001 - never block a forward on this
+        if not _LOGGED_COMPUTE_POSITION_FALLBACK:
+            _LOGGED_COMPUTE_POSITION_FALLBACK = True
+            logger.warning(
+                "kunlun: xspeedgate_ops.compute_position_kernel unusable (%s); "
+                "falling back to compute_position_torch. Positions are "
+                "identical; the trace then lacks "
+                "xspeedgate_ops::compute_position_kernel and "
+                "xinfer3::compute_position_kernel.",
+                exc,
+            )
+        from sglang.srt.model_executor.forward_batch_info import compute_position_torch
+
+        return compute_position_torch(extend_prefix_lens, extend_seq_lens)
 
 
 @plugin_hook(

@@ -1196,7 +1196,16 @@ class DeepEPMoE(FusedMoE):
         # GroupGemm-0
         num_groups, m, _ = hidden_states.size()
         n = w13_weight.size(1)
-        expected_m = min(expected_m, m)
+        # `expected_m` is passed to the vendor GEMM verbatim, as 0.5.8 does
+        # (`compressed_tensors_moe.py:2839-2845`): it is the kernel's hint for
+        # the average rows-per-group and it selects the tile/loop order. The
+        # `min(expected_m, m)` clamp that used to be here changed that hint and
+        # with it the instantiation -- the 0.5.8 decode trace runs
+        # `moe_bf16_rn_kn_mnk` and `moe_bf16_rn_mn_kmn` (2886 launches each, one
+        # per layer per step) where this path emitted a single
+        # `moe_bf16_rn_km_nmk`, which is a missing operator against the parity
+        # gate. The clamp was also redundant: `expected_m` only feeds heuristics,
+        # while the row bound the kernel honours is `masked_m`.
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states.device, dtype=torch.bfloat16
         )

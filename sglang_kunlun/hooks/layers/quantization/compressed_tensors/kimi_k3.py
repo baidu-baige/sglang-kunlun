@@ -87,6 +87,39 @@ def is_kimi_k3_moe_layer_name(layer_name: Any) -> bool:
     )
 
 
+def _targets_use_k3_projection_names(config: Any) -> bool:
+    """Whether this checkpoint names its expert targets ``w1``/``w3``/``w2``.
+
+    ``model.layers.<i>.mlp.experts`` is the routed-expert container for every
+    DeepSeek-V2-shaped MoE, Kimi-K3 and GLM-5.3 alike, so the layer name alone
+    cannot tell the two checkpoints apart. The *targets* can: Kimi-K3 names
+    ``.0.w1``/``.0.w3``/``.0.w2`` while GLM-5.3 names
+    ``.(gate_proj|up_proj|down_proj)$``. Remapping a GLM checkpoint onto the K3
+    names turns upstream's ``gate_proj`` probe into ``w1`` and the lookup then
+    fails with "Unable to find matching target for
+    model.layers.N.mlp.experts.0.w1", which is the probe this remap created.
+
+    So gate the remap on the config describing itself, not on the model family.
+    """
+    targets = []
+    for group in (getattr(config, "target_scheme_map", None) or {}):
+        targets.append(group)
+    for group in (getattr(config, "config_groups", None) or {}).values():
+        group_targets = getattr(group, "targets", None)
+        if group_targets is None and isinstance(group, dict):
+            group_targets = group.get("targets")
+        if isinstance(group_targets, str):
+            targets.append(group_targets)
+        elif group_targets:
+            targets.extend(str(t) for t in group_targets)
+    joined = " ".join(targets)
+    if not joined:
+        return False
+    # ``w1`` as a whole token: the targets may spell it ``.0.w1`` or inside an
+    # alternation such as ``.(w1|w3|w2)$``.
+    return bool(re.search(r"\bw1\b", joined)) and "gate_proj" not in joined
+
+
 @contextlib.contextmanager
 def kimi_k3_expert_scheme_dict(config: Any, layer_name: Any):
     """Map K3 fused expert probe names onto the checkpoint's ``w1/w3/w2`` names.
@@ -102,7 +135,9 @@ def kimi_k3_expert_scheme_dict(config: Any, layer_name: Any):
     A no-op for every layer name that is not a K3 expert container, so it is
     safe to wrap unconditionally.
     """
-    if not is_kimi_k3_moe_layer_name(layer_name):
+    if not is_kimi_k3_moe_layer_name(layer_name) or not _targets_use_k3_projection_names(
+        config
+    ):
         yield
         return
 

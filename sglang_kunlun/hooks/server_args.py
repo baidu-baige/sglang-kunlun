@@ -126,3 +126,81 @@ def handle_a2a_moe_deepep_normal_kunlun(original, server_args, *args, **kwargs):
             "break."
         )
     return result
+
+
+@plugin_hook(
+    "sglang.srt.arg_groups.model_hook._dsa_kv_cache_dtype_default",
+    type=HookType.AROUND,
+)
+@plugin_hook(
+    "sglang.srt.arg_groups.overrides._dsa_kv_cache_dtype_default",
+    type=HookType.AROUND,
+)
+def tolerate_kunlun_int8_kv_cache(original, view, *args, **kwargs):
+    """Let the Kunlun int8 KV cache through the DSA dtype gate.
+
+    ``_dsa_kv_cache_dtype_default`` asserts bf16/fp8_e4m3 because that is what
+    the CUDA DSA kernels accept. Kunlun's ``KunlunDSAAttnBackend`` carries its
+    own int8 KV path -- the 0.5.8 fork serves GLM-5.3 w4a8 with
+    ``--kv-cache-dtype int8`` -- so on this platform the value is legal and
+    needs no defaulting; returning ``{}`` leaves it untouched. This mirrors
+    what upstream already does for XPU and NPU (``overrides.py:500-508``),
+    which Kunlun cannot use because it registers as ``PlatformEnum.OOT`` with
+    ``device_type="cuda"``, so ``get_platform().is_xpu`` is False.
+
+    **Two targets on purpose.** ``arg_groups/model_hook.py:11-14`` does
+    ``from sglang.srt.arg_groups.overrides import _dsa_kv_cache_dtype_default``
+    at import time and then calls that captured reference
+    (``run_post_process_pass(server_args, _dsa_kv_cache_dtype_default)``,
+    ``model_hook.py:343``). Patching only the defining module left that stale
+    binding pointing at the original, and the boot died with
+    ``AssertionError: DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3
+    kv_cache_dtype`` even though the log showed the hook applied. The registry's
+    ``_propagate_patch`` is supposed to rebind such references, but it only
+    walks modules already in ``sys.modules`` when the hook lands, and whether
+    ``model_hook`` is imported by then depends on import order. Registering the
+    consumer's own attribute as a second target makes it order-independent.
+    """
+    # Both values `configure_kv_cache_dtype_kunlun` can map onto a Kunlun pool
+    # (`hooks/mem_cache/common.py`): int8 (the 0.5.8 production value) and fp16
+    # (the model dtype). Anything else keeps upstream's verdict.
+    if getattr(view, "kv_cache_dtype", None) in ("int8", "fp16"):
+        return {}
+    return original(view, *args, **kwargs)
+
+
+@plugin_hook(
+    "sglang.srt.arg_groups.overrides._tp_lm_head_all_to_all_default",
+    type=HookType.AROUND,
+)
+def decline_tp_lm_head_all_to_all_kunlun(original, view, *args, **kwargs):
+    """Keep the decode LM head on the communication-free DP path.
+
+    0.5.23 added `_tp_lm_head_all_to_all_default` (`overrides.py:1400-1418`),
+    which *infers* `enable_tp_lm_head_all_to_all` rather than defaulting it off:
+    it turns on for exactly this topology -- `disaggregation_mode == "decode"`,
+    `attn_dp_size > 1`, `tp_size == attn_dp_size`, `attn_cp_size == 1`, no
+    `enable_dp_lm_head`. Nobody passes the flag; upstream derives it. The
+    capture path then demands a PyNCCL communicator
+    (`RuntimeError: --enable-tp-lm-head-all-to-all requires an available
+    PyNCCL communicator for CUDA graph capture.`), and this platform has none:
+    the Kunlun `init_model_parallel_group` REPLACE hardcodes `use_pynccl=False`
+    because the pynccl collectives are not available here
+    (`hooks/distributed/parallel_state.py:93` and its comment block).
+
+    So the feature is structurally impossible on Kunlun, and declining it
+    restores the 0.5.8 production behaviour -- a vocab-parallel LM head sharded
+    over the full TP group with no all-to-all. An explicit CLI value still
+    wins: upstream returns `{}` early when the user set it, and this hook only
+    overrides the *inferred* value.
+    """
+    result = original(view, *args, **kwargs)
+    if result.get("enable_tp_lm_head_all_to_all"):
+        logger.info(
+            "Kunlun: declining the inferred --enable-tp-lm-head-all-to-all; "
+            "this platform runs without a PyNCCL communicator, so the capture "
+            "path cannot use it. The LM head stays vocab-parallel over the TP "
+            "group, as the 0.5.8 production configuration runs it."
+        )
+        return {"enable_tp_lm_head_all_to_all": False}
+    return result

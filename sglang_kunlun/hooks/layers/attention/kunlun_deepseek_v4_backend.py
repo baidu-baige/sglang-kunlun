@@ -802,6 +802,40 @@ def _kunlun_sparse_prefill_capable() -> bool:
     )
 
 
+def _resolve_flash_mla_sparse_fwd():
+    """Return the ``flash_mla_sparse_fwd`` entrypoint, whichever module carries it.
+
+    Newer builds moved this entrypoint out of kunlun_ops into chen_ops, so take
+    whichever module actually carries it instead of assuming either.
+    """
+    import kunlun_ops
+
+    sparse_fwd = getattr(kunlun_ops, "flash_mla_sparse_fwd", None)
+    if sparse_fwd is None:
+        try:
+            import chen_ops
+        except ImportError as exc:
+            raise AttributeError(
+                "flash_mla_sparse_fwd is missing from kunlun_ops and chen_ops "
+                "is not installed"
+            ) from exc
+        sparse_fwd = getattr(chen_ops, "flash_mla_sparse_fwd", None)
+        if sparse_fwd is None:
+            raise AttributeError(
+                "flash_mla_sparse_fwd is missing from both kunlun_ops and chen_ops"
+            )
+    return sparse_fwd
+
+
+@plugin_hook(
+    # 0.5.23 resolves this per platform inside `_forward_prefill_sparse`:
+    # `from sgl_kernel import flash_mla_sparse_fwd` when `_is_xpu`, otherwise
+    # from `flash_mla_interface`. `is_xpu()` is False on Kunlun (the platform
+    # aliases the device type to cuda), so the *CUDA* branch is the live one and
+    # it lands on pre_shim's raising stub.
+    "sglang.kernels.ops.attention.flash_mla_interface.flash_mla_sparse_fwd",
+    type=HookType.REPLACE,
+)
 @plugin_hook(
     "sgl_kernel.flash_mla.flash_mla_sparse_fwd",
     type=HookType.REPLACE,
@@ -849,7 +883,7 @@ def flash_mla_sparse_fwd_kunlun(
     Returns:
         Attention output, maximum logits, and log-sum-exp tensors.
     """
-    import kunlun_ops
+    sparse_fwd = _resolve_flash_mla_sparse_fwd()
 
     if q.dim() != 3:
         raise ValueError(f"q must be [s_q, h_q, d_qk], got {tuple(q.shape)}")
@@ -891,7 +925,7 @@ def flash_mla_sparse_fwd_kunlun(
     # positional masking means nothing to them (same reason the cu_seqlens stay
     # None).
     if _sparse_mla_allocates_outputs():
-        out, max_logits, lse, _ = kunlun_ops.flash_mla_sparse_fwd(
+        out, max_logits, lse, _ = sparse_fwd(
             q_arg,
             kv_arg,
             indices_arg,
@@ -910,7 +944,7 @@ def flash_mla_sparse_fwd_kunlun(
         out = torch.empty((tokens, heads, d_v), dtype=q_arg.dtype, device=q_arg.device)
         max_logits = torch.empty((tokens, heads), dtype=torch.float32, device=q_arg.device)
         lse = torch.empty_like(max_logits)
-        status = kunlun_ops.flash_mla_sparse_fwd(
+        status = sparse_fwd(
             q=q_arg, kv=kv_arg, indices=indices_arg.squeeze(1),
             o=out, max_logits=max_logits, lse=lse,
             qlod_cpu=None, qlod_xpu=None, kvlod_cpu=None, kvlod_xpu=None,
@@ -944,9 +978,13 @@ def flash_mla_sparse_fwd_kunlun(
 
 @functools.cache
 def _sparse_mla_allocates_outputs() -> bool:
-    import kunlun_ops
-
-    return "d_v" in inspect.signature(kunlun_ops.flash_mla_sparse_fwd).parameters
+    sparse_fwd = _resolve_flash_mla_sparse_fwd()
+    try:
+        return "d_v" in inspect.signature(sparse_fwd).parameters
+    except (ValueError, TypeError):
+        # pybind11 builtins (e.g. the chen_ops build) may not expose a
+        # signature; those follow the allocating ABI.
+        return True
 
 
 # ``get_paged_mqa_logits_metadata`` used to be replaced here with an empty
@@ -1642,6 +1680,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         *,
         compress_ratio: int = 4,
         use_prefill_cuda_graph: bool = False,
+        rows_per_request: int = 1,
     ):
         """Build the indexer metadata and fill the Kunlun paged-MQA schedule.
 
@@ -1654,6 +1693,11 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             core_attn_metadata: Core metadata for the current attention batch.
             compress_ratio: Compression ratio used to construct indexer metadata.
             use_prefill_cuda_graph: Whether metadata is built for prefill capture.
+            rows_per_request: Query rows each request contributes. 0.5.23 added
+                it and the low-ratio verify call sites
+                (`deepseek_v4_backend.py:2321,2331`, compress_ratio 1/2) pass
+                it, which is why only a V4.1 checkpoint reaches it: a V4-Flash
+                batch resolves ratio 4 and takes the call site that does not.
 
         Returns:
             Indexer metadata with its paged-MQA schedule populated.
@@ -1662,6 +1706,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             core_attn_metadata,
             compress_ratio=compress_ratio,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
+            rows_per_request=rows_per_request,
         )
         if indexer_metadata.deep_gemm_metadata is None:
             indexer_metadata.deep_gemm_metadata = (
@@ -1758,6 +1803,10 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         """Low-ratio decode/verify indexer top-k via the fused XSpeedGate
         ``dsv41_low_ratio_indexer`` kernel on Kunlun.
         """
+        from sglang_kunlun.hooks.mem_cache.common import low_ratio_index_k_int8_enabled
+
+        use_int8 = low_ratio_index_k_int8_enabled()
+        op_name = "dsv41_low_ratio_indexer_int8" if use_int8 else "dsv41_low_ratio_indexer"
         ratio = layer.compress_ratio
         indexer = layer.indexer
         core = self.forward_metadata.core_metadata
@@ -1780,6 +1829,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             metadata.max_compressed_seq_len,
             self.req_to_token.shape[1] // ratio,
         )
+        window = (window // 512) * 512
         # 0519 aligned window downward to a multiple of block_size here; the
         # migration dropped this line and replaced it with a modulo-window bail
         # condition. Measured window=262411 block_size=8 (remainder 3), so decode
@@ -1799,7 +1849,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             or window < block_size
             or k < 1
             or k > 512
-            or not hasattr(torch.ops.xspeedgate_ops, "dsv41_low_ratio_indexer")
+            or not hasattr(torch.ops.xspeedgate_ops, op_name)
         )
         if _bail:
             return self._low_ratio_index_topk_sm90_decode_native(
@@ -1813,7 +1863,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         q = indexer.queries(q_lora, layer.freqs_cis[pos]).contiguous()  # [R,32,128]
         head_w = indexer.head_weights(x).contiguous()  # [R,32]
         k_pool = pool.get_index_k_with_scale_buffer(layer.layer_id)
-        fp4_lut = self._low_ratio_fp4_lut(q.device)
+        layout_args = () if use_int8 else (self._low_ratio_fp4_lut(q.device),)
 
         req_i = req.to(torch.int32).contiguous()
         pos_i = pos.to(torch.int32).contiguous()
@@ -1841,11 +1891,11 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             # Ignored when `is_consume` is False, but the op still type-checks it.
             cand_mask = torch.zeros((rows, window), dtype=torch.bool, device=q.device)
 
-        page_out, published = torch.ops.xspeedgate_ops.dsv41_low_ratio_indexer(
+        page_out, published = getattr(torch.ops.xspeedgate_ops, op_name)(
             q,
             head_w,
             k_pool,
-            fp4_lut,
+            *layout_args,
             req_to_token,
             req_i,
             pos_i,
@@ -3009,6 +3059,16 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             )
 
         lengths = forward_batch.extend_seq_lens_cpu
+        # 0.5.23's decoder SWA bounded replay runs the late layers over each
+        # request's tail rows, so the q rows are the tail's while the batch's
+        # own extend lengths still describe the whole extend (lengths=193 vs
+        # queries=128). The tail carries its own per-request lengths; CP keeps
+        # the rank-local ones in `local_lens_cpu`.
+        tail = getattr(self.forward_metadata, "late_layer_tail", None)
+        if tail is not None and lengths is not None and sum(lengths) != num_queries:
+            tail_lengths = tail.local_lens_cpu or tail.extend_seq_lens_cpu
+            if tail_lengths is not None and sum(tail_lengths) <= num_queries:
+                lengths = list(tail_lengths)
         if lengths is None:
             batch_size = forward_batch.seq_lens.shape[0]
             if batch_size == 0 or num_queries % batch_size:
@@ -3071,10 +3131,29 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
             envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get()
             or pool.swa_kv_pool is None
             or pool.swa_kv_pool.store_dtype not in (torch.bfloat16, torch.float16)
+            # The request window writes through its own activated layout
+            # (`window.activate(layout).write_loc`, already SWA-space), which
+            # this full-space + mapping writer cannot reproduce.
+            or pool.request_window is not None
         ):
             return super().store_cache(layer_id, swa_k, forward_batch)
 
         scheduler_raw_loc = forward_batch.out_cache_loc
+        # 0.5.23 runs the late layers over a *subset* of the extend under decoder
+        # SWA bounded replay, so `swa_k` is the tail's rows while out_cache_loc
+        # is still the whole extend (the vendor op reported "k_val.size(0) must
+        # equal raw_loc.size(0), got 128 vs 193"). Upstream's own
+        # `get_swa_out_cache_loc` answers with `late_layer_tail.swa_out_cache_loc`,
+        # which is already translated; this writer wants full-space rows, so take
+        # the same row selection off out_cache_loc instead.
+        tail = getattr(self.forward_metadata, "late_layer_tail", None)
+        if tail is not None and scheduler_raw_loc.shape[0] != swa_k.shape[0]:
+            scheduler_raw_loc = tail.rows(scheduler_raw_loc)
+        if scheduler_raw_loc.shape[0] != swa_k.shape[0]:
+            raise ValueError(
+                "Kunlun DSV4 store_cache: cache rows do not match the write "
+                f"locations: k={swa_k.shape[0]}, loc={scheduler_raw_loc.shape[0]}"
+            )
         raw_loc = scheduler_raw_loc.to(dtype=torch.int32).contiguous()
         mapping = pool.full_to_swa_index_mapping
         assert mapping is not None
@@ -4408,3 +4487,9 @@ class KunlunDeepseekV4MultiStepBackend(DeepseekV4MultiStepBackend):
 # `_dense_fp4_indexer_usable()` 读的是已删除的 env，且全树没有调用者，一并删掉。
 #
 # ⚠ 开机时要断言 `_use_deep_gemm_prefill()` 为 False（见 S2_DRIFT.md 的 I4）。
+# part2 (`0157787`) 重新引入了 `_dense_fp4_indexer_usable()`，这里**不**接受：
+# 它读的 `envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER` 在 0.5.23 的 environ.py 里已
+# 不存在（0 处命中），而且带上 part2 之后全树依然没有调用者。int8/FP4 布局保护在
+# 0.5.23 上的活代码是 `dsv41_torch_indexer.dense_fp4_indexer_layout_guard`——
+# AROUND `v41_indexer.has_dense_fp4_indexer`，由 `DSV4_LOW_RATIO_INDEX_KCACHE`
+# 决定，不经过这个已删除的 env。

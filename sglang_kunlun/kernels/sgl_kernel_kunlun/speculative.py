@@ -6,6 +6,8 @@ from typing import Any
 
 import torch
 
+_verify_fallback_warned = False
+
 
 def build_tree_kernel_efficient(
     parent_list: torch.Tensor,
@@ -61,7 +63,19 @@ def verify_tree_greedy(
     retrive_next_sibling: torch.Tensor,
     target_predict: torch.Tensor,
 ) -> None:
-    """Verify an Eagle tree greedily in-place."""
+    """Verify an Eagle tree greedily in-place.
+
+    The baseline 0.5.8 ran this as the fused vendor kernel: its
+    ``sgl_kernel.verify_tree_greedy`` is a two-line wrapper around
+    ``kunlun_ops.verify_tree_greedy`` (``sgl-kernel/python/sgl_kernel/
+    speculative.py:47-70``), which is what shows up in the decode trace as
+    ``xpuops3::infer_verify_tree_greedy``. The torch loop below therefore cannot
+    be the primary path -- it is both a missing operator against the trace
+    baseline and, with three ``.item()`` calls per tree node, a device sync per
+    candidate. It is kept as the fallback (and as the reference for
+    ``DSV4_MTP_FORCE_REJECT``), which is also how it was validated against the
+    kernel in the first place.
+    """
 
     import os
 
@@ -71,6 +85,40 @@ def verify_tree_greedy(
 
     if target_predict.dim() > 1:
         target_predict = target_predict.flatten()
+
+    if not force_reject:
+        try:
+            from kunlun_ops import verify_tree_greedy as _verify_tree_greedy
+
+            # Same argument order and dtypes as 0.5.8: the index tensors are
+            # already int64 (``eagle_info.py:72-79``) and the mutable outputs are
+            # int32. The kernel wants ``target_predict`` 2-D --
+            # ``_xflashinfer_sampling.py:1390`` raises "Tensor target_predict has
+            # wrong dim! Expected 2" otherwise -- while the reference loop needs
+            # it flat, so the two get different views of the same storage.
+            _verify_tree_greedy(
+                predicts,
+                accept_index,
+                accept_token_num,
+                candidates,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                target_predict.reshape(batch_size, -1),
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 - fall back, never crash verify
+            global _verify_fallback_warned
+            if not _verify_fallback_warned:
+                _verify_fallback_warned = True
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "kunlun_ops.verify_tree_greedy unavailable (%s); using the "
+                    "torch loop -- the decode trace will lack "
+                    "infer_verify_tree_greedy and decode will be sync-bound",
+                    exc,
+                )
 
     trace = os.getenv("DSV4_MTP_VERIFY_TRACE", "0") == "1"
     if trace:

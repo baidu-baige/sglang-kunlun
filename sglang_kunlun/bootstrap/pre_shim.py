@@ -11,6 +11,7 @@ def _install_import_stub(names: tuple[str, ...]) -> None:
     """Replace ``names`` with empty stub modules in ``sys.modules``."""
     import sys
     import types
+    import importlib.machinery
 
     for name in list(sys.modules):
         for root in names:
@@ -21,6 +22,7 @@ def _install_import_stub(names: tuple[str, ...]) -> None:
     for name in names:
         stub = types.ModuleType(name)
         stub.__path__ = []  # namespace-like so submodule imports fail cleanly
+        stub.__spec__ = importlib.machinery.ModuleSpec(name, None, is_package=True)
         stub._kunlun_stub = True
         sys.modules[name] = stub
 
@@ -321,6 +323,17 @@ def _patch_flashinfer_optional_symbols() -> None:
     symbols = [
         ("flashinfer.prefill", "cudnn_batch_prefill_with_kv_cache"),
         ("flashinfer.gemm", "mm_M1_16_K7168_N256"),
+        # 0.5.23 added the mxint4 MoE scheme, whose module-level
+        # `if is_flashinfer_available():` block imports this. The image's
+        # flashinfer predates it, so the ImportError propagates out of
+        # `compressed_tensors_w4a4_mxint4_moe` and takes down every module that
+        # transitively imports the compressed-tensors scheme registry --
+        # measured with resolve_jit_targets.py: GONE=17, all of them this one
+        # cause, including `sglang.srt.layers.moe.topk.grouped_topk`,
+        # `sglang.srt.mem_cache.allocation.assign_req_to_token_pool` and
+        # `sglang.srt.speculative.dflash_utils.top_{k,p}_renorm_prob`, so the
+        # plugin's registrations on them installed on nothing.
+        ("flashinfer.fused_moe", "trtllm_mxint4_block_scale_moe"),
     ]
     for module_path, symbol_name in symbols:
         try:
@@ -487,7 +500,7 @@ def _provide_flash_mla_interface_if_unusable() -> None:
             importlib.import_module("flash_mla")
             return  # the real wheel works; let upstream use it
         except Exception as exc:
-            logger.info(
+            logger.debug(
                 "Kunlun: flash_mla wheel unusable (%s: %s); stubbing %s",
                 type(exc).__name__,
                 str(exc)[:120],
@@ -539,6 +552,16 @@ def _kunlun_pre_shim() -> None:
 
     try:
         _patch_optional_tilelang_import()
+    except Exception:
+        pass
+
+    # 0.5.23's function-call registry imports Kimi-K3's structural tags
+    # unconditionally, and those need xgrammar >= 0.2 names. Backfill them
+    # before sglang's import reaches that module.
+    try:
+        from sglang_kunlun.bootstrap import xgrammar_structural_tag_shim
+
+        xgrammar_structural_tag_shim.install()
     except Exception:
         pass
 
@@ -697,7 +720,7 @@ def _stub_deep_gemm_if_missing() -> None:
         return
     if importlib.util.find_spec("deep_gemm") is not None:
         return
-    logger.info(
+    logger.debug(
         "Kunlun: deep_gemm 未安装；安装空 stub 以通过上游 "
         "`if is_cuda(): import deep_gemm` 这类裸 import。"
     )

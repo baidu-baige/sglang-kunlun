@@ -498,7 +498,20 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 dtype=torch.float32,
         ) # can't be col major
         if num_tokens > 0:
-            kunlun_ops.quant2d(hidden_states, hidden_states_int8, hidden_states_scale)
+            # `force_sdnn=True` is what the 0.5.8 dispatch used for the same
+            # per-token int8 quant (`compressed_tensors_moe.py:2820` in
+            # `apply_deepep_ll`). Without it the vendor op takes its generic
+            # elementwise path, which the trace shows as
+            # `xpuops3::infer_quant2d_smallm` on every layer of every step;
+            # 0.5.8's trace is dominated by `infer_quant2d_bigm` (14.5k launches
+            # against our 90, at matched load) because sdnn selects the
+            # matrix-unit variant. Same values, different engine.
+            kunlun_ops.quant2d(
+                hidden_states,
+                hidden_states_int8,
+                hidden_states_scale,
+                force_sdnn=True,
+            )
         x_to_dispatch = (hidden_states_int8, hidden_states_scale)
         hidden_states = x_to_dispatch
         

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, List, Optional
@@ -10,6 +11,18 @@ import torch
 
 import kunlun_ops
 import xspeedgate_ops  # noqa: F401  # registers torch.ops.xspeedgate_ops
+
+# `xspeedgate_ops.sparse_attn_fwd` is registered by *this* extension, not by
+# the `xspeedgate_ops` python package: its `__init__` only binds the proxy, the
+# schema comes out of the cocopod .so. The `torch.ops.<ns>` proxy is lazy, so
+# neither `dir()` nor `hasattr` can tell whether an op exists -- enumerating
+# `torch._C._jit_get_all_schemas()` is the only reliable probe. That gives
+#   xspeedgate_ops::sparse_attn_fwd(Tensor q, Tensor kv, Tensor indices,
+#       float sm_scale, int d_v, Tensor topk_length, Tensor? attn_sink=None)
+#       -> Tensor[]
+# The import is for the registration side effect only, exactly like the
+# `xspeedgate_ops` import above.
+import cocopod  # noqa: F401  # registers torch.ops.xspeedgate_ops.sparse_attn_fwd
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
@@ -20,18 +33,6 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
-from sglang.srt.layers.attention.dsa.utils import (
-    is_dsa_prefill_cp_round_robin_split,
-)
-
-try:
-    from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
-except ImportError:  # dsv4.1 删掉了 DSA prefill-CP 的 in-seq-split 模式
-
-    def is_dsa_prefill_cp_in_seq_split() -> bool:
-        """0.5.14 prefill-CP no longer supports in-seq-split."""
-        return False
-
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
     DeepseekSparseAttnMultiStepBackend,
@@ -44,6 +45,147 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+logger = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------- #
+# Native INT8 mixed-cache sparse MLA attention
+# --------------------------------------------------------------------------- #
+# The 0.5.8 baseline never dequantized the packed rows. When the pool reported
+# int8 storage it branched straight to `_native_mixed_attn` -- the same helper
+# from both arms, sparse prefill/verify
+# (`sgl-kernel/.../attention/nsa_backend.py:1751-1759`) and decode
+# (`:2235-2238`) -- and handed the 656 B rows to the vendor op as they are.
+#
+# Restoring that call is also what puts the three baseline kernels back into
+# the torch-profiler trace. All three are launched by ONE host function,
+# `xfa::dsa_prefill_with_mixed_cache<float16, int8, bfloat16, float16, float16,
+# float, int>` in `torch_xmlir/libxpu_flash_attention.so` (symbol at
+# 0x13ffe10; disassembled and its call targets resolved):
+#   * `fa_xpu3::dsa_fwd_mixed_cache_multistream_cluster<int8, bfloat16,
+#     float16, int>` -- called directly through its PLT entry,
+#   * `fa_xpu3::dsa_fwd_multistream_sdnn<float16, ..., float, 0>` -- through the
+#     helper at 0x2286ed0,
+#   * `fa_xpu3::constant_kl` -- through the fill helper at 0x2e51050.
+# The dequant + `sparse_attn_fwd` chain reaches none of them, which is why the
+# fresh traces are missing exactly those three.
+#
+# Two python entry points land on that host function in this image, and 0.5.8
+# could use either (`SGLANG_NSA_MIXED_ATTN_IMPL`, `nsa_backend.py:190-214`):
+#
+#   * `torch.ops.xspeedgate_ops.sparse_mixed_attn_int8` -- 0.5.8's default
+#     (`nsa_backend.py:166`). Registered here too, schema
+#       (q, kv, indices, out!, max_logits!, lse!, sm_scale, qlod_cpu, qlod_xpu,
+#        kvlod_cpu, kvlod_xpu, is_causal, topk, side_stream,
+#        max_seq_kv_bound=-1) -> int
+#     and `nm -D --undefined-only` on its .so shows it links exactly the two
+#     int8/bf16-rope instantiations (q=fp16 and q=bf16) plus
+#     `xmlir_rt::getXdnnContext`, i.e. the runtime context that makes it
+#     graph-capture safe.
+#   * `kunlun_ops.dsa_prefill_with_mixed_cache` -- 0.5.8's `=kunlun` variant
+#     (`nsa_backend.py:208`). Same work, different argument order, and no
+#     `max_seq_kv_bound`: it derives that scalar from `kvlod_cpu` on the host,
+#     so a capture has to be fed an upper-bound host lod
+#     (`nsa_backend.py:2091-2110`).
+#
+# Row layout: both the op's own docstring and the writer agree on
+# `[kv_lora_rank(512) int8 nope | 4 fp32 scales (one per 128 nope) |
+# rope_head_dim(64) bf16]` = 656 B/token, which is what
+# `kunlun_ops.quantize_mla_kv_cache_split` emits and what
+# `kernels/mixed_int8_kv.py` documents. The 604 B
+# `kv_lora_rank(int8) + rope(TROPE) + n_scale(fp32)` order in the docstring of
+# `kunlun_ops.hybrid_attention_with_mixed_cache` belongs to that *other* op
+# (DSV4 SWA/CSA, 448+64+7); it takes win/com caches and window/compress
+# arguments this model has no use for, and nothing in 0.5.8 ever called it.
+# There is no `n_scale_blocks` / `xbf16_label` selector: the rope element type
+# is a template parameter of the host function (bfloat16 in every instantiation
+# the wrapper links) and the scale tiling follows from the kv_lora_rank
+# argument, so the field order is fixed by the instantiation, not by a flag.
+
+_MIXED_ATTN_IMPL = None  # ("xspeed"|"kunlun"|"none", op) -- resolved once
+_MIXED_ATTN_SIDE_STREAMS: dict = {}  # device index -> persistent side stream
+_MIXED_ATTN_BOUND_KVLODS: dict = {}  # (rows, topk) -> capture-time host lod
+_MIXED_ATTN_FALLBACK_LOGGED = False
+
+
+def _resolve_mixed_attn_impl():
+    """Resolve the native mixed-cache op once. ``(kind, None)`` means none."""
+    global _MIXED_ATTN_IMPL
+    if _MIXED_ATTN_IMPL is None:
+        # `torch.ops.<ns>` is a lazy proxy, so neither `dir()` nor `hasattr`
+        # can answer "is this op registered" -- enumerating the schemas is the
+        # only reliable probe (same note as `sparse_attn_fwd` at the top of
+        # this file).
+        names = {schema.name for schema in torch._C._jit_get_all_schemas()}
+        if "xspeedgate_ops::sparse_mixed_attn_int8" in names:
+            _MIXED_ATTN_IMPL = (
+                "xspeed",
+                torch.ops.xspeedgate_ops.sparse_mixed_attn_int8,
+            )
+        elif hasattr(kunlun_ops, "dsa_prefill_with_mixed_cache"):
+            _MIXED_ATTN_IMPL = (
+                "kunlun",
+                kunlun_ops.dsa_prefill_with_mixed_cache,
+            )
+        else:
+            _MIXED_ATTN_IMPL = ("none", None)
+    return _MIXED_ATTN_IMPL
+
+
+def _mixed_attn_side_stream(device: torch.device) -> torch.cuda.Stream:
+    """Persistent non-default side stream for one device.
+
+    The op is multi-stream only ("仅支持多流版本, side_stream 需外部管理" in the
+    vendor docstring) and dispatches part of its work onto the handle it is
+    given. 0.5.8 kept one pair alive per device rather than creating one per
+    call (`nsa_backend.py:229-238`): a fresh stream per call would be recorded
+    into every captured graph.
+    """
+    index = device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    stream = _MIXED_ATTN_SIDE_STREAMS.get(index)
+    if stream is None:
+        stream = torch.cuda.Stream(device=index)
+        _MIXED_ATTN_SIDE_STREAMS[index] = stream
+    return stream
+
+
+def _mixed_attn_bound_kvlod(rows: int, topk: int) -> torch.Tensor:
+    """Capture-time upper-bound host kv lod, one ``topk``-long segment per row.
+
+    Only `kunlun_ops.dsa_prefill_with_mixed_cache` needs this: it reads the
+    batch's kv total off `kvlod_cpu` on the host, and under capture that scalar
+    is baked into the recorded launch, so the warmup batch's (short) real lod
+    would under-plan every replay. Each row's count is
+    ``min(valid_kv_len, topk) <= topk``, so ``rows * topk`` bounds it. The
+    device lod stays the real one, which is what the kernel reads per row
+    (`nsa_backend.py:217-226`, `:2091-2110`).
+    """
+    cpu = _MIXED_ATTN_BOUND_KVLODS.get((rows, topk))
+    if cpu is None:
+        cpu = (torch.arange(0, rows + 1, dtype=torch.int32) * int(topk)).contiguous()
+        _MIXED_ATTN_BOUND_KVLODS[(rows, topk)] = cpu
+    return cpu
+
+
+def _log_mixed_attn_fallback(reason: str) -> None:
+    """Warn once that the packed rows are being dequantized instead."""
+    global _MIXED_ATTN_FALLBACK_LOGGED
+    if _MIXED_ATTN_FALLBACK_LOGGED:
+        return
+    _MIXED_ATTN_FALLBACK_LOGGED = True
+    logger.warning(
+        "sglang-kunlun: native INT8 mixed-cache attention unusable (%s); "
+        "falling back to dequant + xspeedgate_ops.sparse_attn_fwd. That costs "
+        "one dense copy of the whole KV table per layer per forward, and the "
+        "torch-profiler trace will then lack fa_xpu3::constant_kl, "
+        "fa_xpu3::dsa_fwd_mixed_cache_multistream_cluster and "
+        "fa_xpu3::dsa_fwd_multistream_sdnn.",
+        reason,
+    )
+
 
 
 def _paged_topk_transform(
@@ -245,6 +387,18 @@ class KunlunDSAIndexerMetadata(DSAIndexerMetadata):
 class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
     """DeepSeek sparse attention backend running on Kunlun XPU."""
 
+    # 0.5.23 defaults this to False on the DSA backend
+    # (`dsa_backend.py:505`, `:4173`) and then nulls the host mirror of
+    # `seq_lens_cpu` for spec-v2 (`dsa_backend.py:1112`). The Kunlun indexer
+    # reads that mirror on the MTP/nextn path
+    # (`kunlun_dsa_indexer.py`, `assert forward_batch.seq_lens_cpu is not None`),
+    # so decode dies at the first draft step with `AssertionError`. Declaring the
+    # need is the upstream seam for exactly this: `BaseSpecWorker` ORs the flag
+    # over `spec_v2_attn_backends` (`speculative/base_spec_worker.py:262-264`)
+    # to decide whether the CPU mirror is materialised.
+    needs_cpu_seq_lens = True
+
+
     # ------------------------------------------------------------------ #
     # metadata
     # ------------------------------------------------------------------ #
@@ -420,6 +574,178 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
     # forward
     # ------------------------------------------------------------------ #
 
+    def _native_mixed_attn(
+        self,
+        q_all: torch.Tensor,
+        page_table_1: torch.Tensor,
+        layer: RadixAttention,
+        metadata: KunlunDSAMetadata,
+    ) -> Optional[torch.Tensor]:
+        """Sparse MLA attention read straight off the packed INT8 rows.
+
+        Port of 0.5.8's `_native_mixed_attn`
+        (`sgl-kernel/.../attention/nsa_backend.py:1770-1856`) and its
+        `_call_mixed_attn` (`:2076-2169`), minus the decode-context-parallel
+        arm: that one needs `dcp_own_topk` / `dcp_lse_merge_reduce_scatter`
+        and this tree refuses DCP on the write side already
+        (`kunlun_pools.py`, `_write_mla_kv_buffer`), so `dcp_size` is 1 here by
+        construction.
+
+        Returns ``None`` -- never raises -- when the op is missing or rejects
+        the arguments, so the caller degrades to the dequantization chain
+        instead of taking the server down on a signature change.
+        """
+        kind, op = _resolve_mixed_attn_impl()
+        if op is None:
+            _log_mixed_attn_fallback(
+                "neither xspeedgate_ops::sparse_mixed_attn_int8 nor "
+                "kunlun_ops.dsa_prefill_with_mixed_cache is available"
+            )
+            return None
+
+        # Lod convention is the bf16 path's own semantics: every q row is its
+        # own segment, and `dsa_cu_seqlens_k` -- the cumsum of
+        # `dsa_cache_seqlens_int32` = min(valid_kv_len, index_topk) per row
+        # (`dsa_backend.py:273-275`, `:1361`) -- says how many LEADING entries
+        # of that row's top-k list are real; the tail is -1 padding. Same
+        # number `sparse_attn_fwd` is handed as `topk_length` in the fallback
+        # branches, only accumulated. The host mirrors are materialized once
+        # per forward batch by `KunlunDSAMetadata`, which is exactly what the
+        # op wants ("qlod_cpu must be a CPU int32 tensor" in its own checks)
+        # and what 0.5.8 had to refresh by hand on every replay
+        # (`nsa_backend.py:1348-1381`).
+        ql_cpu = metadata.dsa_cu_seqlens_q_cpu
+        ql_xpu = metadata.dsa_cu_seqlens_q
+        kvl_cpu = metadata.dsa_cu_seqlens_k_cpu
+        kvl_xpu = metadata.dsa_cu_seqlens_k
+        if any(t is None for t in (ql_cpu, ql_xpu, kvl_cpu, kvl_xpu)):
+            _log_mixed_attn_fallback("the DSA lods are absent from the metadata")
+            return None
+
+        kv_rows = self.token_to_kv_pool.mixed_int8_kv_rows(layer.layer_id)
+        q_all = q_all.contiguous()
+        n_rows = q_all.shape[0]
+        n_lod = int(kvl_cpu.numel()) - 1
+        if n_lod > n_rows:
+            # Cuda-graph buckets size these buffers for the batch they were
+            # captured at; a lod with more segments than there are q rows would
+            # make the kernel read q past its end. Slicing from 0 keeps
+            # `data_ptr`, so a recorded launch still reads the same storage on
+            # replay.
+            ql_cpu, ql_xpu = ql_cpu[: n_rows + 1], ql_xpu[: n_rows + 1]
+            kvl_cpu, kvl_xpu = kvl_cpu[: n_rows + 1], kvl_xpu[: n_rows + 1]
+            n_lod = n_rows
+        elif n_lod < n_rows:
+            # TP + partial-DP padding adds q rows the metadata never saw.
+            # Extend with zero-length kv segments so those rows read nothing,
+            # and build the pads on CPU first: `.cpu()` inside a capture is an
+            # illegal D2H copy (0.5.8 `nsa_backend.py:1809-1827`). Starting the
+            # q pad at `n_lod + 1` avoids duplicating the last value, which
+            # would add a segment and make the two lods disagree on batch_num.
+            pad_q = torch.arange(n_lod + 1, n_rows + 1, dtype=torch.int32)
+            ql_cpu = torch.cat([ql_cpu, pad_q])
+            ql_xpu = torch.cat([ql_xpu, pad_q.to(ql_xpu.device)])
+            pad_kv = kvl_cpu[-1:].expand(n_rows - n_lod)
+            kvl_cpu = torch.cat([kvl_cpu, pad_kv])
+            kvl_xpu = torch.cat([kvl_xpu, pad_kv.to(kvl_xpu.device)])
+            n_lod = n_rows
+
+        idx = page_table_1
+        if idx.dtype != torch.int32:
+            idx = idx.to(torch.int32)
+        # -1 padding (and the EAGLE warmup's garbage ids) map to slot 0, which
+        # the pool keeps zeroed; the per-row lods bound the read anyway. Same
+        # clamp 0.5.8 applied (`nsa_backend.py:1798-1802`), done on the device
+        # so it is capture-safe.
+        idx = torch.where(
+            (idx < 0) | (idx >= kv_rows.shape[0]), torch.zeros_like(idx), idx
+        ).contiguous()
+        topk = idx.shape[-1]
+
+        out = torch.empty(
+            (n_rows, q_all.shape[1], layer.v_head_dim),
+            dtype=q_all.dtype,
+            device=q_all.device,
+        )
+        # Both outputs are required by the op even though only `out` is used
+        # here; 0.5.8 read `lse` only for its DCP merge.
+        max_logits = torch.empty(
+            (n_rows, q_all.shape[1]), dtype=torch.float32, device=q_all.device
+        )
+        lse = torch.empty_like(max_logits)
+
+        side = _mixed_attn_side_stream(q_all.device)
+        capturing = torch.cuda.is_current_stream_capturing()
+        try:
+            if kind == "xspeed":
+                # `max_seq_kv_bound` is a by-value scalar baked into a recorded
+                # launch, so a capture must not let the C++ side derive it from
+                # the (short) warmup lod -- pass the per-bucket upper bound
+                # `n_rows * topk`; eager passes -1 and lets the op compute the
+                # exact last-first value (0.5.8 `nsa_backend.py:2125-2156`).
+                # `is_causal=False` in both arms, decode and prefill alike:
+                # each q row carries its own already causal-filtered top-k
+                # list, so there is no triangle left to mask.
+                status = op(
+                    q_all,
+                    kv_rows,
+                    idx,
+                    out,
+                    max_logits,
+                    lse,
+                    layer.scaling,
+                    ql_cpu,
+                    ql_xpu,
+                    kvl_cpu,
+                    kvl_xpu,
+                    False,
+                    topk,
+                    side.cuda_stream,
+                    n_rows * topk if capturing else -1,
+                )
+            else:
+                status = op(
+                    q=q_all,
+                    kv_cache=kv_rows,
+                    indices=idx,
+                    o=out,
+                    max_logits=max_logits,
+                    lse=lse,
+                    qlod_cpu=ql_cpu,
+                    qlod_xpu=ql_xpu,
+                    kvlod_cpu=(
+                        _mixed_attn_bound_kvlod(n_rows, topk)
+                        if capturing
+                        else kvl_cpu
+                    ),
+                    kvlod_xpu=kvl_xpu,
+                    sm_scale=layer.scaling,
+                    is_causal=False,
+                    topk=topk,
+                    side_stream=side.cuda_stream,
+                    use_xfa_boost=False,
+                )
+            if not capturing:
+                # The op farms sub-work out to `side_stream`, so this stream has
+                # to join it before anyone reads `out`. Illegal during capture,
+                # where the graph records the dependency itself.
+                torch.cuda.current_stream(q_all.device).wait_stream(side)
+        except Exception as exc:  # noqa: BLE001 - degrade, do not kill the server
+            _log_mixed_attn_fallback(f"the {kind} op raised: {exc}")
+            return None
+        if int(status) != 0:
+            _log_mixed_attn_fallback(
+                f"the {kind} op returned {int(status)} (1=INVALID_PARAM "
+                f"2=RUNTIME_ERROR 3=NO_ENOUGH_WORKSPACE 4=NOT_IMPLEMENT); "
+                f"capturing={capturing} rows={n_rows} lod={n_lod} topk={topk} "
+                f"q={tuple(q_all.shape)}/{q_all.dtype} "
+                f"kv={tuple(kv_rows.shape)}/{kv_rows.dtype} "
+                f"idx={tuple(idx.shape)}"
+            )
+            return None
+        return out
+
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -486,6 +812,13 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
 
         # Do absorbed multi-latent attention (MLA path)
         assert q_rope is not None
+        # `get_key_buffer` is the accessor that yields the table this op indexes:
+        # one row per *token slot*, in slot order (`memory_pool.py:4893-4900`;
+        # the Kunlun DSA pool overrides only the allocation, not the accessor --
+        # `kunlun_pools.py`). `indices` below is built with `page_size=1`
+        # from the token id, so it addresses those rows directly. A dense
+        # bf16/fp16 pool row *is* that table; a mixed INT8 row is 656 bytes of
+        # packed nope/scales/rope and is dequantized into it at the call site.
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -525,97 +858,132 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
 
         q_all = torch.cat([q_nope, q_rope], dim=-1)
 
-        # sparse_prefill_fwd_opt takes explicit q/kv lods and needs preallocated
-        # output buffers.
-        o_ = torch.zeros(
-            [q_all.shape[0], layer.tp_q_head_num, layer.v_head_dim],
-            dtype=torch.bfloat16,
-            device=q_all.device,
-        )
-        max_logits = torch.zeros(
-            [q_all.shape[0], layer.tp_q_head_num],
-            dtype=torch.float32,
-            device=q_all.device,
-        )
-        lse = torch.zeros(
-            [q_all.shape[0], layer.tp_q_head_num],
-            dtype=torch.float32,
-            device=q_all.device,
-        )
-
-        if (
-            forward_batch.attn_cp_metadata is not None
-            and is_dsa_prefill_cp_in_seq_split()
-        ):
-            # Only use attn_cp_metadata attributes in "in seq split" mode;
-            # round-robin split is handled by the override below.
-            # prefix_kv_len = KV from prior chunks (0 for first chunk, >0 for 2nd+),
-            # because kv_len_prev/next only cover the current chunk's CP range.
-            cp_metadata = forward_batch.attn_cp_metadata
-            prefix_kv_len = 0
-            if (
-                forward_batch.extend_seq_lens_cpu is not None
-                and forward_batch.seq_lens_cpu is not None
-            ):
-                prefix_kv_len = int(forward_batch.seq_lens_cpu[0].item()) - int(
-                    sum(forward_batch.extend_seq_lens_cpu)
-                )
-
-            actual_seq_q_prev = cp_metadata.actual_seq_q_prev_list[0]
-            kv_len_prev_total = prefix_kv_len + cp_metadata.kv_len_prev_list[0]
-            kv_len_next_total = prefix_kv_len + cp_metadata.kv_len_next_list[0]
-
-            # lod is a cumulative offset: the kernel derives per-batch length as
-            # lod[i+1] - lod[i]; batch 0 is "prev", batch 1 is "next".
-            cum_q_lod_cpu = torch.tensor(
-                [0, actual_seq_q_prev, q_all.shape[0]], dtype=torch.int32
+        # Sparse MLA prefill goes through the same vendor op the 0.5.8 baseline
+        # ran (sgl-kernel `.../attention/nsa_backend.py`, sparse-prefill arm),
+        # not through `kunlun_ops.sparse_prefill_fwd_opt`:
+        #
+        #   torch.ops.xspeedgate_ops.sparse_attn_fwd(
+        #       q, kv, indices, sm_scale, d_v, topk_length, attn_sink=None)
+        #       -> Tensor[]  # (out, max_logits, lse)
+        #
+        # `sparse_prefill_fwd_opt` is a 0.5.23-era call that has never worked on
+        # this hardware: it reaches `xfa::dsa_prefill`, whose non-zero return is
+        # what surfaces as `xops_block_ERROR ... prefill_dsa_attention_opt_block.cc
+        # line:115` -- a vendor-block status, not a wrapper dtype/shape check.
+        #
+        # Shapes/semantics below are the op's own (schema + the validation
+        # strings in its meta function), and they differ from the old call:
+        #   q           [s_q, h_q, qk_head_dim], fp16/bf16, contiguous
+        #   kv          [s_kv, qk_head_dim],     dtype == q.dtype, contiguous
+        #   indices     [s_q, topk],             int32 -- 2-D, no kv-head axis
+        #   sm_scale    float
+        #   d_v         int, value width of `out`
+        #   topk_length [s_q],                   int32
+        # No q/kv lods: the batch structure is implied by the page-1 table (every
+        # q row owns its own top-k list) and the only per-row bound is
+        # `topk_length`. So `q_all` keeps the model's dtype instead of being
+        # forced to bf16 (the op instantiates fp16 as well as bf16), and `out`
+        # consequently comes back in q's dtype.
+        #
+        # `kv` must be the flat [tokens, qk_head_dim] pool view in q's dtype.
+        #
+        # * `--kv-cache-dtype int8` stores the packed mixed row
+        #   `[int8 nope | fp32 per-128 scales | bf16 rope]`, 656 B/token
+        #   (`kernels/mixed_int8_kv.py`, written by
+        #   `KunlunNSATokenToKVPool._write_mla_kv_buffer`). This op has no scale
+        #   argument and no int8 instantiation, so those rows go to the native
+        #   mixed-cache op (`_native_mixed_attn`) and are only dequantized here
+        #   when that op is unavailable.
+        #   `mixed_int8_kv` is the pool's own answer: a *cast* int8
+        #   row (what this tree produced while the pool had no mixed-row
+        #   writer) does not advertise it and still fails the guard below,
+        #   rather than being "dequantized" into numbers nobody quantized.
+        # * fp8 DSA storage (`dsa_kv_cache_store_fp8`) packs
+        #   [fp8 nope | fp32 per-128 scales | bf16 rope] into 656 u8 elements.
+        #   It is not the int8 row (different element dtype, different scale
+        #   tiling) and it is refused below: its row width is not
+        #   `qk_head_dim` (`calculate_mla_kv_cache_dim`,
+        #   `kv_cache_configurator.py:3464-3482`).
+        if getattr(self.token_to_kv_pool, "mixed_int8_kv", False):
+            # The op instantiates bf16/fp16 only, so a model served in either
+            # runs in its own dtype. The fp32 projections the dense branch
+            # documents below (`q=float` in the op's own error) fall back to
+            # fp16 -- the dtype this layer chain's residual stream carries, and
+            # the same value `forward_decode` hardcodes for the same reason.
+            out_dtype = q_all.dtype
+            if out_dtype not in (torch.float16, torch.bfloat16):
+                out_dtype = torch.float16
+            q_all = q_all.to(out_dtype)
+            # 0.5.8 branched here instead of dequantizing
+            # (`nsa_backend.py:1751-1759`, sparse prefill and target-verify
+            # both). The native op reads the packed row and its embedded
+            # scales, so it saves the dense copy below and is what emits the
+            # three `fa_xpu3` mixed-cache kernels the operator-set gate wants.
+            native = self._native_mixed_attn(q_all, page_table_1, layer, metadata)
+            if native is not None:
+                return native
+            kv = self.token_to_kv_pool.dequant_mixed_kv_table(
+                layer.layer_id, out_dtype
             )
-            kv_lod_cpu = torch.tensor(
-                [0, kv_len_prev_total, kv_len_prev_total + kv_len_next_total],
-                dtype=torch.int32,
-            )
-            cum_q_lod = cum_q_lod_cpu.to(device=q_all.device)
-            kv_lod = kv_lod_cpu.to(device=q_all.device)
         else:
-            cum_q_lod = metadata.cu_seqlens_q
-            cum_q_lod_cpu = metadata.cu_seqlens_q_cpu
-            kv_lod = metadata.cu_seqlens_k
-            kv_lod_cpu = metadata.cu_seqlens_k_cpu
+            if kv_cache.dtype not in (torch.float16, torch.bfloat16) or (
+                kv_cache.size(-1) != layer.head_dim
+            ):
+                raise RuntimeError(
+                    "Kunlun DSA prefill: the KV pool row is "
+                    f"{kv_cache.size(-1)} elements of {kv_cache.dtype}, but "
+                    "sparse_attn_fwd reads kv as [tokens, "
+                    f"qk_head_dim={layer.head_dim}] in q's dtype. Only the "
+                    "mixed INT8 row (KunlunNSATokenToKVPool.mixed_int8_kv) and "
+                    "a dense fp16/bf16 row are usable here; fp8 DSA storage "
+                    "belongs to dsa_prefill_with_mixed_cache."
+                )
+            # Match `q` to the KV pool's dtype, not the other way round. On P800
+            # the projections come out of the vendor GEMV in fp32 (`q=float` in
+            # the op's own error), and `sparse_attn_fwd` instantiates only bf16
+            # and fp16. The pool dtype is already the configured KV dtype, so
+            # this is the one cast both sides can agree on.
+            # Everything the op touches goes to the KV pool's dtype, and the
+            # result comes back in the same dtype. The pool dtype is the
+            # configured `--kv-cache-dtype` (model dtype for a dense pool), so
+            # this is what the residual stream and the W8A8 projections
+            # downstream expect -- their `kunlun_ops.matmul` rejects anything
+            # else with `Check failed, matmul unimplemented`.
+            out_dtype = kv_cache.dtype
+            q_all = q_all.to(out_dtype)
+            kv = kv_cache.contiguous().view(-1, layer.head_dim)
 
-        if (
-            forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
-        ):
-            cum_q_lod = metadata.cum_q_lod
-            cum_q_lod_cpu = metadata.cum_q_lod_cpu
+        # `dsa_cache_seqlens_int32` is this tree's `nsa_cache_seqlens_int32`: one
+        # int32 per q row holding `min(valid_kv_len, index_topk)`
+        # (`compute_dsa_seqlens` clamps to `dsa_index_topk`, `dsa/utils.py:159-161`),
+        # i.e. the "how many LEADING entries of `indices` are real, the tail is
+        # -1 padding" contract this op wants. Upstream reads the same field for
+        # the same purpose (`_forward_flashmla_sparse`, `dsa_backend.py:2854-2868`).
+        # DP/CP padding rows are already zero-length segments in it.
+        topk_length = metadata.dsa_cache_seqlens_int32
+        if topk_length.shape[0] != q_all.shape[0]:
+            # Metadata rows are expected to match q rows, but this op has no
+            # "compute the full width" fallback (its `topk_length` is required),
+            # so rebuild the counts from the page-1 table: `indices >= 0` is
+            # exactly the number of real slots in the row (device-side, so it is
+            # capture-safe).
+            topk_length = (page_table_1 >= 0).sum(dim=-1).to(torch.int32)
 
-        if is_dsa_prefill_cp_round_robin_split():
-            cum_q_lod = metadata.dsa_cu_seqlens_q
-            cum_q_lod_cpu = metadata.dsa_cu_seqlens_q_cpu
-            kv_lod = metadata.dsa_cu_seqlens_k
-            kv_lod_cpu = metadata.dsa_cu_seqlens_k_cpu
-
-        kunlun_ops.sparse_prefill_fwd_opt(
-            q=q_all,
-            kv=kv_cache.contiguous().view(-1, kv_cache.size(-1)),
-            indices=page_table_1.unsqueeze(1),
-            out=o_,
-            max_logits=max_logits,
-            lse=lse,
-            sm_scale=layer.scaling,
-            is_causal=True,
-            qlod_cpu=cum_q_lod_cpu,
-            qlod_xpu=cum_q_lod,
-            kvlod_cpu=kv_lod_cpu,
-            kvlod_xpu=kv_lod,
+        o_, _, _ = torch.ops.xspeedgate_ops.sparse_attn_fwd(
+            q_all,
+            kv,
+            page_table_1.to(torch.int32),
+            layer.scaling,
+            layer.v_head_dim,
+            topk_length,
         )
 
-        # Defensive: replace NaN with 0 (e.g. when kv_lod has 0-length padding)
-        o_ = torch.nan_to_num(o_, nan=0.0)
-
-        del max_logits
-        del lse
-        return o_
+        # Defensive: replace NaN with 0 (zero-length padding rows).
+        # Back to the dtype the layer chain runs in. In the bf16 pool case the
+        # op returns bf16 while the residual stream is fp16, and the next
+        # `add_rmsnorm_inplace` rejects a mixed pair (`x and residual must have
+        # the same dtype`).
+        return torch.nan_to_num(o_, nan=0.0).to(out_dtype)
 
     def forward_decode(
         self,
@@ -680,40 +1048,66 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
 
         q_all = torch.cat([q_nope, q_rope], dim=-1)
 
-        # fwd_kvcache_mla wants a [tokens, 1, heads, head_dim] q and preallocated
-        # output buffers.
-        reshape_q = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
-        bs = forward_batch.batch_size
-        o_ = torch.zeros(
-            [bs, reshape_q.shape[1], layer.tp_q_head_num, layer.v_head_dim],
-            dtype=torch.bfloat16,
-            device=q_all.device,
+        # Decode runs the SAME operator as sparse prefill, exactly as the 0.5.8
+        # baseline does: `sgl-kernel/.../nsa_backend.py:2240-2244` calls
+        # `torch.ops.xspeedgate_ops.sparse_attn_fwd(q_all, kv_attn, page_table_1,
+        # layer.scaling, layer.v_head_dim, nsa_cache_seqlens_int32)` for both
+        # arms -- on the int8 arm 0.5.8 only reaches `_native_mixed_attn` because
+        # that image's op had an int8 instantiation; this one takes plain
+        # values, so the mixed row is dequantized first
+        # (`KunlunNSATokenToKVPool.dequant_mixed_kv_table`).
+        #
+        # The 0.5.23 plugin called `kunlun_ops.fwd_kvcache_mla` here instead,
+        # which is a different vendor entry point and fails on this stack with
+        # `decode_attention_dsa failed ret=3` once its dtype gate is satisfied.
+        # Same contract as prefill: q [tokens, heads, qk_head_dim], kv
+        # [tokens, qk_head_dim], indices [tokens, topk] int32, a per-row
+        # `topk_length`, and the result in q's dtype.
+        # bf16, not the pool dtype: the layer chain this feeds runs bf16 on
+        # this platform even under `--dtype float16` (the vendor attention and
+        # projection ops are bf16-only). Measured in both directions -- fp32 out
+        # makes the W8A8 `o_proj` raise `matmul unimplemented`, fp16 out makes
+        # the next `add_rmsnorm_inplace` raise `x and residual must have the
+        # same dtype` against the bf16 residual stream.
+        # fp16, the residual stream's dtype. Measured with a one-shot probe in
+        # the plugin's `fused_add_rmsnorm`: x=bf16 vs residual=fp16, weight=fp16,
+        # hence `x and residual must have the same dtype`. The earlier fp32
+        # attempt failed the W8A8 `o_proj` (`matmul unimplemented`), so the
+        # model dtype is the only value both consumers accept.
+        out_dtype = torch.float16
+        q_all = q_all.to(out_dtype)
+        if getattr(self.token_to_kv_pool, "mixed_int8_kv", False):
+            # Decode takes the same native op as sparse prefill, exactly as
+            # 0.5.8 did: `nsa_backend.py:2235-2238` calls the one
+            # `_native_mixed_attn` helper for both arms (with `allow_dcp=True`,
+            # which is a no-op here -- see `_native_mixed_attn`).
+            native = self._native_mixed_attn(q_all, page_table_1, layer, metadata)
+            if native is not None:
+                return native
+            # Fallback: `--kv-cache-dtype int8` rows are packed
+            # [int8 nope | fp32 scales | bf16 rope] and `sparse_attn_fwd` takes
+            # plain values in q's dtype only, so they are dequantized per
+            # layer. `.to(fp16)` here would reinterpret the packed bytes as
+            # codes.
+            kv_attn = self.token_to_kv_pool.dequant_mixed_kv_table(
+                layer.layer_id, out_dtype
+            )
+        else:
+            kv_attn = kv_cache.to(out_dtype).contiguous().view(-1, layer.head_dim)
+
+        topk_length = metadata.cache_seqlens_int32
+        if topk_length.shape[0] != q_all.shape[0]:
+            topk_length = (page_table_1 >= 0).sum(dim=-1).to(torch.int32)
+
+        o_, _, _ = torch.ops.xspeedgate_ops.sparse_attn_fwd(
+            q_all,
+            kv_attn,
+            page_table_1.to(torch.int32),
+            layer.scaling,
+            layer.v_head_dim,
+            topk_length,
         )
-        max_logits = torch.zeros(
-            [bs, reshape_q.shape[1], layer.tp_q_head_num],
-            dtype=torch.float32,
-            device=q_all.device,
-        )
-        p_sums = torch.zeros(
-            [bs, reshape_q.shape[1], layer.tp_q_head_num],
-            dtype=torch.float32,
-            device=q_all.device,
-        )
-        kunlun_ops.fwd_kvcache_mla(
-            q_c=reshape_q,
-            kv_cache=kv_cache.view(-1, self.kv_cache_dim),
-            indices=page_table_1.view(bs, reshape_q.shape[1], page_table_1.shape[-1]),
-            out=o_,
-            max_logits=max_logits,
-            p_sums=p_sums,
-            softmax_scale=layer.scaling,
-            kv_lod_cpu=metadata.cache_seqlens_int32_cpu,
-            kv_lod_xpu=metadata.cache_seqlens_int32,
-            max_seq_kv=metadata.max_seq_len_k,
-        )
-        del max_logits
-        del p_sums
-        return o_
+        return torch.nan_to_num(o_, nan=0.0)
 
     def _forward_standard_mha(
         self,

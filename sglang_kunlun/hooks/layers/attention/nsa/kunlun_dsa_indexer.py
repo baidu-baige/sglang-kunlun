@@ -47,6 +47,12 @@ except ImportError:  # dsv4.1 删掉了 DSA prefill-CP 的 in-seq-split 模式
     def is_dsa_prefill_cp_in_seq_split() -> bool:
         """上游只保留 interleave / round-robin 模式，这个符号守着的分支永远不会激活。"""
         return False
+from sglang.srt.layers.attention.mqa_logits_utils import mqa_logits_should_chunk
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_hip
+
+_IS_HIP = is_hip()
+
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
@@ -87,7 +93,7 @@ def dsa_weights_proj_bf16_in_fp32_out_kunlun(self, x: torch.Tensor) -> torch.Ten
     what the Kunlun indexer's own ``_get_logits_head_gate`` does.
     """
 
-    weights, _ = self.weights_proj(x.to(self.weights_proj.weight.dtype))
+    _, weights = _indexer_wk_weights(self, x)
     return weights.float()
 
 
@@ -95,10 +101,8 @@ def dsa_weights_proj_bf16_in_fp32_out_kunlun(self, x: torch.Tensor) -> torch.Ten
 # surface between the Kunlun indexer and upstream.
 REQUIRED_INDEXER_ATTRS = (
     "_get_k_bf16",
-    "_should_chunk_mqa_logits",
     "alt_stream",
     "block_size",
-    "cp_size",
     "head_dim",
     "index_topk",
     "k_norm",
@@ -108,15 +112,86 @@ REQUIRED_INDEXER_ATTRS = (
     "rope_head_dim",
     "rotary_emb",
     "softmax_scale",
-    "weights_proj",
-    "wk",
     "wq_b",
 )
+
+# Checked structurally rather than by name: 0.5.23 builds the key/gate
+# projections in one of two layouts and which one depends on the platform.
+PROJECTION_LAYOUTS = ("wk+weights_proj", "wk_weights_proj")
+
+
+def _indexer_projection_layout(indexer):
+    """Which key/gate projection layout upstream built on this instance."""
+    if getattr(indexer, "wk_weights_proj", None) is not None:
+        return "wk_weights_proj"
+    if getattr(indexer, "wk", None) is not None and (
+        getattr(indexer, "weights_proj", None) is not None
+    ):
+        return "wk+weights_proj"
+    return None
+
+
+def _indexer_wk_weights(indexer, x: torch.Tensor):
+    """``(key, weights)`` from whichever projection layout upstream built.
+
+    0.5.19 and 0.5.22 always built ``wk`` and ``weights_proj`` separately.
+    0.5.23's ``Indexer.__init__`` folds them into one ``wk_weights_proj`` Linear
+    of width ``head_dim + n_heads`` whenever ``use_dsa_indexer_fusion`` holds --
+    ``_is_cuda and not SGLANG_DISABLE_DSA_INDEXER_FUSION and not is_neox_style``
+    (``dsa/dsa_indexer.py:310-314``). Kunlun reports itself as CUDA, so the
+    fused layout is the one built here and the two separate modules never exist.
+    Upstream splits the fused output the same way (``dsa_indexer.py:605``,
+    ``1090``, ``1121``). Both layouts stay accepted so a build with the fusion
+    switched off needs no further change.
+
+    Cost note, deliberate: the two call sites need these separately (the key on
+    the tensor-parallel path, the gate weights on a possibly requantized copy of
+    ``x``), so the fused layout runs the projection twice per layer -- one
+    ``[rows, hidden] x [hidden, head_dim + n_heads]`` GEMV. That is a
+    performance follow-up, not a correctness one: forcing the non-fused layout
+    would need a server arg or an env switch, and this upgrade may add neither
+    (R5/R6).
+    """
+    orig_dtype = x.dtype
+    fused = getattr(indexer, "wk_weights_proj", None)
+    if fused is not None:
+        # Cast first: 0.5.23 builds this Linear with `params_dtype=bfloat16`
+        # regardless of the model dtype (`dsa_indexer.py:353-358`), while this
+        # run serves GLM-5.3 at `--dtype float16`. Handing it an fp16 activation
+        # makes the Kunlun linear kernel reject the call outright
+        # (`Check ret == 0 failed ... linear custom kernel call Failed`).
+        # Prefer upstream's own accessor so the split order and the dtype cast
+        # stay theirs (`dsa_indexer.py:605-607`, `kw.split([head_dim,
+        # n_heads])` -> key, weights).
+        x = x.to(fused.weight.dtype)
+        split = getattr(indexer, "_fused_k_weights", None)
+        if split is not None:
+            key, weights = split(x)
+        else:
+            out, _ = fused(x)
+            key, weights = torch.split(
+                out, [indexer.head_dim, indexer.n_heads], dim=-1
+            )
+        # Stay in the projection's own dtype (bf16). The DSA indexer chain on
+        # this platform is bf16 end to end -- the Hadamard rotation is bf16-only
+        # and `prefill_attention_dsa_opt` checks that q, kv, out and lse_out all
+        # agree (`Check failed, prefill_attention_dsa_opt not support q/kv/out/
+        # lse_out/indices dtype` when they do not). Casting back to the model
+        # dtype here makes the indexer the only fp16 link in a bf16 chain.
+        del orig_dtype
+        return key, weights
+    # Non-fused layout (0.5.19/0.5.22 and any 0.5.23 build with the fusion off):
+    # the two separate projections, exactly as before.
+    weights, _ = indexer.weights_proj(x.to(indexer.weights_proj.weight.dtype))
+    key, _ = indexer.wk(x)
+    return key, weights
 
 
 def _resolve_deps(indexer) -> None:
     """Fail loudly (once per call) if upstream renamed something we depend on."""
     missing = [a for a in REQUIRED_INDEXER_ATTRS if not hasattr(indexer, a)]
+    if _indexer_projection_layout(indexer) is None:
+        missing.append(f"one of {PROJECTION_LAYOUTS}")
     if missing:
         raise AttributeError(
             f"kunlun dsa indexer requires Indexer attributes {missing}; upstream "
@@ -141,14 +216,25 @@ def xspeedgate_hadamard_transform(
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
-    """Rotate activations with a scaled Hadamard transform."""
+    """Rotate activations with a scaled Hadamard transform.
 
-    assert x.dtype == torch.bfloat16
+    The Hadamard op is bf16-only and the assert used to be unconditional, which
+    held as long as every producer handed it bf16. 0.5.23's fused
+    ``wk_weights_proj`` is built at ``params_dtype=bfloat16`` while this run
+    serves GLM-5.3 at ``--dtype float16``, so the projections upstream folds
+    together now come back at different dtypes and the caller has to pick one
+    for the rotary embedding (it requires q and k to agree). Rather than force
+    both to bf16 -- which would move the projection's output dtype away from
+    the model dtype -- the transform keeps its own bf16 requirement internally
+    and returns the caller's dtype.
+    """
+    out_dtype = x.dtype
+    x = x.to(torch.bfloat16)
     hidden_size = x.size(-1)
     assert (
         hidden_size & (hidden_size - 1)
     ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
-    return xspeedgate_hadamard_transform(x, hidden_size**-0.5)
+    return xspeedgate_hadamard_transform(x, hidden_size**-0.5).to(out_dtype)
 
 
 def chunk_cu_seqlens(
@@ -197,7 +283,7 @@ def chunk_cu_seqlens(
 @torch.compile(dynamic=True)
 def _get_logits_head_gate(indexer, x: torch.Tensor, q_scale: torch.Tensor):
     """ _get_logits_head_gate """
-    weights, _ = indexer.weights_proj(x.to(indexer.weights_proj.weight.dtype))
+    _, weights = _indexer_wk_weights(indexer, x)
     # GLM 5掉点
     weights = weights.float()
     weights = weights * indexer.n_heads**-0.5
@@ -249,17 +335,18 @@ def _metadata_shapes(attn_metadata) -> str:
 
 
 def _require_continuous_index_k(pool, where: str) -> None:
-    """Fail loudly on the 0.5.22 index-K API change.
+    """Fail loudly on the 0.5.22 index-K API change (in-seq-split CP path only).
 
     0.5.22 removed the per-request ``get_index_k_continuous`` /
     ``get_index_k_scale_continuous`` gather. The replacement is the batched
-    ``get_index_k_scale_buffer(layer_id)`` buffer view (or
-    ``IndexKeyCache.get_k_and_scale(layer_id, seq_len_tensor, page_indices,
-    seq_len_sum, max_seq_len)``), which materialises every request's K in one
-    call. Porting these two ragged/CP paths onto it is not a rename -- the
-    per-request loop and the ``torch.cat`` packing change shape -- and no Kunlun
-    run exercises them (DSV4 uses ``kunlun_deepseek_v4_backend``), so leave them
-    unimplemented with a readable message instead of an AttributeError.
+    ``get_index_k_scale_buffer(...)`` -> ``IndexKeyCache.get_k_and_scale(...)``;
+    ``_get_topk_ragged`` is ported onto it above. ``_get_topk_ragged_with_cp``
+    is not: it gathers a sub-range of one request per ``cp_index`` entry and
+    rebuilds ``ks``/``ke`` around those row offsets, so it needs its offset
+    bookkeeping reworked as well. 0.5.23 cannot reach it anyway --
+    ``is_dsa_prefill_cp_in_seq_split()`` is False here, so CP prefill takes the
+    interleave path through ``_get_topk_ragged``. Readable message instead of an
+    AttributeError.
     """
     if hasattr(pool, "get_index_k_continuous"):
         return
@@ -281,6 +368,127 @@ def _align_rows_to_q(tensor, extend_lens: List[int], q_offset: int):
     if tensor.shape[0] > q_offset:
         return tensor[:q_offset]
     return tensor
+
+
+_PAGED_TOPK_FALLBACK_LOGGED = False
+
+
+def _log_paged_topk_fallback(exc: BaseException) -> None:
+    """Warn once that the metadata torch port is standing in for the kernel."""
+    global _PAGED_TOPK_FALLBACK_LOGGED
+    if _PAGED_TOPK_FALLBACK_LOGGED:
+        return
+    _PAGED_TOPK_FALLBACK_LOGGED = True
+    import logging
+
+    logging.getLogger(__name__).warning(
+        "sglang-kunlun: xspeedgate_ops.topk_transform unusable on the paged "
+        "path (%s); falling back to KunlunDSAIndexerMetadata.topk_transform. "
+        "The selected set is the same, but the trace then lacks "
+        "xinfer3::topk_transform_decode_kernelv2 and shows "
+        "topk_find_kth_converted_clusterwise / topk_select_element_clusterwise "
+        "/ masked_fill_scalar instead.",
+        exc,
+    )
+
+
+def _paged_topk_transform(
+    logits: torch.Tensor,
+    topk: int,
+    metadata,
+    page_table_index: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Select ``topk`` positions per row and map them to page-1 cache slots.
+
+    0.5.8 ran the vendor fused kernel here
+    (``sgl_kernel/patch/layers/attention/nsa_backend.py:500``, reached from
+    ``patch/.../nsa_indexer.py:162 _get_topk_paged``), and the baseline decode
+    trace shows it launching as
+    ``xinfer3::topk_transform_decode_kernelv2<float, 2048>`` from
+    ``cudaGraphLaunch`` under ``eagle_draft_cuda_graph_runner.py:175`` -- i.e. it
+    is safe to capture, which is why the call is made unconditionally rather than
+    being gated on capture mode.
+
+    ``KunlunDSAIndexerMetadata.topk_transform``'s PAGED branch
+    (``kunlun_nsa_backend.py``) replaced it with a torch port because the score
+    is page aligned (``real_page_table.shape[1] * page_size``) while
+    ``page_table_1`` is only ``max_seqlen_k`` wide. 0.5.8 hit that same mismatch
+    and fixed it by right-padding the table with -1
+    (``nsa_backend.py:480-497``): -1 is never dereferenced, because ``lengths``
+    bounds each row's gather to its real sequence length.
+    """
+    # Same lengths/table selection the metadata's own PAGED branch would make
+    # (`kunlun_nsa_backend.py` `KunlunDSAIndexerMetadata.topk_transform`, and
+    # 0.5.8 `nsa_backend.py:471`), so the only thing that changes here is which
+    # kernel runs.
+    seq_lens_topk = metadata.get_seqlens_expanded()
+    page_table_1 = metadata.attn_metadata.page_table_1
+    if page_table_index is not None:
+        page_table_1 = page_table_1[page_table_index]
+    # The vendor kernel takes the row count off `score` and indexes `lengths`
+    # with it, so a short `lengths` would read out of bounds instead of failing.
+    # The torch port raised on the same mismatch (broadcasting
+    # `lengths.unsqueeze(1)` against the score rows), so keep it an error.
+    if seq_lens_topk.shape[0] != logits.shape[0]:
+        raise RuntimeError(
+            "kunlun DSA paged top-k: seqlens rows do not match the score rows "
+            f"(lengths={tuple(seq_lens_topk.shape)}, "
+            f"score={tuple(logits.shape)})"
+        )
+    try:
+        return _paged_topk_transform_vendor(
+            score=logits,
+            lengths=seq_lens_topk,
+            src_page_table=page_table_1,
+            topk=topk,
+            cu_seqlens_q=metadata.attn_metadata.cu_seqlens_q,
+        )
+    except Exception as exc:  # noqa: BLE001 - keep serving on the torch port
+        _log_paged_topk_fallback(exc)
+        return metadata.topk_transform(
+            logits, topk, batch_idx_list=page_table_index
+        )
+
+
+def _paged_topk_transform_vendor(
+    score: torch.Tensor,
+    lengths: torch.Tensor,
+    src_page_table: torch.Tensor,
+    topk: int,
+    cu_seqlens_q: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Fused select + page-1 lookup in one launch.
+
+    Contract from the vendor stub (``xspeedgate_ops/_topk.pyi:152-179``):
+    ``score`` float32 with ``stride(1) == 1``, ``lengths`` int32 contiguous,
+    ``src_page_table`` int32, ``dst_page_table`` int32 ``[rows, topk]``,
+    contiguous and written in place.
+    """
+    rows, width = score.shape
+    # The kernel indexes ``src_page_table`` by the selected column and writes
+    # ``topk`` entries per row, so the table must cover both the score width and
+    # ``topk``. 0.5.8 spelled the first term ``align64(page_table_1.width)``,
+    # which equals the page-aligned score width when both tables are built from
+    # the same ``max_seqlen_k``.
+    need = max(topk, width)
+    table = src_page_table
+    if table.shape[1] < need:
+        table = torch.nn.functional.pad(table, (0, need - table.shape[1]), value=-1)
+    dst_page_table = score.new_empty((rows, topk), dtype=torch.int32)
+    torch.ops.xspeedgate_ops.topk_transform(
+        score=score if score.stride(1) == 1 else score.contiguous(),
+        lengths=lengths.to(torch.int32).contiguous(),
+        src_page_table=table.to(torch.int32).contiguous(),
+        dst_page_table=dst_page_table,
+        topk=topk,
+        # One score row per request on decode, one per query token on
+        # target-verify / draft-extend; the kernel expands the table rows from
+        # this, which is why 0.5.8 passed it on every PAGED call.
+        cu_seqlens_q=(
+            None if cu_seqlens_q is None else cu_seqlens_q.to(torch.int32).contiguous()
+        ),
+    )
+    return dst_page_table
 
 
 def _get_topk_paged(
@@ -441,8 +649,8 @@ def _get_topk_paged(
                 f"provenance={getattr(forward_batch, '_kunlun_draft_meta_provenance', None)})"
             )
 
-    topk_result = metadata.topk_transform(
-        logits, indexer.index_topk, batch_idx_list=page_table_index
+    topk_result = _paged_topk_transform(
+        logits, indexer.index_topk, metadata, page_table_index
     )
     # Restore possible padding exist in the hidden states.
     if q_offset < q_fp8.shape[0]:
@@ -468,12 +676,22 @@ def _get_topk_ragged(
     metadata: "BaseIndexerMetadata",
     topk_result: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    _require_continuous_index_k(get_token_to_kv_pool(), "_get_topk_ragged")
     """Kunlun ragged indexer.
 
     ``enable_dual_stream`` / ``topk_result`` exist for upstream 0.5.14 signature
     compatibility; the Kunlun path never uses the alternate stream and always
     allocates its own ``topk_result``.
+
+    The K/scale gather is the batched 0.5.23 accessor, as upstream uses it
+    (``dsa/dsa_indexer.py:1548``), not the 0.5.19 per-request loop: the index-K
+    pool dropped ``get_index_k_continuous`` / ``get_index_k_scale_continuous``
+    (only ``get_index_k_scale_buffer`` survives, ``memory_pool.py:5562``) and the
+    first disaggregated ragged prefill raised ``NotImplementedError`` here.
+    ``get_index_k_scale_buffer`` builds the identical ragged layout in one
+    launch -- per request its first ``seq_len_i`` K rows, then that request's
+    scales, requests concatenated in order -- which is exactly what the loop's
+    ``torch.cat`` produced for ``I8_mqa_logits``'s ``context_k_lens``
+    (``cu_seqlens_k``).
     """
     if TYPE_CHECKING:
         assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
@@ -484,8 +702,6 @@ def _get_topk_ragged(
     assert page_size == 64, "only support page size 64"
     if len(weights.shape) == 3:
         weights = weights.squeeze(-1)
-    k_fp8_list = []
-    k_scale_list = []
     block_tables = metadata.get_page_table_64()
 
     assert (
@@ -504,26 +720,40 @@ def _get_topk_ragged(
 
     indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
     assert len(indexer_seq_lens_cpu) == batch_size
-    for i in range(batch_size):
-        seq_len = indexer_seq_lens_cpu[i].item()
-        assert isinstance(seq_len, int)
-        # Use fused Triton kernel to get both K and scale in a single call
-        k_fp8 = get_token_to_kv_pool().get_index_k_continuous(
-            layer_id,
-            seq_len,
-            block_tables[i],
-        )
-        k_scale = get_token_to_kv_pool().get_index_k_scale_continuous(
-            layer_id,
-            seq_len,
-            block_tables[i],
-        )
+    # ``get_k_and_scale`` wants the length vector on the device (one program per
+    # sequence in ``_get_k_and_s_triton_kernel``) and a 2-D page table it indexes
+    # as ``page_indices[batch_id * num_pages + page]``. Take the device vector the
+    # metadata already carries instead of copying the host mirror; ``sum``/``max``
+    # stay on the host mirror, so they replace the loop's per-request ``.item()``
+    # reads without adding a sync.
+    indexer_seq_lens = metadata.get_indexer_seq_len()
+    if indexer_seq_lens is None:
+        indexer_seq_lens = indexer_seq_lens_cpu.to(device, non_blocking=True)
+    assert indexer_seq_lens.shape[0] == batch_size, (
+        "kunlun DSA ragged top-k: indexer seq_lens rows do not match the page "
+        f"table rows (seq_lens={tuple(indexer_seq_lens.shape)}, "
+        f"page_table={tuple(block_tables.shape)})"
+    )
 
-        k_fp8_list.append(k_fp8)
-        k_scale_list.append(k_scale)
-    
-    k_fp8 = torch.cat(k_fp8_list, dim=0)
-    k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
+    # One physical index page is ``[int8 K bytes | fp32 scales]`` with
+    # ``scale_offset = page_size * index_head_dim`` bytes
+    # (`dsa_index_k_cache.py` ``S_OFFSET_NBYTES_IN_PAGE``, the same split
+    # ``_get_topk_paged`` reads through ``gather_paged_scale``), so the K half is
+    # ``(sum seq_len, head_dim)`` int8 and the scale half is ``(sum seq_len, 4)``
+    # bytes holding one fp32 per token.
+    k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
+        layer_id=layer_id,
+        seq_len_tensor=indexer_seq_lens,
+        page_indices=block_tables,
+        seq_len_sum=int(indexer_seq_lens_cpu.sum().item()),
+        max_seq_len=int(indexer_seq_lens_cpu.max().item()),
+    )
+    # ``I8_mqa_logits`` wants K in ``q``'s dtype, int8 on the int8 path
+    # (``kunlun_ops/_deepgemm.py:I8_mqa_logits``), while the gather hands back
+    # bytes (``dsa_index_k_cache.py`` allocates ``uint8``). Reinterpret, do not
+    # convert: ``.to(int8)`` would copy the whole K block.
+    k_fp8 = k_fp8.view(torch.int8)
+    k_scale = k_scale.view(torch.float32).squeeze(-1)
     if q_fp8.dtype is torch.int8:
         k_scale /= 127
     ks, ke = metadata.get_indexer_kvcache_range()
@@ -550,7 +780,16 @@ def _get_topk_ragged(
     device = q_fp8.device
 
     # Check if we need to chunk to avoid OOM
-    need_chunk, free_mem = indexer._should_chunk_mqa_logits(q_offset, k_offset, device)
+    # 0.5.23 moved this off the instance onto `mqa_logits_should_chunk`
+    # (`layers/attention/mqa_logits_utils.py:71`), with the free-memory budget
+    # behind a callable so the host sync only happens when the static gate
+    # passes -- the same behaviour the 0.5.19 method had inline.
+    need_chunk, free_mem = mqa_logits_should_chunk(
+        num_rows=q_offset,
+        num_cols=k_offset,
+        get_budget_bytes=lambda: indexer._get_mqa_logits_budget_bytes(device),
+        rocm=_IS_HIP,
+    )
     if need_chunk:
         import logging
         logging.warning(f"[NSA] chunk path triggered: q_offset={q_offset}, \
@@ -870,6 +1109,84 @@ def _get_topk_ragged_with_cp(
     return topk_result
 
 
+# 0.5.8 production kept an escape hatch on the vendor key-LayerNorm
+# (``patch/layers/attention/nsa/nsa_indexer.py:119``); keep the same name so a
+# run can be put back on upstream's torch path without a code change.
+_KLX_KNORM = os.environ.get("KLX_KNORM", "1") != "0"
+
+
+def _k_norm(indexer, key: torch.Tensor) -> torch.Tensor:
+    """LayerNorm the indexer key with the vendor op instead of ``F.layer_norm``.
+
+    ``indexer.k_norm`` is upstream's ``LayerNorm(head_dim, dtype=torch.float32)``
+    (``dsa/dsa_indexer.py:378-385``), and on this platform its ``forward_cuda``
+    falls straight through to ``forward_native``: ``flashinfer.norm.layernorm``
+    does not exist in this image, so ``_flashinfer_layernorm_available`` is
+    False (``layers/layernorm.py:1042-1049``). ``forward_native`` is up-cast to
+    fp32 -> ``F.layer_norm`` -> down-cast, three kernels, and the middle one
+    traces as ``xpukernel_xpu3::layer_norm_fwd`` -- torch_xmlir's own kernel
+    (``layer_norm_fwd`` is in ``torch_xmlir/libxpuapi.so``; it does not exist in
+    ``kunlun_ops/libapiinfer.so`` at all).
+
+    0.5.8 replaced exactly this call with the vendor op:
+    ``sgl-kernel/python/sgl_kernel/patch/layers/attention/nsa/nsa_indexer.py:122-139``
+    (``_k_norm_``) does ``kunlun_ops.layernorm(key, self.k_norm.weight, key,
+    self.k_norm.variance_epsilon, bias=self.k_norm.bias)``, gated on
+    ``KLX_KNORM``, ``key.dim() == 2`` and ``key.is_contiguous()``, and defers to
+    ``self.k_norm(key)`` otherwise. ``kunlun_ops.layernorm``
+    (``kunlun_ops/_xflashinfer_norm.py:363``) -> ``xpu_flash_ops.layernorm`` ->
+    ``optimized_ops::layer_norm<T, TW>``, which is the only thing that launches
+    ``xpuops3::infer_layer_norm_no_ada`` (disassembled
+    ``optimized_ops::layer_norm<float16, float>``: it calls
+    ``__device_stub__infer_layer_norm_no_ada<float16, float>``). ``<T, TW>`` is
+    (activation, weight/bias); ``<bfloat16, float>`` and ``<float16, float>``
+    are both instantiated, so a half-precision key with the fp32 weight and bias
+    is the kernel's native argument shape and it accumulates in fp32 inside --
+    which is what the up-cast in ``forward_native`` was there for.
+
+    Two deviations from the 0.5.8 guard, both forced by 0.5.23:
+
+    * 0.5.23 folds ``wk`` and ``weights_proj`` into one Linear
+      (:func:`_indexer_wk_weights`), so ``key`` arrives as a column slice of the
+      fused output and is *not* contiguous. The vendor op rejects a strided
+      input (``layernorm, Tensor x is not contiguous!``), so the slice is packed
+      here rather than handed back to torch.
+    * The result goes to a separate buffer instead of aliasing ``key``. The
+      caller mutates the norm's output afterwards (``key[..., :rope_head_dim] =
+      k_rope``) and upstream's ``forward_native`` returned a fresh tensor, so
+      writing in place would start mutating the fused projection's output; it
+      also keeps the fallback below usable after a failed call.
+
+    ``index_k_norm_type == "rms"`` builds an ``RMSNorm`` here instead
+    (``dsa_indexer.py:375-376``), which is different math and has no bias, so
+    the affine/bias attributes are the gate rather than the class name.
+    """
+
+    norm = indexer.k_norm
+    if (
+        not _KLX_KNORM
+        or key.dim() != 2
+        or not getattr(norm, "elementwise_affine", False)
+        or not getattr(norm, "use_bias", False)
+        or getattr(norm, "weight", None) is None
+        or getattr(norm, "bias", None) is None
+    ):
+        return norm(key)
+    packed = key.contiguous()
+    out = torch.empty_like(packed)
+    try:
+        kunlun_ops.layernorm(
+            packed,
+            norm.weight,
+            out,
+            norm.variance_epsilon,
+            bias=norm.bias,
+        )
+    except Exception:
+        return norm(key)
+    return out
+
+
 def _get_q_k_bf16(
     indexer,
     q_lora: torch.Tensor,
@@ -882,7 +1199,17 @@ def _get_q_k_bf16(
         current_stream = torch.cuda.current_stream()
         indexer.alt_stream.wait_stream(current_stream)
         # for kunlun ops
-        query, _ = indexer.wq_b(q_lora)
+        query, _ = indexer.wq_b(q_lora.to(indexer.wq_b.weight.dtype))
+        # The DSA indexer chain runs in bf16: the Hadamard rotation is bf16-only
+        # and `prefill_attention_dsa_opt` requires q/kv/out/lse_out to agree
+        # (measured: passing fp16 q with bf16 kv raises `Check failed,
+        # prefill_attention_dsa_opt not support q/kv/out/lse_out/indices dtype`,
+        # and passing fp16 q with bf16 k raises `query and key must have same
+        # dtype` in the rotary). 0.5.23 builds the fused `wk_weights_proj` at
+        # `params_dtype=bfloat16` while this run serves GLM-5.3 at
+        # `--dtype float16`, so the projection's own dtype is the one to follow
+        # rather than the model dtype.
+        query = query.to(torch.bfloat16)
         query = rearrange(query, "l (h d) -> l h d", d=indexer.head_dim)
         q_rope, _ = torch.split(
             query,
@@ -891,8 +1218,8 @@ def _get_q_k_bf16(
         )
         with torch.cuda.stream(indexer.alt_stream):
             # TODO we should also put DeepGEMM half SM here?
-            key, _ = indexer.wk(x)
-            key = indexer.k_norm(key)
+            key, _ = _indexer_wk_weights(indexer, x)
+            key = _k_norm(indexer, key)
 
             k_rope, _ = torch.split(
                 key,
@@ -902,13 +1229,23 @@ def _get_q_k_bf16(
 
         current_stream.wait_stream(indexer.alt_stream)
     else:
-        query, _ = indexer.wq_b(q_lora)
+        query, _ = indexer.wq_b(q_lora.to(indexer.wq_b.weight.dtype))
+        # The DSA indexer chain runs in bf16: the Hadamard rotation is bf16-only
+        # and `prefill_attention_dsa_opt` requires q/kv/out/lse_out to agree
+        # (measured: passing fp16 q with bf16 kv raises `Check failed,
+        # prefill_attention_dsa_opt not support q/kv/out/lse_out/indices dtype`,
+        # and passing fp16 q with bf16 k raises `query and key must have same
+        # dtype` in the rotary). 0.5.23 builds the fused `wk_weights_proj` at
+        # `params_dtype=bfloat16` while this run serves GLM-5.3 at
+        # `--dtype float16`, so the projection's own dtype is the one to follow
+        # rather than the model dtype.
+        query = query.to(torch.bfloat16)
         query = rearrange(query, "l (h d) -> l h d", d=indexer.head_dim)
         q_rope, _ = torch.split(
             query, [indexer.rope_head_dim, indexer.head_dim - indexer.rope_head_dim], dim=-1
         )
-        key, _ = indexer.wk(x)
-        key = indexer.k_norm(key)
+        key, _ = _indexer_wk_weights(indexer, x)
+        key = _k_norm(indexer, key)
         k_rope, _ = torch.split(
             key, [indexer.rope_head_dim, indexer.head_dim - indexer.rope_head_dim], dim=-1
         )
@@ -944,7 +1281,10 @@ def _get_q_k_bf16(
     elif dsa_use_prefill_cp(forward_batch):
         key = cp_all_gather_rerange_output(
             key.contiguous(),
-            indexer.cp_size,
+            # 0.5.23 dropped the `cp_size` snapshot from Indexer; the live
+            # value is on the parallel state (`kunlun_deepseek_v4_backend.py`
+            # reads it the same way).
+            get_parallel().attn_cp_size,
             forward_batch,
             torch.cuda.current_stream(),
         )
@@ -1038,6 +1378,11 @@ def forward_cuda(
     forward_batch: ForwardBatch,
     layer_id: int,
     return_indices: bool = True,
+    # 0.5.23 threaded this through from the piecewise/breakable graph path; the
+    # Kunlun body refuses that path outright (see the assertion below), so the
+    # value cannot change the result -- it only has to be accepted so a caller
+    # passing it by keyword does not raise TypeError.
+    use_cuda_graph: bool = True,
 ) -> Optional[torch.Tensor]:
     """forward_cuda"""
     # TODO: try to remove this patch
@@ -1190,9 +1535,12 @@ def forward_cuda(
         index_k=store_k_fp8,
         index_k_scale=store_k_scale,
     )
-    seq_len = forward_batch.seq_lens_cpu[0].item()
-    
-    # TODO: remove this to _get_logits_head_gate
+    # The old first line here read `forward_batch.seq_lens_cpu[0].item()` and
+    # stored it in a `seq_len` nothing ever used, *before* the assert that
+    # guards the same attribute. On 0.5.23's decode path the CPU mirror is
+    # legitimately None (the metadata is device-only), so the dead read became
+    # `TypeError: 'NoneType' object is not subscriptable` at the first decode
+    # step. The assert below is the real contract; keep it, drop the dead read.
     if q_fp8.dtype is torch.int8:
         weights /= 127
 

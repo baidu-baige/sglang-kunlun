@@ -78,6 +78,8 @@ class KunlunCompressedTensorsW8A8Int8(CompressedTensorsW8A8Int8):
             dtype=output_dtype,
             device=x_q.device,
         )
+        if x_q.shape[0] == 0:
+            return out
         kunlun_ops.matmul(
             x_q,
             layer.weight.data,

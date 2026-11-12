@@ -260,6 +260,49 @@ class KunlunSRTPlatform(KunlunDeviceMixin, SRTPlatform):
 
         return KunlunPagedTokenToKVPoolAllocator
 
+    def supports_speculative_algorithm(self, algorithm: str) -> bool:
+        """Declare which speculative algorithms this platform carries.
+
+        0.5.23 added an out-of-tree allow-list: `_check_oot_speculative_algorithm`
+        (`arg_groups/speculative_hook.py:1062`) raises as soon as
+        `current_platform.is_out_of_tree()` and this returns False, and
+        `PlatformInterface.supports_speculative_algorithm` defaults to False
+        (`platforms/interface.py:225-227`). So an OOT platform that says nothing
+        is read as "no speculative decoding at all", and the GLM-5.3 w4a8 decode
+        node dies in arg resolution with
+        `ValueError: EAGLE speculative decoding is not supported by
+        KunlunSRTPlatform on device 'cuda'.` before a single weight loads.
+
+        EAGLE is the production contract on this platform: the plugin carries
+        the whole worker path for it (`hooks/speculative/eagle_worker_v2.py`,
+        `hooks/mtp_production.py`, `hooks/ragged_draft_extend.py`), and the
+        0.5.8 fork serves GLM-5.3 with `--speculative-algorithm EAGLE
+        --speculative-num-steps 3 --speculative-eagle-topk 1
+        --speculative-num-draft-tokens 4`. EAGLE3 shares that worker. DSPARK
+        and DFLASH have their own hook families here as well.
+
+        Everything not named stays False, which is the point of the allow-list:
+        a new upstream algorithm then fails loudly in arg resolution rather
+        than silently running an unported draft path.
+        """
+        return algorithm in ("EAGLE", "EAGLE3", "DSPARK", "DFLASH")
+
+    def supports_speculative_draft_attention_backend(
+        self, algorithm: str, backend: str
+    ) -> bool:
+        """Which draft attention backends pair with which algorithm here.
+
+        Same default-False trap as above (`platforms/interface.py:229-233`),
+        consumed by `_resolve_dflash_draft_attention_backend`
+        (`arg_groups/speculative_hook.py:898`). The draft worker runs the same
+        Kunlun backends as the target: `nsa` is what GLM-5.3 uses on both, and
+        the plugin's `KunlunDSAAttnBackend` is admitted into the draft-extend
+        graph backend list by `hooks/mtp_production.py`.
+        """
+        if not self.supports_speculative_algorithm(algorithm):
+            return False
+        return backend in ("nsa", "kunlun", "flashattention")
+
     def get_piecewise_backend_cls(self) -> type:
         from sglang.srt.compilation.backend import SGLangBackend
 

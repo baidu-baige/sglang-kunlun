@@ -144,7 +144,12 @@ def _replace_imported_bindings(original: object, replacement: object) -> None:
             if value is not original:
                 continue
             setattr(module, symbol_name, replacement)
-            logger.info("kernel_ops: patched imported binding %s.%s", module_name, symbol_name)
+            # Per-binding INFO was 9 lines of boot noise for one fact; the
+            # resolution report at the end of install() already carries the
+            # totals, so the detail belongs at DEBUG.
+            logger.debug(
+                "kernel_ops: patched imported binding %s.%s", module_name, symbol_name
+            )
 
 
 def _patch_symbol(spec: KernelSpec, replacement: object) -> None:
@@ -2042,7 +2047,7 @@ def page_table_positions_kernel(
 
 
 @register_jit_op(
-    "sglang.kernels.ops.attention.dsv4_attn_metadata_kernels",
+    "sglang.kernels.ops.attention.dsv4.attn_metadata_kernels",
     "build_causal_swa_page_indices_triton",
 )
 def build_causal_swa_page_indices_kunlun(
@@ -2232,6 +2237,8 @@ def moe_align_small_numel_kunlun(
     sorted_token_ids: torch.Tensor,
     expert_ids: torch.Tensor,
     num_tokens_post_pad: torch.Tensor,
+    *,
+    write_inactive_prefix_count: bool = False,
 ) -> None:
     """Single-launch MoE align for tiny batches on the XSpeedGate kernel.
 
@@ -2256,6 +2263,13 @@ def moe_align_small_numel_kunlun(
         sorted_token_ids: Output buffer receiving the padded token ordering.
         expert_ids: Output buffer receiving the expert for each block.
         num_tokens_post_pad: Output buffer receiving the total padded token count.
+        write_inactive_prefix_count: Also publish, in
+            ``num_tokens_post_pad[1]``, the number of leading blocks that belong
+            to the EP-filtered (``-1``) expert. 0.5.23 added this keyword-only
+            parameter and its only call site
+            (``moe_runner/triton_utils/moe_align_block_size.py:153``) passes it
+            unconditionally, so not accepting it was a ``TypeError`` for any
+            configuration that reaches the small-numel fast path.
     """
 
     op = "moe_align_small_numel"
@@ -2278,14 +2292,42 @@ def moe_align_small_numel_kunlun(
         f"numel {topk_ids.numel()} exceeds the kernel's 1024 capacity",
     )
 
+    if write_inactive_prefix_count:
+        # Upstream's own buffer contract for the second slot
+        # (``moe/moe_align_small_numel.py:141``).
+        _dspark_require(
+            num_tokens_post_pad.numel() == 2 and num_tokens_post_pad.is_contiguous(),
+            op,
+            "write_inactive_prefix_count needs a contiguous int32[2] count "
+            f"buffer, got shape {tuple(num_tokens_post_pad.shape)}",
+        )
+
+    # The op publishes only the total, so hand it slot 0 alone: a kernel that
+    # fills the whole buffer must not clobber the count derived below.
     torch.ops.xspeedgate_ops.moe_align_small_numel(
         topk_ids.contiguous(),
         num_experts,
         block_size,
         sorted_token_ids,
         expert_ids,
-        num_tokens_post_pad,
+        num_tokens_post_pad[:1] if write_inactive_prefix_count else num_tokens_post_pad,
     )
+
+    if write_inactive_prefix_count:
+        # The filtered bucket is bucket 0, so its blocks are the leading ones and
+        # carry expert id -1; blocks at or past the published total are left
+        # unwritten by the op and must be masked out. Tensor-only, so this stays
+        # graph-capturable and adds no host sync.
+        block_start = (
+            torch.arange(
+                expert_ids.numel(), dtype=torch.int32, device=expert_ids.device
+            )
+            * block_size
+        )
+        inactive_blocks = (
+            (expert_ids == -1) & (block_start < num_tokens_post_pad[0])
+        ).sum(dtype=torch.int32)
+        num_tokens_post_pad[1:2].copy_(inactive_blocks.reshape(1))
 
 
 @register_jit_op(
@@ -3273,22 +3315,17 @@ def markov_greedy_step_triton(
     type=HookType.REPLACE,
 )
 def markov_sample_step_execute_kunlun(cls, **kwargs):
-    """Keep the DSpark draft sampler on its own torch reference.
+    """Use exact greedy reduction, retaining the torch sampling reference.
 
-    0.5.22 replaced the 0.5.19 online sampler (``sample_step_tokens`` plus the
-    ``_online_partial_kernel`` / ``_online_combine_kernel`` /
-    ``_build_step_local_kernel`` triton kernels this plugin used to replace one by
-    one) with ``MarkovSampleStep``, a single Philox Gumbel-max kernel. Its
-    ``execute`` dispatches on ``inputs_on_cuda(**kwargs)``, which is true on
-    Kunlun because the platform reuses the CUDA dispatch key, so every draft step
-    would try to compile ``_markov_sample_partial_kernel``.
-
-    ``MarkovSampleStep.torch`` is upstream's own reference for the same math
-    (same Philox stream, same rounding through ``step_dtype``), so routing there
-    is an upstream-sanctioned degradation rather than a Kunlun-only code path.
+    Kunlun reuses the CUDA dispatch key but cannot compile the upstream Triton
+    sampler. The greedy helper preserves fp32 addition, step-dtype rounding,
+    and the current collective layout. Sampling and kept logits still use
+    ``MarkovSampleStep.torch`` with its original Philox stream.
     """
 
-    return cls.torch(**kwargs)
+    from sglang_kunlun.kernels.markov_greedy import markov_greedy_step
+
+    return markov_greedy_step(cls, **kwargs)
 
 
 @register_triton_op(
@@ -3805,8 +3842,18 @@ def memcpy_triton_kernel(
     chunk_size: int,
     BLOCK_SIZE: int,
 ) -> None:
-    """Copy token ranges between tensors for data-parallel attention."""
+    """Copy token ranges between tensors for data-parallel attention.
 
+    `memcpy_token` is dtype-strict on both sides (`Expected
+    dst_tensor.dtype() == src_tensor.dtype()`), while the upstream call site
+    copies the logits gather, where the source can be a different float width
+    from the destination buffer. `copy_` semantics -- cast on the way in -- are
+    what the surrounding code expects, so normalise the source instead of
+    letting the vendor op reject the pair.
+    """
+
+    if src.dtype != dst.dtype:
+        src = src.to(dst.dtype)
     torch.ops.xspeedgate_ops.memcpy_token(dst, src, 0, offset, sz, offset_src)
 
 
@@ -4284,21 +4331,15 @@ def _moe_gate_sqrtsoftplus_log1p(
         )
     ranking = activated + row_bias
     ranking = torch.where(torch.isnan(ranking), float("inf"), ranking)
-    ids = torch.arange(experts, device=scores.device)[None, :]
-    remaining = torch.ones_like(ranking, dtype=torch.bool)
     weights = torch.empty((rows, topk), dtype=torch.float32, device=scores.device)
     indices = torch.empty((rows, topk), dtype=torch.int32, device=scores.device)
-    # Explicit argmax/min-id avoids topk's unspecified tie order, including
-    # all -inf rows. Keep remaining separately so no expert is selected twice.
-    for slot in range(routed):
-        maximum = ranking.max(dim=1, keepdim=True).values
-        winner = torch.where(remaining & (ranking == maximum), ids, experts).min(
-            dim=1, keepdim=True
-        ).values
-        weights[:, slot:slot + 1] = activated.gather(1, winner)
-        indices[:, slot:slot + 1] = winner.to(torch.int32)
-        remaining = remaining & (ids != winner)
-        ranking = ranking.masked_fill(~remaining, -float("inf"))
+    if rows == 0:
+        return weights, indices
+    # Preserve lowest-ID ties, including NaNs promoted to +inf, with one sort
+    # instead of repeated full-width max/min reductions for every expert.
+    winners = torch.argsort(ranking, dim=1, descending=True, stable=True)[:, :routed]
+    weights[:, :routed] = activated.gather(1, winners)
+    indices[:, :routed] = winners.to(torch.int32)
     routed_sum = weights[:, :routed].sum(dim=1, keepdim=True)
     if num_fused_shared_experts:
         weights[:, routed:] = routed_sum / scale
@@ -5462,6 +5503,131 @@ def fill_accepted_out_cache_loc(
         accepted_out_cache_loc[: valid_indices.shape[0]] = out_cache_loc[valid_indices]
 
 
+@register_triton_op(
+    "sglang.kernels.ops.speculative.eagle",
+    "prepare_verify_commit_outputs",
+)
+def prepare_verify_commit_outputs(
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_draft_tokens: int = 0,
+    mamba_track_interval: int = 0,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    Tuple[Optional[torch.Tensor], Optional[torch.Tensor]],
+    Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]],
+]:
+    """Commit one verify step's accept metadata without a Triton launch.
+
+    New in 0.5.22: ``eagle_worker_common.eagle_prepare_for_verify`` calls this
+    launcher on every topk==1 decode step, and ``predict.is_cuda`` is true on
+    Kunlun, so the launch behind it (``eagle.py:183``) hits "0 compatible
+    backends for target (cuda)" on the first EAGLE verify of the decode graph.
+
+    Mirrors ``eagle.py:158-208`` row for row. The launch extent is
+    ``cdiv(max(bs, predict.numel()), 128)`` -- wider than ``bs`` when the draft
+    width dominates -- which is what makes ``ids`` the *whole*
+    ``predict.long()`` while ``last_steps`` / ``correct`` / ``select`` /
+    ``track_steps`` stay ``bs``-sized. The negative-index wrap
+    (``idx + PREDICT_SIZE``) applies to the bonus lookup only: ``last_steps``
+    and the mamba tracking column keep the raw ``accept_index`` entry, which is
+    legitimately -1.
+
+    Returns ``(new_seq_lens, bonus, (last_steps, track_steps), (correct,
+    select, ids))``. With ``num_draft_tokens == 0`` every step buffer is None
+    and only ``(new_seq_lens, bonus)`` comes back; with
+    ``mamba_track_interval == 0`` only ``track_steps`` is None.
+    """
+
+    bs = accept_lens.numel()
+    num_predict = predict.numel()
+    new_seq_lens = torch.empty(
+        (bs,),
+        device=seq_lens.device,
+        dtype=torch.promote_types(seq_lens.dtype, accept_lens.dtype),
+    )
+    bonus = torch.empty((bs,), device=predict.device, dtype=torch.int32)
+    last_steps = track_steps = correct = select = ids = None
+    if num_draft_tokens:
+        last_steps = torch.empty((bs,), device=seq_lens.device, dtype=torch.int64)
+        if mamba_track_interval:
+            track_steps = torch.empty_like(last_steps)
+        correct = torch.empty_like(accept_lens, memory_format=torch.contiguous_format)
+        select = torch.empty_like(last_steps)
+        ids = torch.empty((num_predict,), device=predict.device, dtype=torch.int64)
+    # Same launch guard as the launcher: an empty batch leaves the step buffers
+    # exactly as uninitialised as upstream leaves them.
+    if bs:
+        width = int(num_draft_tokens)
+        rows = torch.arange(bs, device=accept_lens.device, dtype=torch.int64)
+        accepted = accept_lens.to(torch.int64)
+        length = seq_lens.to(torch.int64)
+        # ``accept_index[row, accepted - 1]``: advanced indexing honours the
+        # same (stride(0), stride(1)) pair the kernel indexes with.
+        step = accept_index[rows, accepted - 1].to(torch.int64)
+        if width:
+            last_steps.copy_(step - rows * width)
+            correct.copy_((accepted - 1).to(correct.dtype))
+            select.copy_(rows * width + accepted - 1)
+            # Row extent covers ``predict.numel()``, so ``ids`` is a full copy.
+            ids.copy_(predict.reshape(-1).to(torch.int64))
+            if mamba_track_interval:
+                interval = int(mamba_track_interval)
+                post = length + accepted
+                # Triton's ``//`` truncates toward zero; seq/post are >= 0 here,
+                # so this only pins the semantics rather than changing them.
+                crossing = _trunc_div(length, interval) != _trunc_div(post, interval)
+                tracking_position = torch.clamp(
+                    _trunc_div(post, interval) * interval - length - 1, min=0
+                )
+                tracked = (
+                    accept_index[rows, tracking_position].to(torch.int64)
+                    - rows * width
+                )
+                track_steps.copy_(torch.where(crossing, tracked, -1))
+        # Draft slots store -1 for "no token"; it wraps to the tail of predict.
+        step = torch.where(step < 0, step + num_predict, step)
+        bonus.copy_(predict.reshape(-1)[step].to(torch.int32))
+        new_seq_lens.copy_(length + accepted)
+    if num_draft_tokens:
+        return new_seq_lens, bonus, (last_steps, track_steps), (correct, select, ids)
+    return new_seq_lens, bonus
+
+
+@register_triton_op(
+    "sglang.kernels.ops.speculative.eagle",
+    "prepare_draft_extend_inputs",
+)
+def prepare_draft_extend_inputs(
+    accept_lens: torch.Tensor,
+    predict: torch.Tensor,
+    num_draft_tokens: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the draft-extend selectors without launching the Triton kernel.
+
+    Mirrors ``eagle.py:235-254``: ``correct`` keeps ``accept_lens.dtype`` (the
+    plain ``accepted - 1``), ``select`` is the int64 flat slot of the last
+    accepted token, and ``ids`` is the whole ``predict.long()`` -- the launch
+    extent is ``max(bs, tokens)``, so ``ids`` is always full even when ``bs``
+    is the smaller of the two.
+    """
+
+    bs, tokens = accept_lens.numel(), predict.numel()
+    correct = torch.empty((bs,), device=accept_lens.device, dtype=accept_lens.dtype)
+    select = torch.empty((bs,), device=accept_lens.device, dtype=torch.int64)
+    ids = torch.empty((tokens,), device=predict.device, dtype=torch.int64)
+    if max(bs, tokens):
+        rows = torch.arange(bs, device=accept_lens.device, dtype=torch.int64)
+        accepted = accept_lens.to(torch.int64)
+        correct.copy_((accepted - 1).to(correct.dtype))
+        select.copy_(rows * int(num_draft_tokens) + accepted - 1)
+        ids.copy_(predict.reshape(-1).to(torch.int64))
+    return correct, select, ids
+
+
 def _draft_kv_row_view(
     table: torch.Tensor, row_id: int, row_stride: int
 ) -> torch.Tensor:
@@ -5925,6 +6091,445 @@ def gather_spec_extras(
         else None
     )
     return topk_p, topk_index, bonus_tokens, hidden_states
+
+
+# --- EAGLE tree structure (speculative/tree.py) -----------------------------
+#
+# `sglang/kernels/ops/speculative/tree.py` has no torch fallback: all three of
+# its entry points are `load_jit("speculative_tree", cuda_files=["speculative/
+# tree.cuh"], cuda_wrappers=[...])` handles around the CUDA kernels in
+# `python/sglang/kernels/jit/include/sgl_kernel/speculative/{tree,eagle,ngram}.cuh`
+# (there is no `ops/speculative/data/csrc` in this tree). This host cannot
+# build CUDA, so the first EAGLE draft step on a decode node dies with
+# `RuntimeError: Failed to build JIT module sgl_kernel_jit_speculative_tree`.
+#
+# `build_tree_kernel_efficient` is unconditionally on the draft path:
+# `srt/speculative/eagle_utils.py:213` calls it through
+# `spec_tree.build_tree_kernel_efficient_func` on every step, and
+# `spec_tree.py:32` resolves the CUDA spelling because Kunlun answers
+# `is_cuda()` (the platform registers as OOT with `device_type="cuda"`, see
+# `hooks/server_args.py`). `sgl_kernel.speculative` is a different resolution
+# path (`bootstrap/sgl_kernel_stub.py`), so it does not cover this module.
+#
+# Sized for the deployment (`--speculative-num-steps 3 --speculative-eagle-topk
+# 1 --speculative-num-draft-tokens 4`, decode batch <= 8 per DP rank, i.e. [8, 4]
+# int64 rows and a 4x4 tree mask), so plain vectorised torch is enough. Every
+# loop bound below is a Python int from a shape or an argument: no `.item()`,
+# no host sync, no data-dependent branch, no side stream, so the whole thing
+# rides the caller's stream into the decode graph.
+
+
+@register_jit_op("sglang.kernels.ops.speculative.tree", "build_tree_kernel_efficient")
+def build_tree_kernel_efficient_tree_kunlun(
+    parent_list: torch.Tensor,
+    selected_index: torch.Tensor,
+    verified_seq_len: torch.Tensor,
+    tree_mask: torch.Tensor,
+    positions: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    topk: int,
+    depth: int,
+    draft_token_num: int,
+    tree_mask_mode: int,
+) -> None:
+    """Build the EAGLE tree and its retrieval links, in place.
+
+    Mirrors ``build_tree_efficient`` (``tree.cuh:35-124``) and its bit-packed
+    sibling ``build_tree_efficient_partial_packed`` (``tree.cuh:134-213``). The
+    buffers are preallocated by the caller, so the shape/dtype contract is the
+    wrapper's (``tree.py:30-57``): int64 throughout, a one-byte tree mask.
+    """
+    bs = verified_seq_len.shape[0]
+    dt = int(draft_token_num)
+    if bs == 0:
+        # tree.cuh:90 returns before the launch when the batch is empty.
+        return
+    # Same reasoning as `verify_tree_greedy` above: 0.5.8's
+    # `sgl_kernel.build_tree_kernel_efficient` forwards to
+    # `kunlun_ops.build_tree_efficient` (`sgl-kernel/python/sgl_kernel/
+    # speculative.py:73-100`), which the decode trace shows as
+    # `xpuops3::infer_build_tree_efficient`. The vendor signature takes the
+    # index tensors as int64 and adds `batch_size` / `seq_lens_sum` tail
+    # arguments (`inspect.signature(kunlun_ops.build_tree_efficient)`), and it
+    # has no `tree_mask_mode` -- 0.5.8 passed none either, so the bit-packed
+    # mode stays on the torch path below.
+    if tree_mask_mode == 0:
+        try:
+            from kunlun_ops import build_tree_efficient as _vendor_build_tree
+
+            _vendor_build_tree(
+                parent_list.to(torch.long),
+                selected_index,
+                verified_seq_len.to(torch.int32),
+                tree_mask,
+                positions,
+                retrive_index.to(torch.long),
+                retrive_next_token.to(torch.long),
+                retrive_next_sibling.to(torch.long),
+                int(topk),
+                int(depth),
+                dt,
+                bs,
+                -1,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 - never fail the draft step
+            _log_once(
+                "build_tree_kernel_efficient",
+                "kunlun_ops.build_tree_efficient unavailable (%s); using the "
+                "torch build -- the trace will lack infer_build_tree_efficient",
+                exc,
+            )
+    device = verified_seq_len.device
+    cols = torch.arange(dt, device=device)
+    # The kernel addresses all of these as `bid * draft_token_num + tid`
+    # (tree.cuh:54-67), so they must be contiguous. `view` rather than
+    # `reshape` keeps a wrong layout a loud failure instead of a silent copy.
+    pos = positions.view(bs, dt)
+    ridx = retrive_index.view(bs, dt)
+    nxt = retrive_next_token.view(bs, dt)
+    sib = retrive_next_sibling.view(bs, dt)
+    mask_flat = tree_mask.view(-1)
+
+    # retrive_index is the flat identity map: the link loop stores `bid * dt + i`
+    # for every i in [1, dt) and its tail stores `bid * dt`
+    # (tree.cuh:76-77 and :104).
+    ridx.copy_(torch.arange(bs * dt, device=device).view(bs, dt))
+
+    # ---- ancestor closure ---------------------------------------------------
+    # `selected_index[bid, c] // topk` is the `parent_list` slot of draft node
+    # `c`; slot 0 is the root and ends the walk (tree.cuh:78, :110-113). For
+    # topk=1 every selected column is its own slot, which is why the deployed
+    # chain carries selected_index == arange(dt - 1) and parent_list == [-1, 0, 1]
+    # (`base_spec_worker.py:143-149`).
+    sel = selected_index.view(bs, dt - 1)
+    parent_width = parent_list.shape[1]
+    # Cell column 0 is the root slot of every row -- `tree_mask[token_tree_idx -
+    # 1] = true`, with the rest of the width-`dt` cell cleared first
+    # (tree.cuh:65-68) -- and cell column k > 0 is draft node k - 1.
+    cell = torch.zeros((bs, dt, dt), dtype=torch.bool, device=device)
+    cell[:, :, 0] = True
+
+    if dt > 1:
+        nodes = torch.arange(dt - 1, device=device)
+        slot = sel // topk
+        if parent_width > 0:
+            parent_token = parent_list.view(bs, parent_width).gather(
+                1, slot.clamp(0, parent_width - 1)
+            )
+            # `found` is "the parent token is one of this row's selected
+            # tokens"; `par_col` is the FIRST such column, because tree.cuh:82-88
+            # scans upwards and breaks (the path walk at :116-120 does the same).
+            seen = (sel.unsqueeze(1) == parent_token.unsqueeze(-1)) & (
+                slot < parent_width
+            ).unsqueeze(-1)
+            found = seen.any(dim=-1)
+            par_col = torch.where(seen, nodes.view(1, 1, -1), dt).amin(dim=-1)
+        else:
+            # depth == 1 carries an empty parent_list: nothing can be linked.
+            found = slot < 0
+            par_col = torch.full_like(slot, dt)
+        rooted = slot <= 0
+        # A child's parent cell position is `column + 1`, and 0 for a child of
+        # the root (tree.cuh:79-88). A parent token that is not in
+        # `selected_index` leaves the node without a link, which is the CUDA
+        # `continue` at tree.cuh:89-94; the CUDA itself then walks off the row,
+        # so dropping the link is the only defined reading of that case.
+        par_pos = torch.where(rooted, torch.zeros_like(slot), par_col + 1)
+        par_pos = torch.where(found | rooted, par_pos, torch.full_like(par_pos, -1))
+        next_col = torch.where(found & ~rooted, par_col, torch.full_like(par_col, -1))
+
+        # Path membership: node `c` marks itself and then walks to its parent
+        # until it reaches the root (tree.cuh:106-121). A node's chain is at most
+        # `depth` long by construction, which is what makes the bound static.
+        reach = torch.zeros((bs, dt - 1, dt - 1), dtype=torch.bool, device=device)
+        cursor = nodes.expand(bs, dt - 1)
+        live = torch.ones((bs, dt - 1), dtype=torch.bool, device=device)
+        for _ in range(depth):
+            reach |= live.unsqueeze(-1) & (
+                cursor.unsqueeze(-1) == nodes.view(1, 1, -1)
+            )
+            step = torch.gather(next_col, 1, cursor.clamp(0, dt - 2))
+            live = live & (step >= 0)
+            cursor = torch.where(live, step, cursor)
+
+        # positions[bid, tid] = seq_len + |path(tid - 1)|: the mark count
+        # includes the node itself (tree.cuh:107-122).
+        pos[:, 1:].copy_(reach.sum(dim=-1) + verified_seq_len.unsqueeze(1))
+        cell[:, 1:, 1:].copy_(reach)
+
+        # ---- child lists ----------------------------------------------------
+        # The link loop walks child i from dt - 1 down to 1 and prepends it to
+        # its parent's list (tree.cuh:75-103), so the finished list is ascending:
+        # next_token[p] is the SMALLEST child of p and sibling[i] is the next
+        # larger child, left at its initial -1 for the largest one.
+        child = torch.arange(1, dt, device=device)
+        cell_positions = torch.arange(dt, device=device)
+        linked = par_pos >= 0
+        has_child = linked.unsqueeze(-1) & (
+            par_pos.unsqueeze(-1) == cell_positions.view(1, 1, -1)
+        )
+        first_child = torch.where(has_child, child.view(1, -1, 1), dt).amin(dim=1)
+        nxt.copy_(torch.where(has_child.any(dim=1), first_child, nxt))
+        # Siblings share a parent and differ in index. Both rows must be linked
+        # first, or two unlinked nodes (-1) would look like siblings.
+        same_parent = (
+            linked.unsqueeze(1)
+            & linked.unsqueeze(-1)
+            & (par_pos.unsqueeze(1) == par_pos.unsqueeze(-1))
+        )
+        larger = child.view(1, -1, 1) > child.view(1, 1, -1)
+        sibling = torch.where(same_parent & larger, child.view(1, -1, 1), dt).amin(
+            dim=1
+        )
+        sib[:, 1:].copy_(torch.where(sibling < dt, sibling, sib[:, 1:]))
+
+    pos[:, 0].copy_(verified_seq_len)
+
+    # ---- tree mask ----------------------------------------------------------
+    # Each (request, draft row) owns one width-`dt` cell: the whole row for
+    # QLEN_ONLY, the trailing `dt` columns of a `seq_len + dt` wide row for
+    # FULL_MASK (tree.cuh:60-64). A FULL_MASK row's prefix belongs to the
+    # caller's fill, so only the cells are written here.
+    mode = int(tree_mask_mode)
+    if mode == 0:  # TreeMaskMode.FULL_MASK
+        prefix = torch.cumsum(verified_seq_len, dim=0) - verified_seq_len
+        # Row `tid` of request `bid` starts at
+        # `dt*dt*bid + sum(seq_lens[:bid])*dt + (seq_len + dt)*tid + seq_len`
+        # (tree.cuh:54-64); its width-`dt` cell is that row's tail.
+        base = (
+            dt * dt * torch.arange(bs, device=device)
+            + prefix * dt
+            + verified_seq_len
+        )
+        cell_start = base.unsqueeze(1) + (verified_seq_len + dt).unsqueeze(
+            1
+        ) * cols.view(1, -1)
+        flat = cell_start.unsqueeze(-1) + cols.view(1, 1, -1)
+        mask_flat.index_put_((flat.reshape(-1),), cell.reshape(-1).to(mask_flat.dtype))
+    elif mode == 1:  # TreeMaskMode.QLEN_ONLY
+        mask_flat.view(bs, dt, dt).copy_(cell)
+    else:  # TreeMaskMode.QLEN_ONLY_BITPACKING: one packed row per draft token,
+        # little-endian bits (tree.cuh:155, :196-198). The row width in bytes is
+        # the AOT launcher's rule (tree.cuh:79-81).
+        nbytes = 4 if dt > 16 else (2 if dt > 8 else 1)
+        bits = (cell.to(torch.int64) << cols.view(1, 1, -1)).sum(dim=-1)
+        packed = (
+            (bits.unsqueeze(-1) >> (8 * torch.arange(nbytes, device=device))) & 0xFF
+        ).to(torch.uint8)
+        byte_rows = mask_flat.view(torch.uint8)[: bs * dt * nbytes].view(
+            bs, dt, nbytes
+        )
+        # Byte 0 of a row is a plain store in the kernel and the remaining path
+        # bits are OR'd in (tree.cuh:155, :198). The caller zeroes the buffer
+        # first (`eagle_utils.py` fills 0 in this mode), which is what makes the
+        # OR and a store agree.
+        byte_rows[:, :, 0].copy_(packed[:, :, 0])
+        if nbytes > 1:
+            byte_rows[:, :, 1:].bitwise_or_(packed[:, :, 1:])
+
+
+_LOGGED_ONCE: set = set()
+
+
+def _log_once(key: str, msg: str, *args) -> None:
+    if key in _LOGGED_ONCE:
+        return
+    _LOGGED_ONCE.add(key)
+    logger.warning(msg, *args)
+
+
+@register_jit_op("sglang.kernels.ops.speculative.tree", "verify_tree_greedy")
+def verify_tree_greedy_tree_kunlun(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    target_predict: torch.Tensor,
+) -> None:
+    """Accept the longest matching path greedily, in place.
+
+    Mirrors ``VerifyTreeGreedy`` (``eagle.cuh:215-256``). Every buffer is
+    written by the caller and every write below is unconditional on the row
+    level, so a row that stops accepting keeps whatever the step before it left.
+    """
+    bs, dt = candidates.shape
+    if bs == 0:
+        # eagle.cuh:154 returns before the launch when the batch is empty.
+        return
+    # 0.5.8 ran the vendor kernel here, not this torch traversal: its
+    # `sgl_kernel.verify_tree_greedy` is a two-line wrapper around
+    # `kunlun_ops.verify_tree_greedy` (`sgl-kernel/python/sgl_kernel/
+    # speculative.py:47-70`), which the decode trace shows as
+    # `xpuops3::infer_verify_tree_greedy`. Keeping the torch version as the
+    # primary path costs that operator AND one device sync per tree node (three
+    # `.item()` calls each), so the vendor op leads and this stays as fallback.
+    # The kernel wants `target_predict` 2-D (`_xflashinfer_sampling.py:1390`
+    # raises "Tensor target_predict has wrong dim! Expected 2") while the
+    # traversal below needs it flat.
+    try:
+        from kunlun_ops import verify_tree_greedy as _vendor_verify
+
+        _vendor_verify(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            target_predict.reshape(bs, -1),
+        )
+        return
+    except Exception as exc:  # noqa: BLE001 - never fail verify
+        _log_once(
+            "verify_tree_greedy",
+            "kunlun_ops.verify_tree_greedy unavailable (%s); using the torch "
+            "traversal -- the trace will lack infer_verify_tree_greedy",
+            exc,
+        )
+    spec = accept_index.shape[1]
+    device = candidates.device
+    ridx = retrive_index.view(bs, dt)
+    nxt = retrive_next_token.view(bs, dt)
+    sib = retrive_next_sibling.view(bs, dt)
+    acc = accept_index.view(bs, spec)
+    pred = predicts.view(-1)
+    # `target_predict` is addressed FLATLY by a retrieve index -- the kernel uses
+    # `target_predict[last_accepted_retrive_idx]` (eagle.cuh:239), i.e. a global
+    # `bid * dt + col` offset, not a 2-D row/col pair.
+    target = target_predict.view(-1)
+    flat_limit = bs * dt - 1
+
+    last = ridx[:, 0].clone()
+    acc[:, 0].copy_(last.to(acc.dtype))
+    num = torch.zeros(bs, dtype=torch.int64, device=device)
+    cursor = torch.zeros(bs, dtype=torch.int64, device=device)
+    live = torch.ones(bs, dtype=torch.bool, device=device)
+    acc_col = torch.arange(spec, device=device)
+
+    # The level loop (eagle.cuh:234) and the sibling walk (:236-251) are serial
+    # per block in the kernel. Both bounds are static here, so the traversal
+    # unrolls into per-row ops and stays capturable.
+    for _ in range(spec - 1):
+        step = torch.gather(nxt, 1, cursor.clamp(0, dt - 1).unsqueeze(1)).squeeze(1)
+        cursor = torch.where(live, step, cursor)
+        matched = torch.zeros(bs, dtype=torch.bool, device=device)
+        for _ in range(dt):
+            valid = live & (cursor >= 0) & (~matched)
+            safe = torch.where(valid, cursor, torch.zeros_like(cursor))
+            draft_index = torch.gather(ridx, 1, safe.unsqueeze(1)).squeeze(1)
+            draft_token = torch.gather(candidates, 1, safe.unsqueeze(1)).squeeze(1)
+            target_token = torch.gather(target, 0, last.clamp(0, flat_limit))
+            hit = valid & (draft_token == target_token)
+            # predicts[last] = target (eagle.cuh:243). Scattering the gathered
+            # value back for non-hits keeps the write shape constant.
+            keep = torch.gather(pred, 0, last.clamp(0, flat_limit))
+            pred.scatter_(
+                0,
+                last.clamp(0, flat_limit),
+                torch.where(hit, target_token.to(pred.dtype), keep),
+            )
+            num = num + hit.to(num.dtype)
+            # accept_index[bx * spec + num] = draft_index, after the increment
+            # (eagle.cuh:244-245).
+            slot = num.clamp(max=spec - 1)
+            acc.copy_(
+                torch.where(
+                    hit.unsqueeze(1) & (acc_col.view(1, -1) == slot.unsqueeze(1)),
+                    draft_index.to(acc.dtype).unsqueeze(1),
+                    acc,
+                )
+            )
+            last = torch.where(hit, draft_index, last)
+            matched = matched | hit
+            # Unmatched drafts advance to the next sibling (eagle.cuh:249);
+            # `cursor` keeps the accepted index on a hit, so the next level
+            # starts from its child.
+            cursor = torch.where(
+                valid & (~hit),
+                torch.gather(sib, 1, safe.unsqueeze(1)).squeeze(1),
+                cursor,
+            )
+        # `while (cur_index != -1)` only exits on an exhausted sibling list
+        # (eagle.cuh:252), which is exactly "nothing matched at this level".
+        live = live & matched
+
+    accept_token_num.copy_(num.to(accept_token_num.dtype))
+    # Final unconditional write of the token after the accepted prefix
+    # (eagle.cuh:255) -- with zero accepts this is the root's own prediction.
+    pred.scatter_(
+        0,
+        last.clamp(0, flat_limit),
+        torch.gather(target, 0, last.clamp(0, flat_limit)).to(pred.dtype),
+    )
+
+
+@register_jit_op(
+    "sglang.kernels.ops.speculative.tree", "reconstruct_indices_from_tree_mask"
+)
+def reconstruct_indices_from_tree_mask_tree_kunlun(
+    tree_mask: torch.Tensor,
+    verified_seq_len: torch.Tensor,
+    positions: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    batch_size: int,
+    draft_token_num: int,
+) -> None:
+    """Rebuild ngram retrieval links and positions from a tree mask, in place.
+
+    Mirrors ``reconstructIndicesFromTreeMask`` (``ngram.cuh:26-91``). The mask is
+    one flat ``[bs, dt, dt]`` row-major tile per request (``ngram.cuh:41-45``)
+    where ``mask[b, i, j]`` says node ``j`` is an ancestor-or-self of node ``i``
+    -- the same reading ``reconstruct_tree.py:21-29`` documents for the existing
+    triton port of this contract.
+    """
+    bs = int(batch_size)
+    dt = int(draft_token_num)
+    if bs == 0:
+        return
+    device = tree_mask.device
+    nodes = torch.arange(dt, device=device)
+    # A one-byte mask read as bytes, exactly as the kernel casts it
+    # (``tree.cuh:186-188`` checks 8 bits, not the element type).
+    ancestor = tree_mask.view(-1)[: bs * dt * dt].view(bs, dt, dt).to(torch.bool)
+    # The depth scan runs j from i - 1 down to 0 (``ngram.cuh:50``), so the
+    # diagonal is not part of it: `below` holds the strict ancestors.
+    strict = nodes.view(1, -1) < nodes.view(-1, 1)
+    below = ancestor & strict
+    positions.view(bs, dt).copy_(below.sum(dim=-1) + verified_seq_len.unsqueeze(1))
+    # retrive_index is the flat identity map (``ngram.cuh:58``).
+    retrive_index.view(bs, dt).copy_(torch.arange(bs * dt, device=device).view(bs, dt))
+    # parent[i] = largest j < i that is an ancestor of i; the downward scan at
+    # ``ngram.cuh:50-56`` keeps its first hit, and -1 means a root.
+    neg = torch.full_like(nodes, -1)
+    parent = torch.where(below, nodes.view(1, 1, -1), neg.view(1, 1, -1)).amax(dim=-1)
+    # First child of tid = smallest k > tid with mask[b, k, tid]
+    # (``ngram.cuh:61-67``). transposing puts column `tid` on the row axis.
+    child_of = ancestor.transpose(1, 2)
+    is_child = child_of & (nodes.view(1, -1) > nodes.view(-1, 1))
+    first_child = torch.where(is_child, nodes.view(1, -1), dt).amin(dim=-1)
+    retrive_next_token.view(bs, dt).copy_(
+        torch.where(first_child < dt, first_child, neg)
+    )
+    # Sibling of tid = smallest k > tid whose parent is tid's parent, and -1 for
+    # a root (``ngram.cuh:70-90``). The kernel's inner scan over
+    # ``parent + 1 .. k - 1`` is the same predicate: no ancestor strictly between
+    # k and its parent means k's deepest ancestor IS that parent.
+    same_parent = (
+        (parent.unsqueeze(-1) == parent.unsqueeze(1))
+        & (parent.unsqueeze(1) >= 0)
+        & (nodes.view(1, -1) > nodes.view(-1, 1))
+    )
+    sibling = torch.where(same_parent, nodes.view(1, -1), dt).amin(dim=-1)
+    retrive_next_sibling.view(bs, dt).copy_(torch.where(sibling < dt, sibling, neg))
 
 
 def _chain_block_verification_select(
@@ -7076,6 +7681,24 @@ def fused_dsa_draft_extend_metadata(
     )
 
 
+_CP_SPLIT_FALLBACK_LOGGED = False
+
+
+def _log_cp_split_fallback(exc: BaseException) -> None:
+    """Warn once that the torch rewrite is standing in for the vendor op."""
+    global _CP_SPLIT_FALLBACK_LOGGED
+    if _CP_SPLIT_FALLBACK_LOGGED:
+        return
+    _CP_SPLIT_FALLBACK_LOGGED = True
+    logger.warning(
+        "kunlun: xspeedgate_ops.nsa_cp_round_robin_split_q_seqs_kernel unusable "
+        "(%s); falling back to the torch split. The split is identical; the "
+        "trace then shows cumsum / nonzero / index_select instead of one "
+        "split-q-seqs launch.",
+        exc,
+    )
+
+
 @register_triton_op(
     "sglang.kernels.ops.attention.dsa.cp_split",
     "_dsa_cp_interleave_q_seqs_kernel",
@@ -7089,9 +7712,39 @@ def dsa_cp_interleave_q_seqs_kernel(
     cp_rank: int,
     **kwargs,
 ) -> None:
-    """Round-robin CP q-sequence split, without the sequential Triton loop."""
+    """Round-robin CP q-sequence split.
+
+    0.5.8 ran upstream's Triton kernel here, under its old name
+    (``sglang/srt/layers/attention/nsa/utils.py:209-245``; the baseline prefill
+    trace shows the bare Triton symbol
+    ``nsa_cp_round_robin_split_q_seqs_kernel`` launched through
+    ``triton/backends/xpu/driver.py:376`` from
+    ``patch/layers/attention/nsa_backend.py:625 init_forward_metadata``).
+    0.5.23 renamed the kernel to ``_dsa_cp_interleave_q_seqs_kernel``
+    (``sglang/kernels/ops/attention/dsa/cp_split.py:11``) and reaches it from
+    ``layers/cp/interleave.py:263 InterleaveCPStrategy.shard_per_request``.
+
+    The vendor op has the identical contract -- same six arguments, same
+    "write the non-empty rows, in order" semantics
+    (``xspeedgate_ops/_attention.pyi:206-238``) -- so prefer it over the torch
+    rewrite below, which needs cumsum + nonzero + two index_selects to express
+    the same prefix recurrence.
+    """
     if out_seqs.numel() == 0:
         return
+
+    try:
+        torch.ops.xspeedgate_ops.nsa_cp_round_robin_split_q_seqs_kernel(
+            in_seqs.contiguous(),
+            out_seqs,
+            bs_idx,
+            tokens,
+            cp_size,
+            cp_rank,
+        )
+        return
+    except Exception as exc:  # noqa: BLE001 - keep serving on the torch path
+        _log_cp_split_fallback(exc)
 
     lengths = in_seqs[:tokens].to(torch.int64)
     total = torch.cumsum(lengths, dim=0)
@@ -8047,7 +8700,12 @@ DSV4_KV_DIM = 512
 
 @register_jit_op(
     "sglang.kernels.ops.attention.dsv4.dequant_k_cache",
-    "dequantize_k_cache_paged",
+    # 0.5.23 renamed the V4 wrapper to `..._dsv4` and added a separate
+    # `dequantize_k_cache_paged_v41` it dispatches to for the packed V4.1
+    # layouts. Registering the old name only produced a "not found" warning, and
+    # upstream's own wrapper then subscripted its `@triton.jit` kernel --
+    # "'function' object is not subscriptable" at the first sparse prefill.
+    "dequantize_k_cache_paged_dsv4",
 )
 def dsv4_dequantize_k_cache_paged_kunlun(
     quant_k_cache: torch.Tensor,
@@ -8134,6 +8792,17 @@ def dsv4_dequantize_k_cache_paged_kunlun(
 # `accept_sampling_matrix.sh`. It reproduces identically on 0.5.22, so this is a
 # pre-existing Kunlun gap, not upgrade drift -- and it was invisible until an
 # acceptance 口径 used temperature 1.0 with top_p.
+#
+# 0.5.23 widened the reach: EAGLE's own verify sampler now takes the same two
+# names from this module (``srt/speculative/eagle_utils.py:11``, used at :729 /
+# :737 inside ``eagle_sample``'s non-greedy branch), where 0.5.19 imported them
+# function-locally ``from sgl_kernel`` -- the one spelling ``sgl_kernel_stub``
+# already covered. So on 0.5.23 this registration, not the stub, is what keeps
+# plain ``--speculative-algorithm EAGLE`` off flashinfer; without it GLM-5.3
+# decode at temperature 1.0 with top_p/top_k collapses to ``accept len 1.00``.
+# ``_patch_symbol`` covers the consumer in both import orders: it rebinds the
+# canonical attribute here, and ``_replace_imported_bindings`` rewrites any
+# ``sglang.*`` module that already copied the LazyImport by value.
 @register_jit_op("sglang.kernels.ops.sampling.renorm", "top_k_renorm_prob")
 def top_k_renorm_prob_kunlun(
     probs: torch.Tensor, top_k: torch.Tensor

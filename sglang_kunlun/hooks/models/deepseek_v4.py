@@ -253,11 +253,27 @@ def moe_gate_forward_kunlun(
     implementation (`Gate.forward`: `linear(x.float(), weight.float())`). V4.1
     has 384 experts + top-6; fp16 only has about 3 decimal significant digits,
     so `sqrtsoftplus` scores that are close together can pick the wrong expert.
+
+    DSV4's direct half-precision router GEMM used to be a *second* (``AROUND``)
+    hook on this same target, in ``deepseek_v4_precision.py``: the registry
+    applied this ``REPLACE`` first and then wrapped it, so that fast path ran
+    ahead of this body and fell through to it otherwise. Two hooks on one
+    target is forbidden, so the branch is folded in below in exactly that
+    order. GLM-5.3 keeps the fp32 route -- its ``MoEGate.is_deepseek_v4`` is
+    False (only ``srt/models/deepseek_v4.py:3163`` passes
+    ``is_deepseek_v4=True``; ``GlmMoeDsaForCausalLM`` subclasses
+    ``DeepseekV2ForCausalLM``).
     """
 
     del gemm_output_zero_allocator, forward_batch
     if hidden_states.dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise TypeError(f"unsupported Kunlun MoE gate input dtype: {hidden_states.dtype}")
+    if (
+        self.is_deepseek_v4
+        and hidden_states.dtype == self.weight.dtype
+        and hidden_states.dtype in (torch.bfloat16, torch.float16)
+    ):
+        return hidden_states @ self.weight.T
     return hidden_states.float() @ self.weight.float().T
 
 
@@ -642,3 +658,24 @@ def allow_vision_with_cp(original_fn, self, *args, **kwargs):
     finally:
         _dsv4.get_parallel = real_get_parallel
         _dsv4.get_moe_a2a_backend = real_get_a2a
+
+
+@plugin_hook(
+    "sglang.srt.models.deepseek_v4.DeepseekV4ForCausalLM.get_image_feature",
+    type=HookType.AROUND,
+)
+def get_image_feature_unwrap_shm_kunlun(original_fn, self, items):
+    """Materialize warmup image features that bypass the request receiver."""
+    from sglang.srt.managers.mm_utils import ShmPointerMMData
+
+    def unwrap(value):
+        if isinstance(value, ShmPointerMMData):
+            return value.materialize()
+        if isinstance(value, (tuple, list)):
+            return type(value)(unwrap(item) for item in value)
+        return value
+
+    for item in items:
+        if getattr(item, "feature", None) is not None:
+            item.feature = unwrap(item.feature)
+    return original_fn(self, items)

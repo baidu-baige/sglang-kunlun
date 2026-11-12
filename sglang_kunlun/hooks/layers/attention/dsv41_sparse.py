@@ -200,8 +200,9 @@ def scores_kunlun(original_fn, self, q, k, weights):
     -- the new form is not only faster but **closer to the fp32 reference than
     upstream** (fp16's 10 mantissa bits beat bf16's 7).
 
-    Precision gate (**on by default**, `DSV4_INDEXER_SCORES_FP16=0` turns it off
-    for comparison):
+    Default scoring now uses bf16 to match the fused path and 0519 ed72476.
+    ``DSV4_INDEXER_SCORES_FP16=1`` selects the older fp16 calculation described
+    by the historical measurements below; ``0`` delegates to upstream.
 
     * ifeval limit=300 (268 examples scored): the two versions' main metrics are
       character-for-character identical: `prompt_level_strict` both 89.9%,
@@ -248,7 +249,8 @@ def scores_kunlun(original_fn, self, q, k, weights):
       caller's ``masked_fill`` line, so the semantics are bit-for-bit comparable
       to the bmm version above.
     """
-    if os.environ.get("DSV4_INDEXER_SCORES_FP16", "1") != "1":
+    scores_mode = os.environ.get("DSV4_INDEXER_SCORES_FP16", "auto")
+    if scores_mode == "0":
         return original_fn(self, q, k, weights)
 
     if os.environ.get("DSV4_INDEXER_SCORES_FUSED", "1") != "0" and _fused_logits_usable(
@@ -292,6 +294,148 @@ def scores_kunlun(original_fn, self, q, k, weights):
     # the MAC, unlike the elementwise version which rounds each product to fp16
     # first, so it is more accurate than the fp16 version of
     # `(s.relu() * w).sum()`.
-    s = torch.einsum("bhd,nd->bhn", q, k.to(q.dtype))
+    dt = q.dtype if scores_mode == "1" else torch.bfloat16
+    s = torch.einsum("bhd,nd->bhn", q.to(dt), k.to(dt))
     out = torch.bmm(weights.unsqueeze(1).to(s.dtype), s.relu())
     return out.squeeze(1).float()
+
+
+# ``dsv41_sparse.py`` hardcodes these linears to bf16 weights (``dtype=torch.bfloat16``
+# / ``params_dtype=torch.bfloat16``), but this deployment runs ``--dtype float16``, so
+# ``F.linear(fp16_x, bf16_weight)`` raises a dtype mismatch on XPU. The two that go
+# through ``Linear.forward`` get a bf16-compute wrapper below.
+_SPARSE_BF16_COMPUTE_ATTRS = ("wkv", "weights_proj")
+# ``DSV4_SPARSE_WEIGHT_DTYPE=model`` switches back to the old "downcast weights to
+# model dtype" behavior for A/B.
+_SPARSE_LINEAR_ATTRS = ("wkv", "wgate", "wkv_gate", "weights_proj")
+_LOGGED_DTYPE_ALIGN = False
+
+
+def _cast_result(res, out_dtype):
+    """Cast a Linear result (tensor or ``(out, bias)``) back to ``out_dtype``."""
+    if isinstance(res, torch.Tensor):
+        return res if res.dtype == out_dtype else res.to(out_dtype)
+    if isinstance(res, tuple) and res and isinstance(res[0], torch.Tensor):
+        if res[0].dtype != out_dtype:
+            return (res[0].to(out_dtype),) + tuple(res[1:])
+    return res
+
+
+def _install_bf16_compute(linear, out_dtype) -> bool:
+    """Wrap ``forward``: upcast x to the weight dtype for the GEMM, cast back.
+
+    Only the instance's ``forward`` is wrapped (``nn.Module._call_impl`` reads
+    ``self.forward``); the class and the weights are untouched. Idempotent.
+    """
+    if getattr(linear, "_kunlun_bf16_compute", False):
+        return False
+    weight = getattr(linear, "weight", None)
+    if not (isinstance(weight, torch.Tensor) and weight.is_floating_point()):
+        return False
+
+    w_dtype = weight.dtype
+    inner = linear.forward
+
+    def forward(x, *args, **kwargs):
+        if isinstance(x, torch.Tensor) and x.dtype != w_dtype:
+            x = x.to(w_dtype)
+        return _cast_result(inner(x, *args, **kwargs), out_dtype)
+
+    linear.forward = forward
+    linear._kunlun_bf16_compute = True
+    return True
+
+
+@plugin_hook(
+    "sglang.srt.model_executor.model_runner.ModelRunner.load_model",
+    type=HookType.AFTER,
+)
+def align_dsv41_sparse_weight_dtype_kunlun(result, self, *args, **kwargs):
+    """Run the bf16-hardcoded `dsv41_sparse` linears as bf16 GEMMs under fp16.
+
+    The public output dtype stays at the model dtype; under a bf16 deployment
+    this is a no-op. Casting the result back to fp16 is mandatory: the D-side
+    requires `head_w` dtype to match `q`, otherwise the low-ratio indexer (and
+    cuda-graph capture) breaks. Only the matmul precision changes, not the dtype
+    contract.
+    """
+    global _LOGGED_DTYPE_ALIGN
+
+    model = getattr(self, "model", None)
+    dtype = self.model_config.dtype
+    if model is None or dtype not in (torch.float16, torch.bfloat16):
+        return None
+
+    from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
+        DeepseekV41Compressor,
+        DeepseekV41Indexer,
+    )
+
+    downcast = os.environ.get("DSV4_SPARSE_WEIGHT_DTYPE", "bf16") == "model"
+    touched, names = 0, set()
+    for module in model.modules():
+        if not isinstance(module, (DeepseekV41Compressor, DeepseekV41Indexer)):
+            continue
+        if downcast:
+            for attr in _SPARSE_LINEAR_ATTRS:
+                linear = getattr(module, attr, None)
+                weight = getattr(linear, "weight", None)
+                if not (
+                    isinstance(weight, torch.Tensor)
+                    and weight.is_floating_point()
+                    and weight.dtype != dtype
+                ):
+                    continue
+                # `.data` is detached from autograd (inference runs without grad);
+                # `copy_` would cast into bf16 storage and keep the weight bf16.
+                linear.weight.data = weight.data.to(dtype)
+                touched += 1
+                names.add(attr)
+            continue
+        for attr in _SPARSE_BF16_COMPUTE_ATTRS:
+            linear = getattr(module, attr, None)
+            if linear is not None and _install_bf16_compute(linear, dtype):
+                touched += 1
+                names.add(attr)
+
+    if touched and not _LOGGED_DTYPE_ALIGN:
+        _LOGGED_DTYPE_ALIGN = True
+        logger.warning(
+            "[kunlun] dsv41_sparse: %s (%d linears: %s; out dtype %s)",
+            (
+                "downcast bf16 weights to model dtype (pure fp16 matmul)"
+                if downcast
+                else "bf16 matmul with bf16 weights, result cast back"
+            ),
+            touched,
+            ", ".join(sorted(names)),
+            dtype,
+        )
+
+
+@plugin_hook(
+    "sglang.kernels.ops.gemm.small_gemm_bf16.n32k5120_gemm_bf16",
+    type=HookType.AROUND,
+)
+@plugin_hook(
+    "sglang.kernels.ops.gemm.small_gemm_bf16.n128k512_gemm_bf16",
+    type=HookType.AROUND,
+)
+def small_gemm_bf16_dtype_guard_kunlun(original_fn, x, w, out=None):
+    """Decode small GEMMs for ``weights_proj`` / ``forward_wk``.
+
+    These kernels carry a ``with_dtype<bf16_t>`` check and bypass
+    ``Linear.forward``, so apply the same "upcast x to bf16 -> run kernel ->
+    cast result back to x's dtype" here. When the weight is not bf16
+    (``DSV4_SPARSE_WEIGHT_DTYPE=model``) fall back to ``F.linear``.
+    """
+    if w.dtype == torch.bfloat16:
+        xb = x if x.dtype == torch.bfloat16 else x.to(torch.bfloat16)
+        if out is not None and out.dtype == torch.bfloat16:
+            return original_fn(xb, w, out)
+        y = original_fn(xb, w, None)
+        if out is not None:
+            return out.copy_(y)
+        return y if y.dtype == x.dtype else y.to(x.dtype)
+    y = torch.nn.functional.linear(x.to(w.dtype), w)
+    return y if out is None else out.copy_(y)

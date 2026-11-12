@@ -45,7 +45,7 @@ def install() -> None:
         added.append(name)
 
     if added:
-        logger.info(
+        logger.debug(
             "sglang-kunlun: registered %d compat env fields: %s",
             len(added),
             ", ".join(added),

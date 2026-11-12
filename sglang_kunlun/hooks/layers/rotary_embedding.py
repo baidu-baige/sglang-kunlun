@@ -31,6 +31,16 @@ def rotary_embedding_forward_kunlun(
     positions = positions.flatten()
     num_tokens = positions.shape[0]
 
+    # The vendor rotary requires q and k to share one dtype (`RuntimeError:
+    # query and key must have same dtype`). On this platform the two arrive from
+    # different producers: the EAGLE draft's projection emits the model dtype
+    # while the target's attention path emits bf16 from the vendor kernels
+    # (measured elsewhere in this plugin: `x=bf16 residual=fp16`). `key` is the
+    # tensor that carries the stream, so q is normalised to it rather than the
+    # other way round.
+    if query.dtype != key.dtype:
+        query = query.to(key.dtype)
+
     query_shape = query.shape
     query = query.view(num_tokens, -1, self.head_size)
     key_shape = key.shape

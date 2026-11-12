@@ -25,8 +25,12 @@ def _enable_kunlun_attention_choice(module) -> None:
         for meta in getattr(raw_annotation, "__metadata__", ()) or ():
             choices = getattr(meta, "choices", None)
             if isinstance(choices, list):
-                if "fp16" not in choices:
-                    choices.append("fp16")
+                # ``fp16``: Kunlun runs the model dtype as fp16. ``int8``: the
+                # GLM-5.3 w4a8 deployment's KV cache (0.5.8 accepts it; the
+                # 0.5.23 arg group does not list it).
+                for extra in ("fp16", "int8"):
+                    if extra not in choices:
+                        choices.append(extra)
                 appended = True
         if not appended and isinstance(raw_annotation, str):
             choices_start = raw_annotation.find("choices=[")
@@ -34,11 +38,11 @@ def _enable_kunlun_attention_choice(module) -> None:
             if (
                 choices_start >= 0
                 and choices_end > choices_start
-                and "'fp16'" not in raw_annotation[choices_start:choices_end]
+                and "'int8'" not in raw_annotation[choices_start:choices_end]
             ):
                 annotations["kv_cache_dtype"] = (
                     raw_annotation[:choices_end]
-                    + ", 'fp16'"
+                    + ", 'fp16', 'int8'"
                     + raw_annotation[choices_end:]
                 )
     except Exception:
@@ -154,6 +158,53 @@ class _ServerArgsFinder(importlib.abc.MetaPathFinder):
         return None
 
 
+def _quiet_plugin_loader() -> None:
+    """Demote the upstream plugin loader's per-process banner.
+
+    ``sglang.srt.plugins`` logs "Available plugins for group ...", "Loaded
+    plugin ...", "OOT platform plugin activated ..." at INFO, for two groups, in
+    each of the ~10 processes a PD role spawns -- 33 identical lines per boot.
+    This has to run here rather than from a hook module: the banner is printed
+    *while* loading our plugin, so by the time any hook executes it has already
+    been emitted. Warnings and errors from that logger still come through.
+    """
+    import logging
+
+    logging.getLogger("sglang.srt.plugins").setLevel(logging.WARNING)
+
+
+def _load_sglang_plugins_early() -> None:
+    """Run upstream's own plugin loader before the arg-resolution pipeline.
+
+    0.5.23 applies OOT hooks when ``sglang.srt.plugins.load_plugins()`` runs,
+    and upstream's own docstring says it "should be called early in every
+    process (main, engine core, workers)" -- but nothing in the serving path
+    calls it; the hooks only land as a side effect of whoever first resolves
+    ``get_platform()``.
+
+    That made hook application depend on flag order, and the PD pair diverged:
+    the prefill node resolves the platform early (``--disable-cuda-graph`` ->
+    ``parse_cuda_graph_config``), so its 224 hooks were applied before
+    ``resolve_once()``; the decode node's first ``get_platform()`` call happens
+    *inside* ``_dsa_kv_cache_dtype_default`` itself (``overrides.py:500``
+    reads ``get_platform().is_npu``), so the hooks landed while that very frame
+    was already executing the unhooked original -- 0 ``Applied ... hook`` lines
+    in the decode log and ``AssertionError: DeepSeek DSA only supports
+    bf16/bfloat16 or fp8_e4m3 kv_cache_dtype``, with the fix for that assert
+    sitting right there in the tree, installed on nothing.
+
+    Calling it here, from the shim that already runs in every process before
+    argparse, makes hook application deterministic and order-independent.
+    ``load_plugins()`` is idempotent (``_plugins_loaded`` guard), so the later
+    implicit call is a no-op.
+    """
+    try:
+        from sglang.srt.plugins import load_plugins
+    except Exception:  # upstream too old, or sglang not importable yet
+        return
+    load_plugins()
+
+
 _startup_args = [*getattr(sys, "orig_argv", ()), *sys.argv]
 _is_package_tool = any(
     arg == "pip"
@@ -181,6 +232,8 @@ if (
             _enable_kunlun_attention_choice(sys.modules["sglang.srt.server_args"])
         elif not any(isinstance(finder, _ServerArgsFinder) for finder in sys.meta_path):
             sys.meta_path.insert(0, _ServerArgsFinder())
+        _quiet_plugin_loader()
+        _load_sglang_plugins_early()
     except Exception as exc:
         if os.environ.get("SGLANG_KUNLUN_SHIM_DEBUG"):
             print(f"[kunlun-shim] sitecustomize failed: {exc}", file=sys.stderr)

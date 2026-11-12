@@ -101,30 +101,11 @@ def hc_post_kunlun(
     return out
 
 
-@plugin_hook(
-    "sglang.srt.models.deepseek_v2.MoEGate.forward",
-    type=HookType.AROUND,
-)
-def moe_gate_forward_half_precision_kunlun(
-    original_fn,
-    self,
-    hidden_states,
-    gemm_output_zero_allocator=None,
-    forward_batch=None,
-):
-    """Match the direct half-precision DSV4 router GEMM contract."""
-    if (
-        self.is_deepseek_v4
-        and hidden_states.dtype == self.weight.dtype
-        and hidden_states.dtype in (torch.bfloat16, torch.float16)
-    ):
-        return hidden_states @ self.weight.T
-    return original_fn(
-        self,
-        hidden_states,
-        gemm_output_zero_allocator,
-        forward_batch,
-    )
+# NOTE: the DSV4 half-precision router GEMM used to live here as a second
+# (AROUND) @plugin_hook on ``sglang.srt.models.deepseek_v2.MoEGate.forward``,
+# wrapping the REPLACE in ``hooks/models/deepseek_v4.py``. Two hooks on one
+# target is forbidden, so the branch now sits inside that single REPLACE
+# (``moe_gate_forward_kunlun``), in the same order the registry applied them.
 
 
 def _restore_requested_fp16_parameter_dtype(*linears):

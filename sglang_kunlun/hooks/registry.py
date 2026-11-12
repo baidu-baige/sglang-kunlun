@@ -13,6 +13,9 @@ import logging
 logger = logging.getLogger(__name__)
 
 HOOK_MODULES = (
+    # First: it only flips one module flag, and every later hook that runs under
+    # a profiler depends on it (see the module docstring).
+    "sglang_kunlun.hooks.custom_op_eager",
     "sglang_kunlun.hooks.utils.common",
     "sglang_kunlun.hooks.server_args",
     # Release hook for startup argument validation: must register before any arg_groups parsing.

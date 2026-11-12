@@ -19,9 +19,15 @@ validated path for, and left raising for every other one: a pool family that
 really has no Kunlun implementation must keep failing loudly at boot rather than
 building CUDA-assuming classes.
 
-Scoped to the configurator's own module binding (it does
-``from sglang.srt.platforms.interface import reject_out_of_tree_path`` at import
-time) so every other caller of the guard keeps the upstream behaviour.
+Hooked on the configurator's own module binding, which is where the guard is
+called from (``kv_cache_configurator`` does ``from sglang.srt.platforms.interface
+import reject_out_of_tree_path`` at import time, and its call sites read that
+module global). Note that the override is *not* confined to that module:
+``HookRegistry._apply_target`` follows the ``setattr`` with ``_propagate_patch``,
+which rebinds every module-level alias of the same function object -- including
+``sglang.srt.platforms.interface.reject_out_of_tree_path`` itself. So the
+delegation below must use the ``original_fn`` the AROUND hook is handed; a
+re-import of the upstream name resolves to this wrapper again and recurses.
 """
 
 from __future__ import annotations
@@ -48,9 +54,11 @@ _announced: set[str] = set()
 
 @plugin_hook(
     "sglang.srt.mem_cache.kv_cache_configurator.reject_out_of_tree_path",
-    type=HookType.REPLACE,
+    type=HookType.AROUND,
 )
-def reject_out_of_tree_path_kunlun(platform, *, subsystem: str) -> None:
+def reject_out_of_tree_path_kunlun(
+    original_fn, platform, *, subsystem: str
+) -> None:
     """Allow the pool families Kunlun implements; keep rejecting the rest."""
     if subsystem in _KUNLUN_SUPPORTED_SUBSYSTEMS:
         if subsystem not in _announced:
@@ -62,6 +70,6 @@ def reject_out_of_tree_path_kunlun(platform, *, subsystem: str) -> None:
             )
         return
 
-    from sglang.srt.platforms.interface import reject_out_of_tree_path
-
-    reject_out_of_tree_path(platform, subsystem=subsystem)
+    # Carry the upstream guard through the call: re-importing it by name
+    # resolves to this wrapper (see the module docstring) and recurses.
+    return original_fn(platform, subsystem=subsystem)

@@ -319,8 +319,40 @@ def engram_open_shared_fd_compat(original_fn, self, nbytes, name):
 _ENGRAM_GATE_MODE = os.environ.get("SGLANG_KUNLUN_ENGRAM_GATE", "fused")
 
 
+@plugin_hook("sglang.srt.layers.engram._sorted_host_reads", type=HookType.REPLACE)
+def sorted_host_reads_kunlun(device: int = 0) -> bool:
+    """Answer the host-page-table probe without asking the NVIDIA driver.
+
+    0.5.23 added `_sorted_host_reads`, which decides whether host-table rows are
+    read in address order by querying
+    `CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES` through
+    `cuda.bindings.driver`. There is no such driver here, so building the first
+    engram layer died at model load with
+    `RuntimeError: Failed to get cuGetProcAddress_v2` -- before any Kunlun code
+    ran, during `EngramEmbedding.__init__` -> `_init_host_table`.
+
+    False is the correct answer and not merely a safe one: it is what upstream
+    returns for HIP and what `__init__` defaults to (`engram.py:1011`), and the
+    only consumer is the `sort_ids` argument of the gather, which the Kunlun
+    implementation documents and discards (`kernels/dsv41_low_ratio.py:917`).
+    So the flag cannot change a result on this platform -- only whether the
+    server boots.
+
+    Args:
+        device: Device ordinal upstream would have probed.
+
+    Returns:
+        False: host-table rows are not read in address order here.
+    """
+    del device
+    return False
+
+
 @plugin_hook("sglang.srt.layers.engram.engram_gate", type=HookType.AROUND)
-def engram_gate_fp16(original_fn, x, kv, q_weight, k_weight, eps, clamp_value):
+def engram_gate_fp16(
+    original_fn, x, kv, q_weight, k_weight, eps, clamp_value,
+    input_ids=None, image_token_id=None,
+):
     """Route the fp16 serving path to the fused op.
 
     Upstream's ``engram_gate`` guard admits bf16/fp32 io only, so an fp16 run
@@ -338,19 +370,29 @@ def engram_gate_fp16(original_fn, x, kv, q_weight, k_weight, eps, clamp_value):
         k_weight: Key normalization weights.
         eps: Normalization epsilon.
         clamp_value: Gate clamp bound.
+        input_ids: 0.5.23 addition. Rows whose entry equals ``image_token_id``
+            keep ``x`` ungated; upstream passes both positionally from
+            ``EngramHasher.forward`` (`engram.py:1362`), so dropping them from
+            this wrapper's signature was a `TypeError` at the first captured
+            decode graph, not a silent loss.
+        image_token_id: 0.5.23 addition, see ``input_ids``.
 
     Returns:
         The selected implementation's gated engram output.
     """
     if x.dtype is not torch.float16 or _ENGRAM_GATE_MODE != "fused":
-        return original_fn(x, kv, q_weight, k_weight, eps, clamp_value)
+        return original_fn(
+            x, kv, q_weight, k_weight, eps, clamp_value, input_ids, image_token_id
+        )
     if kv.dtype is not x.dtype:
         # ``wkv``'s quantized output carries the checkpoint's bf16, not the
         # serving dtype; bf16->fp16 is exact for in-range values.
         kv = kv.to(x.dtype)
     from sglang_kunlun.kernels.dsv41_low_ratio import fused_engram_gate_kunlun
 
-    return fused_engram_gate_kunlun(x, kv, q_weight, k_weight, eps, clamp_value)
+    return fused_engram_gate_kunlun(
+        x, kv, q_weight, k_weight, eps, clamp_value, input_ids, image_token_id
+    )
 
 
 def _index_has_int8_engram(model_path: str) -> bool:
@@ -386,6 +428,18 @@ def engram_embed_weight_is_int8() -> bool:
         return _INT8_CACHE
 
     model_path = os.environ.get("MODEL_PATH") or os.environ.get("DSV4_MODEL_PATH") or ""
+    if not model_path:
+        # A launcher that assigns MODEL_PATH without exporting it used to land
+        # here and silently take the fp8 branch: the fp8 table makes the engram
+        # row stage decline ("table is not channel-wise int8"), and decode-graph
+        # capture then dies inside the host gather. The operator's own
+        # `--model-path` answers the same question without an env var.
+        try:
+            from sglang.srt.runtime_context import get_server_args
+
+            model_path = str(get_server_args().model_path or "")
+        except Exception:  # noqa: BLE001 - detection must never break the build
+            model_path = ""
     if model_path and _index_has_int8_engram(model_path):
         _INT8_CACHE = True
         return True
@@ -480,6 +534,14 @@ class EngramEmbeddingKunlun(EngramEmbedding):
             row_end = num_embeddings * (tp_rank + 1) // self.tp_size
         self.rows = row_end - self.row_start
         self.host_table: Optional[object] = None
+        # 0.5.23 state that the INT8 branch does not set up but upstream methods
+        # read unconditionally: `finish_load` dereferences `self.peer`, and
+        # `shared_host_table_without_ats` / the stager read `_sort_host_reads`
+        # and `staged_by_scheduler`. nn.Module.__getattr__ turns a missing one
+        # into AttributeError at weight load, not at import.
+        self._sort_host_reads = False
+        self.staged_by_scheduler = False
+        self.peer = None
         if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
             self._init_host_table_int8(num_embeddings, dim, layer_id)
         else:
@@ -511,6 +573,10 @@ class EngramEmbeddingKunlun(EngramEmbedding):
         scale = raw[w_bytes : w_bytes + s_bytes].view(torch.bfloat16).view(n, 1)
         self.weight = nn.Parameter(weight, requires_grad=False)
         self.weight_scale = nn.Parameter(scale, requires_grad=False)
+        # Upstream `_table_ptrs()` returns this pair whenever `host_table` is
+        # set, and 0.5.23 reads it from paths the INT8 branch inherits.
+        device_ptr = self.host_table.device_ptr
+        self._host_table_ptrs = (device_ptr, device_ptr + w_bytes)
 
     def forward(
         self,

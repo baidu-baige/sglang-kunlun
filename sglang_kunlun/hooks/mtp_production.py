@@ -314,6 +314,9 @@ def capture_cuda_graphs_kunlun(self):
     from sglang_kunlun.hooks.layers.attention.kunlun_deepseek_v4_backend import (
         KunlunDeepseekV4AttnBackend,
     )
+    from sglang_kunlun.hooks.layers.attention.kunlun_nsa_backend import (
+        KunlunDSAAttnBackend,
+    )
 
     self.cuda_graph_runner = None
     self.cuda_graph_runner_for_draft_extend = None
@@ -322,13 +325,47 @@ def capture_cuda_graphs_kunlun(self):
     if self.server_args.model_impl == "mindspore":
         return
 
+    # Upstream's own accounting, which the 0.5.19 transcription dropped:
+    # ``graph_memory_usage`` / ``graph_time_usage`` (base_spec_worker.py:82-93)
+    # merge these two dicts, and the begin/end lines are the only evidence that
+    # the draft graphs were captured at all. Without them the startup report
+    # reads 0.00 GB for draft_decode / draft_extend on a server that did
+    # capture, which is indistinguishable from capture being off (invariant I2).
+    decode_backend = upstream.get_exec().graph.cuda_graph_config.decode.backend
+    capture_bs, _ = upstream.get_batch_sizes_to_capture(self.draft_runner)
+
     device_to_draft_runner = {
         "npu": upstream.EAGLEDraftNpuGraphRunner,
         "cuda": upstream.EAGLEDraftCudaGraphRunner,
         "musa": upstream.EAGLEDraftCudaGraphRunner,
     }
     if self.speculative_num_steps > 1:
+        tic = upstream.time.perf_counter()
+        before_mem = upstream.get_available_gpu_memory(self.device, self.gpu_id)
+        upstream.log_info_on_rank0(
+            upstream.logger,
+            f"Capture draft decode CUDA graph begin. backend={decode_backend}, "
+            f"num_tokens_per_req={self.topk}, bs={capture_bs}, "
+            f"avail mem={before_mem:.2f} GB",
+        )
         self.cuda_graph_runner = device_to_draft_runner[self.target_worker.device](self)
+        after_mem = upstream.get_available_gpu_memory(self.device, self.gpu_id)
+        capture_time = upstream.time.perf_counter() - tic
+        self._specialized_graph_memory_usage["draft_decode"] = (
+            self._specialized_graph_memory_usage.get("draft_decode", 0.0)
+            + before_mem
+            - after_mem
+        )
+        self._specialized_graph_time_usage["draft_decode"] = (
+            self._specialized_graph_time_usage.get("draft_decode", 0.0) + capture_time
+        )
+        upstream.log_info_on_rank0(
+            upstream.logger,
+            "Capture draft decode CUDA graph end. "
+            f"elapsed={capture_time:.2f} s, "
+            f"mem usage={(before_mem - after_mem):.2f} GB, "
+            f"avail mem={after_mem:.2f} GB.",
+        )
 
     device_to_extend_runner = {
         "npu": upstream.EAGLEDraftExtendNpuGraphRunner,
@@ -352,18 +389,52 @@ def capture_cuda_graphs_kunlun(self):
             getattr(upstream, "TokenspeedMLABackend", None),
             getattr(upstream, "FlashInferAttnBackend", None),
             KunlunDeepseekV4AttnBackend,
+            # GLM-5.3 (and any DSA/NSA model) runs ``KunlunDSAAttnBackend``;
+            # without it here the draft-extend graph is never captured, which
+            # silently keeps the whole MTP path on the eager branch.
+            KunlunDSAAttnBackend,
         )
         if isinstance(backend_class, type)
     )
     supports_cuda_extend = (
         upstream._is_cuda or upstream._is_musa
     ) and isinstance(self.draft_extend_attn_backend, supported_backend_classes)
-    if self.draft_extend_attn_backend and (
-        upstream._is_npu or supports_cuda_extend or supports_hip_aiter
+    if (
+        self.draft_extend_attn_backend
+        # 0.5.19 and 0.5.23 both gate the extend capture on this upstream
+        # switch; the transcription never read it, so the documented way to
+        # turn the draft-extend graph off silently did nothing.
+        and not upstream.envs.SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH.get()
+        and (upstream._is_npu or supports_cuda_extend or supports_hip_aiter)
     ):
+        tic = upstream.time.perf_counter()
+        before_mem = upstream.get_available_gpu_memory(self.device, self.gpu_id)
+        upstream.log_info_on_rank0(
+            upstream.logger,
+            f"Capture draft extend CUDA graph begin. backend={decode_backend}, "
+            f"num_tokens_per_req={self.speculative_num_draft_tokens}, "
+            f"bs={capture_bs}, avail mem={before_mem:.2f} GB",
+        )
         self.cuda_graph_runner_for_draft_extend = device_to_extend_runner[
             self.target_worker.device
         ](self)
+        after_mem = upstream.get_available_gpu_memory(self.device, self.gpu_id)
+        capture_time = upstream.time.perf_counter() - tic
+        self._specialized_graph_memory_usage["draft_extend"] = (
+            self._specialized_graph_memory_usage.get("draft_extend", 0.0)
+            + before_mem
+            - after_mem
+        )
+        self._specialized_graph_time_usage["draft_extend"] = (
+            self._specialized_graph_time_usage.get("draft_extend", 0.0) + capture_time
+        )
+        upstream.log_info_on_rank0(
+            upstream.logger,
+            "Capture draft extend CUDA graph end. "
+            f"elapsed={capture_time:.2f} s, "
+            f"mem usage={(before_mem - after_mem):.2f} GB, "
+            f"avail mem={after_mem:.2f} GB.",
+        )
 
 
 @plugin_hook(
@@ -454,6 +525,9 @@ def draft_extend_for_decode_kunlun(self, batch, batch_result, *, kv_loc_plan=Non
     if corrected is not None:
         batch_result.logits_output.hidden_states = corrected
 
+    # Compacted path keeps ``accept_lens - 1``; the fixed-width branch below
+    # may replace it with the value 0.5.23's verify already prepared.
+    num_correct_drafts = batch_result.accept_lens - 1
     if self.server_args.disable_overlap_schedule:
         accepted = accepted_prefix_indices(
             batch_result.accept_lens, self.speculative_num_draft_tokens
@@ -477,13 +551,23 @@ def draft_extend_for_decode_kunlun(self, batch, batch_result, *, kv_loc_plan=Non
     else:
         hidden_states = batch_result.logits_output.hidden_states
         out_cache_loc = batch.out_cache_loc
-        select_index = (
-            torch.arange(len(batch.seq_lens), device=self.device)
-            * self.speculative_num_draft_tokens
-            + batch_result.accept_lens
-            - 1
-        )
-        next_token_ids = batch_result.next_token_ids.to(torch.int64)
+        # 0.5.23 precomputes the fixed-width extension indices inside the verify
+        # path (``prepared_draft_extend_inputs``, an op-kernel path gated on
+        # ``topk == 1`` and CUDA tensors) and hands them over ready-made. Use
+        # them when present: the triple is exactly
+        # ``(num_correct_drafts, select_index, next_token_ids)`` and recomputing
+        # it here would drop the kernel's rounding and add a sync.
+        prepared = getattr(batch_result, "prepared_draft_extend_inputs", None)
+        if prepared is not None:
+            num_correct_drafts, select_index, next_token_ids = prepared
+        else:
+            select_index = (
+                torch.arange(len(batch.seq_lens), device=self.device)
+                * self.speculative_num_draft_tokens
+                + batch_result.accept_lens
+                - 1
+            )
+            next_token_ids = batch_result.next_token_ids.to(torch.int64)
         # Full-width path: this forward writes the plan's whole window.
         write_cols = None
 
@@ -503,7 +587,7 @@ def draft_extend_for_decode_kunlun(self, batch, batch_result, *, kv_loc_plan=Non
 
     draft_extend_input = upstream.EagleDraftExtendInput(
         hidden_states=hidden_states,
-        num_correct_drafts=batch_result.accept_lens - 1,
+        num_correct_drafts=num_correct_drafts,
         num_accept_tokens=batch_result.accept_lens,
         num_tokens_per_req=self.speculative_num_draft_tokens,
         num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
@@ -556,7 +640,18 @@ def draft_extend_for_decode_kunlun(self, batch, batch_result, *, kv_loc_plan=Non
     )
     with draft_forward_context(self.draft_runner), canary_context:
         output = (
-            self.cuda_graph_runner_for_draft_extend.execute(forward_batch)
+            # 0.5.23 moved the per-request row selection *into* the captured
+            # graph: ``execute(forward_batch, select_index)`` copies the index
+            # into ``buffers.select_index`` (runner:583), binds it on the
+            # graph's own ``EagleDraftExtendInput`` (runner:379/423) so lm_head
+            # and LAST hidden capture run on those rows only
+            # (``num_tokens_for_logprob_per_req=1``), and returns
+            # ``next_token_logits[:raw_bs]`` / ``hidden_states[:raw_bs]``
+            # (runner:684). The 0.5.19 one-argument call is a TypeError on the
+            # first graph-path draft extend.
+            self.cuda_graph_runner_for_draft_extend.execute(
+                forward_batch, select_index
+            )
             if can_graph
             else self.draft_runner.forward(forward_batch).logits_output
         )
@@ -569,9 +664,13 @@ def draft_extend_for_decode_kunlun(self, batch, batch_result, *, kv_loc_plan=Non
         f"draft_extend_for_decode (cuda_graph={can_graph})",
     )
 
-    output.next_token_logits = output.next_token_logits[select_index]
-    if output.hidden_states is not None:
-        output.hidden_states = output.hidden_states[select_index]
+    if not can_graph:
+        # Eager path only. The graph runner already returned the selected
+        # ``raw_bs`` rows, so re-indexing them with token-space positions reads
+        # out of range. Mirrors upstream eagle_worker_v2.py:1236-1243.
+        output.next_token_logits = output.next_token_logits[select_index]
+        if output.hidden_states is not None:
+            output.hidden_states = output.hidden_states[select_index]
     if self.server_args.speculative_use_rejection_sampling:
         # 0.5.23 replaced the `renorm_draft_probs` + `fast_sample` pair here
         # with `sample_draft_proposal`, which draws X from q and returns
@@ -616,3 +715,8 @@ def draft_extend_for_decode_kunlun(self, batch, batch_result, *, kv_loc_plan=Non
             next_draft_input.dsa_topk_indices = seed_capture[select_index]
     if self.server_args.speculative_use_rejection_sampling:
         next_draft_input.draft_probs = draft_probs
+    # 0.5.23 lets the caller reuse the draft graph only when the next loop's
+    # indexer seed exists; leaving this unset forces the eager path every step.
+    next_draft_input.cuda_graph_compatible = not (
+        seed_enabled and getattr(next_draft_input, "dsa_topk_indices", None) is None
+    )

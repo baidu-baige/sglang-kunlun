@@ -72,6 +72,8 @@ def dynamic_quantize_int8(
     x_int8 = torch.empty_like(x, dtype=torch.int8)
     scale_shape = (x.shape[0], 1) if keepdim else (x.shape[0],)
     x_scale = torch.empty(scale_shape, dtype=torch.float32, device=x.device)
+    if x.shape[0] == 0:
+        return x_int8, x_scale
     kunlun_ops.quant2d(x=x, y=x_int8, max=x_scale, force_sdnn=True)
     return x_int8, x_scale
 

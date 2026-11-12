@@ -156,6 +156,11 @@ class EngramHostStager:
 
     # --------------------------------------------------------------- allocation
 
+    @property
+    def staged(self) -> bool:
+        """Whether the stage was discovered and allocated for this model."""
+        return self._ready
+
     def ensure_alloc(self, model_runner, max_tokens: int) -> bool:
         """Allocate the stage before capture, sized for the widest captured graph.
 
@@ -413,6 +418,15 @@ def engram_stage_capture(original_fn, self, *args, **kwargs):
         width = int(getattr(self, "captured_req_width", 1) or 1)
         max_tokens = max(capture_bs) * width
     if not stager.ensure_alloc(self.model_runner, max_tokens):
+        if not stager.staged:
+            # `_discover` declined: this model's engram table is not the staged
+            # layout (not shared per rank, or not channel-wise int8). It already
+            # logged "keeping the CPU gather path", which is a documented
+            # degradation, so capture proceeds without the stage. Turning that
+            # into a fatal error killed every rank at decode-graph capture on
+            # W4A8-INT4, where the table is not channel-wise int8 by
+            # construction.
+            return original_fn(self, *args, **kwargs)
         raise RuntimeError("engram stage: cannot allocate capture stage; disable CUDA graph")
     self._kunlun_engram_stager = stager
     stager.begin_capture()

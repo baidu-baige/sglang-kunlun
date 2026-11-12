@@ -149,3 +149,23 @@ def reduce_scatterv_without_pynccl(original_fn, self, input_, output=None, sizes
         return original_fn(self, input_, output, sizes)
 
     return self._deterministic_reduce_scatterv(input_, output, sizes)
+
+
+@plugin_hook(
+    "sglang.srt.distributed.parallel_state.reg_all_gather_into_tensor",
+    type=HookType.AROUND,
+)
+def all_gather_dtype_matched_kunlun(original, output, input, group_name):
+    """Cast the gathered activation to the output buffer's dtype.
+
+    The DP-attention all-gather is dtype-strict on this platform (`TypeError:
+    output tensor must have the same type as input tensor`, out of
+    `all_gather_into_tensor`), while the two sides can disagree by construction:
+    the caller allocates `output` from the model dtype and the activation comes
+    out of a vendor kernel at bf16. The collective's own contract is a byte copy
+    of rows, so casting the input to the destination dtype is what the
+    surrounding code expects -- same shape of fix as the `memcpy_token` shim.
+    """
+    if input.dtype != output.dtype:
+        input = input.to(output.dtype)
+    return original(output, input, group_name)

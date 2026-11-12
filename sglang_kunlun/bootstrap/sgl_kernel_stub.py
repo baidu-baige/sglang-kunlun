@@ -251,5 +251,14 @@ def install() -> None:
     for module in (root, sys.modules["sgl_kernel.memory"]):
         module.weak_ref_tensor = _weak_ref_tensor  # type: ignore[attr-defined]
 
+    from sglang_kunlun.kernels.sgl_kernel_kunlun.dsv4_hicache import (
+        transfer_kv_all_layer_mla,
+        transfer_kv_per_layer_mla,
+    )
+
+    for module in (root, sys.modules["sgl_kernel.kvcacheio"]):
+        module.transfer_kv_all_layer_mla = transfer_kv_all_layer_mla
+        module.transfer_kv_per_layer_mla = transfer_kv_per_layer_mla
+
     # Register custom op schemas so @torch.library.register_fake succeeds.
     _define_custom_ops()

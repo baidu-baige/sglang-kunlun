@@ -49,10 +49,26 @@ def hc_mix_stats_kunlun(
     faults inside takes the process down with no Python traceback, so a lone
     `enter` line localizes the crash to the op itself.
     """
+    op = "hc_mix_stats"
     x_flat = x_flat.contiguous()
     hc_fn = hc_fn.contiguous()
-    mixes = torch.ops.xspeedgate_ops.hc_mix_stats(x_flat, hc_fn, eps)
-    return mixes
+    if hasattr(torch.ops.xspeedgate_ops, "hc_mix_stats"):
+        note_op_path(op, "xspeedgate")
+        return torch.ops.xspeedgate_ops.hc_mix_stats(x_flat, hc_fn, eps)
+
+    # Builds older than the op (1.2.0+8e67128 here) do not export it, and the
+    # upstream Triton path cannot run on Kunlun, so the V4.1 MHC prefill died at
+    # decode-graph capture with `'_OpNamespace' 'xspeedgate_ops' object has no
+    # attribute 'hc_mix_stats'`. This is upstream's own documented expression
+    # (`kernels/ops/layernorm/mhc.py:2343`): batch-invariant
+    # `F.linear(x_flat.float(), hc_fn) * rsqrt(mean(x_flat^2) + eps)`, fp32 in
+    # and fp32 out, computed in one shot so the row result does not depend on
+    # how K was sliced.
+    _dspark_warn_fallback(op, "xspeedgate_ops.hc_mix_stats is unavailable")
+    note_op_path(op, "torch")
+    x32 = x_flat.float()
+    scale = torch.rsqrt(x32.pow(2).mean(dim=-1, keepdim=True) + eps)
+    return torch.nn.functional.linear(x32, hc_fn) * scale
 
 
 @register_jit_op("sglang.kernels.ops.layernorm.mhc", "mhc_combine")

@@ -320,10 +320,169 @@ def _fused_engram_gate_torch(
     return _keep_image_rows(out, x, input_ids, image_token_id)
 
 
+_ENGRAM_HASH_INT_DTYPES = (torch.int32, torch.int64)
+_EHI_MAX_N, _EHI_MAX_LN, _EHI_MAX_PH, _EHI_MAX_COL = 16, 256, 2048, 512
+
+
+def _engram_hash_ids_op_args(
+    input_ids, positions, *, mode, history, token_map, multipliers, primes,
+    offsets, num_real, req_slots, block, row, starts,
+    image_token_id=None, mm_pad_shift=0,
+):
+    """0519 ABI normalization, with metadata guards and lossless position cast."""
+    if not hasattr(torch.ops.xspeedgate_ops, "engram_hash_ids"):
+        return None
+    if not input_ids.is_cuda or input_ids.ndim != 1 or positions.ndim != 1:
+        return None
+    if positions.shape != input_ids.shape:
+        return None
+    if history.ndim != 2 or multipliers.ndim != 2 or primes.ndim != 3:
+        return None
+    if offsets.ndim != 2 or token_map.ndim != 1 or token_map.numel() == 0:
+        return None
+    if any(t.dtype not in _ENGRAM_HASH_INT_DTYPES
+           for t in (input_ids, positions, history)):
+        return None
+    if positions.device != input_ids.device or history.device != input_ids.device:
+        return None
+    if not history.is_contiguous():
+        return None
+    for buf in (token_map, multipliers, primes, offsets):
+        if (buf.dtype != torch.int64 or not buf.is_contiguous()
+                or buf.device != input_ids.device):
+            return None
+    layers, n = multipliers.shape
+    heads = primes.shape[2]
+    total = input_ids.numel()
+    if not (0 < layers and 2 <= n <= _EHI_MAX_N and heads > 0):
+        return None
+    if (layers * n > _EHI_MAX_LN or (n - 1) * heads > _EHI_MAX_COL
+            or layers * (n - 1) * heads > _EHI_MAX_PH):
+        return None
+    if (primes.shape != (layers, n - 1, heads)
+            or offsets.shape != (layers, (n - 1) * heads)
+            or history.shape[1] != n - 1 or history.shape[0] == 0):
+        return None
+    if type(mode) is not int or mode not in (0, 1, 2):
+        return None
+    if type(block) is not int or not 1 <= block < 2**31:
+        return None
+    if total >= 2**31 or history.shape[0] >= 2**31:
+        return None
+    if num_real is not None and (
+        type(num_real) is not int or not 0 <= num_real <= total
+    ):
+        return None
+    for index in (req_slots, row, starts):
+        if index is not None and (
+            index.ndim != 1 or index.dtype not in _ENGRAM_HASH_INT_DTYPES
+            or index.device != input_ids.device
+        ):
+            return None
+    if mode == 2:
+        if row is None or starts is None or row.numel() != total:
+            return None
+        rows = starts.numel()
+        if rows == 0 or rows >= 2**31:
+            return None
+    else:
+        rows = total if mode == 0 else (total + block - 1) // block
+    if req_slots is not None:
+        if req_slots.numel() < rows:
+            return None
+    elif history.shape[0] < rows:
+        return None
+    # Narrow multimodal support to the ordinary model contract. Other thresholds
+    # retain the exact 0522 fallback, including padded-zero rewriting.
+    if image_token_id is not None and (
+        type(image_token_id) is not int
+        or not 0 < image_token_id < token_map.numel() - 1
+        or type(mm_pad_shift) is not int
+        or not token_map.numel() <= mm_pad_shift < 2**63
+    ):
+        return None
+    if token_map.numel() >= 2**31:
+        return None
+    # Service VERIFY hashing runs eagerly before graph replay. Value checks here
+    # must never become a capture-time assumption about future input/history.
+    if torch.cuda.is_current_stream_capturing() or total == 0:
+        return None
+    real = total if num_real is None else num_real
+    live_rows = real if mode == 0 else (real + block - 1) // block
+    if mode == 2:
+        live_rows = rows
+    # Compact only this batch's history. Padded requests are not read by vendor.
+    # Keep rows for the full batch so mode=2 row indices retain their meaning.
+    slots = None if req_slots is None else req_slots[:rows].to(torch.int64).contiguous()
+    hist = history[:rows] if slots is None else history.index_select(0, slots)
+
+    def valid_ids(value):
+        valid = (value >= 0) & (value < token_map.numel())
+        if image_token_id is not None:
+            valid = valid | (value >= mm_pad_shift)
+        return valid.all()
+
+    if not bool(valid_ids(input_ids[:real]) & valid_ids(hist[:live_rows])):
+        return None
+    # Widen rather than truncate: multimodal placeholders may exceed int32.
+    dtype = torch.promote_types(input_ids.dtype, history.dtype)
+    ids = input_ids.to(dtype).contiguous()
+    hist = hist.to(dtype).contiguous()
+    # Only comparisons against shifts 0..n-1 observe positions. Saturation is
+    # equivalent even for int64 extrema, unlike the unconditional 0519 cast.
+    pos = positions.clamp(-1, n - 1).to(torch.int32).contiguous()
+    row_i = None if row is None else row.to(torch.int64).contiguous()
+    starts_i = None if starts is None else starts.to(torch.int64).contiguous()
+    return ids, pos, hist, None, row_i, starts_i
+
+
 @register_jit_op(
     "sglang.kernels.ops.embeddings.engram_hash", "engram_hash_ids"
 )
 def engram_hash_ids_kunlun(
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    mode: int,
+    history: torch.Tensor,
+    token_map: torch.Tensor,
+    multipliers: torch.Tensor,
+    primes: torch.Tensor,
+    offsets: torch.Tensor,
+    pad_id: int,
+    num_real: "int | None" = None,
+    req_slots: "torch.Tensor | None" = None,
+    block: int = 1,
+    row: "torch.Tensor | None" = None,
+    starts: "torch.Tensor | None" = None,
+    image_token_id: "int | None" = None,
+    mm_pad_shift: int = 0,
+    block_t: int = 32,
+):
+    """0519 vendor dispatch with the unchanged 0522 Torch body as fallback."""
+    args = _engram_hash_ids_op_args(
+        input_ids, positions, mode=mode, history=history, token_map=token_map,
+        multipliers=multipliers, primes=primes, offsets=offsets,
+        num_real=num_real, req_slots=req_slots, block=block, row=row, starts=starts,
+        image_token_id=image_token_id, mm_pad_shift=mm_pad_shift,
+    )
+    if args is not None and input_ids.numel():
+        ids, pos, hist, slots, row_i, starts_i = args
+        note_op_path("engram_hash_ids", "xspeedgate:engram_hash_ids")
+        return torch.ops.xspeedgate_ops.engram_hash_ids(
+            ids, pos, mode, hist, token_map, multipliers, primes, offsets,
+            pad_id, num_real, slots, block, row_i, starts_i, image_token_id, mm_pad_shift,
+        )
+    note_op_path("engram_hash_ids", "torch")
+    return _engram_hash_ids_torch(
+        input_ids, positions, mode=mode, history=history, token_map=token_map,
+        multipliers=multipliers, primes=primes, offsets=offsets, pad_id=pad_id,
+        num_real=num_real, req_slots=req_slots, block=block, row=row, starts=starts,
+        image_token_id=image_token_id, mm_pad_shift=mm_pad_shift, block_t=block_t,
+    )
+
+
+def _engram_hash_ids_torch(
     input_ids: torch.Tensor,
     positions: torch.Tensor,
     *,
@@ -853,6 +1012,70 @@ def quantize_fp4_indexer_tensor_kunlun(
     return payload, scales
 
 
+def _paged_quant_takes_store_scale() -> bool:
+    """Whether this XSpeedGate build declares ``store_scale`` on the quant store.
+
+    The 0.5.23-release image ships
+    ``set_k_and_s_paged_quant(buf, loc, key, page_size)`` -- four arguments, no
+    ``store_scale`` -- and passing the flag aborts decode-graph capture with
+    "expected at most 4 argument(s) but received 5". The scale is written
+    unconditionally there, so dropping the flag is behaviour-preserving.
+    """
+    global _PAGED_QUANT_STORE_SCALE
+    if _PAGED_QUANT_STORE_SCALE is None:
+        overloads = torch.ops.xspeedgate_ops.set_k_and_s_paged_quant.overloads()
+        op = getattr(
+            torch.ops.xspeedgate_ops.set_k_and_s_paged_quant,
+            overloads[0] if overloads else "default",
+        )
+        names = [a.name for a in op._schema.arguments]
+        _PAGED_QUANT_STORE_SCALE = "store_scale" in names
+    return _PAGED_QUANT_STORE_SCALE
+
+
+_PAGED_QUANT_STORE_SCALE: Optional[bool] = None
+
+
+def store_index_k_cache_int8(input, cache, loc, *, page_size: int) -> None:
+    """Write signed int8 payloads followed by one fp32 scale per token."""
+    assert page_size == 64
+    assert input.shape[-1] == 128
+    assert cache.dtype == torch.uint8 and cache.shape[1] == page_size * 132
+    if input.numel() == 0:
+        return
+    num_slots = cache.shape[0] * page_size
+    loc = loc.reshape(-1)
+    loc = torch.where((loc > 0) & (loc < num_slots), loc, torch.full_like(loc, -1))
+    args = (
+        cache, loc.contiguous(), input.reshape(-1, 128).contiguous(), page_size,
+    )
+    if _paged_quant_takes_store_scale():
+        torch.ops.xspeedgate_ops.set_k_and_s_paged_quant(*args, store_scale=True)
+    else:
+        torch.ops.xspeedgate_ops.set_k_and_s_paged_quant(*args)
+
+
+def load_index_k_cache_int8(
+    cache, slots, *, page_size: int, dim: int,
+    out_dtype: torch.dtype = torch.bfloat16,
+):
+    """Decode the paged int8 layout used by set_k_and_s_paged_quant.
+
+    The stored fp32 is the per-token absmax on the four-argument build of the
+    op (measured: ``_upgrade/probe_paged_quant_scale.py`` -- q saturates at 127
+    and ``q * scale / 127`` reproduces the input to 0.4% while ``q * scale`` is
+    127x too large), so the divisor follows the writer this build dispatches to.
+    """
+    slots = slots.reshape(-1).to(torch.int64)
+    page, off = slots // page_size, slots % page_size
+    cols = (off * dim).unsqueeze(-1) + torch.arange(dim, device=cache.device)
+    q = cache[page.unsqueeze(-1), cols].view(torch.int8).float()
+    scale = cache.view(torch.float32)[page, page_size * (dim // 4) + off]
+    if not _paged_quant_takes_store_scale():
+        scale = scale / 127.0
+    return (q * scale.unsqueeze(-1)).to(out_dtype)
+
+
 @register_jit_op(
     "sglang.kernels.ops.attention.dsv4.fp4_indexer", "flat_selection_slots"
 )
@@ -905,11 +1128,15 @@ def store_fp4_index_k_cache_kunlun(
     """
     assert input.shape[-1] == 128
     assert page_size > 0
-    assert cache.ndim == 2 and cache.shape[1] == page_size * 68
+    assert cache.ndim == 2
     assert cache.dtype == torch.uint8 and cache.stride(1) == 1
     assert cache.device == input.device == loc.device
     assert loc.ndim == 1 and loc.dtype in (torch.int32, torch.int64)
     assert loc.numel() == input.numel() // 128
+    # Dispatch from the allocated layout so C4 FP4 stays FP4 with low-ratio int8.
+    if cache.shape[1] == page_size * 132:
+        return store_index_k_cache_int8(input, cache, loc, page_size=page_size)
+    assert cache.shape[1] == page_size * 68
     k_fp4, k_sf = quantize_fp4_indexer_tensor_kunlun(input.contiguous(), rne=rne)
     n_tokens = input.numel() // input.shape[-1]
     if n_tokens == 0:

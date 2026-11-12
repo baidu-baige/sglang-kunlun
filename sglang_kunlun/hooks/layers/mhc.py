@@ -107,3 +107,8 @@ def get_mhc_ops_kunlun():
         mhc_post=mhc_module._mhc_post_torch,
         fused_hc_head=dsv4.hc_head_torch,
     )
+
+
+from .mhc_post import register_hooks as _register_mhc_post
+
+_register_mhc_post()
