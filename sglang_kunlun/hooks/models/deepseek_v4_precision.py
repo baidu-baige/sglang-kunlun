@@ -95,9 +95,6 @@ def hc_post_kunlun(
         self.hc_mult,
         x.shape[-1],
     )
-    if out.dtype is torch.float16:
-        # The fused MHC-post overflows to inf/NaN under long context, so fp16 must be guarded.
-        out = torch.nan_to_num(out)
     return out
 
 

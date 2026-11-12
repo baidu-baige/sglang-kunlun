@@ -1877,7 +1877,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         page_indices[:rows, :k] = page_out
         if is_publish:
             # Row-keyed mask shared with the native path's consume layers.
-            self.candidate_masks = {"rows": published.to(torch.bool)}
+            self.candidate_masks = {"rows": published.view(torch.bool)}
 
     def _low_ratio_index_topk_sm90_decode_native(self, layer, x, q_lora, req, pos) -> None:
         """Capture-safe low-ratio decode/verify indexer top-k.

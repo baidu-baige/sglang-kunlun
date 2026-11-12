@@ -1,8 +1,8 @@
 """Restore Kunlun MHC post at the module entry used by the 0.5.22 target model.
 
 The old DecoderLayer.hc_post hook still handles the draft model. The target
-model calls deepseek_v4_mhc.post directly. Keep the 0519 fused accumulation and
-fp16 nan_to_num policy at this new entry; unsupported contracts use upstream.
+model calls deepseek_v4_mhc.post directly. Keep the 0519 fused accumulation at
+this new entry; unsupported contracts use upstream.
 """
 from __future__ import annotations
 
@@ -50,8 +50,6 @@ def mhc_post_kunlun(original_fn, cfg, x, residual, post_mix, comb):
         post_mix.contiguous(), x.contiguous(), comb.contiguous(),
         residual.contiguous(), out, x.shape[0], cfg.mult, x.shape[-1],
     )
-    if out.dtype is torch.float16:
-        out = torch.nan_to_num(out)
     return out
 
 

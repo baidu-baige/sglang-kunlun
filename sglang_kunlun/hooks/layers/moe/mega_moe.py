@@ -34,6 +34,10 @@ from typing import Optional, Tuple
 
 import torch
 
+from sglang_kunlun.hooks.layers.quantization.compressed_tensors.utils import (
+    dynamic_quantize_int8,
+)
+
 logger = logging.getLogger(__name__)
 
 # hydrax.xaccelerator.mega_moe.MEGA_MOE_L1_INTERLEAVE_GRANULARITY
@@ -283,16 +287,8 @@ def forward(layer, hidden_states: torch.Tensor, topk_output) -> torch.Tensor:
             "or raise SGLANG_KUNLUN_MEGA_MOE_MAX_TOKENS."
         )
 
-    # Per-token symmetric int8 with a raw-absmax scale, which is the convention
-    # the op documents for `x_sf` (it applies the 1/127 itself).
     flat = hidden_states.reshape(num_tokens, hidden)
-    absmax = flat.abs().amax(-1).to(torch.float32).clamp_min(1e-6)
-    x_q = (
-        (flat.to(torch.float32) / absmax[:, None] * 127.0)
-        .round()
-        .clamp_(-127, 127)
-        .to(torch.int8)
-    )
+    x_q, absmax = dynamic_quantize_int8(flat, keepdim=False)
 
     topk_ids = topk_output.topk_ids
     topk_weights = topk_output.topk_weights
