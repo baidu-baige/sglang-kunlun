@@ -1,5 +1,20 @@
 # Kunlun P800 SGLang inference image
 
+Two image definitions live here, kept side by side on purpose while we decide which one to keep. Everything below this section describes `Dockerfile.xpu`.
+
+- **`Dockerfile.xpu`** — Python 3.10 / cp310 wheels, built from `ubuntu:20.04` in 6 stages, no Kunlun base image. Component URLs also live in `kunlun-components.env`.
+- **`Dockerfile`** — Python 3.12 / cp312 wheels, built **from** the Kunlun base image `xpytorch:torch29-py312-ubuntu20.04-v0.45`, two stages, flattened to a single layer by a trailing `FROM scratch`. Migrated from `dev-kunlun-0.5.19-dsv4.1`.
+
+```bash
+# py3.12 image -- same two-sibling context as below, different -f
+DOCKER_BUILDKIT=1 docker build -f sglang-kunlun/dockerfile/Dockerfile \
+  -t iregistry.baidu-int.com/aicapx/sglang-kunlun:dev .
+```
+
+`DOCKER_BUILDKIT=1` is required for `Dockerfile` only: its pip layers use `--mount=type=cache` so a failed build resumes from the wheels it already fetched.
+
+---
+
 `Dockerfile.xpu` builds the inference image from `ubuntu:20.04` in 6 stages (os → torch → XPU runtime → Kunlun plugins → sglang layer → cleanup). It does not depend on the Kunlun base image. Every tunable is an `ARG` at the top of the file.
 
 Verified on 2026-10-30 (192.168.32.2): `docker build -f Dockerfile.xpu -t klx-sglang:test .` with no `--build-arg` produces a 13.6 GB image; DeepSeek-V4-Flash-0731 started with the single-node qualification SOP was healthy in 250 s and answered a single request with `--speculative-algorithm DSPARK` and thinking enabled (`reasoning_tokens=97`). Concurrency, long context, function call and PD disaggregation are untested.
@@ -84,4 +99,3 @@ Never add `tilelang` — it drags stock triton in and shadows xtriton, which mus
 - process neither exits nor progresses, `ps` gains a `_build_optional_torch_c_dlpack` every few seconds → `TVM_FFI_DISABLE_TORCH_C_DLPACK` is missing
 - chained `ModuleNotFoundError` (orjson → IPython → traitlets → ...) → `SGLANG_PIP_PLAIN` was emptied or failed
 - `RuntimeError: Form data requires "python-multipart"` → same, that one is a FastAPI runtime check
-
