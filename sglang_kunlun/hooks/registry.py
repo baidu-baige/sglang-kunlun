@@ -62,6 +62,7 @@ def register_all() -> None:
     from sglang_kunlun.kernels import deep_geem_hook as _deep_geem_hook  # noqa: F401
     from sglang_kunlun.kernels import flashinfer_hook as _flashinfer_hook  # noqa: F401
     from sglang_kunlun.kernels import k3_conv_registry as _k3_conv_registry  # noqa: F401
+    from sglang_kunlun.kernels import interleave_rows as _interleave_rows  # noqa: F401
     from sglang_kunlun.kernels import kernel_ops, kernel_registry
 
     # V4.1 low-ratio (compress_ratio 1/2) kernel replacements. Must be imported

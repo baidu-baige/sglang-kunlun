@@ -24,18 +24,46 @@ try:
     from sglang.srt.layers.attention.dsa.utils import (
         is_dsa_prefill_cp_round_robin_split,
     )
-except ImportError:  # 0.5.23 的 DSA prefill-CP 换成了 interleave 口径，删掉了 round-robin split
 
-    def is_dsa_prefill_cp_round_robin_split() -> bool:
-        """0.5.23 prefill-CP no longer exposes the round-robin split mode."""
-        return False
+    def _cp_rowwise_split(forward_batch) -> bool:
+        """Pre-0.5.23 spelling: the predicate took no per-batch argument."""
+        return is_dsa_prefill_cp_round_robin_split()
+
+except ImportError:
+    # 0.5.23 renamed the round-robin split to "interleave" (same layout, token
+    # i -> rank i % cp_size) and made the predicate per-batch, so the old name
+    # is gone. Falling back to False is not harmless: the only call site swaps
+    # in the CP-aware q/kv LoD before `sparse_prefill_fwd_opt`, so stuck at
+    # False the kernel reads global LoD against rank-local rows. Measured on
+    # ERNIE 5.5 (cp2 vs dp8, same 4K request), layer 7 -- the first full-MLA
+    # layer this backend serves -- reaches maxrel 9.9e-1 and the served output
+    # is empty. `kunlun_deepseek_v4_backend.py` already followed the rename.
+    try:
+        from sglang.srt.layers.attention.dsa.utils import (
+            can_dsa_prefill_cp_interleave as _can_dsa_prefill_cp_interleave,
+        )
+
+        def _cp_rowwise_split(forward_batch) -> bool:
+            """0.5.23 spelling of the same row-wise CP split."""
+            return bool(_can_dsa_prefill_cp_interleave(forward_batch))
+
+    except ImportError:
+
+        def _cp_rowwise_split(forward_batch) -> bool:
+            """Neither spelling available: no row-wise CP split on this build."""
+            return False
+
 
 try:
     from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 except ImportError:  # dsv4.1 删掉了 DSA prefill-CP 的 in-seq-split 模式
 
     def is_dsa_prefill_cp_in_seq_split() -> bool:
-        """0.5.14 prefill-CP no longer supports in-seq-split."""
+        """0.5.14 prefill-CP no longer supports in-seq-split.
+
+        Unlike the rename above, this mode really is gone: it was a different
+        layout (contiguous per-rank ranges), not a renamed one.
+        """
         return False
 
 from sglang.srt.layers.attention.dsa_backend import (
@@ -603,7 +631,7 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
             cum_q_lod = metadata.cum_q_lod
             cum_q_lod_cpu = metadata.cum_q_lod_cpu
 
-        if is_dsa_prefill_cp_round_robin_split():
+        if _cp_rowwise_split(forward_batch):
             cum_q_lod = metadata.dsa_cu_seqlens_q
             cum_q_lod_cpu = metadata.dsa_cu_seqlens_q_cpu
             kv_lod = metadata.dsa_cu_seqlens_k

@@ -1079,8 +1079,13 @@ def forward_cuda(
     forward_batch: ForwardBatch,
     layer_id: int,
     return_indices: bool = True,
+    use_cuda_graph: bool = True,
 ) -> Optional[torch.Tensor]:
     """forward_cuda"""
+    # Accepted and ignored: it only gates upstream's piecewise cuda-graph
+    # branch, which this backend refuses below. The parameter has to exist
+    # because the prefill-CP interleave path passes it by keyword.
+    del use_cuda_graph
     # TODO: try to remove this patch
 
     from sglang.kernels.ops.quantization.act_quant_triton import act_quant
