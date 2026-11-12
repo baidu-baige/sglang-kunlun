@@ -276,44 +276,24 @@ def _require_continuous_index_k(pool, where: str) -> None:
 
 
 def _index_k_continuous(pool, layer_id, seq_len, page_indices):
-    """Per-request index-K continuous view (K, scale), replacing the dropped
-    0.5.22 ``get_index_k_continuous``/``get_index_k_scale_continuous`` with the
-    retained ``get_index_k_with_scale_buffer``.
-    """
-    if getattr(pool, "use_fp4_indexer", False):
-        raise NotImplementedError(
-            "index-K continuous view: fp4 index keys not supported on Kunlun"
-        )
-    if getattr(pool, "index_kpool", 1) != 1:
-        raise NotImplementedError(
-            "index-K continuous view: pooled index keys (index_kpool != 1) need "
-            "token regrouping, not implemented on Kunlun"
-        )
-
-    key_bytes = pool.index_head_dim          # int8 K bytes/token (non-fp4)
-    scale_bytes = pool.index_head_dim // pool.quant_block_size * 4  # fp32 scale/token
-    page_size = pool.index_page_size
-    # XPU index_select rejects (uint8, int64); view int8 (same itemsize, bit
-    # identical), which is also what the downstream I8_mqa_logits consumes.
+    """Gather unpooled INT8 index-K and raw FP32 absmax bytes per token."""
+    if getattr(pool, "use_fp4_indexer", False) or getattr(pool, "index_kpool", 1) != 1:
+        raise NotImplementedError("Native gather requires unpooled INT8 index keys")
+    head = pool.index_head_dim
+    if head // pool.quant_block_size != 1:
+        raise NotImplementedError("Native gather requires one FP32 absmax per token")
+    size = pool.index_page_size
     buf = pool.get_index_k_with_scale_buffer(layer_id).view(torch.int8)
-    expected_row = page_size * (key_bytes + scale_bytes)
-    if buf.shape[1] != expected_row:
-        raise NotImplementedError(
-            "index-K continuous view: buffer row %d B != page_size*"
-            "index_bytes_per_token %d B; layout changed"
-            % (buf.shape[1], expected_row)
-        )
-    key_block = page_size * key_bytes  # K bytes for the whole page
-    num_pages = (seq_len + page_size - 1) // page_size
-    pages = page_indices[:num_pages].to(torch.int64)
-    rows = buf.index_select(0, pages)  # [num_pages, page_size*index_bytes_per_token]
-    # Split the page into its K block and scale block, then de-page to tokens.
-    k = rows[:, :key_block].reshape(-1, key_bytes)  # [num_pages*page_size, key_bytes]
-    k_scale = rows[:, key_block:].reshape(-1, scale_bytes)
-    # .contiguous() required: downstream .view() cannot reinterpret a strided slice.
-    k = k[:seq_len].contiguous()
-    k_scale = k_scale[:seq_len].contiguous()
-    return k, k_scale
+    if buf.shape[1] != size * (head + 4):
+        raise NotImplementedError("Index-K page layout differs from validated contract")
+    pages = page_indices[: (seq_len + size - 1) // size].to(torch.int64).contiguous()
+    key = torch.empty((seq_len, head), dtype=torch.int8, device=buf.device)
+    scale = torch.empty((seq_len, 4), dtype=torch.int8, device=buf.device)
+    # Keep scale as raw FP32 bytes; downstream applies its existing scaling.
+    torch.ops.xspeedgate_ops.gather_index_k_scale_prefix_into(
+        buf, pages, seq_len, key, scale, size
+    )
+    return key, scale
 
 
 def _align_rows_to_q(tensor, extend_lens: List[int], q_offset: int):

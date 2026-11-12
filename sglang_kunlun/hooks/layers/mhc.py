@@ -160,8 +160,7 @@ def mhc_pre_kunlun(
     type=HookType.REPLACE,
 )
 def mhc_post_kunlun(x, residual, post_layer_mix, comb_res_mix):
-    """Fused mHC post: ``out[n] = post[n]*x + sum_k comb[k,n]*residual[k]``.
-    """
+    """Compute mHC post with the XSG native operator."""
     post = (
         post_layer_mix.squeeze(-1)
         if post_layer_mix.dim() == residual.dim()
@@ -169,30 +168,12 @@ def mhc_post_kunlun(x, residual, post_layer_mix, comb_res_mix):
     )
     if x.shape[0] == 0:
         return torch.empty_like(residual)
-
-    batch, n, d = residual.shape
-    if n == 4 and x.is_cuda:
-        try:
-            out = torch.empty((batch, n, d), dtype=x.dtype, device=x.device)
-            kunlun_ops.hc_post_kunlun_impl(
-                post.contiguous(),
-                x.contiguous(),
-                comb_res_mix.contiguous(),
-                residual.contiguous(),
-                out,
-                batch,
-                n,
-                d,
-            )
-            return out
-        except Exception:
-            pass
-
-    # Memory-light torch fallback: out[.,j,:] = sum_i comb[.,i,j]*res[.,i,:] via
-    # bmm (comb^T @ res), fp32 accumulate like the kernel; no [T,hc,hc,H] tensor.
-    mixed = torch.bmm(comb_res_mix.transpose(1, 2).float(), residual.float())
-    out = post.unsqueeze(-1).float() * x.unsqueeze(1).float() + mixed
-    return out.type_as(x)
+    return torch.ops.xspeedgate_ops.mhc_post(
+        x.contiguous(),
+        residual.contiguous(),
+        post.unsqueeze(-1).contiguous(),
+        comb_res_mix.contiguous(),
+    )
 
 
 @plugin_hook(
