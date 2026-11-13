@@ -274,16 +274,74 @@ class KunlunDSAMetadata(DSAMetadata):
         ``.cpu()`` tensor per replay would leave the graph reading capture-time
         lengths. Copy into the existing storage instead, and only reallocate when
         the shape/dtype actually changes.
+
+        The seven mirrors used to be seven ``host.copy_(dev)`` calls, i.e. seven
+        blocking device-to-host transfers per call and three calls per decode
+        step (measured 1.16 ms/step). Stage the device tensors of one dtype into
+        a single contiguous device buffer first (device-to-device, no sync) and
+        bring them back in one transfer per dtype; the final host-to-host copies
+        into the existing mirrors keep every ``data_ptr`` stable.
         """
+        plan = self._mirror_plan()
+        if plan is None:
+            # Shapes/dtypes changed (or a mirror had to be reallocated); the
+            # mirrors are already up to date in that case.
+            return
+        for dtype, entries, dev_buf, host_buf in plan:
+            for _, dev, offset, numel in entries:
+                dev_buf[offset : offset + numel].copy_(dev.reshape(-1))
+            host_buf.copy_(dev_buf)
+            for host, _, offset, numel in entries:
+                host.reshape(-1).copy_(host_buf[offset : offset + numel])
+
+    def _mirror_plan(self):
+        """Return the cached staging plan, rebuilding it when shapes change.
+
+        Returns ``None`` when a rebuild happened: the rebuild path already
+        refreshed every mirror with a plain ``.cpu()``, so the caller is done.
+        """
+        signature = tuple(
+            None if (dev := getattr(self, dev_name, None)) is None
+            else (tuple(dev.shape), dev.dtype)
+            for _, dev_name in self._MIRRORED
+        )
+        cached = getattr(self, "_mirror_staging", None)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+
+        by_dtype: dict[torch.dtype, list] = {}
         for host_name, dev_name in self._MIRRORED:
             dev = getattr(self, dev_name, None)
             if dev is None:
                 continue
             host = getattr(self, host_name, None)
             if host is None or host.shape != dev.shape or host.dtype != dev.dtype:
-                object.__setattr__(self, host_name, dev.cpu())
+                host = dev.cpu()
+                object.__setattr__(self, host_name, host)
             else:
                 host.copy_(dev)
+            by_dtype.setdefault(dev.dtype, []).append((host, dev))
+
+        plan = []
+        for dtype, pairs in by_dtype.items():
+            entries = []
+            offset = 0
+            for host, dev in pairs:
+                numel = dev.numel()
+                entries.append((host, dev, offset, numel))
+                offset += numel
+            dev_buf = torch.empty(offset, dtype=dtype, device=pairs[0][1].device)
+            try:
+                host_buf = torch.empty(
+                    offset, dtype=dtype, device="cpu", pin_memory=True
+                )
+            except RuntimeError:
+                # Pinning is unavailable on some runtimes; a pageable staging
+                # buffer still collapses the seven transfers into one.
+                host_buf = torch.empty(offset, dtype=dtype, device="cpu")
+            plan.append((dtype, entries, dev_buf, host_buf))
+        object.__setattr__(self, "_mirror_staging", (signature, plan))
+        return None
 
 
 @dataclass(frozen=True)
