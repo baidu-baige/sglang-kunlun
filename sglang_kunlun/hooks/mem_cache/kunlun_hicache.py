@@ -208,6 +208,37 @@ def _transfer_all_layer(pool, host_indices, device_indices, io_backend: str) -> 
     )
 
 
+
+def _transfer_all_layer_direct(pool, host_indices, device_indices) -> None:
+    """D2H for `direct`/`page_first_direct`: device layer-first -> host page-first."""
+    _require_matching_size(pool, host_indices, device_indices)
+    if host_indices is None or host_indices.numel() == 0:
+        return
+    page_size = _pool_page_size(pool)
+    torch.ops.xspeedgate_ops.transfer_kv_all_layer_direct_lf_pf(
+        src_ptrs=pool.device_buffers,
+        dst_ptrs=[pool.kv_buffer],
+        src_indices=_page_rows(device_indices, page_size),
+        dst_indices=_page_rows(host_indices, page_size),
+        page_size=1,
+    )
+
+
+def _transfer_per_layer_direct(pool, host_indices, device_indices, layer_id) -> None:
+    """H2D for `direct`/`page_first_direct`: host page-first -> one device layer."""
+    _require_matching_size(pool, host_indices, device_indices)
+    if host_indices is None or host_indices.numel() == 0:
+        return
+    page_size = _pool_page_size(pool)
+    torch.ops.xspeedgate_ops.transfer_kv_per_layer_direct_pf_lf(
+        src_ptrs=[pool.kv_buffer],
+        dst_ptrs=[pool.device_buffers[layer_id]],
+        src_indices=_page_rows(host_indices, page_size),
+        dst_indices=_page_rows(device_indices, page_size),
+        layer_id=layer_id,
+        page_size=1,
+    )
+
 def _transfer_per_layer(
     pool, host_indices, device_indices, layer_id, io_backend: str
 ) -> None:
@@ -264,13 +295,19 @@ def _transfer_per_layer(
 def dsv4_paged_backup_kunlun(
     original_fn, self, device_pool, host_indices, device_indices, io_backend
 ):
-    """Back up all layers of the DSV4 paged host pool with the Kunlun kernel.
+    """Back up all layers of the DSV4 paged host pool.
 
-    共享 host KV 开启时只有 leader rank 写 host（原实现在
-    ``shared_host_kv_hooks`` 里以第二个 AROUND 短路表达；两个 hook 同 target
-    会触发 "Multiple AROUND hooks" 提示且顺序敏感，这里合并为单一 hook）。
+    Only the leader rank writes host when shared host KV is on. The
+    kernel/layer_first pair uses the Kunlun kernel; `direct`/`page_first_direct`
+    is left to upstream, which calls the vendor direct transfer itself.
     """
     if shared_host_kv.skip_write():
+        return None
+    if io_backend == "direct":
+        # Upstream's direct branch calls `sgl_kernel.kvcacheio`, which is a
+        # NotImplementedError stub on Kunlun; the same transfer exists as an
+        # XSpeedGate op, so issue it here instead.
+        _transfer_all_layer_direct(self, host_indices, device_indices)
         return None
     _transfer_all_layer(self, host_indices, device_indices, io_backend)
 
@@ -297,7 +334,11 @@ def dsv4_paged_load_kunlun(
     transfer reads the pool off ``self``, so it is accepted (no caller passes it
     today, but omitting the name makes any future one a TypeError) and ignored.
     """
-    del is_draft
+    if io_backend == "direct":
+        _transfer_per_layer_direct(
+            self, host_indices, device_indices, layer_id
+        )
+        return None
     _transfer_per_layer(self, host_indices, device_indices, layer_id, io_backend)
 
 

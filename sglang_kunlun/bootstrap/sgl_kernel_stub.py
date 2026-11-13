@@ -115,6 +115,14 @@ def install() -> None:
     root = _StubModule("sgl_kernel")
     sys.modules["sgl_kernel"] = root
 
+    # The direct HiCache transfers are Kunlun-backed: replace the stub with the
+    # XSpeedGate implementations as soon as the stub exists, so upstream's
+    # ``sgl_kernel.kvcacheio.transfer_kv_*`` call sites (pool_host/base.py,
+    # pool_host/mla.py) resolve to real kernels instead of raising.
+    from sglang_kunlun.kernels.sgl_kernel_kunlun import kvcacheio_direct
+
+    kvcacheio_direct.install_into_stub()
+
     # Pre-register submodules sglang code imports under
     # ``from sgl_kernel.X import Y`` form. Listing them eagerly is not
     # strictly required — _StubModule.__getattr__ would lazily create

@@ -1,4 +1,4 @@
-"""Shared host KV storage for DeepSeek V4 MLA HiCache.
+"""Shared host KV storage for MLA-style HiCache (DSV4 / GLM5-DSA).
 
 This feature is opt-in.  When enabled, every rank in one TP group maps the
 same host allocation, while only the group leader performs D2H writes.  It is
@@ -28,6 +28,13 @@ from sglang.srt.utils import get_bool_env_var
 logger = logging.getLogger(__name__)
 
 ENABLED = get_bool_env_var("HICACHE_SHARED_HOST_KV", "false")
+logger.info(
+    "shared_host_kv: ENABLED=%s (HICACHE_SHARED_HOST_KV=%r, "
+    "XSGL_HICACHE_SHARED_HOST_KV=%r)",
+    ENABLED,
+    os.environ.get("HICACHE_SHARED_HOST_KV"),
+    os.environ.get("XSGL_HICACHE_SHARED_HOST_KV"),
+)
 VERIFY = get_bool_env_var("HICACHE_SHARED_VERIFY", "false")
 SHARED_DIR = os.environ.get("HICACHE_SHARED_DIR", "/dev/shm")
 _HUGE_PAGE_SIZE = 2 * 1024 * 1024
@@ -266,12 +273,22 @@ def configure(tp_rank: int, tp_group) -> None:
         torch.distributed.get_world_size(group=tp_group) if tp_group is not None else 1
     )
     if world_size <= 1:
+        logger.info(
+            "shared_host_kv: not activated, sharing group world_size=%d", world_size
+        )
         return
 
     local_ok = os.path.isdir(SHARED_DIR) and os.access(SHARED_DIR, os.W_OK)
     local_ok = local_ok and callable(getattr(torch.cuda, "cudart", None))
     if not _same_node():
         local_ok = False
+    logger.info(
+        "shared_host_kv: group world_size=%d, dir_writable=%s, cudart=%s, same_node=%s",
+        world_size,
+        os.path.isdir(SHARED_DIR) and os.access(SHARED_DIR, os.W_OK),
+        callable(getattr(torch.cuda, "cudart", None)),
+        _same_node(),
+    )
     if not _all_true(local_ok):
         raise RuntimeError(
             "HICACHE_SHARED_HOST_KV requires a writable shared directory, "
@@ -286,15 +303,57 @@ def configure(tp_rank: int, tp_group) -> None:
     _tag = f"sgl_hicache_{int(tag.item()):016x}"
     _active = True
     logger.info(
-        "Shared DSV4 host KV enabled: tp_rank=%d, dir=%s, tag=%s, numa=interleave",
+        "Shared host KV enabled: tp_rank=%d, dir=%s, tag=%s, numa=interleave",
         _tp_rank,
         SHARED_DIR,
         _tag,
     )
 
 
+_configured = False
+
+
+def ensure_configured() -> None:
+    """Configure sharing lazily from the live parallel context.
+
+    The ``build_deepseek_v4_hicache_stack`` hook only fires on the DSV4
+    assembler; GLM-5.x builds its host pools through ``HostPoolGroup`` and never
+    reaches it, so the first allocation configures the group instead. Every TP
+    rank builds the same pools in the same order, which is what makes the
+    collective inside ``configure`` safe here.
+    """
+    global _configured
+    if _configured or not ENABLED:
+        return
+    from sglang.srt.runtime_context import get_parallel
+
+    parallel = get_parallel()
+    candidates = (
+        getattr(parallel, "attn_cp_group", None),
+        getattr(parallel, "attn_tp_group", None),
+        getattr(parallel, "tp_group", None),
+    )
+    # sglang hands back GroupCoordinator wrappers; the collectives inside
+    # configure() need the raw process group.
+    best, best_size = None, 0
+    for group in candidates:
+        if group is None:
+            continue
+        size = getattr(group, "world_size", None)
+        if size is None:
+            size = torch.distributed.get_world_size(group=group)
+        if size > best_size:
+            best, best_size = group, size
+    raw = getattr(best, "cpu_group", None) or best
+    raw = getattr(raw, "device_group", None) or raw
+    _configured = True
+    configure(torch.distributed.get_rank(group=raw) if raw else 0, raw)
+
+
 def maybe_shared_alloc(dims, dtype, device: str) -> Optional[torch.Tensor]:
     """Allocate a shared, DMA-registered CPU tensor or return ``None``."""
+    if not _active and device == "cpu":
+        ensure_configured()
     if not _active or device != "cpu":
         return None
 

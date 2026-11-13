@@ -9,14 +9,46 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 from . import shared_host_kv
 
 
+def _is_shareable_kvcache(kvcache) -> bool:
+    """Whether this KV pool's host content is replicated across the TP group.
+
+    Only replicated pools qualify: the DSV4 compressed KV, and the MLA latent +
+    DSA indexer (num_head=1). MHA shards by head, so ranks hold different data.
+    """
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+    return "DeepSeekV4" in type(kvcache).__name__ or isinstance(
+        kvcache, MLATokenToKVPool
+    )
+
+
+def _select_sharing_group(params):
+    """Widest replicated-content group; ``tp_cache_group`` collapses under CP."""
+    candidates = (
+        getattr(params, "attn_cp_cache_group", None),
+        getattr(params, "attn_tp_cache_group", None),
+        params.tp_cache_group,
+    )
+    best, best_size = None, 0
+    for group in candidates:
+        if group is None:
+            continue
+        size = torch.distributed.get_world_size(group=group)
+        if size > best_size:
+            best, best_size = group, size
+    return best if best is not None else params.tp_cache_group
+
+
 def _configure_dsv4(params, kvcache) -> None:
     if not shared_host_kv.is_enabled():
         return
-    if "DeepSeekV4" not in type(kvcache).__name__:
+    if not _is_shareable_kvcache(kvcache):
         raise RuntimeError(
-            "HICACHE_SHARED_HOST_KV is only supported for DeepSeek V4"
+            "HICACHE_SHARED_HOST_KV only supports models whose host KV is "
+            "replicated across the TP group (DeepSeek V4 / MLA-DSA such as "
+            f"GLM5), got kvcache={type(kvcache).__name__}"
         )
-    group = params.tp_cache_group
+    group = _select_sharing_group(params)
     rank = torch.distributed.get_rank(group=group) if group is not None else 0
     shared_host_kv.configure(rank, group)
 
