@@ -134,15 +134,10 @@ def _resolve_mixed_attn_impl():
         names = {schema.name for schema in torch._C._jit_get_all_schemas()}
         has_xspeed = "xspeedgate_ops::sparse_mixed_attn_int8" in names
         has_kunlun = hasattr(kunlun_ops, "dsa_prefill_with_mixed_cache")
-        # Both entry points land on the SAME vendor host function,
-        # `xfa::dsa_prefill_with_mixed_cache` in
-        # `torch_xmlir/libxpu_flash_attention.so` -- the xspeedgate wheel only
-        # carries the torch wrapper (`nm -D --undefined-only` on it shows the
-        # two int8 instantiations as `U`). So "the wheel lost the op" is a
-        # wrapper problem, not a kernel problem, and `kunlun` reaches the same
-        # kernels. This knob exists to measure that claim, and to serve from
-        # the `kunlun` entry point if a rebuilt wheel ever drops the wrapper
-        # again. 0.5.8 had the same switch (`nsa_backend.py:190-214`).
+        # Both entry points land on the same vendor host function
+        # (`xfa::dsa_prefill_with_mixed_cache`); the wheel only carries the
+        # wrapper. The `kunlun` arm was measured and returns NOT_IMPLEMENT at
+        # this model's decode shape, so it is not a substitute.
         want = os.environ.get("SGLANG_NSA_MIXED_ATTN_IMPL", "auto").strip().lower()
         if want not in ("auto", "xspeed", "kunlun", "none"):
             logger.warning(
@@ -328,20 +323,12 @@ class KunlunDSAMetadata(DSAMetadata):
             object.__setattr__(self, host_name, None if dev is None else dev.cpu())
 
     def refresh_host_mirrors(self) -> None:
-        """Update the host mirrors *in place*, keeping their storage stable.
+        """Update the host mirrors in place, keeping their storage stable.
 
-        On the cuda-graph path this object is reused across replays and the
-        Kunlun kernels were recorded against these host buffers, so a fresh
-        ``.cpu()`` tensor per replay would leave the graph reading capture-time
-        lengths. Copy into the existing storage instead, and only reallocate when
-        the shape/dtype actually changes.
-
-        The seven mirrors used to be seven ``host.copy_(dev)`` calls, i.e. seven
-        blocking device-to-host transfers per call and three calls per decode
-        step (measured 1.16 ms/step). Stage the device tensors of one dtype into
-        a single contiguous device buffer first (device-to-device, no sync) and
-        bring them back in one transfer per dtype; the final host-to-host copies
-        into the existing mirrors keep every ``data_ptr`` stable.
+        The graph was recorded against these host buffers, so copy into the
+        existing storage and reallocate only when shape/dtype changes. Stage the
+        device tensors per dtype into one buffer and take one D2H per dtype
+        instead of seven blocking ones (measured 1.16 ms/step).
         """
         plan = self._mirror_plan()
         if plan is None:

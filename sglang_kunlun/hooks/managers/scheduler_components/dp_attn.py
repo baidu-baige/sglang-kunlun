@@ -108,9 +108,8 @@ _FALLBACK_CACHE: dict = {}
 def _fallback_tensor_cached(self, device, dtype=torch.int64) -> torch.Tensor:
     """``_get_fallback_tensor`` without the per-call host-to-device build.
 
-    Its contents are constants and every use is a read (``repeat``, masked
-    assignment), so one tensor per (device, dtype) is enough. Upstream rebuilt
-    it on every call: three allocations and three transfers per decode step.
+    Contents are constants and every use is a read, so one tensor per
+    (device, dtype) is enough; upstream rebuilt it three times per step.
     """
     key = (str(device), dtype)
     cached = _FALLBACK_CACHE.get(key)
@@ -124,9 +123,7 @@ def _local_tensor_cached(self, device, dtype=torch.int64) -> torch.Tensor:
     """``_get_local_tensor`` through persistent pinned host + device buffers.
 
     ``torch.tensor([...], device=xpu)`` allocates a pinned staging buffer per
-    call; measured 34.85 such ``to()`` calls and 2.72 ms per decode step. Fill
-    one persistent pinned buffer and copy it into one persistent device buffer.
-    The value order is upstream's ``_get_local_tensor`` order.
+    call (34.85 per step, 2.72 ms). The value order is upstream's.
     """
     values = (
         self.num_tokens,

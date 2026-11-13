@@ -6082,20 +6082,12 @@ def gather_spec_extras(
     """Single-launch row-gather of the speculative extras on Kunlun.
 
     One kernel copies all four rows per index instead of four advanced-index
-    gathers plus the ``indices.to(torch.long)`` cast and four ``.contiguous()``
-    calls. ``hidden_states_buf`` stays genuinely optional: when it is None the
-    op runs with three buffers and returns None for the fourth output.
+    gathers, the dtype cast and four ``.contiguous()`` calls. Graph-safe: every
+    allocation shape is host-side metadata fixed at capture time, and the index
+    values are read on device only (no ``.item()``).
 
-    Measured at the SLO shape (m=32, topk=8, hidden=6144 fp16) by
-    ``tests/cache/test_gather_spec_extras.py::batch_perf_test`` in the
-    XSpeedGate tree: torch 345.9 us -> kernel 35.8 us (0.10x), with 3/3
-    byte-exact accuracy cases.
-
-    CUDA-graph safe: the only allocations are the four output tensors, whose
-    shapes come from ``indices.shape[0]`` and the source buffers' trailing dims
-    -- all host-side metadata fixed at capture time. The index values are read
-    on device only; there is no host sync and no ``.item()``. Same allocation
-    shape as the torch path, so capture behaviour does not regress.
+    Measured at the SLO shape in ``test_gather_spec_extras.py::batch_perf_test``:
+    torch 345.9 us -> kernel 35.8 us, 3/3 byte-exact.
     """
 
     try:

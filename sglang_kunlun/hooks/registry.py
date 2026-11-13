@@ -58,12 +58,9 @@ def register_all() -> None:
     _kunlun_pre_shim()
     env_compat.install()
 
-    # Optimization C's operators ship as a SECOND extension module rather than
-    # a rebuilt `xspeedgate_ops` wheel: the installed wheel is the only place
-    # `sparse_mixed_attn_int8` exists, and reinstalling it has twice cost a day
-    # (the lost op is a 3.5x TPOT with no error, and the reinstall also takes
-    # cocopod's files with it). Must be imported before `kernel_ops.install()`
-    # resolves the registration tables.
+    # C's operators come from a second extension, not a rebuilt wheel: the
+    # installed wheel is the only place `sparse_mixed_attn_int8` exists. Must
+    # precede `kernel_ops.install()`.
     from sglang_kunlun import extra_ops
 
     if extra_ops.loaded:
