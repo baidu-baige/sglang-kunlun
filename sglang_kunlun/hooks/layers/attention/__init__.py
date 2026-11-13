@@ -74,5 +74,8 @@ _redirect_nsa_backend()
 from . import attention_registry  # noqa: E402,F401
 from . import nsa  # noqa: E402,F401
 from . import fla  # noqa: E402,F401
-from . import deepseek_v4_backend  # noqa: E402,F401
+try:
+    from . import deepseek_v4_backend  # noqa: E402,F401
+except ImportError as e:
+    logger.info("[kunlun-adapt] deepseek_v4_backend hooks skipped: %s", e)
 from . import flashinfer_compat  # noqa: E402,F401

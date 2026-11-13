@@ -27,7 +27,7 @@ Usage:
     python3 sglang_xpu_patch.py [--search-root /path/to/search] [--dry-run]
 
 The script will:
-1. Find parallel_state.py in the aiak_sglang installation
+1. Find parallel_state.py in the sglang installation
 2. Parse it using Python AST
 3. Inject the XPU profiler and CPU binding code at the beginning of init_distributed_environment
 4. Write the patched file back
@@ -55,7 +55,6 @@ from typing import Optional, Tuple
 # Primary search paths, tried in order (first hit wins)
 PRIMARY_SGLANG_PATHS = (
     Path("/root/miniconda/envs/python310_torch29_cuda/lib/python3.10/site-packages"),
-    Path("/workspace/aiak_sglang/python"),
 )
 TARGET_FILE = "sglang/srt/distributed/parallel_state.py"
 TARGET_FUNCTION = "init_distributed_environment"
@@ -195,7 +194,7 @@ def find_parallel_state(search_root: Optional[Path] = None) -> Optional[Path]:
     """Find parallel_state.py in the filesystem.
 
     Strategy:
-    1. Check primary paths first (conda site-packages, then aiak_sglang)
+    1. Check primary paths first (conda site-packages, then source checkouts)
     2. Fallback: search from provided root or common locations
     """
     # Strategy 1: Primary paths

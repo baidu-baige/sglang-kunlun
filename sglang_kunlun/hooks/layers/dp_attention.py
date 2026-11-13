@@ -105,6 +105,7 @@ def _dp_gather_dtype_bridge(
     local_tokens,
     forward_batch,
     is_partial,
+    cp_shard_counts=None,
 ):
     """Cast ``local_tokens`` to ``global_tokens.dtype`` before the DP gather.
 
@@ -138,4 +139,12 @@ def _dp_gather_dtype_bridge(
                 local_tokens.dtype,
             )
         local_tokens = local_tokens.to(global_tokens.dtype)
+    # 0.5.21 added ``cp_shard_counts`` to _dp_gather_via_all_reduce (CP ranks
+    # write their own shards); forward it only when the caller supplied it so
+    # the all-gather variant keeps its four-argument signature.
+    if cp_shard_counts is not None:
+        return original_fn(
+            global_tokens, local_tokens, forward_batch, is_partial,
+            cp_shard_counts=cp_shard_counts,
+        )
     return original_fn(global_tokens, local_tokens, forward_batch, is_partial)

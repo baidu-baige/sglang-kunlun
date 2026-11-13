@@ -238,7 +238,7 @@ def _set_swa_key_buffer_radix_fused_norm_rope_drain(original_fn, *args, **kwargs
 
 
 @plugin_hook(
-    "sglang.srt.layers.communicator_dsa_cp.dsa_cp_gather_hidden_states",
+    "sglang.srt.layers.layer_boundary.adapters.context_parallel.dsa_cp_gather_hidden_states",
     type=HookType.AROUND,
 )
 def _dsa_cp_gather_hidden_states_kunlun(original_fn, hidden_states):

@@ -2302,7 +2302,7 @@ def sglang_per_token_group_quant_int8(
 
 
 @register_triton_op(
-    "sglang.kernels.ops.quantization.int8_kernel",
+    "sglang.kernels.ops.gemm.int8_kernel",
 "_w8a8_block_int8_matmul",
 )
 def _w8a8_block_int8_matmul(

@@ -936,9 +936,17 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         # Kunlun deep_ep low_latency_dispatch asserts a 2-D contiguous bfloat16
         # input; the float16 model hidden_states must be cast to bf16 first.
         if isinstance(hidden_states, torch.Tensor):
+            if not hidden_states.is_cuda:
+                hidden_states = hidden_states.to(torch.cuda.current_device())
             if hidden_states.dtype != torch.bfloat16:
                 hidden_states = hidden_states.to(torch.bfloat16)
             hidden_states = hidden_states.contiguous()
+        if isinstance(topk_ids, torch.Tensor) and not topk_ids.is_cuda:
+            topk_ids = topk_ids.to(torch.cuda.current_device())
+            if not hidden_states.is_cuda:
+                hidden_states = hidden_states.to(torch.cuda.current_device())
+        if isinstance(topk_ids, torch.Tensor) and not topk_ids.is_cuda:
+            topk_ids = topk_ids.to(torch.cuda.current_device())
         packed_recv_hidden, self.packed_recv_count, self.handle, _ll_event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,

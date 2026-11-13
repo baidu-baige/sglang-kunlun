@@ -50,7 +50,7 @@ _silu_out_ok = None
 
 
 @plugin_hook(
-    "sglang.kernels.ops.attention.dsv4.moe.silu_and_mul_clamp",
+    "sglang.kernels.ops.moe.dsv4.silu_and_mul_clamp",
     type=HookType.REPLACE,
 )
 def _silu_and_mul_clamp_kunlun(
@@ -92,7 +92,7 @@ def _silu_and_mul_clamp_kunlun(
 
 
 @plugin_hook(
-    "sglang.kernels.ops.attention.dsv4.moe.hash_topk",
+    "sglang.kernels.ops.moe.dsv4.hash_topk",
     type=HookType.REPLACE,
 )
 def _hash_topk_torch(
@@ -168,7 +168,7 @@ _ROW_INDEX: dict = {}
 
 
 @plugin_hook(
-    "sglang.kernels.ops.attention.dsv4.moe.mask_topk_ids",
+    "sglang.kernels.ops.moe.dsv4.mask_topk_ids",
     type=HookType.REPLACE,
 )
 def _mask_topk_ids_torch(

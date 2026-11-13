@@ -1357,13 +1357,7 @@ def _low_ratio_index_topk_dense_kunlun(
     from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
         quantize_fp4_indexer_tensor,
     )
-    from sglang.srt.layers.attention.deepseek_v4_backend import (
-        _as_int_list,
-        _dense_fp4_mqa_logits,
-        ceil_align,
-        topk_transform_ragged_v2,
-    )
-    from sglang.srt.layers.attention.dsv4.candidate_indexer import CandidateMasks
+    from sglang.srt.layers.attention.deepseek_v4_backend import _as_int_list
 
     pool = self.token_to_kv_pool
     core = self.forward_metadata.core_metadata
@@ -1412,9 +1406,11 @@ def _low_ratio_index_topk_dense_kunlun(
     num_tokens = pos.shape[0]
     if not slot_chunks or num_tokens == 0:
         if indexer.is_candidate_source:
-            self.forward_metadata.candidate_metadata = CandidateMasks(
-                request_masks=[empty_mask for _ in lc_per_req]
+            from sglang.srt.layers.attention.dsv4.v41_indexer import (
+                CandidateMetadata,
             )
+
+            self.forward_metadata.candidate_metadata = CandidateMetadata()
         return
     k_slots = torch.cat(slot_chunks)
     read = _read_index_k_fp4_rowwise(pool, layer.layer_id, k_slots)
@@ -1422,26 +1418,43 @@ def _low_ratio_index_topk_dense_kunlun(
         read = pool.get_low_ratio_index_k_fp4(layer.layer_id, k_slots)
     k_fp4, k_sf = read
 
-    q = indexer.queries(q_lora, layer.freqs_cis[pos])  # [T, H, 128] fp4 grid
+    q = indexer.queries(q_lora, layer.freqs_cis[pos])  # [T, H, 128]
     num_heads = q.shape[1]
-    q_fp4, q_sf = quantize_fp4_indexer_tensor(q.flatten(0, 1), rne=True)
-    q_fp4 = q_fp4.view(num_tokens, num_heads, 64)
-    q_sf = q_sf.view(num_tokens, num_heads)
+    # The fp4 query quantize only exists to feed deep_gemm's fp8_fp4 logits
+    # kernel.  When that kernel is absent (this XPU build) the torch fallback
+    # dequantises the fp4 query right back, so the round trip only degrades the
+    # query.  The engine's own non-CP torch indexer scores the bf16 query
+    # directly; do the same here (``SGLANG_KUNLUN_CP_BF16_INDEXER`` overrides).
+    use_bf16_q = _bf16_idx_enabled()
+    if not use_bf16_q:
+        q_fp4, q_sf = quantize_fp4_indexer_tensor(q.flatten(0, 1), rne=True)
+        q_fp4 = q_fp4.view(num_tokens, num_heads, 64)
+        q_sf = q_sf.view(num_tokens, num_heads)
     weights = indexer.head_weights(x).float()
     compress_lens = ((pos + 1) // ratio).to(torch.int32)
     ks = _row_slot_offsets(starts, q_lens_cpu, q_lens, num_tokens, device)
     # the fused top-k reads score rows through 16-byte vectors
-    epi_width = ceil_align(max(lc_per_req), 4)
+    epi_width = (max(lc_per_req) + 3) // 4 * 4
     _publish_epi_plan(lc_per_req, q_lens_cpu, k_slots.numel(), epi_width, num_tokens)
-    logits = _dense_fp4_mqa_logits(
-        (q_fp4, q_sf),
-        (k_fp4, k_sf),
-        weights,
-        ks,
-        ks + compress_lens,
-        epi_width,
-    )
-    if indexer.is_candidate_source or indexer.uses_candidates:
+    if use_bf16_q:
+        logits = _dense_bf16_mqa_logits_torch(
+            q.contiguous(),
+            (k_fp4, k_sf),
+            weights,
+            ks,
+            ks + compress_lens,
+            epi_width,
+        )
+    else:
+        logits = _dense_fp4_mqa_logits_torch(
+            (q_fp4, q_sf),
+            (k_fp4, k_sf),
+            weights,
+            ks,
+            ks + compress_lens,
+            epi_width,
+        )
+    if False:  # 0.5.21 enables candidates; use exact full-window top-k on XPU
         self._publish_or_consume_candidates(
             indexer, logits, compress_lens, lc_per_req, q_lens_cpu, empty_mask
         )
@@ -1451,11 +1464,11 @@ def _low_ratio_index_topk_dense_kunlun(
         logits, compress_lens, out_offsets=ks, out_indices=selected
     )
     if not ran_native:
-        topk_transform_ragged_v2(
+        _topk_transform_ragged_v2_torch(
             logits, compress_lens, out_offsets=ks, out_indices=selected
         )
     ascending = ran_native and _ascending_topk_ragged_v2_available()
-    if indexer.uses_candidates and not indexer.is_candidate_source:
+    if False and indexer.uses_candidates and not indexer.is_candidate_source:
         # No mask_topk_scores in the normal pose: it clears a selected entry
         # only when its score is -inf, i.e. when the row has fewer than topk
         # finite candidates.  The candidate mask keeps >= min(
@@ -1495,8 +1508,6 @@ def _low_ratio_index_topk_dense_kunlun(
         raw_indices[:num_tokens, :topk] = torch.where(
             chosen, selected - ks[:, None], -1
         )
-
-
 _CANDIDATE_BLOCK_MASKS_CLS = None
 
 

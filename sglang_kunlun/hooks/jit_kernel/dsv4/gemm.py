@@ -168,7 +168,7 @@ def _vendor_bf16_fp32(x: torch.Tensor, y: torch.Tensor):
 
 
 @plugin_hook(
-    "sglang.kernels.ops.attention.dsv4.gemm.linear_bf16_fp32",
+    "sglang.kernels.ops.gemm.bf16_fp32.linear_bf16_fp32",
     type=HookType.REPLACE,
 )
 def _linear_bf16_fp32_torch(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

@@ -164,7 +164,7 @@ def kunlun_init_model_parallel_group(
     """Kunlun: init GroupCoordinator with XPU/NPU/HPU communicators."""
     from sglang.srt.distributed.parallel_state import (
         _ENABLE_CUSTOM_ALL_REDUCE,
-        _ENABLE_MSCCLPP_ALL_REDUCE,
+        _ENABLE_MSCCLPP,
         _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE,
         GroupCoordinator,
     )
@@ -172,7 +172,7 @@ def kunlun_init_model_parallel_group(
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
     if use_mscclpp_allreduce is None:
-        use_mscclpp_allreduce = _ENABLE_MSCCLPP_ALL_REDUCE
+        use_mscclpp_allreduce = _ENABLE_MSCCLPP
     if use_torch_symm_mem_allreduce is None:
         use_torch_symm_mem_allreduce = _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
 
@@ -181,7 +181,7 @@ def kunlun_init_model_parallel_group(
         local_rank=local_rank,
         torch_distributed_backend=backend,
         use_pynccl=False,
-        use_pymscclpp=use_mscclpp_allreduce,
+        use_mscclpp=use_mscclpp_allreduce,
         use_custom_allreduce=use_custom_allreduce,
         use_torch_symm_mem_all_reduce=use_torch_symm_mem_allreduce,
         use_hpu_communicator=True,

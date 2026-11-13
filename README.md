@@ -253,13 +253,20 @@ is not a complete compatibility matrix.
 | MiMo-V2-Flash | General W8A8 INT8 paths | Use only with a matching model/runtime environment. |
 | Other SGLang models | General platform, attention, KV-cache, MoE, and quantization hooks | Validate each model family and quantization mode separately. |
 
+The HTTP entrypoint also normalizes two client conventions for the
+DeepSeek-V4.1 reasoning detector: legacy top-level `thinking` /
+`enable_thinking` fields are mapped into `chat_template_kwargs`, and a request
+that carries no system message gets the default `You are a helpful assistant.`
+system prompt. Set `SGLANG_KUNLUN_DEFAULT_SYSTEM=""` to disable the
+system-message injection.
+
 ---
 
 ## Version Matrix
 
 | Component | Version or branch | Source |
 | --- | --- | --- |
-| `sglang-kunlun` | `0.1.0` | [`pyproject.toml`](pyproject.toml) |
+| `sglang-kunlun` | `0.5.21` | [`pyproject.toml`](pyproject.toml) |
 | Release branch | `v0.5.21-dev` | This branch |
 | SGLang | `0.5.21` community release | Validated engine for the DeepSeek-V4.1-Flash EPD topology |
 | PyTorch | `2.9.0+cu129` | Validated runtime |

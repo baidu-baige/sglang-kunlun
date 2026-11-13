@@ -39,7 +39,6 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     _as_int_list,
     _pad_tensor_to_size,
 )
-from sglang.srt.layers.attention.dsv4.candidate_indexer import CandidateMasks
 
 # Bind the module, not the function: ``kernel_ops.install()`` swaps
 # ``dsv41_sparse.token_req_indices`` for the Kunlun replacement (host-mirror
@@ -48,6 +47,7 @@ from sglang.srt.layers.attention.dsv4.candidate_indexer import CandidateMasks
 # ``from ... import token_req_indices`` here keeps pointing at the upstream
 # ``_PADFIX`` version for the whole process.
 from sglang.srt.layers.attention.dsv4 import dsv41_sparse as _dsv41_sparse
+
 from sglang.srt.layers.cp.interleave import interleave_rows_per_request
 from sglang.srt.layers.cp.utils import cp_materialize_global_token_order
 from sglang.srt.runtime_context import get_parallel
@@ -95,7 +95,6 @@ logger = logging.getLogger(__name__)
 # KL_CFG_CACHE=0 restores the per-call behaviour (A/B arm).
 _CFG_CACHE = os.environ.get("KL_CFG_CACHE", "1") != "0"
 _CP_ROUND_ROBIN_SPLIT: Optional[bool] = None
-_PUBLISHED_MASKS = None
 _SPARSE_PREFILL_OPT: Optional[bool] = None
 
 
@@ -112,18 +111,6 @@ def _cp_round_robin_split() -> bool:
     if _CFG_CACHE:
         _CP_ROUND_ROBIN_SPLIT = value
     return value
-
-
-def _published_masks():
-    """``candidate_indexer.published_masks`` handle, resolved once."""
-    global _PUBLISHED_MASKS
-    if _PUBLISHED_MASKS is not None and _CFG_CACHE:
-        return _PUBLISHED_MASKS
-    from sglang.srt.layers.attention.dsv4.candidate_indexer import published_masks
-
-    if _CFG_CACHE:
-        _PUBLISHED_MASKS = published_masks
-    return published_masks
 
 
 def _sparse_prefill_opt() -> bool:
@@ -1969,83 +1956,33 @@ class KunlunDeepseekV4AttnBackend(_V1CompressorBackendMixin, DeepseekV4AttnBacke
     # into a single C++ kernel.
     # ------------------------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # CP prefill: project the compressor on this rank's own rows first
-    # ------------------------------------------------------------------
-    # Upstream ships the whole prompt's hidden state to every CP rank and runs
-    # the full-width ratio-1/2 projection on all of it. ``Compressor.project``
-    # is row-wise, so projecting this rank's rows and gathering only the narrow
-    # (kv, score) rows produces the same global rows for 1/cp_size of the GEMM
-    # and far less gather traffic. ``KL_CP_PROJECT_FIRST=0`` (or the
-    # /tmp/kl_cp_off marker for one process) falls back to the base method.
-    def _forward_low_ratio_sources_cp(
+    def _low_ratio_index_topk(
         self,
-        *,
         layer,
         x,
         q_lora,
-        positions,
+        req,
+        pos,
         forward_batch,
-        run_compressor,
-        run_indexer,
+        *,
+        rows_per_request=None,
     ) -> None:
-        if not _cp_project_first():
-            return super()._forward_low_ratio_sources_cp(
-                layer=layer,
-                x=x,
-                q_lora=q_lora,
-                positions=positions,
-                forward_batch=forward_batch,
-                run_compressor=run_compressor,
-                run_indexer=run_indexer,
+        mode = forward_batch.forward_mode
+        if mode.is_decode():
+            from sglang.srt.model_executor.runner_utils.capture_mode import (
+                skip_low_ratio_indexer,
             )
-        cp_meta = forward_batch.attn_cp_metadata
-        total = int(cp_meta.total_seq_lens)
-        tail = self.forward_metadata.late_layer_tail
-        if tail is not None:
-            q_lens_cpu = tail.local_lens_cpu
-            req_global, pos_global = tail.req_global, tail.pos_global
-        else:
-            q_lens_cpu = interleave_rows_per_request(
-                _as_int_list(forward_batch.extend_seq_lens_cpu),
-                get_parallel().attn_cp_rank,
-                get_parallel().attn_cp_size,
-            )
-            req_global = _dsv41_sparse.token_req_indices(
-                forward_batch, num_tokens=total
-            )
-            pos_global = forward_batch.positions[:total].to(torch.int64)
-        num_local = sum(q_lens_cpu)
-        if run_compressor and layer.compressor is not None:
-            kv_local, score_local = layer.compressor.project(x[:num_local])
-            stream = torch.cuda.current_stream()
-            kv_global = cp_materialize_global_token_order(
-                kv_local, forward_batch, stream
-            )[:total]
-            score_global = (
-                None
-                if score_local is None
-                else cp_materialize_global_token_order(
-                    score_local, forward_batch, stream
-                )[:total]
-            )
-            self._low_ratio_compress_torch(
-                layer,
-                None,
-                req_global,
-                pos_global,
-                projected=(kv_global, score_global),
-            )
-        if run_indexer and layer.indexer is not None:
-            self._low_ratio_index_topk_dense(
-                layer,
-                x[:num_local],
-                q_lora[:num_local],
-                positions[:num_local].to(torch.int64),
-                forward_batch,
-                torch.tensor(q_lens_cpu, dtype=torch.int32, device=x.device),
-                q_lens_cpu,
-            )
+
+            if skip_low_ratio_indexer(layer.compress_ratio):
+                return
+            # KL fused-decode kill switch: set SGLANG_KUNLUN_FUSED_DECODE=0 to
+            # fall back to the upstream paged indexer (slow, torch shim).
+            if os.getenv("SGLANG_KUNLUN_FUSED_DECODE", "1") != "0":
+                return self._low_ratio_index_topk_sm90_decode(layer, x, q_lora, req, pos)
+        return super()._low_ratio_index_topk(
+            layer, x, q_lora, req, pos, forward_batch,
+            rows_per_request=rows_per_request,
+        )
 
     def _low_ratio_index_topk_sm90_decode(self, layer, x, q_lora, req, pos) -> None:
         pool = self.token_to_kv_pool
@@ -2096,27 +2033,11 @@ class KunlunDeepseekV4AttnBackend(_V1CompressorBackendMixin, DeepseekV4AttnBacke
         pos_i32 = pos.to(torch.int32).contiguous()
         topk = min(indexer.index_topk, lmax)
 
-        is_publish = indexer.is_candidate_source
-        is_consume = indexer.uses_candidates and not indexer.is_candidate_source
-
-        # Build candidate mask for consume layers
-        if is_consume:
-            consume_mask = _published_masks()(
-                self.forward_metadata.candidate_metadata
-            ).mask
-            assert torch.is_tensor(consume_mask) and consume_mask.shape[0] == bs
-            # Pad/trim to window width
-            if consume_mask.shape[1] < lmax:
-                cand_mask = F.pad(
-                    consume_mask, (0, lmax - consume_mask.shape[1]), value=False
-                )
-            else:
-                cand_mask = consume_mask[:, :lmax]
-            cand_mask = cand_mask.contiguous()
-        else:
-            cand_mask = torch.zeros(
-                bs, lmax, dtype=torch.bool, device=pos.device
-            )
+        # 0.5.21 port: candidates are not published; the fused kernel performs
+        # the exact top-k over the full visible window.
+        is_publish = False
+        is_consume = False
+        cand_mask = torch.zeros(bs, lmax, dtype=torch.bool, device=pos.device)
 
         # --- Call fused xspeedgate kernel ---
         fused_page_indices, published = (
@@ -2158,11 +2079,129 @@ class KunlunDeepseekV4AttnBackend(_V1CompressorBackendMixin, DeepseekV4AttnBacke
             # None for decode. This branch is defensive only.
             pass
 
-        if is_publish:
-            # Convert uint8 bitmap → bool mask for CandidateMasks
-            mask = published.to(torch.bool)
-            self.forward_metadata.candidate_metadata = CandidateMasks(mask=mask)
 
+
+    # ------------------------------------------------------------------
+    # CP prefill: project the compressor on this rank's own rows first
+    # ------------------------------------------------------------------
+    # Upstream ships the whole prompt's hidden state to every CP rank and runs
+    # the full-width ratio-1/2 projection on all of it. ``Compressor.project``
+    # is row-wise, so projecting this rank's rows and gathering only the narrow
+    # (kv, score) rows produces the same global rows for 1/cp_size of the GEMM
+    # and far less gather traffic. ``KL_CP_PROJECT_FIRST=0`` (or the
+    # /tmp/kl_cp_off marker for one process) falls back to the base method.
+    def _low_ratio_index_topk_dense(
+        self, layer, x, q_lora, pos, forward_batch, q_lens, q_lens_cpu
+    ) -> None:
+        """0.5.21 compatibility: upstream renamed this to _low_ratio_index_topk.
+
+        The Kunlun CP prefill path still calls this name; the implementation is
+        the existing dense indexer, with the three module-level helpers that
+        0.5.21 removed substituted by their local torch equivalents.
+        """
+        from sglang_kunlun.hooks.layers.dsv41_cp_indexer import (
+            _low_ratio_index_topk_dense_kunlun,
+        )
+
+        return _low_ratio_index_topk_dense_kunlun(
+            self, layer, x, q_lora, pos, forward_batch, q_lens, q_lens_cpu
+        )
+
+    def _forward_low_ratio_sources_cp(
+        self,
+        *,
+        layer,
+        x,
+        q_lora,
+        positions,
+        forward_batch,
+        run_compressor,
+        run_indexer,
+    ) -> None:
+        if not _cp_project_first():
+            # Upstream compressor (materialise the whole prompt on every rank,
+            # then project) but keep the Kunlun CP dense indexer: the upstream
+            # indexer call passes req=None and asserts on the torch fallback.
+            cp_meta = forward_batch.attn_cp_metadata
+            total = int(cp_meta.total_seq_lens)
+            tail = self.forward_metadata.late_layer_tail
+            if tail is not None:
+                q_lens_cpu = tail.local_lens_cpu
+                req_global, pos_global = tail.req_global, tail.pos_global
+            else:
+                q_lens_cpu = interleave_rows_per_request(
+                    _as_int_list(forward_batch.extend_seq_lens_cpu),
+                    get_parallel().attn_cp_rank,
+                    get_parallel().attn_cp_size,
+                )
+                req_global = _dsv41_sparse.token_req_indices(
+                    forward_batch, num_tokens=total
+                )
+                pos_global = forward_batch.positions[:total].to(torch.int64)
+            num_local = sum(q_lens_cpu)
+            if run_compressor and layer.compressor is not None:
+                x_global = cp_materialize_global_token_order(
+                    x.contiguous(), forward_batch, torch.cuda.current_stream()
+                )[:total]
+                self._low_ratio_compress_torch(layer, x_global, req_global, pos_global)
+            if run_indexer and layer.indexer is not None:
+                self._low_ratio_index_topk_dense(
+                    layer,
+                    x[:num_local],
+                    q_lora[:num_local],
+                    positions[:num_local].to(torch.int64),
+                    forward_batch,
+                    torch.tensor(q_lens_cpu, dtype=torch.int32, device=x.device),
+                    q_lens_cpu,
+                )
+            return
+        cp_meta = forward_batch.attn_cp_metadata
+        total = int(cp_meta.total_seq_lens)
+        tail = self.forward_metadata.late_layer_tail
+        if tail is not None:
+            q_lens_cpu = tail.local_lens_cpu
+            req_global, pos_global = tail.req_global, tail.pos_global
+        else:
+            q_lens_cpu = interleave_rows_per_request(
+                _as_int_list(forward_batch.extend_seq_lens_cpu),
+                get_parallel().attn_cp_rank,
+                get_parallel().attn_cp_size,
+            )
+            req_global = _dsv41_sparse.token_req_indices(
+                forward_batch, num_tokens=total
+            )
+            pos_global = forward_batch.positions[:total].to(torch.int64)
+        num_local = sum(q_lens_cpu)
+        if run_compressor and layer.compressor is not None:
+            kv_local, score_local = layer.compressor.project(x[:num_local])
+            stream = torch.cuda.current_stream()
+            kv_global = cp_materialize_global_token_order(
+                kv_local, forward_batch, stream
+            )[:total]
+            score_global = (
+                None
+                if score_local is None
+                else cp_materialize_global_token_order(
+                    score_local, forward_batch, stream
+                )[:total]
+            )
+            self._low_ratio_compress_torch(
+                layer,
+                None,
+                req_global,
+                pos_global,
+                projected=(kv_global, score_global),
+            )
+        if run_indexer and layer.indexer is not None:
+            self._low_ratio_index_topk_dense(
+                layer,
+                x[:num_local],
+                q_lora[:num_local],
+                positions[:num_local].to(torch.int64),
+                forward_batch,
+                torch.tensor(q_lens_cpu, dtype=torch.int32, device=x.device),
+                q_lens_cpu,
+            )
 
 class KunlunDeepseekV4MultiStepBackend(_V1CompressorBackendMixin, DeepseekV4MultiStepBackend):
     """0.5.14 multi-step control flow composed only of Kunlun backends."""
