@@ -10,9 +10,14 @@ from torch import nn
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+from sglang.srt.utils import get_bool_env_var
 from sglang_kunlun.kernels.kernel_ops import dsv4_mqa_wo_a_einsum_kunlun
 
 from .mtp_input_correction import strip_correction_blocks
+
+# Escape hatch for a router-precision bisect: restores the fp32 router GEMM that
+# ``moe_gate_forward_kunlun`` used to run for every non-DSV4 model.
+_MOE_GATE_FORCE_FP32 = get_bool_env_var("KUNLUN_MOE_GATE_FP32")
 
 
 def _store_kv_to_swa_cache_direct(self, kv, forward_batch, attn_backend) -> None:
@@ -246,30 +251,52 @@ def moe_gate_forward_kunlun(
     gemm_output_zero_allocator=None,
     forward_batch=None,
 ):
-    """Match the Kunlun DSV4 router GEMM contract.
+    """Run the router GEMM at the input dtype, as the 0.5.8 fork did.
 
-    logits go through **fp32**, matching all upstream CUDA paths
-    (`tiny_gemm_bf16(out_dtype=fp32)` / `linear_bf16_fp32`) and the reference
-    implementation (`Gate.forward`: `linear(x.float(), weight.float())`). V4.1
-    has 384 experts + top-6; fp16 only has about 3 decimal significant digits,
-    so `sqrtsoftplus` scores that are close together can pick the wrong expert.
+    The 0.5.8 production router was plain
+    ``F.linear(hidden_states, self.weight, None)``
+    (``aima_sglang/.../models/deepseek_v2.py:469``). Its only fp32 branch is
+    ``dsv3_router_gemm`` at ``:456-462``, gated on
+    ``hidden_states.shape[1] == 7168``; GLM-5.3 is hidden 6144, so the fork
+    never reached it and shipped fp16 logits -- the accuracy the gate was
+    measured against.
 
-    DSV4's direct half-precision router GEMM used to be a *second* (``AROUND``)
-    hook on this same target, in ``deepseek_v4_precision.py``: the registry
-    applied this ``REPLACE`` first and then wrapped it, so that fast path ran
-    ahead of this body and fell through to it otherwise. Two hooks on one
-    target is forbidden, so the branch is folded in below in exactly that
-    order. GLM-5.3 keeps the fp32 route -- its ``MoEGate.is_deepseek_v4`` is
-    False (only ``srt/models/deepseek_v4.py:3163`` passes
-    ``is_deepseek_v4=True``; ``GlmMoeDsaForCausalLM`` subclasses
-    ``DeepseekV2ForCausalLM``).
+    Widening the operands here instead costs three device ops per MoE layer and
+    buys nothing. Measured on the 2026-11-12 decode traces, 78 MoE layer
+    invocations per step (75 routed layers + 3 EAGLE draft replays):
+
+      0.5.8   fc_one_loop<ArgsJL1_10713181448243477287>   fp16, 8.04 us
+      0.5.23  cluster_cast_kl3<float16, float>  (weight)        8.09 us
+              cluster_cast_kl3<float16, float>  (activations)   2.42 us
+              fc_one_loop<ArgsJL1_12003570218661124528>   fp32, 12.60 us
+
+    The two xblas instantiations differ in exactly one property -- a/b/c/d and
+    gemm_type float16 vs float, identical ``trans_b``, scales and null-ness
+    (``/tmp/.xblas_cache/1.1.0.0/kXPU3/jlevel1/*/*/{10713181448243477287,
+    12003570218661124528}/kernel.meta.json``) -- so the fp32 route is the same
+    GEMM made 57% slower. ``self.weight.float()`` is the expensive half: it
+    re-widens the whole [n_routed_experts, hidden] weight on every layer of
+    every step because ``Tensor.float()`` cannot cache.
+
+    Accumulation is unaffected: both instantiations carry ``gemmo_type =
+    float``, so the product is summed in fp32 either way and only the stored
+    logits are narrower. The correction bias also stays fp32
+    (``srt/models/deepseek_v2.py:518-530`` keeps fp32 for ``is_glm_moe_dsa``),
+    and the vendor top-k scores in fp32 regardless -- its second template
+    parameter is the score dtype and the 0.5.8 trace shows
+    ``infer_moe_sigmoid_topk_norm<float16, float, int, float, true>``.
+
+    DSV4 is unchanged: it already took this half-precision path, since the
+    previous body gated it on ``self.is_deepseek_v4``. The fp32 fallback still
+    serves fp32 inputs and any dtype mismatch, and ``KUNLUN_MOE_GATE_FP32=1``
+    forces it back for a precision bisect.
     """
 
     del gemm_output_zero_allocator, forward_batch
     if hidden_states.dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise TypeError(f"unsupported Kunlun MoE gate input dtype: {hidden_states.dtype}")
     if (
-        self.is_deepseek_v4
+        not _MOE_GATE_FORCE_FP32
         and hidden_states.dtype == self.weight.dtype
         and hidden_states.dtype in (torch.bfloat16, torch.float16)
     ):

@@ -1046,7 +1046,34 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
                 page_size=1,
             )
 
-        q_all = torch.cat([q_nope, q_rope], dim=-1)
+        # Concatenate in the attention dtype, do not let ``torch.cat`` pick it.
+        # ``q_nope`` is the absorbed-MLA bmm output and ``q_rope`` the rotary
+        # output, and on 0.5.23 those two arrive in *different* dtypes (bf16 and
+        # fp16 respectively, because upstream's ``w_kc`` is hardcoded bf16 --
+        # ``deepseek_weight_loader.py:747-749``). ``torch.cat`` then promotes the
+        # pair to fp32, concatenates at double width and the ``.to(out_dtype)``
+        # below casts the result back, which the 2026-11-12 decode trace shows as
+        # three extra casts per layer invocation around one widened concat::
+        #
+        #     cluster_cast_kl3<bfloat16, float>  5.2 us   q_nope
+        #     cluster_cast_kl3<float16, float>   2.4 us   q_rope
+        #     concat_t_different                 6.8 us   (4.7 us in fp16 on 0.5.8)
+        #     cluster_cast_kl3<float, float16>   5.2 us   q_all
+        #
+        # i.e. 243 casts per step for ~1.04 ms/step, where 0.5.8 ran the concat
+        # alone with both operands fp16 (``sgl-kernel/.../nsa_backend.py``, same
+        # ``torch.cat([q_nope, q_rope])`` with an fp16 bmm output).
+        #
+        # Casting the operands first costs one cast on the mismatched operand
+        # instead of three on both plus the result, and once the absorbed
+        # projections are restored to the served dtype
+        # (``hooks/models/deepseek_v4_precision.py:180-244``) both ``.to`` calls
+        # become no-ops -- ``Tensor.to`` returns ``self`` for a matching dtype --
+        # and this is exactly the 0.5.8 single-kernel concat. ``out_dtype`` below
+        # is the same constant and documents why fp16 is the right target.
+        q_all = torch.cat(
+            [q_nope.to(torch.float16), q_rope.to(torch.float16)], dim=-1
+        )
 
         # Decode runs the SAME operator as sparse prefill, exactly as the 0.5.8
         # baseline does: `sgl-kernel/.../nsa_backend.py:2240-2244` calls

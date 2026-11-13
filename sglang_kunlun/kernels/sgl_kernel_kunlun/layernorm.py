@@ -34,9 +34,25 @@ def rmsnorm(
     # has to stay `empty_like(x)`, and the model dtype can only be restored by
     # casting the result.
     out = torch.empty_like(x)
+    # Pass the weight in the activation's dtype when it already is that dtype.
+    # The probe above only requires ``weight.dtype in (x.dtype, fp32)``, not fp32
+    # itself, and pinning fp32 casts the whole ``[hidden]`` weight vector on
+    # every call: the 2026-11-12 decode trace shows two
+    # ``cluster_cast_kl3<float16, float>`` (2.2 us + 3.3 us) per layer directly
+    # ahead of the two ``infer_rms_layer_norm_ns_with_stride<float16, float, 4>``
+    # / ``<..., 1>`` launches, i.e. 162 casts per step for 0.45 ms/step. The
+    # 0.5.8 baseline ran the same two norms as
+    # ``infer_rms_layer_norm_ns_with_stride<float16, float16, 4>`` / ``<..., 1>``
+    # with no cast in front (``aima_sglang/sglang/sgl-kernel/python/sgl_kernel/
+    # patch/layers/layernorm.py:47-48`` passes ``self.weight.data`` untouched,
+    # i.e. the model dtype), and that instantiation is the faster one in the same
+    # trace (3.8 us against 4.8 us). ``fused_add_rmsnorm`` below already
+    # made exactly this change for the fused op; this is the same decision for
+    # the out-of-place one.
+    weight_for_op = weight if weight.dtype == x.dtype else weight.to(torch.float32)
     kunlun_ops.rmsnorm(
         x,
-        weight.to(torch.float32),
+        weight_for_op,
         out,
         eps,
         False,

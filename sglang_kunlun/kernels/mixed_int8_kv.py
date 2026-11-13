@@ -117,6 +117,40 @@ def write_mixed_int8_rows(
     )
 
 
+def _reinterpret(packed: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """``packed.view(dtype)`` without a staging copy when the layout permits.
+
+    The bytes are a *container*: one mixed row is
+    ``[int8 nope | fp32 scales | bf16 rope]``, so reading its scale and rope
+    columns is a reinterpretation of identical storage, never a conversion --
+    which is why this module reaches for ``view(dtype)`` and not ``to(dtype)``.
+
+    Torch's widening ``Tensor.view(dtype)`` (``aten::view_dtype``) needs four
+    things, all of which a column slice of this row satisfies: the last
+    dimension packed (``stride(-1) == 1`` -- a column slice of a 2-D row keeps
+    it), its length a multiple of the element-size ratio, the storage offset a
+    multiple of it, and every other stride a multiple of it. For this layout
+    that reduces to "the row stride and the column offset are multiples of the
+    target element size", which :func:`mixed_int8_bytes_per_token` already
+    enforces for the fp32 scales (``nope_dim % 4``) and which the bf16 tail
+    inherits. The ``.contiguous()`` this replaces copied one full column of the
+    whole layer's pool (77k slots) per call, per layer.
+
+    Anything else -- a different pool width, a row buffer that starts at an odd
+    byte -- falls back to the copy rather than raising.
+    """
+    ratio = torch.empty((), dtype=dtype).element_size() // packed.element_size()
+    strides = packed.stride()
+    if ratio > 1 and not (
+        strides[-1] == 1
+        and packed.shape[-1] % ratio == 0
+        and packed.storage_offset() % ratio == 0
+        and all(stride % ratio == 0 for stride in strides[:-1])
+    ):
+        packed = packed.contiguous()
+    return packed.view(dtype)
+
+
 def unpack_mixed_int8(
     cache: torch.Tensor,
     nope_dim: int,
@@ -150,12 +184,14 @@ def unpack_mixed_int8(
             f"of {cache.dtype}"
         )
     num_groups = nope_dim // group_size
-    scale = (
-        cache[:, nope_dim : nope_dim + scale_bytes]
-        .contiguous()
-        .view(torch.float32)
-        .reshape(-1, num_groups)
-    )
+    # ``mul_`` below broadcasts this against the fp32 noPE staging buffer, which
+    # is a torch elementwise op (TensorIterator): it already receives a
+    # non-contiguous operand today (``unsqueeze(-1)`` makes the last axis a
+    # broadcast one), so dropping the pack only changes the *value* of the outer
+    # stride, not the kernel the platform has to serve.
+    scale = _reinterpret(
+        cache[:, nope_dim : nope_dim + scale_bytes], torch.float32
+    ).reshape(-1, num_groups)
     out_shape = (cache.shape[0], nope_dim + rope_dim)
     if out is None:
         out = torch.empty(out_shape, dtype=dtype, device=cache.device)
@@ -170,9 +206,14 @@ def unpack_mixed_int8(
     nope.mul_(scale.unsqueeze(-1))
     out[:, :nope_dim] = nope.reshape(-1, nope_dim)
     if rope_dim:
-        out[:, nope_dim:] = (
-            cache[:, nope_dim + scale_bytes : stride]
-            .contiguous()
-            .view(torch.bfloat16)
+        # The consumer is ``aten::copy_``, which takes arbitrary strides on both
+        # sides: the destination here has been strided all along
+        # (``out[:, nope_dim:]`` is the tail of a wider row), and a strided copy
+        # is a kernel this platform serves per decode step by the hundred
+        # (``xpukernel_xpu3::strided_slice_copy2d``, 335/step on the 2026-11-12
+        # decode trace). So this is the copy that was always going to happen,
+        # minus the pack that used to precede it.
+        out[:, nope_dim:] = _reinterpret(
+            cache[:, nope_dim + scale_bytes : stride], torch.bfloat16
         )
     return out

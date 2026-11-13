@@ -25,6 +25,7 @@ HOOK_MODULES = (
     "sglang_kunlun.hooks.mem_cache",
     "sglang_kunlun.hooks.model_loader",
     "sglang_kunlun.hooks.model_executor",
+    "sglang_kunlun.hooks.managers",
     "sglang_kunlun.hooks.distributed",
     "sglang_kunlun.hooks.constrained",
     "sglang_kunlun.hooks.disaggregation",

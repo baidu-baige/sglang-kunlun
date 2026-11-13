@@ -9,6 +9,34 @@ import torch
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 
+def _as_head_view(t: torch.Tensor, num_tokens: int, head_size: int) -> torch.Tensor:
+    """Reshape to ``[tokens, heads, head_size]`` without materialising a copy.
+
+    ``flashinfer_rotary_embedding`` takes non-contiguous views -- it writes back
+    through the original storage and only requires the last dimension to have
+    stride 1 (``xspeedgate_ops/_rope.pyi:177-178, 204``: "query/key 允许是非连续
+    视图 ... 算子直接写回原 storage, 无需调用方手动 .contiguous(), 无额外内存
+    分配" / "query 和 key 最后一维的 stride 必须为 1, 其余维度 stride 不限").
+
+    ``Tensor.view`` cannot express that: it raises on any input whose strides are
+    not row-major, which forces every caller holding a slice (the absorbed-MLA
+    ``q[..., kv_lora_rank:]`` fork, for one) to pay a ``.contiguous()`` the
+    kernel never wanted.  Split the last axis instead, so a strided input keeps
+    its strides and only a genuinely unusable layout falls back to a copy.
+    """
+    if t.dim() == 3 and t.shape[0] == num_tokens and t.shape[2] == head_size:
+        return t if t.stride(2) == 1 else t.contiguous()
+    if t.stride(-1) == 1 and t.shape[-1] % head_size == 0:
+        # unflatten keeps the leading strides, so a view over a slice stays a
+        # view; it only fails when the split needs interleaving, which the
+        # stride(-1) == 1 guard above has already excluded.
+        try:
+            return t.reshape(num_tokens, -1, head_size)
+        except RuntimeError:
+            pass
+    return t.contiguous().view(num_tokens, -1, head_size)
+
+
 @plugin_hook(
     "sglang.srt.layers.rotary_embedding.RotaryEmbedding.forward_cuda",
     type=HookType.REPLACE,
@@ -42,9 +70,9 @@ def rotary_embedding_forward_kunlun(
         query = query.to(key.dtype)
 
     query_shape = query.shape
-    query = query.view(num_tokens, -1, self.head_size)
+    query = _as_head_view(query, num_tokens, self.head_size)
     key_shape = key.shape
-    key = key.view(num_tokens, -1, self.head_size)
+    key = _as_head_view(key, num_tokens, self.head_size)
 
     query, key = torch.ops.xspeedgate_ops.flashinfer_rotary_embedding(
         positions=positions,

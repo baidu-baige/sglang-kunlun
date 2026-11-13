@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import torch
 from kunlun_ops import hc_post_kunlun_impl
 from typing import Optional
@@ -9,7 +11,10 @@ from torch import nn
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+from sglang.srt.utils import get_bool_env_var
 from sglang_kunlun.kernels.kernel_ops import dsv4_mqa_wo_a_einsum_kunlun
+
+logger = logging.getLogger(__name__)
 
 
 def _dsv4_dump(self, name, value):
@@ -19,6 +24,10 @@ def _dsv4_dump(self, name, value):
 
 
 _FP16_DTYPE_NAMES = frozenset(("fp16", "float16", "half"))
+
+# Escape hatch for the absorbed-MLA dtype restore below: leaves ``w_kc`` /
+# ``w_vc`` in the bf16 upstream hands over.
+_MLA_BMM_KEEP_BF16 = get_bool_env_var("KUNLUN_MLA_BMM_BF16")
 
 
 # Golden keeps this hook disabled so the upstream Torch hc_pre runs and the
@@ -125,6 +134,114 @@ def _restore_requested_fp16_parameter_dtype(*linears):
         weight = getattr(linear, "weight", None)
         if weight is not None and weight.dtype != torch.float16:
             weight.data = weight.data.to(dtype=torch.float16)
+
+
+_ABSORBED_MLA_WEIGHTS = ("w_kc", "w_vc")
+
+
+def _restore_requested_fp16_absorbed_mla_weights(self_attn) -> int:
+    """Put one layer's absorbed MLA projections back in the served dtype.
+
+    Same job as ``_restore_requested_fp16_parameter_dtype`` above, but these are
+    plain tensors derived after weight loading rather than Linear parameters, so
+    they need the post-load seam instead of an ``__init__`` seam.
+    """
+    if _MLA_BMM_KEEP_BF16:
+        return 0
+
+    from sglang_kunlun.compat import server_arg
+
+    if server_arg("dtype", None) not in _FP16_DTYPE_NAMES:
+        return 0
+
+    converted = 0
+    for name in _ABSORBED_MLA_WEIGHTS:
+        tensor = getattr(self_attn, name, None)
+        # Only the dequantized half/single form is convertible. The fp8 and
+        # block-quantized forms carry a separate ``w_scale`` and feed
+        # ``bmm_fp8`` / ``grouped_gemm_nt_f8f8bf16_masked``
+        # (``forward_mla.py:866-913``), so they must be left exactly as loaded.
+        if tensor is None or tensor.dtype not in (torch.bfloat16, torch.float32):
+            continue
+        # ``empty_strided`` + ``copy_`` reproduces the stride upstream built --
+        # ``w_kc`` is a transposed view over a contiguous [b, n, k] buffer and
+        # ``w_vc`` a transpose of a contiguous one
+        # (``deepseek_weight_loader.py:779-786``). The vendor GEMM picks its
+        # kernel off the strides, so the layout has to survive the dtype change.
+        out = torch.empty_strided(
+            tensor.shape, tensor.stride(), dtype=torch.float16, device=tensor.device
+        )
+        out.copy_(tensor)
+        setattr(self_attn, name, out)
+        converted += 1
+    return converted
+
+
+@plugin_hook(
+    "sglang.srt.models.deepseek_common.deepseek_weight_loader."
+    "DeepseekV2WeightLoaderMixin.post_load_weights",
+    type=HookType.AFTER,
+)
+def restore_absorbed_mla_weight_dtype_kunlun(result, self, *args, **kwargs):
+    """Restore ``w_kc`` / ``w_vc`` to the served dtype, once, at load time.
+
+    Upstream dequantizes channel-wise-int8 ``kv_b_proj`` into **hardcoded bf16**
+    (``deepseek_weight_loader.py:747-749``) and splits that into ``w_kc`` /
+    ``w_vc`` (``:762-764``). The 0.5.8 fork dequantized at the *served* dtype on
+    the same line (``aima_sglang/.../deepseek_weight_loader.py:558-565``:
+    ``_model_dtype = getattr(torch, get_global_server_args().dtype)``), so under
+    ``--dtype float16`` its absorbed projections were fp16. Same formula, same
+    tensors, same transposes -- only the dtype differs, and no scale was dropped
+    (``w_scale`` stays whatever upstream bound at ``:787-795``).
+
+    That one word costs 243 cast launches per decode step. There is no bfloat16
+    ``bmm`` instantiation in the xblas JIT cache -- every ``batched_gemm_bsp`` /
+    ``bmm_one_loop`` / ``bmm_kn_mnk`` / ``bmm_km_nmk`` meta under
+    ``/tmp/.xblas_cache`` is ``a_type float16`` or ``a_type float`` -- so bf16
+    operands cannot be served natively and torch_xmlir widens both sides to
+    fp32, runs the fp32 kernel and casts the result back. Measured on the
+    2026-11-12 decode traces, 81 attention layer invocations per step (78 layers
+    + 3 EAGLE draft replays), around
+    ``batched_gemm_bsp<ArgsJL1_16890920128378793682>``:
+
+      -2  cluster_cast_kl3<bfloat16, float>  (the weight)  25.59 us  2.07 ms/step
+      -1  cluster_cast_kl3<bfloat16, float>  (activations)  4.66 us  0.38 ms/step
+       0  batched_gemm_bsp  fp32                           22.54 us  1.83 ms/step
+      +1  cluster_cast_kl3<float, bfloat16>  (the result)   5.86 us  0.47 ms/step
+
+    The 0.5.8 trace runs the same bmm as
+    ``batched_gemm_bsp<ArgsJL1_14665100556029249500>`` (``a_type float16``) at
+    162/step with zero casts, which is the state this restores.
+
+    fp16 is lossless here, not merely in range: the checkpoint stores
+    ``kv_b_proj.weight_scale`` as **bf16**, so upstream's
+    ``int8.to(bf16) * scale.to(bf16)`` product already has at most an 8-bit
+    mantissa, which fp16's 11 bits hold exactly. Measured over the checkpoint
+    (layers 0/3/5/20/40/60/77, 14.68M entries each): ``|w|`` max 0.18-0.29
+    against an fp16 max of 65504, smallest non-zero 6.6e-6 against an fp16
+    smallest subnormal of 5.96e-8, zero entries out of range in either
+    direction, and the bf16 -> fp16 round trip is bit-exact (max abs err 0.0).
+    """
+    model = getattr(self, "model", None)
+    if model is None:
+        return result
+
+    modules = list(getattr(model, "layers", None) or ())
+    decoder = getattr(model, "decoder", None)
+    if decoder is not None:
+        modules.append(decoder)
+
+    converted = 0
+    for module in modules:
+        self_attn = getattr(module, "self_attn", None)
+        if self_attn is not None:
+            converted += _restore_requested_fp16_absorbed_mla_weights(self_attn)
+    if converted:
+        logger.info(
+            "Kunlun: restored %d absorbed MLA projections (w_kc/w_vc) to fp16",
+            converted,
+        )
+    return result
 
 
 @plugin_hook(

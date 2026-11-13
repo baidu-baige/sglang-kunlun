@@ -1196,16 +1196,37 @@ class DeepEPMoE(FusedMoE):
         # GroupGemm-0
         num_groups, m, _ = hidden_states.size()
         n = w13_weight.size(1)
-        # `expected_m` is passed to the vendor GEMM verbatim, as 0.5.8 does
-        # (`compressed_tensors_moe.py:2839-2845`): it is the kernel's hint for
-        # the average rows-per-group and it selects the tile/loop order. The
-        # `min(expected_m, m)` clamp that used to be here changed that hint and
-        # with it the instantiation -- the 0.5.8 decode trace runs
-        # `moe_bf16_rn_kn_mnk` and `moe_bf16_rn_mn_kmn` (2886 launches each, one
-        # per layer per step) where this path emitted a single
-        # `moe_bf16_rn_km_nmk`, which is a missing operator against the parity
-        # gate. The clamp was also redundant: `expected_m` only feeds heuristics,
-        # while the row bound the kernel honours is `masked_m`.
+        # Every argument is built the way 0.5.8's `apply_deepep_ll` builds it
+        # (`aima_sglang/.../compressed_tensors_moe.py:2836-2867`): freshly
+        # allocated contiguous `torch.empty` outputs and the dispatch's
+        # per-token amax handed over untouched. The masked layout needs that --
+        # it runs the vendor op in SortedByExpertPadding mode, which asserts
+        # `a.stride[0] == a.shape[1] * a.stride[1]` and
+        # `expert_num == a.shape[-3]` (strings from
+        # xBLAS/src/host/launcher/moe/launcher.h in torch_xmlir/libxpu_blas.so),
+        # so a `.view()` of a reused buffer aborts the launch rather than
+        # quietly costing time.
+        #
+        # `expected_m` is positional ballast, not a tile hint: the wrapper
+        # `kunlun_ops/_deepgemm.py:352-384` takes it and never reads it. Only the
+        # four tensors, `scale_n`/`scale_k` recomputed from the weight-scale
+        # shape, and the masked flag reach `xpu_kunlun_ops.moe_fc_v3`. The row
+        # bound the kernel honours is `masked_m`, through the device-side lod
+        # `moe_expert_m_to_lod` builds from it, so clamping `expected_m`
+        # host-side changes nothing in either direction.
+        #
+        # Which `moe_bf16_rn_*` instantiation runs is not decided here either.
+        # xBLAS assembles the name host-side as "moe_bf16_rn_" + the chosen
+        # AlgoConfig loop order (xBLAS/src/host/launcher/moe/algo3/
+        # launch_kernel.cpp), and the three variants the decode traces show --
+        # `kn_mnk`, `mn_kmn`, `km_nmk` -- share one template_instantiation_hash
+        # 5705316909179429569 (/tmp/.xblas_cache/1.1.0.0/kXPU3/jlevel1/
+        # 3645340146/3083505228/5705316909179429569/kernel.meta.json), i.e.
+        # identical dtypes, sort modes, scale locations and pointer null-ness.
+        # The pick comes from the runtime sizes plus the launch's cluster unit,
+        # and the only size this function does not own is `m`:
+        # num_max_dispatch_tokens_per_rank * ep_size, fixed by the launcher env
+        # SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states.device, dtype=torch.bfloat16
         )

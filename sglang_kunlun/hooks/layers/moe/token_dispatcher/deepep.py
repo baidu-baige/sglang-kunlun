@@ -554,11 +554,34 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         """_dispatch_core"""
         buffer = self._get_buffer()
 
-        num_tokens_per_rank = None
-        num_tokens_per_rdma_rank = None
-        num_tokens_per_expert = None
-        is_token_in_rank = None
-        
+        # Compute the dispatch layout host-side first, as the 0.5.8 fork did
+        # (``aima_sglang/.../layers/moe/token_dispatcher/deepep.py:434-444``).
+        #
+        # Leaving all four layout arguments as ``None`` makes ``buffer.dispatch``
+        # derive them internally via ``bkcl_notify_dispatch_standard``, and that
+        # is the path that fails under sustained prefill load:
+        #
+        #   RuntimeError: Failed: Assertion error deep_ep.cpp:410
+        #     'recv_num_tokens >= 0 and "bkcl_notify_dispatch_standard failed"'
+        #
+        # Measured: nine prefill logs under logs_pd_glm52/ carry that assertion,
+        # always on the normal (prefill) dispatcher and always minutes into a
+        # run -- it is what truncated the 180-case accuracy cell to 15 samples.
+        # 0.5.8 ran the same load to completion with the explicit pre-pass.
+        (
+            num_tokens_per_rank,
+            num_tokens_per_rdma_rank,
+            num_tokens_per_expert,
+            is_token_in_rank,
+            previous_event,
+        ) = buffer.get_dispatch_layout(
+            topk_ids,
+            self.num_experts,
+            previous_event=previous_event,
+            async_finish=self.async_finish,
+            allocate_on_comm_stream=previous_event is not None,
+        )
+
         # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
         # However, doing this would incur an unknown synchronization error, but keeping
         # `handle` as a member variable works.

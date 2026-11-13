@@ -532,6 +532,10 @@ def _get_topk_paged(
         seqlens_32_cpu = metadata.get_seqlens_int32_cpu()
 
     assert len(q_fp8.shape) == 3, f"q_fp8.shape: {q_fp8.shape}"
+    # Raw hidden-state row count, captured before the draft fold below
+    # reshapes ``q_fp8`` to one entry per *request*: the trailing top-k
+    # padding is per hidden-state row, not per kernel batch entry.
+    q_rows = q_fp8.shape[0]
     q_fp8 = q_fp8.unsqueeze(1)
 
     if len(weights.shape) == 2:
@@ -570,8 +574,90 @@ def _get_topk_paged(
             f"provenance={getattr(forward_batch, '_kunlun_draft_meta_provenance', None)}"
         )
         
+    # --- draft fold: one kernel batch entry per *request*, not per draft token
+    #
+    # ``real_page_table`` carries one row per draft token and those rows are
+    # identical within a request: upstream builds them with
+    # ``repeat_interleave(page_indices, speculative_num_draft_tokens)``
+    # (``sglang/srt/layers/attention/dsa_backend.py:1938`` for target-verify,
+    # ``:2021`` for draft-extend-v2). Handing the op ``bs * D`` single-query
+    # entries therefore makes it walk the same request's index-K ``D`` times.
+    # ``dsa_paged_mqa_logits`` reads ``max_seq_q`` from ``q.size(1)`` and
+    # supports 1-2 (``kunlun_ops/_deepgemm.py:694-726``), so fold a request's
+    # D query positions into one entry -- which is what 0.5.8 did
+    # (``sgl_kernel/patch/layers/attention/nsa/nsa_indexer.py:193-225``).
+    #
+    # Trace evidence (step-normalised on ``moe_pre_process``/156, 8 ranks,
+    # base=``traces/pd_deepep_D`` 0.5.8, new=``traces/dstack`` 0.5.23):
+    #   fa_xpu3::dsa_mqa_logits<signed char, float, float16, float, int, ...>
+    #     0.5.8   23.0/step  median  88.7us  2.05 ms/step  <.., 1, 1, 1, 0>
+    #     0.5.23  22.0/step  median 176.6us  5.14 ms/step  <.., 1, 0, 0, 0>
+    #   xinfer3::gather_paged_scale_kernel<int>    7.7us -> 15.5us  (+0.17)
+    # Both kernels are linear in the entry count and both are exactly 2x
+    # (= D = speculative_num_draft_tokens on that run). The third kernel of
+    # the group, ``topk_transform_decode_kernelv2<float, 2048>``, is bounded
+    # by ``lengths`` and not by the entry count, and does not move (-0.32).
+    #
+    # The two flipped template bools are a symptom, not an extra cost. Only 12
+    # of the 16 combinations are instantiated in
+    # ``torch_xmlir/libxpu_flash_attention.so`` and the four missing ones are
+    # all ``<.., false, true, *, *>``, so bools 1-2 encode a 3-state rather
+    # than two free flags. Bool 3 is the merge-Q optimisation
+    # (``XPU_MQA_LOGITS_USE_MERGE_Q_OPT``, default ``true`` in XFA's env
+    # table), which has nothing to merge at ``max_seq_q == 1``; bool 2 is the
+    # strided-K path that the ``.contiguous()`` above used to defeat. Prefill,
+    # which enters through the ragged host function, runs
+    # ``<.., false, false, true, false>`` on both versions.
+    bs = int(getattr(forward_batch, "batch_size", 0) or 0)
+    num_draft = (block_tables.shape[0] // bs) if bs else 1
+    batched_draft = (
+        num_draft > 1
+        and bs * num_draft == q_offset
+        and block_tables.shape[0] == bs * num_draft
+        and len(extend_lens) == bs * num_draft
+        and all(int(e) == 1 for e in extend_lens)
+        and q_fp8.is_contiguous()
+        and (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        )
+    )
+    if batched_draft:
+        # ``cache_seqlens_int32`` is the per-request length (``seq_lens +
+        # speculative_num_draft_tokens``) and is refreshed on every replay by
+        # both the fused and the torch metadata builders
+        # (``dsa_backend.py:1904`` / ``:1933``); its host mirror is refreshed
+        # in place by ``KunlunDSAMetadata.refresh_host_mirrors``, so the
+        # captured graph keeps reading the same storage.
+        req_lens = metadata.get_seqlens_int32()
+        req_lens_cpu = metadata.get_seqlens_int32_cpu()
+        if (
+            req_lens is not None
+            and req_lens_cpu is not None
+            and req_lens.shape[0] >= bs
+            and req_lens_cpu.shape[0] >= bs
+        ):
+            seqlens_32 = req_lens[:bs]
+            seqlens_32_cpu = req_lens_cpu[:bs]
+            block_tables = block_tables[::num_draft].contiguous()
+            q_in = q_fp8[:q_offset].view(
+                bs, num_draft, q_fp8.shape[2], q_fp8.shape[3]
+            )
+        else:
+            batched_draft = False
+    if not batched_draft:
+        q_in = q_fp8[:q_offset]
+
     head_dim = get_token_to_kv_pool().index_head_dim
-    k_fp8 = kv_cache_fp8[:, :page_size * head_dim].view(
+    # Keep this a *conversion*, not a reinterpretation. ``.view(torch.int8)``
+    # skips the copy but preserves the parent pool's row stride (8448 elements
+    # for the [int8 512 B | fp32 scales | bf16 rope] row), so the vendor op then
+    # receives K with a gap between pages. The two layouts hold identical bytes
+    # (verified), but the strided one put the decode step on a path that
+    # tripled TPOT (38.60 -> 139.82 ms), while the copy this restores costs
+    # ~22 launches/step at ~64 us. Copy first; only reinterpret after a
+    # consumer-side measurement says the strided layout is fine.
+    k_fp8 = kv_cache_fp8[:, : page_size * head_dim].view(
         kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim
     ).to(torch.int8)
     
@@ -585,22 +671,61 @@ def _get_topk_paged(
         context_lens=seqlens_32,
     )
 
-    # NOTE: reverted luno-4142 (1830d8ea) -- scale the gathered k scales here
-    # instead of relying on the kernel's q_is_int8 argument.
+    # The int8 K-side 1/127 correction. 0.5.8 folded it into the gather kernel
+    # (``nsa_indexer.py:232-241`` passes
+    # ``q_is_int8=(q_fp8.dtype == torch.int8)``); this port reverted that
+    # (luno-4142 / 1830d8ea) and applied it here instead -- on ``k_scale``,
+    # which is ``[q_rows, max_seq_len]`` fp32 and by far the biggest tensor in
+    # this function. Measured on the 2026-11-12 decode traces: 22 launches per
+    # step in the 25-30 us band (``tensor_calc_scalar<3, float, float, true,
+    # float>``, 0.61 ms/step), against zero in that band on 0.5.8.
+    #
+    # The logits are linear in both operands --
+    # ``logits[b,s,t] = sum_h weights[b,s,h] * (q[b,s,h] . k[t]) * k_scale[b,t]``
+    # (``kunlun_ops/_deepgemm.py:694-726``) -- so moving the same constant onto
+    # ``weights``, which is ``[q_rows, 1, n_heads]`` (four orders of magnitude
+    # smaller), is the identical number. The caller applies the q-side 1/127 to
+    # ``weights`` exactly this way already (``kunlun_dsa_indexer.py:1543-1545``).
+    # Out of place on purpose: ``weights`` belongs to the caller.
     if q_fp8.dtype is torch.int8:
-        k_scale /= 127
-        
-    fused_kv_cache = [k_fp8.contiguous(), k_scale.contiguous()]
+        weights = weights * (1.0 / 127)
+
+    # No ``.contiguous()`` on either operand, which is what 0.5.8 passed
+    # (``nsa_indexer.py:243`` ``fused_kv_cache = [k_fp8, k_scale]``):
+    #
+    # * ``k_fp8`` is the K half of the index page, i.e. a dim-0-strided view
+    #   (``[pages, 8448]`` sliced to ``[:, :8192]`` and viewed as
+    #   ``[pages, 64, 1, 128]``, strides ``(8448, 128, 128, 1)``).
+    #   ``I8_paged_mqa_logits`` documents that layout as supported ("支持 dim-0
+    #   带 stride 的非连续 tensor（如 fused KV cache 的 k 视图）") and asserts
+    #   only the inner dims (``kunlun_ops/_deepgemm.py:727-741``): the C++
+    #   wrapper passes ``stride(0)`` through as ``k_block_stride``. The
+    #   ``.contiguous()`` therefore duplicated the whole index-K pool on every
+    #   indexer invocation: ``strided_slice_copy2d`` 22/step at 64.1 us =
+    #   1.41 ms/step, against 0.07/step on 0.5.8.
+    # * ``k_scale`` is re-``.contiguous()``-ed by the vendor wrapper itself
+    #   (``_deepgemm.py:751``), so doing it here can only ever add a copy.
+    fused_kv_cache = [k_fp8, k_scale]
+    # ``weights`` is rescaled just above, so shape it here and not in the
+    # fold block. ``[q_offset, 1, n_heads] -> [bs, D, n_heads]`` is a view:
+    # row ``b * D + j`` of the per-token layout is entry ``(b, j)`` here,
+    # the same order ``logits.reshape(-1, max_seq_len)`` hands to the
+    # top-k, and the same order as ``dsa_seqlens_expanded`` and
+    # ``page_table_1``.
+    weights_in = weights[:q_offset]
+    if batched_draft:
+        weights_in = weights_in.reshape(bs, num_draft, -1)
+
     logits = torch.empty(
-        (q_offset, q_fp8.shape[1], max_seq_len),
+        (q_in.shape[0], q_in.shape[1], max_seq_len),
         dtype=torch.float32,
-        device=q_fp8.device
+        device=q_in.device
     )
 
     kunlun_ops.I8_paged_mqa_logits(
-        q=q_fp8[:q_offset],
+        q=q_in,
         fused_kv_cache=fused_kv_cache,
-        weights=weights[:q_offset],
+        weights=weights_in,
         context_lens=[seqlens_32_cpu, seqlens_32],
         block_table=block_tables,
         max_context_len=max_seq_len,
@@ -653,8 +778,8 @@ def _get_topk_paged(
         logits, indexer.index_topk, metadata, page_table_index
     )
     # Restore possible padding exist in the hidden states.
-    if q_offset < q_fp8.shape[0]:
-        pad_len = q_fp8.shape[0] - q_offset
+    if q_offset < q_rows:
+        pad_len = q_rows - q_offset
         padding = torch.full(
             (pad_len, topk_result.shape[1]),
             -1,
@@ -1187,6 +1312,51 @@ def _k_norm(indexer, key: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _store_rope_(dst: torch.Tensor, rope: torch.Tensor, rope_head_dim: int) -> None:
+    """Write ``rope`` into ``dst[..., :rope_head_dim]`` unless it is already there.
+
+    The Kunlun rotary rotates **in place** and hands the caller's own storage
+    back: ``xspeedgate_ops/_rope.pyi:177-178`` ("原地修改 query 和 key.
+    query/key 允许是非连续视图(如 ``q_full[..., -rotary_dim:]`` ...), 算子直接
+    写回原 storage, 无需调用方手动 ``.contiguous()``, 无额外内存分配") and its
+    Returns table, ``:208-210`` ("``query`` | 同输入 query (data_ptr 相同)").
+    The plugin's own hook preserves that: ``hooks/layers/rotary_embedding.py``
+    ``_as_head_view`` keeps a strided view strided when ``stride(-1) == 1``
+    (``_rope.pyi:214``: "query 和 key 最后一维的 stride 必须为 1, 其余维度
+    stride 不限") and only reshapes metadata around the call.
+
+    ``q_rope`` / ``k_rope`` here are the leading ``rope_head_dim`` columns of
+    ``query`` / ``key`` produced by the ``torch.split`` above, so upstream's
+    unconditional write-back copies a slice onto itself: two
+    ``xpukernel_xpu3::strided_slice_copy2d`` launches per indexer invocation,
+    moving bytes that are already in place. This model shares index top-k
+    across layers, so the indexer runs 22 times per decode step, not 78 -- the
+    2026-11-12 traces pin that count three independent ways
+    (``xpuops3::infer_layer_norm_no_ada`` 22/step, ``fa_xpu3::dsa_mqa_logits``
+    22/step, ``xinfer3::infer_hadamard_transform`` and
+    ``xpuops3::infer_quant2d_midm`` 44/step = q and k) -- i.e. 44 launches per
+    step removed, and never more than before: the guard can only skip a copy.
+
+    The identity is *checked*, never assumed, because two paths legitimately
+    return a fresh tensor and those results still have to be stored: the dtype
+    coercion when q and k disagree (``rotary_embedding.py:69-70``, the vendor op
+    requires one dtype) and the ``.contiguous()`` fallback inside
+    ``_as_head_view`` for a layout the op cannot take. Same storage, same
+    offset, same shape, same strides and same dtype is exactly "the rotation is
+    already written where this assignment would put it"; anything else copies,
+    as before.
+    """
+    view = dst[..., :rope_head_dim]
+    if (
+        rope.dtype is view.dtype
+        and rope.data_ptr() == view.data_ptr()
+        and rope.shape == view.shape
+        and rope.stride() == view.stride()
+    ):
+        return
+    view.copy_(rope)
+
+
 def _get_q_k_bf16(
     indexer,
     q_lora: torch.Tensor,
@@ -1252,8 +1422,8 @@ def _get_q_k_bf16(
 
     q_rope, k_rope = indexer.rotary_emb(positions, q_rope, k_rope)
 
-    query[..., : indexer.rope_head_dim] = q_rope
-    key[..., : indexer.rope_head_dim] = k_rope
+    _store_rope_(query, q_rope, indexer.rope_head_dim)
+    _store_rope_(key, k_rope, indexer.rope_head_dim)
 
     if enable_dual_stream:
         current_stream = torch.cuda.current_stream()

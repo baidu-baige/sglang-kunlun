@@ -14,6 +14,9 @@ _logger = _logging.getLogger(__name__)
 from . import deepseek_v4  # noqa: F401
 from . import deepseek_v4_precision  # noqa: F401
 from . import deepseek_v4_nextn  # noqa: F401
+
+# 吸收式 MLA 的两个 bmm 回迁到 kunlun_ops.bmm（0.5.8 fork 的 _klx_absorb_bmm）。
+from . import absorbed_mla_bmm  # noqa: F401
 from . import dsv41_engram_int8  # noqa: F401
 from . import dsv41_engram_stage  # noqa: F401
 
