@@ -421,6 +421,19 @@ def moe_fc(
     return output
 
 
+_LANE_IDS: dict = {}
+
+
+def _lane_ids(like: torch.Tensor) -> torch.Tensor:
+    """Cached 0..numel-1 laid out like ``like``, used to spread masked lanes."""
+    key = (like.numel(), like.device, like.dtype)
+    buf = _LANE_IDS.get(key)
+    if buf is None:
+        buf = torch.arange(like.numel(), device=like.device, dtype=like.dtype)
+        _LANE_IDS[key] = buf
+    return buf.view_as(like)
+
+
 def moe_post(
     down: torch.Tensor,
     sorted_tokens_idx: torch.Tensor,
@@ -456,7 +469,22 @@ def moe_post(
     owned = moe_index >= 0
     # Unconditional elementwise ops, no host sync, safe for CUDA graph capture.
     normed_scale = topk_weights.to(torch.float32) * owned
-    moe_index = moe_index.clamp_min(0)
+    # Masked lanes are multiplied by 0, so which row they read cannot change the
+    # result -- but it does change the cost. clamp_min(0) sent all of them to row
+    # 0: on P800 that turns 86016 of the 98304 gathers (EP8) into requests for one
+    # 10 KB address, which serialises on the few memory channels that address maps
+    # to. Measured at m=16384, top_k=6, n=5120: 2.12 ms clamped vs 0.77 ms spread,
+    # i.e. a masked lane costs 3x a real one purely because of the collision.
+    #
+    # They must stay inside [0, n_written) though. `moe_fc` allocates `down` with
+    # torch.empty and writes only the owned rows, so the tail can hold NaN/Inf bit
+    # patterns and 0 * NaN = NaN: spreading over the whole buffer poisoned 87.5% of
+    # the output (measured) and killed the service downstream. owned.sum() is
+    # exactly the number of written rows and stays on device, so no host sync and
+    # the expression is still CUDA-graph capturable. Verified bit-identical to
+    # clamp_min(0) with a NaN-filled tail.
+    n_written = owned.sum().clamp_min(1).to(moe_index.dtype)
+    moe_index = torch.where(owned, moe_index, _lane_ids(moe_index) % n_written)
     dequant_scale = torch.ones_like(topk_weights, dtype=torch.float32)
     kunlun_ops.moe_post(
         x=down.reshape(-1, down.shape[-1]),
