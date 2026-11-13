@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, List, Optional
 
@@ -113,23 +114,83 @@ def _resolve_mixed_attn_impl():
     """Resolve the native mixed-cache op once. ``(kind, None)`` means none."""
     global _MIXED_ATTN_IMPL
     if _MIXED_ATTN_IMPL is None:
+        # A C++ extension registers its schemas when it is *imported*, not when
+        # it is installed -- so the probe below answers "has anything imported
+        # `xspeedgate_ops` yet", not "does the wheel contain the op". Measured
+        # on this box: before `import xspeedgate_ops` the schema set has zero
+        # `xspeedgate_ops::` entries, after it has 256. If the plugin happened
+        # to reach this resolver before any other module imported the package,
+        # it would silently pick the dequant fallback and cost 3.5x decode
+        # throughput with no error. Import it here so the answer depends on the
+        # wheel, not on import order.
+        try:
+            import xspeedgate_ops  # noqa: F401
+        except Exception:  # noqa: BLE001 - absent wheel is a legitimate state
+            pass
         # `torch.ops.<ns>` is a lazy proxy, so neither `dir()` nor `hasattr`
         # can answer "is this op registered" -- enumerating the schemas is the
         # only reliable probe (same note as `sparse_attn_fwd` at the top of
         # this file).
         names = {schema.name for schema in torch._C._jit_get_all_schemas()}
-        if "xspeedgate_ops::sparse_mixed_attn_int8" in names:
+        has_xspeed = "xspeedgate_ops::sparse_mixed_attn_int8" in names
+        has_kunlun = hasattr(kunlun_ops, "dsa_prefill_with_mixed_cache")
+        # Both entry points land on the SAME vendor host function,
+        # `xfa::dsa_prefill_with_mixed_cache` in
+        # `torch_xmlir/libxpu_flash_attention.so` -- the xspeedgate wheel only
+        # carries the torch wrapper (`nm -D --undefined-only` on it shows the
+        # two int8 instantiations as `U`). So "the wheel lost the op" is a
+        # wrapper problem, not a kernel problem, and `kunlun` reaches the same
+        # kernels. This knob exists to measure that claim, and to serve from
+        # the `kunlun` entry point if a rebuilt wheel ever drops the wrapper
+        # again. 0.5.8 had the same switch (`nsa_backend.py:190-214`).
+        want = os.environ.get("SGLANG_NSA_MIXED_ATTN_IMPL", "auto").strip().lower()
+        if want not in ("auto", "xspeed", "kunlun", "none"):
+            logger.warning(
+                "sglang-kunlun: SGLANG_NSA_MIXED_ATTN_IMPL=%r is not one of "
+                "auto/xspeed/kunlun/none; treating it as auto.",
+                want,
+            )
+            want = "auto"
+        if want == "none":
+            _MIXED_ATTN_IMPL = ("none", None)
+        elif want == "kunlun" and has_kunlun:
+            _MIXED_ATTN_IMPL = ("kunlun", kunlun_ops.dsa_prefill_with_mixed_cache)
+        elif want == "xspeed" and has_xspeed:
             _MIXED_ATTN_IMPL = (
                 "xspeed",
                 torch.ops.xspeedgate_ops.sparse_mixed_attn_int8,
             )
-        elif hasattr(kunlun_ops, "dsa_prefill_with_mixed_cache"):
+        elif has_xspeed:
+            if want != "auto":
+                logger.warning(
+                    "sglang-kunlun: SGLANG_NSA_MIXED_ATTN_IMPL=%s is "
+                    "unavailable; falling back to xspeed.",
+                    want,
+                )
+            _MIXED_ATTN_IMPL = (
+                "xspeed",
+                torch.ops.xspeedgate_ops.sparse_mixed_attn_int8,
+            )
+        elif has_kunlun:
             _MIXED_ATTN_IMPL = (
                 "kunlun",
                 kunlun_ops.dsa_prefill_with_mixed_cache,
             )
         else:
             _MIXED_ATTN_IMPL = ("none", None)
+        # Say which branch won, once per process. Without this the only signal
+        # that the fast path was skipped is a warning that fires from the *call*
+        # site, which reads like "neither library has it" even when the real
+        # reason is that the wheel was rebuilt without the operator.
+        logger.info(
+            "sglang-kunlun: DSA decode attention implementation = %s "
+            "(requested %s; xspeedgate_ops::sparse_mixed_attn_int8 "
+            "registered: %s, kunlun_ops.dsa_prefill_with_mixed_cache: %s)",
+            _MIXED_ATTN_IMPL[0],
+            want,
+            has_xspeed,
+            has_kunlun,
+        )
     return _MIXED_ATTN_IMPL
 
 
