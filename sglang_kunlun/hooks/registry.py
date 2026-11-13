@@ -58,6 +58,20 @@ def register_all() -> None:
     _kunlun_pre_shim()
     env_compat.install()
 
+    # Optimization C's operators ship as a SECOND extension module rather than
+    # a rebuilt `xspeedgate_ops` wheel: the installed wheel is the only place
+    # `sparse_mixed_attn_int8` exists, and reinstalling it has twice cost a day
+    # (the lost op is a 3.5x TPOT with no error, and the reinstall also takes
+    # cocopod's files with it). Must be imported before `kernel_ops.install()`
+    # resolves the registration tables.
+    from sglang_kunlun import extra_ops
+
+    if extra_ops.loaded:
+        logger.info(
+            "sglang-kunlun: extra XSpeedGate operators registered: %s",
+            sorted(extra_ops.registered_ops()) or "none",
+        )
+
     # Gate off Kimi-K3 fused features that have no Kunlun equivalent. Must run
     # before any ServerArgs/model code reads the corresponding env variables.
     from sglang_kunlun.platform.k3_capabilities import disable_unsupported_k3_features
