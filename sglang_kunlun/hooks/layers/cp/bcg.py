@@ -3,7 +3,8 @@
 Upstream gates context-parallel prefill capture on ``supports_prefill_cp_bcg``,
 which only whitelists ``cp_strategy=zigzag`` with the ``trtllm_mha`` prefill
 backend. Kunlun runs DSV4 prefill CP as the *interleave* (round-robin) strategy
-with the ``kunlun_compressed`` backend. Everything else the CP-BCG path needs is
+with the ``kunlun_compressed`` or ``nsa`` backend. Everything else the CP-BCG
+path needs is
 already strategy-agnostic and available here:
 
 * ``init_cp_strategy`` selects ``InterleaveCPStrategy`` for ``--cp-strategy
@@ -45,7 +46,18 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 logger = logging.getLogger(__name__)
 
 _KUNLUN_PREFILL_CP_STRATEGY = "interleave"
-_KUNLUN_PREFILL_ATTENTION_BACKEND = "kunlun_compressed"
+# Two prefill backends reach this platform's CP path. ``kunlun_compressed`` is
+# the DSV4 backend the 0.5.22 work was validated on; ``nsa``/``dsa`` is the
+# upstream DeepseekSparseAttnBackend that ``--attention-backend nsa`` resolves
+# to for GLM-5.3 (GlmMoeDsaForCausalLM), which the launchers actually pass.
+# The distinction that makes both safe is the replay metadata contract:
+# ``base_attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph``
+# is False for the DSA backend, so the runner rebuilds attention metadata
+# eagerly per replay (``prefill_cuda_graph_runner.py:1294``
+# ``init_forward_metadata``) instead of refreshing a capture-time copy -- i.e.
+# the DSV4-only class of BCG bug (an indexer reading bucket-padded rows out of
+# captured metadata) is structurally absent on this backend.
+_KUNLUN_PREFILL_ATTENTION_BACKENDS = ("kunlun_compressed", "nsa", "dsa")
 
 # 0.5.19 的 core 已经原生实现了 0.5.17 时代由本插件承担的 CP-v2 + BCG 几何
 # （init_forward_metadata_prefill 自己 pad + reindex、PrefillCPBCGInput.prepare 自己
@@ -458,7 +470,7 @@ def select_replay_bucket_for_batch_kunlun(
     type=HookType.AFTER,
 )
 def supports_prefill_cp_bcg_kunlun(result, server_args, *args, **kwargs):
-    """Accept CP-BCG for the Kunlun interleave + kunlun_compressed combination."""
+    """Accept CP-BCG for Kunlun interleave CP on either Kunlun prefill backend."""
     if result:
         return result
 
@@ -483,7 +495,7 @@ def supports_prefill_cp_bcg_kunlun(result, server_args, *args, **kwargs):
         bool(getattr(resolved, "enable_prefill_cp", False))
         and resolved.attn_cp_size == getattr(resolved, "tp_size", server_args.tp_size)
         and getattr(resolved, "cp_strategy", None) == _KUNLUN_PREFILL_CP_STRATEGY
-        and prefill_attention_backend == _KUNLUN_PREFILL_ATTENTION_BACKEND
+        and prefill_attention_backend in _KUNLUN_PREFILL_ATTENTION_BACKENDS
     )
     if supported:
         logger.warning(

@@ -61,11 +61,13 @@ from sglang.srt.layers.cp.utils import get_cp_strategy, is_cp_active
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.layers.attention.dsa.dsa_indexer import (
     _broadcast_indexer_topk_from_rank0,
+    _make_eager_idle_topk_result,
 )
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -1462,6 +1464,27 @@ def _get_q_k_bf16(
     return query, key
 
 
+def _cp_live_token_count(forward_batch) -> Optional[int]:
+    """Live (unpadded) global token count for cache stores under prefill CP.
+
+    ``InterleaveContextParallelMetadata`` carries both numbers and upstream
+    states which is which: ``graph_num_tokens`` is the capture bucket and
+    "only sequence-dependent graph segments use this capacity. Eager cache
+    operations and gathers must continue using total_seq_lens (live tokens)"
+    (``layers/cp/interleave.py:84``). The CP gather itself sizes its result
+    from ``total_seq_lens``, so a store that pairs gathered rows with cache
+    locations has to use the same count -- under a breakable prefill graph
+    replay ``forward_batch.out_cache_loc`` and ``extend_num_tokens`` are both
+    padded to the bucket.
+    """
+    metadata = getattr(forward_batch, "attn_cp_metadata", None)
+    total = getattr(metadata, "total_seq_lens", None) if metadata else None
+    if total is not None:
+        return int(total)
+    extend_num_tokens = getattr(forward_batch, "extend_num_tokens", None)
+    return None if extend_num_tokens is None else int(extend_num_tokens)
+
+
 def _forward_cuda_k_only(
     indexer,
     x: torch.Tensor,
@@ -1564,6 +1587,23 @@ def forward_cuda(
     # a tuple like (x_fp8, x_scale[, y]). Use `x_meta` for shape/device queries.
     x_meta = x[0] if isinstance(x, tuple) else x
 
+    # A padded eager IDLE rank has no live request, so its DSA metadata still
+    # describes the PREVIOUS batch. ``_get_topk_paged`` aligns its rows to that
+    # stale ``q_offset`` while ``q_fp8`` carries the idle batch's rows, the
+    # slice silently clamps, and the vendor op dies with
+    # ``Check batch == key_cache_scale->size(0) failed, left operand=2``
+    # (measured 2026-11-13 22:46, decode node, DP2, `_draft_forward_idle` at
+    # 1 req/s -- the 2 req/s cell keeps every DP rank busy and never gets here).
+    # This is upstream's own guard (`dsa_indexer.py:1920-1932`), which the port
+    # dropped when it REPLACEd `forward_cuda`: return invalid rows with the
+    # physical DP shape so the later MLP/EP collectives still agree.
+    if forward_batch.forward_mode.is_idle() and not get_is_capture_mode():
+        topk_result = _make_eager_idle_topk_result(
+            x_meta, indexer.index_topk, return_indices
+        )
+        topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
+        return maybe_capture_indexer_topk(layer_id, topk_result)
+
     # Kunlun does not support upstream's TC piecewise cuda graph path (it splits the
     # graph around store_k_cache/mqa_logits and fetches metadata inside custom ops).
     # Fail loudly rather than silently running with metadata=None.
@@ -1649,7 +1689,18 @@ def forward_cuda(
     # split requires a multiple of cp_size) while out_cache_loc only lists the real
     # tokens. The rerange restores token order, so the padding is the tail.
     store_k_fp8, store_k_scale = k_fp8, k_scale
-    loc_rows = forward_batch.out_cache_loc.shape[0]
+    store_loc = forward_batch.out_cache_loc
+    loc_rows = store_loc.shape[0]
+    live_rows = _cp_live_token_count(forward_batch)
+    if live_rows is not None and loc_rows > live_rows:
+        # Breakable prefill graph replay: ``out_cache_loc`` is the static
+        # bucket-padded buffer (measured 2026-11-14: 4736 locations for a
+        # 3500-token prefill at `--cuda-graph-bs-prefill 4736 4864 5120`),
+        # while the CP gather returns exactly the live rows. The padded tail
+        # addresses slots that belong to no request in this batch, so storing
+        # into it would scribble on another request's index-K pages.
+        store_loc = store_loc[:live_rows]
+        loc_rows = live_rows
     if store_k_fp8.shape[0] != loc_rows:
         if store_k_fp8.shape[0] < loc_rows:
             raise RuntimeError(
@@ -1697,11 +1748,11 @@ def forward_cuda(
     # k_buffer: (num_total_tokens + page_size, head_dim) fp8_e4m3fn
     # k_scale: (seq_len, head_dim // block_size = 1) fp8_e4m3fn
     # k_scale_cache: (num_total_tokens + page_size, head_dim // block_size = 1) fp8_e4m3fn
-    if not forward_batch.out_cache_loc.is_contiguous():
-        forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
+    if not store_loc.is_contiguous():
+        store_loc = store_loc.contiguous()
     get_token_to_kv_pool().set_index_k_scale_buffer(
         layer_id=layer_id,
-        loc=forward_batch.out_cache_loc,
+        loc=store_loc,
         index_k=store_k_fp8,
         index_k_scale=store_k_scale,
     )
