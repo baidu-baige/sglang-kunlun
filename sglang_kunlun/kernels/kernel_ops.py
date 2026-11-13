@@ -6079,50 +6079,7 @@ def gather_spec_extras(
     output_tokens_buf: torch.Tensor,
     hidden_states_buf: torch.Tensor | None,
 ):
-    """Single-launch row-gather of the speculative extras on Kunlun.
-
-    One kernel copies all four rows per index instead of four advanced-index
-    gathers, the dtype cast and four ``.contiguous()`` calls. Graph-safe: every
-    allocation shape is host-side metadata fixed at capture time, and the index
-    values are read on device only (no ``.item()``).
-
-    Measured at the SLO shape in ``test_gather_spec_extras.py::batch_perf_test``:
-    torch 345.9 us -> kernel 35.8 us, 3/3 byte-exact.
-    """
-
-    try:
-        # The op addresses ``indices`` linearly and templates over its dtype
-        # (int32/int64), so the ``.to(torch.long)`` cast is gone; the layout
-        # normalisation stays because the index tensor comes from several
-        # producers (a no-op when it is already contiguous, as it normally is).
-        return torch.ops.xspeedgate_ops.gather_spec_extras(
-            indices.contiguous(),
-            topk_p_buf,
-            topk_index_buf,
-            output_tokens_buf,
-            hidden_states_buf,
-        )
-    except Exception as exc:  # noqa: BLE001 - never fail the spec relay
-        _log_once(
-            "gather_spec_extras",
-            "xspeedgate_ops.gather_spec_extras unavailable (%s); using the "
-            "four-gather torch path",
-            exc,
-        )
-
-    return _gather_spec_extras_torch(
-        indices, topk_p_buf, topk_index_buf, output_tokens_buf, hidden_states_buf
-    )
-
-
-def _gather_spec_extras_torch(
-    indices: torch.Tensor,
-    topk_p_buf: torch.Tensor,
-    topk_index_buf: torch.Tensor,
-    output_tokens_buf: torch.Tensor,
-    hidden_states_buf: torch.Tensor | None,
-):
-    """Torch row-gather, kept reachable as the fallback above."""
+    """Torch row-gather replacement for speculative extras on Kunlun."""
 
     indices = indices.to(torch.long).contiguous()
     topk_p = topk_p_buf[indices].contiguous()

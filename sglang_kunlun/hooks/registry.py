@@ -58,16 +58,6 @@ def register_all() -> None:
     _kunlun_pre_shim()
     env_compat.install()
 
-    # C's operators come from a second extension, not a rebuilt wheel: the
-    # installed wheel is the only place `sparse_mixed_attn_int8` exists. Must
-    # precede `kernel_ops.install()`.
-    from sglang_kunlun import extra_ops
-
-    if extra_ops.loaded:
-        logger.info(
-            "sglang-kunlun: extra XSpeedGate operators registered: %s",
-            sorted(extra_ops.registered_ops()) or "none",
-        )
 
     # Gate off Kimi-K3 fused features that have no Kunlun equivalent. Must run
     # before any ServerArgs/model code reads the corresponding env variables.
