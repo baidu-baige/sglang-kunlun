@@ -73,6 +73,7 @@ def _init_attention_store(self, server_args) -> None:
     failure it disables AS rather than crashing the scheduler.
     """
     try:
+        from sglang.srt.runtime_context import get_device, get_parallel
         from sglang_kunlun.mem_cache.asradix.types import (
             AS_BLOCK_SIZE,
             AttentionStoreInitContext,
@@ -90,8 +91,8 @@ def _init_attention_store(self, server_args) -> None:
         target_layer_ids = tuple(
             range(int(layer_info.start_layer), int(layer_info.end_layer))
         )
-        page_shard_id = int(self.ps.attn_tp_rank)
-        page_shard_num = int(self.ps.attn_tp_size)
+        page_shard_id = int(get_parallel().attn_tp_rank)
+        page_shard_num = int(get_parallel().attn_tp_size)
         draft_kv_cache, draft_layer_ids = self._as_draft_swa_layers(
             cache_plan.name, len(target_layer_ids)
         )
@@ -116,14 +117,14 @@ def _init_attention_store(self, server_args) -> None:
             model_version="v1",
             page_size=self.page_size,
             block_size=AS_BLOCK_SIZE,
-            tp_rank=self.ps.attn_tp_rank,
-            tp_size=self.ps.attn_tp_size,
+            tp_rank=get_parallel().attn_tp_rank,
+            tp_size=get_parallel().attn_tp_size,
             pp_rank=0,
             pp_size=1,
             node_pp_start=0,
             node_pp_end=1,
-            dp_rank=self.ps.attn_dp_rank,
-            device_id=self.ps.gpu_id,
+            dp_rank=get_parallel().attn_dp_rank,
+            device_id=get_device().gpu_id,
             gpu_count=gpu_count,
             target_layer_ids=target_layer_ids,
             page_layer_ids=target_layer_ids,

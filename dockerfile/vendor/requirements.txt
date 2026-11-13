@@ -48,7 +48,7 @@ transformers==5.8.1
 uvicorn
 uvloop
 watchfiles
-xgrammar==0.2.1
+# xgrammar is pinned in requirements-no-deps.txt (installed with --no-deps)
 torchao==0.9.0
 # 其余保留原 aiak 清单里额外用到的
 litellm

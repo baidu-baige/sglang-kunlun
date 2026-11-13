@@ -520,6 +520,19 @@ function install_aiak_sglang() {
         PIN_ARG="-c /workspace/torch_pin.txt"
     fi
     pip3 install ${PIN_ARG} -r ${plugin_dir}/dockerfile/vendor/requirements.txt
+    # 需要 --no-deps 的包放 requirements-no-deps.txt：它们的元数据会要求更新的
+    # apache-tvm-ffi，而 XPU 栈锁在 0.1.9（实测 xgrammar 0.2.7 在 0.1.9 上可正常
+    # 工作）。当前只有 xgrammar==0.2.7：0.5.21 的 function-call detector 会传
+    # parallel_tool_calls，0.2.1 没有该参数，所有 tool-call 请求都会报 TypeError。
+    pip3 install --no-deps -r ${plugin_dir}/dockerfile/vendor/requirements-no-deps.txt
+    python3 -I - <<'PYCODE'
+import inspect
+
+from xgrammar import get_model_structural_tag
+
+if "parallel_tool_calls" not in inspect.signature(get_model_structural_tag).parameters:
+    raise SystemExit("xgrammar too old: structural tag lacks parallel_tool_calls")
+PYCODE
     # timm / torch_memory_saver / flashinfer 依赖 torch(+torchvision/cuda)，用 --no-deps 单独装，
     # 防止拖入 stock torch/torchvision/cuda 冲掉 xpytorch。
     # flashinfer 本体必须装（插件只补它缺的符号、不提供它），版本对齐社区引擎 pin。

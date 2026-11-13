@@ -19,16 +19,15 @@
 
 Kunlun RDMA (ibv_reg_mr) requires BOTH the MR start address AND length to be
 2MB-aligned, else registration fails ("Invalid argument [22]"), breaking mooncake
-KV transfer (PD disaggregation). Ported from image aiak_sglang patch
+KV transfer (PD disaggregation). Ported from the internal image's sglang patch
 mem_cache/deepseekv4_memory_pool.py.
 
 Approach: let ORIGINAL create/_alloc run (correct shape/dtype for every pool
 variant), then swap each freshly-zeroed buffer for a 2MB-aligned buffer of the
 SAME shape/dtype/device. CRITICAL: free the original buffer BEFORE allocating its
-aligned replacement (and empty the device cache) so peak memory stays at +1 buffer,
+aligned replacement (and empty the XPU cache) so peak memory stays at +1 buffer,
 not 2x the whole pool (that OOMs at mem-fraction 0.8+).
 """
-
 from __future__ import annotations
 
 import logging
@@ -52,14 +51,11 @@ def _is_kunlun() -> bool:
 
 
 def _empty_cache():
-    """Release cached device memory back to the allocator.
-
-    Kunlun is presented to this stack as CUDA, so the CUDA allocator is the
-    right one to ask. ``torch.xpu`` is not usable here -- see
-    ``test/test_cuda_only_contract.py``.
-    """
+    """Release cached device memory back to the allocator (XPU/CUDA)."""
     try:
-        if torch.cuda.is_available():
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            torch.xpu.empty_cache()
+        elif torch.cuda.is_available():
             torch.cuda.empty_cache()
     except Exception:
         pass

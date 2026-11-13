@@ -1,0 +1,3 @@
+# Packages installed with --no-deps because their metadata would otherwise drag
+# in a newer apache-tvm-ffi (XPU stack stays on the pinned 0.1.9).
+xgrammar==0.2.7

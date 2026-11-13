@@ -320,34 +320,15 @@ class DeepEPDispatchMode(IntEnum):
 
 
 class DeepEPBuffer:
-    """DeepEPBuffer
-
-    Normal-mode buffers are kept per ``slot`` so that each two-batch-overlap
-    sub-batch owns one. The Kunlun DeepEP normal port keeps only the last
-    dispatch's layout, so two sub-batches sharing a single buffer clobber each
-    other as soon as both have a ``dispatch -> combine`` transaction in flight.
-
-    ``slot=0`` is the only slot used when TBO is off, and low-latency always
-    stays on slot 0: its ``return_recv_hook`` API is designed to be in flight,
-    and the low-latency buffer is expensive.
-    """
-
+    """DeepEPBuffer"""
     _buffers = {}
     _dispatch_modes = {}
     _active_key = None
     _buffer = None
-    # How many normal-mode slots to keep. Set from the dispatcher construction
-    # site (``create_moe_dispatcher_kunlun``) once the sub-batch count is known.
-    _num_slots: int = 1
     _dispatch_mode: Optional[DeepEPDispatchMode] = None
     _hidden_size: Optional[int] = None
     _num_max_dispatch_tokens_per_rank: Optional[int] = None
     _num_experts: Optional[int] = None
-
-    @classmethod
-    def set_num_slots(cls, num_slots: int):
-        """Declare how many normal-mode buffers to keep (one per TBO sub-batch)."""
-        cls._num_slots = max(cls._num_slots, int(num_slots))
 
     @classmethod
     def get_deepep_buffer(
@@ -358,14 +339,12 @@ class DeepEPBuffer:
         deepep_mode: DeepEPMode,
         num_max_dispatch_tokens_per_rank: int = -1,
         num_experts: int = -1,
-        slot: int = 0,
     ):
         """get_deepep_buffer"""
         # Keep a strong reference to the communication group in the key. Equal
-        # world sizes do not imply equal communication domains or layouts. The
-        # slot keeps each TBO sub-batch's normal-mode state apart.
+        # world sizes do not imply equal communication domains or layouts.
         key = (
-            slot, group, hidden_size, param_bytes, deepep_mode,
+            group, hidden_size, param_bytes, deepep_mode,
             num_max_dispatch_tokens_per_rank, num_experts,
         )
         cls._active_key = key
@@ -438,7 +417,7 @@ class DeepEPBuffer:
                 f"Consider using --deepep-config to change the behavior."
             )
         
-        buffer = Buffer(
+        cls._buffer = Buffer(
             group,
             num_nvl_bytes,
             num_rdma_bytes,
@@ -448,44 +427,20 @@ class DeepEPBuffer:
             allow_mnnvl=True,
             num_experts=num_experts,
         )
-        cls._buffers[key] = buffer
-        cls._buffer = buffer
-
-        # ``Buffer.__init__`` runs an all_gather_object, so every rank has to
-        # build the same set of buffers at the same program point. Build the
-        # remaining sub-batch slots right here instead of lazily on their first
-        # dispatch, which would diverge across ranks and hang the collective.
-        if slot == 0 and deepep_mode.enable_normal() and cls._num_slots > 1:
-            for extra_slot in range(1, cls._num_slots):
-                cls.get_deepep_buffer(
-                    group,
-                    hidden_size,
-                    param_bytes,
-                    deepep_mode,
-                    num_max_dispatch_tokens_per_rank,
-                    num_experts,
-                    slot=extra_slot,
-                )
-            # The recursion above advanced the active pointer to the last extra
-            # slot; restore slot 0 so the caller's dispatch-mode bookkeeping and
-            # ``cls._buffer`` still describe the buffer it asked for.
-            cls._active_key = key
-            cls._buffer = buffer
-            cls._dispatch_mode = cls._dispatch_modes.get(key)
-
-        return buffer
+        cls._buffers[key] = cls._buffer
+        
+        return cls._buffer
 
     @classmethod
     def clean_buffer(cls):
         """clean_buffer"""
-        for buffer in cls._buffers.values():
-            if not buffer.low_latency_mode:
-                continue
-            buffer.clean_low_latency_buffer(
-                cls._num_max_dispatch_tokens_per_rank,
-                cls._hidden_size,
-                cls._num_experts,
-            )
+        if cls._buffer is None or not cls._buffer.low_latency_mode:
+            return
+        cls._buffer.clean_low_latency_buffer(
+            cls._num_max_dispatch_tokens_per_rank,
+            cls._hidden_size,
+            cls._num_experts,
+        )
 
     @classmethod
     def set_dispatch_mode_as_normal(cls):
@@ -559,7 +514,6 @@ class _DeepEPDispatcherImplBase:
         hidden_size: int,
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
-        buffer_slot: int = 0,
     ):
         if not use_deepep:
             raise ImportError(
@@ -575,8 +529,6 @@ class _DeepEPDispatcherImplBase:
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
-        # Which normal-mode DeepEP buffer this impl uses; one per TBO sub-batch.
-        self.buffer_slot = buffer_slot
 
         self.params_bytes = 2
         # A large value will lead to large memory occupation, thus users should change it accordingly
@@ -829,7 +781,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
-            slot=self.buffer_slot,
         )
         DeepEPBuffer.set_dispatch_mode_as_normal()
         return buffer
@@ -1105,7 +1056,6 @@ class DeepEPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
-        buffer_slot: int = 0,
     ):
         super().__init__()
 
@@ -1120,7 +1070,6 @@ class DeepEPDispatcher(BaseDispatcher):
             hidden_size=hidden_size,
             params_dtype=params_dtype,
             deepep_mode=deepep_mode,
-            buffer_slot=buffer_slot,
         )
 
         # KUNLUN_LL_NORMAL_FALLBACK: stash kwargs so we can lazily build the NORMAL dispatcher even when
@@ -1214,18 +1163,6 @@ class DeepEPDispatcher(BaseDispatcher):
                 **self._normal_common_kwargs,
             )
         return self._normal_dispatcher
-
-    def set_buffer_slot(self, slot: int):
-        """Pick which normal-mode DeepEP buffer this dispatcher uses.
-
-        Called once per TBO sub-batch from the dispatcher construction site, so
-        that the two in-flight ``dispatch -> combine`` transactions do not share
-        normal-mode buffer state. Also updates the stashed kwargs used by the
-        lazy ``_ensure_normal_dispatcher`` path.
-        """
-        self._normal_common_kwargs["buffer_slot"] = slot
-        if self._normal_dispatcher is not None:
-            self._normal_dispatcher.buffer_slot = slot
 
     def _get_impl(self) -> _DeepEPDispatcherImplBase:
         """_get_impl"""

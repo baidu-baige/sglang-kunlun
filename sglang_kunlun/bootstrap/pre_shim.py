@@ -290,6 +290,18 @@ def _disable_xpu_unsupported_argv() -> None:
     import sys
 
     argv = sys.argv[1:]
+    # Only a sglang entrypoint may have sglang flags appended. This shim is
+    # imported by EVERY python process in the image (sitecustomize path), and an
+    # unconditional append broke unrelated commands — `python -m venv` in the
+    # container died with "unrecognized arguments: --no-enable-tp-lm-head-all-to-all"
+    # (2026-11-17, second regression of the same bug).
+    looks_like_sglang = (
+        any(arg == "--model-path" or arg.startswith("--model-path=")
+            for arg in argv)
+        or "sglang" in (sys.argv[0] or "")
+    )
+    if not looks_like_sglang:
+        return
     if ("--enable-tp-lm-head-all-to-all" not in argv
             and "--no-enable-tp-lm-head-all-to-all" not in argv):
         sys.argv.append("--no-enable-tp-lm-head-all-to-all")

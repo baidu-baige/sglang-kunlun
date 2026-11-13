@@ -20,6 +20,34 @@
 Importing this package registers all layer-level ``@plugin_hook`` targets.
 """
 
+import importlib
+
+
+def _target_exists(path: str) -> bool:
+    """Whether the dotted hook target exists in the installed sglang.
+
+    A hook whose target was renamed upstream must not be imported: the registry
+    applies it at startup and a missing attribute aborts the launch with a
+    ``Failed to apply hooks`` traceback (release rules treat that as fatal).
+    0.5.21 renamed the dense-indexer tail to ``_low_ratio_index_topk`` and
+    dropped the fp4/candidate helpers, so the two modules that replace them are
+    native on that build and are skipped instead of registered.
+    """
+    module_path, _, attribute = path.rpartition(".")
+    module_name, _, class_name = module_path.rpartition(".")
+    try:
+        module = importlib.import_module(module_name)
+    except Exception:
+        return False
+    obj = getattr(module, class_name, None)
+    return obj is not None and hasattr(obj, attribute)
+
+
+_HAS_DENSE_INDEXER_TAIL = _target_exists(
+    "sglang.srt.layers.attention.deepseek_v4_backend."
+    "DeepseekV4AttnBackend._low_ratio_index_topk_dense"
+)
+
 from . import linear  # noqa: F401
 from . import quantization  # noqa: F401
 from . import moe  # noqa: F401
@@ -29,9 +57,11 @@ from . import mhc  # noqa: F401,E402
 from . import mhc_head  # noqa: F401,E402
 from . import engram  # noqa: F401,E402
 from . import dsa_cp  # noqa: F401,E402
-from . import dsv41_cp_indexer  # noqa: F401,E402
+if _HAS_DENSE_INDEXER_TAIL:
+    from . import dsv41_cp_indexer  # noqa: F401,E402
 from . import dsv41_wo_a  # noqa: F401,E402
-from . import dsv41_topk_sort  # noqa: F401,E402
+if _HAS_DENSE_INDEXER_TAIL:
+    from . import dsv41_topk_sort  # noqa: F401,E402
 from . import dsv41_pool_pairs  # noqa: F401,E402
 from . import attn_tp_gather  # noqa: F401,E402
 
