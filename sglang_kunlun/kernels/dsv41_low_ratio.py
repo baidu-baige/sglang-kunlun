@@ -1012,6 +1012,9 @@ def quantize_fp4_indexer_tensor_kunlun(
     return payload, scales
 
 
+_PAGED_QUANT_STORE_SCALE: Optional[bool] = None
+
+
 def _paged_quant_takes_store_scale() -> bool:
     """Whether this XSpeedGate build declares ``store_scale`` on the quant store.
 
@@ -1031,9 +1034,6 @@ def _paged_quant_takes_store_scale() -> bool:
         names = [a.name for a in op._schema.arguments]
         _PAGED_QUANT_STORE_SCALE = "store_scale" in names
     return _PAGED_QUANT_STORE_SCALE
-
-
-_PAGED_QUANT_STORE_SCALE: Optional[bool] = None
 
 
 def store_index_k_cache_int8(input, cache, loc, *, page_size: int) -> None:

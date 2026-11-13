@@ -52,7 +52,27 @@ def _same_ordered_group(parallel):
 
 
 def cp_moe_reduce_scatter(original_fn, self, hidden_states, *args, **kwargs):
-    """Finish the CP combine with reduce-scatter when it is exactly equivalent."""
+    """Finish the CP combine with reduce-scatter when it is exactly equivalent.
+
+    Replaces upstream's all-reduce plus a slice of the local shard with
+    ``reduce_scatter_tensor``, which moves the same bytes in one pass.
+
+    Args:
+        original_fn: The wrapped method; called unchanged on every path where
+            the substitution is not provably equivalent.
+        self: The MoE layer the method was bound to.
+        hidden_states: Combine output to reduce.
+        *args: Passed through to ``original_fn``; any value forces a fallback.
+        **kwargs: Passed through to ``original_fn``; any key forces a fallback.
+
+    Returns:
+        The reduced hidden states, from either path.
+
+    Raises:
+        Nothing of its own: every disqualifying condition (extra arguments,
+        another MoE a2a backend, no TP group, missing ``reduce_scatter_tensor``)
+        falls back to ``original_fn`` rather than raising.
+    """
     def fallback():
         return original_fn(self, hidden_states, *args, **kwargs)
 

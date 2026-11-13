@@ -42,18 +42,35 @@ FIELDS = (
     "any_health_check",
     "global_attention_pairs",
 )
+
+
 class _FakeTpGroup:
+    """Minimal stand-in for ``tp_group`` in ``MLPSyncBatchInfo.all_gather``."""
+
     def __init__(self, n):
         self.active_ranks_cpu = torch.ones(n, dtype=torch.int32)
         self.active_ranks = self.active_ranks_cpu
 
 
 class _FakeParallel:
+    """Minimal stand-in for ``get_parallel()``."""
+
     def __init__(self, n):
         self.tp_group = _FakeTpGroup(n)
 
 
 def make_info(dp_size, tp_size, cp_size, seed):
+    """Build an ``MLPSyncBatchInfo`` with deterministic per-rank values.
+
+    Args:
+        dp_size: Number of DP ranks.
+        tp_size: TP size.
+        cp_size: CP size.
+        seed: Generator seed.
+
+    Returns:
+        The populated info object.
+    """
     g = torch.Generator().manual_seed(seed)
 
     def rnd(hi):
@@ -97,7 +114,17 @@ def gather_stub(seed):
         rows[0] = local_row
 
     return exchange_sync_rows
+
+
 def snapshot(info):
+    """Copy every field the gather is supposed to write.
+
+    Args:
+        info: Info object to read.
+
+    Returns:
+        Dict of field name to value.
+    """
     out = {f: getattr(info, f) for f in FIELDS}
     out["tp0_info_cpu"] = info.tp0_info_cpu
     out["dp_cooperation_info"] = info.dp_cooperation_info
@@ -105,6 +132,18 @@ def snapshot(info):
 
 
 def run_case(dp_size, tp_size, cp_size, seed, use_all_reduce):
+    """Compare the forked ``all_gather`` against upstream's on one shape.
+
+    Args:
+        dp_size: Number of DP ranks.
+        tp_size: TP size.
+        cp_size: CP size.
+        seed: Generator seed.
+        use_all_reduce: Exercise the all-reduce arm instead of the exchange.
+
+    Returns:
+        True when every field matches.
+    """
     saved_exchange = up.exchange_sync_rows
     saved_parallel = up.get_parallel
     up.exchange_sync_rows = gather_stub(seed)
@@ -136,7 +175,10 @@ def run_case(dp_size, tp_size, cp_size, seed, use_all_reduce):
         if isinstance(a, list):
             assert all(type(x) is int for x in b), name
     return ref, new
+
+
 def main():
+    """Run the differential check over every shape the scheduler can present."""
     print("fast path enabled:", hook._FAST)
     print("fingerprint ok   :", hook._fingerprint(hook._UPSTREAM_ALL_GATHER))
     assert hook._FAST, "fast path disabled; nothing to compare"

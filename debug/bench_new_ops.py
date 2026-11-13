@@ -34,6 +34,16 @@ EXPANDED = BS * NEXT_N
 
 
 def timeit(fn, iters: int, warmup: int = 20) -> float:
+    """Median device time per call, in microseconds.
+
+    Args:
+        fn: Zero-argument callable to time.
+        iters: Calls per timing round.
+        warmup: Untimed calls issued before the first round.
+
+    Returns:
+        Median of ``5`` rounds of ``iters`` calls, in microseconds.
+    """
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -122,6 +132,7 @@ def bench_gather_spec_extras(dev: str, iters: int) -> list[tuple[str, float, flo
 
 
 def main() -> None:
+    """Run every available bench and print a kernel/torch ratio table."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--device", default="cuda:0")

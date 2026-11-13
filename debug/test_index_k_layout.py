@@ -34,10 +34,23 @@ PAGES = 16
 
 
 def mixed_row_width() -> int:
+    """Byte width of one mixed KV row: nope + scales + rope.
+
+    Returns:
+        Row width in bytes.
+    """
     return PAGE_SIZE * HEAD_DIM + PAGE_SIZE * 4 + PAGE_SIZE * 2
 
 
 def build_pool(device: str = "cpu") -> torch.Tensor:
+    """Allocate a zeroed pool at the production mixed-row width.
+
+    Args:
+        device: Torch device string.
+
+    Returns:
+        ``(PAGES, mixed_row_width())`` uint8 tensor.
+    """
     return torch.zeros((PAGES, mixed_row_width()), dtype=torch.uint8, device=device)
 
 
@@ -49,6 +62,11 @@ def view_like_production(pool: torch.Tensor) -> torch.Tensor:
 
 
 def main() -> int:
+    """Check that the production paged row view stays contiguous.
+
+    Returns:
+        Process exit status; 0 when the layout invariant holds.
+    """
     pool = build_pool()
     sliced = view_like_production(pool)
 

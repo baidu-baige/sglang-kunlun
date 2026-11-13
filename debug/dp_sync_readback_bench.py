@@ -20,6 +20,16 @@ N_COLS = 11
 
 
 def make_tensor(dp_size: int, attn_tp: int, seed: int = 0) -> torch.Tensor:
+    """Build the sync row block ``all_gather`` reads back.
+
+    Args:
+        dp_size: Number of DP ranks.
+        attn_tp: attention TP x CP product.
+        seed: Generator seed.
+
+    Returns:
+        ``(dp_size, N_COLS)`` int64 tensor on CPU.
+    """
     g = torch.Generator().manual_seed(seed)
     full = torch.randint(
         0, 4096, (dp_size, attn_tp, N_COLS), dtype=torch.int64, generator=g
@@ -82,6 +92,17 @@ def variant_numpy(t):
 
 
 def bench(fn, t, iters=20000, reps=7):
+    """Time ``fn(t)`` and return the best round.
+
+    Args:
+        fn: Callable taking the tensor.
+        t: Tensor to pass.
+        iters: Calls per round.
+        reps: Number of rounds.
+
+    Returns:
+        Best (minimum) round, in nanoseconds per call.
+    """
     best = []
     for _ in range(reps):
         t0 = time.perf_counter_ns()
@@ -108,6 +129,7 @@ def breakdown(t):
 
 
 def main():
+    """Run every readback variant across the shapes the scheduler sees."""
     print(f"torch {torch.__version__}  threads={torch.get_num_threads()}")
     for dp_size, attn_tp in ((8, 1), (8, 4), (8, 8), (1, 1), (32, 1)):
         t = make_tensor(dp_size, attn_tp)
