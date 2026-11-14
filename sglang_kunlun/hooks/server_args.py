@@ -204,3 +204,79 @@ def decline_tp_lm_head_all_to_all_kunlun(original, view, *args, **kwargs):
         )
         return {"enable_tp_lm_head_all_to_all": False}
     return result
+
+
+@plugin_hook(
+    "sglang.srt.arg_groups.hisparse_hook.validate_hisparse_kv_cache_dtype",
+    type=HookType.AROUND,
+)
+def validate_hisparse_kv_cache_dtype_kunlun(original, server_args, *args, **kwargs):
+    """Let HiSparse run on the Kunlun int8 KV cache.
+
+    Upstream only allows ``bfloat16`` / ``fp8_e4m3``
+    (``arg_groups/hisparse_hook.py:23``) and otherwise raises, which blocks
+    ``--enable-hisparse`` on this stack outright: GLM-5.3 here runs
+    ``--kv-cache-dtype int8``, and that is not a preference -- the native int8
+    mixed-cache attention op is what keeps decode at 33 ms instead of 139
+    (HANDOVER_TPOT.md section 2), and int8 is also half the bytes per token that
+    bf16 would cost, which is the whole point of turning HiSparse on.
+
+    So the dtype gate is relaxed for int8 while every other HiSparse
+    precondition keeps upstream's behaviour. The device-side sparse pool and its
+    swap kernels still have to handle int8 rows; that is tracked as the next
+    adaptation step rather than hidden here.
+    """
+    kv_cache_dtype = getattr(server_args, "kv_cache_dtype", None)
+    if kv_cache_dtype == "int8":
+        logger.info(
+            "hisparse: allowing --kv-cache-dtype=int8 (Kunlun int8 mixed-cache KV)"
+        )
+        return None
+    return original(server_args, *args, **kwargs)
+
+
+@plugin_hook(
+    "sglang.srt.arg_groups.hisparse_hook.validate_hisparse_dsa_backend",
+    type=HookType.AROUND,
+)
+def validate_hisparse_dsa_backend_kunlun(original, server_args, attr, label, *a, **kw):
+    """Keep the Kunlun DSA backends legal under HiSparse.
+
+    ``_hisparse_allowed_backends`` is keyed by the KV dtype, so with int8 now
+    permitted above there is no entry for it and the stock check would reject
+    whatever backend the Kunlun path resolved (``nsa`` prefill / ``fa3`` decode).
+    The backend choice on this platform comes from the plugin's own attention
+    registry, so leave it alone and let the pool/backend wiring fail loudly if
+    it genuinely cannot serve.
+    """
+    if getattr(server_args, "kv_cache_dtype", None) == "int8":
+        return None
+    return original(server_args, attr, label, *a, **kw)
+
+
+_HISPARSE_SEAMS_ALLOWED = ("the HiSparse DSA KV pool",)
+
+
+@plugin_hook(
+    "sglang.srt.platforms.interface.reject_out_of_tree_path",
+    type=HookType.AROUND,
+)
+def reject_out_of_tree_path_kunlun(original, platform, *, subsystem: str, **kwargs):
+    """Let the Kunlun platform through the HiSparse DSA KV pool seam.
+
+    ``kv_cache_configurator.py:2342-2345`` refuses to build
+    ``HiSparseDSATokenToKVPool`` for an out-of-tree platform because the in-tree
+    class is device-keyed. For this pool the device-specific parts are the swap
+    kernels it calls (``transfer_kv_all_layer_mla``,
+    ``copy_all_layer_kv_cache_func``, ``translate_padded_hisparse_locations``),
+    and those resolve through the plugin's own kernel registry -- so the right
+    move is to let the pool build and fix each kernel as it surfaces, rather
+    than to stay blocked at the seam.
+
+    Every other subsystem keeps upstream's refusal: being permissive there is
+    how a device silently gets the CUDA implementation.
+    """
+    if subsystem in _HISPARSE_SEAMS_ALLOWED:
+        logger.info("hisparse: allowing the Kunlun platform through the %s seam", subsystem)
+        return None
+    return original(platform, subsystem=subsystem, **kwargs)

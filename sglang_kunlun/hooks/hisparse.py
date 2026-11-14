@@ -112,9 +112,26 @@ def move_cold_pool_to_device(coordinator) -> None:
         return
     pool = getattr(coordinator, "mem_pool_host", None)
     buffers = getattr(pool, "kv_buffer", None)
-    if not buffers:
+    # `kv_buffer` is a list for the DSv4 paged host pool but a single tensor for
+    # the DSA HiSparse pool (`HiSparseDSATokenToKVPool`), and `not tensor` on a
+    # multi-element tensor raises "Boolean value of Tensor with more than one
+    # value is ambiguous" -- which is exactly how the first GLM-5.3 hisparse boot
+    # died (measured 2026-11-14 17:55, all 8 decode ranks).
+    if buffers is None:
         return
-    gpu = pool.gpu_device
+    if isinstance(buffers, torch.Tensor):
+        buffers = [buffers]
+    elif len(buffers) == 0:
+        return
+    # The DSv4 paged host pool exposes `gpu_device`; the DSA HiSparse cold pool is
+    # an `MLATokenToKVPoolHost`, which carries only `device` (= "cpu") and a
+    # `_transfer_device` for its transfer target. Resolve in that order and fall
+    # back to the current device, so neither pool needs a special case here.
+    gpu = (
+        getattr(pool, "gpu_device", None)
+        or getattr(pool, "_transfer_device", None)
+        or torch.cuda.current_device()
+    )
     if str(pool.device) == str(gpu):
         return
 
