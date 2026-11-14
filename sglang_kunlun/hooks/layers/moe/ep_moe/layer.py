@@ -134,6 +134,51 @@ class ReusedBuffer:
         return allocated_tensor
 
 
+# The normal-mode MoE scratch buffers are sized from `num_all_tokens`, which
+# changes every call, so allocating them per layer per forward hands the caching
+# allocator a new block size each time. Measured on the prefill node: GPU memory
+# climbed ~5.6 GB per SLO cell (78 -> 95 GB), prompt throughput decayed 102k ->
+# 71k over three cells, and the second cell of boot_v42 died with
+# `OutOfMemory: tried to allocate 2.95 GiB ... 10.29 GiB is free` -- a
+# fragmentation failure, not a capacity one, raised from `_init_new` below.
+#
+# One scratch tensor per (device, slot) that only ever grows fixes that: the
+# steady state is two blocks at the high-water size instead of an unbounded set
+# of near-miss sizes. Reuse is safe because `combine_b` ends every MoE layer
+# with `event.current_stream_wait()`, so the next layer's writes cannot overtake
+# the comm stream still reading the previous layer's rows.
+_MOE_SCRATCH_GRANULARITY = 256 * 1024 * 1024
+_moe_scratch: Dict[Tuple[str, str], torch.Tensor] = {}
+
+
+def _moe_scratch_buffer(slot: str, size_in_bytes: int, device) -> torch.Tensor:
+    """Return a zeroed scratch tensor of at least ``size_in_bytes`` for ``slot``."""
+    key = (str(device), slot)
+    buffer = _moe_scratch.get(key)
+    if buffer is None or buffer.numel() < size_in_bytes:
+        rounded = (
+            (size_in_bytes + _MOE_SCRATCH_GRANULARITY - 1)
+            // _MOE_SCRATCH_GRANULARITY
+            * _MOE_SCRATCH_GRANULARITY
+        )
+        # Drop the old block first, so its bytes are available for the new one.
+        _moe_scratch.pop(key, None)
+        del buffer
+        buffer = torch.zeros(rounded, dtype=torch.uint8, device=device)
+        _moe_scratch[key] = buffer
+        logger.info(
+            "MoE scratch %s grown to %.2f GiB (requested %.2f GiB)",
+            slot,
+            rounded / 1024**3,
+            size_in_bytes / 1024**3,
+        )
+    else:
+        # Same zero-init semantics as the `torch.zeros` this replaces, and the
+        # same cost: only the prefix the views can reach is cleared.
+        buffer[:size_in_bytes].zero_()
+    return buffer
+
+
 class Bfp16orFp16NormalMoeBuffer:
     """
     condition:
@@ -186,10 +231,10 @@ class Bfp16orFp16NormalMoeBuffer:
             # poisons the shared-scale int8 quantisation (and therefore every
             # token) on the first forward, before any expert has filled them.
             self.buffer0 = ReusedBuffer(
-                torch.zeros(buffer0_size, dtype=torch.uint8, device=self.device)
+                _moe_scratch_buffer("bf16_or_fp16.buffer0", buffer0_size, self.device)
             )
             self.buffer1 = ReusedBuffer(
-                torch.zeros(buffer1_size, dtype=torch.uint8, device=self.device)
+                _moe_scratch_buffer("bf16_or_fp16.buffer1", buffer1_size, self.device)
             )
         except Exception as e:
             logger.info(
@@ -288,10 +333,10 @@ class W8A8NormalMoeBuffer:
         buffer1_size = max(self.M * 2 * self.F * 2, self.M * self.H * 2)
         # Zero-initialised for the same reason as Bfp16orFp16NormalMoeBuffer.
         self.buffer0 = ReusedBuffer(
-            torch.zeros(buffer0_size, dtype=torch.uint8, device=self.device)
+            _moe_scratch_buffer("w8a8.buffer0", buffer0_size, self.device)
         )
         self.buffer1 = ReusedBuffer(
-            torch.zeros(buffer1_size, dtype=torch.uint8, device=self.device)
+            _moe_scratch_buffer("w8a8.buffer1", buffer1_size, self.device)
         )
 
     @property
