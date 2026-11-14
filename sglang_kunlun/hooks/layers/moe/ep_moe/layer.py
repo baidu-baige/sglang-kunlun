@@ -71,6 +71,7 @@ from kunlun_ops import (
     m_grouped_gemm_fp16_fp16_bf16_nt_masked_v3,
     m_grouped_gemm_fp16_I4_bf16_nt_contiguous_v3,
     m_grouped_gemm_fp16_I4_bf16_nt_masked_v3,
+    m_grouped_gemm_fp16_I4_fp16_nt_masked_v3,
     m_grouped_gemm_I8_I4_bf16_nt_contiguous_v3,
     m_grouped_gemm_I8_I4_bf16_nt_masked_v3,
     m_grouped_gemm_I8_I8_bf16_nt_contiguous_v3,
@@ -81,6 +82,19 @@ from kunlun_ops import (
     silu_and_per_token_group_quant_I8,
 )
 logger = logging.getLogger(__name__)
+
+# P800 computes bf16 slower than fp16, and the decode MoE chain today is
+# fp16 in -> bf16 GEMM out -> bf16 SwiGLU -> `.to(torch.float16)` -> bf16 GEMM
+# out: the slower dtype plus one full conversion pass over [groups, m, inter]
+# every step. The vendor ships an fp16-output twin of the masked GEMM
+# (`m_grouped_gemm_fp16_I4_fp16_nt_masked_v3`), so the chain can stay fp16.
+# Off by default until a cell says it pays.
+_MOE_FP16_OUT = os.environ.get("SGLANG_KUNLUN_MOE_FP16_OUT", "0") not in (
+    "0",
+    "",
+    "false",
+    "False",
+)
 
 
 class _DSV4ClampedSiluAndMul(torch.nn.Module):
@@ -1177,12 +1191,21 @@ class DeepEPMoE(FusedMoE):
 
         # GroupGemm-0
         n = w13_weight.size(1)
+        # See `_MOE_FP16_OUT`: keeping the chain in fp16 avoids both the slower
+        # bf16 arithmetic on P800 and the `.to(torch.float16)` pass before
+        # GroupGemm-1.
+        out_dtype = torch.float16 if _MOE_FP16_OUT else torch.bfloat16
+        gemm_masked = (
+            m_grouped_gemm_fp16_I4_fp16_nt_masked_v3
+            if _MOE_FP16_OUT
+            else m_grouped_gemm_fp16_I4_bf16_nt_masked_v3
+        )
         gateup_output = torch.empty(
             (num_groups, m, n),
             device=hidden_states_fp16.device,
-            dtype=torch.bfloat16,
+            dtype=out_dtype,
         )
-        m_grouped_gemm_fp16_I4_bf16_nt_masked_v3(
+        gemm_masked(
             hidden_states_fp16,
             (w13_weight, self.w13_weight_scale),
             gateup_output,
@@ -1209,10 +1232,12 @@ class DeepEPMoE(FusedMoE):
         down_output = torch.empty(
             (num_groups, m, w2_weight.size(1)),
             device=down_input.device,
-            dtype=torch.bfloat16,
+            dtype=out_dtype,
         )
-        m_grouped_gemm_fp16_I4_bf16_nt_masked_v3(
-            down_input.to(torch.float16),
+        gemm_masked(
+            # Already fp16 on the `_MOE_FP16_OUT` path, so the conversion pass
+            # over [groups, m, inter] disappears with it.
+            down_input if down_input.dtype == torch.float16 else down_input.to(torch.float16),
             (w2_weight, self.w2_weight_scale),
             down_output,
             masked_m,
