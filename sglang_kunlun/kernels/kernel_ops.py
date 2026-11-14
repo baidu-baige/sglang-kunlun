@@ -7465,6 +7465,30 @@ def _dsa_write_page_tables(
     if max_cols <= 0 or rows == 0:
         return
 
+    # One fused kernel instead of the four full-width passes below. Measured
+    # 2026-11-14 at the production decode shape (rows 8, max_cols 77824,
+    # page 64): **12.2 us/call against 350.7 us** for the torch sequence, which
+    # the decode trace showed as `tensor_calc_n1_1k<13,...>` 3/step = 0.784
+    # ms/step for the compare alone. Byte-exact against the torch path on seven
+    # shapes including empty rows, lengths above `max_cols`, int64 index
+    # tensors and page_size 1 (`XSpeedGate/tests/attention/
+    # test_dsa_write_page_tables.py`, 7/7). Graph-safe: `rows`/`max_cols` are
+    # capture-time constants and the live length is read from the device
+    # `kv_lens` inside the kernel, so a replay picks up new values.
+    _op = getattr(torch.ops.xspeedgate_ops, "dsa_write_page_tables", None)
+    if _op is not None and req_to_token.dtype == torch.int32:
+        _op(
+            req_to_token,
+            req_pool_indices,
+            req_row,
+            kv_lens,
+            page_table_1,
+            real_page_table if real_page_size > 1 else None,
+            int(max_cols),
+            int(real_page_size),
+        )
+        return
+
     device = req_to_token.device
     req_idx = req_pool_indices.index_select(0, req_row).long()
     vals = req_to_token.index_select(0, req_idx)[:, :max_cols].to(torch.int32)

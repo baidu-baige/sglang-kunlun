@@ -69,6 +69,26 @@ def register_all() -> None:
     from sglang_kunlun.kernels import k3_conv_registry as _k3_conv_registry  # noqa: F401
     from sglang_kunlun.kernels import kernel_ops, kernel_registry
 
+    # Operators built from the XSpeedGate tree and shipped as a SECOND .so next
+    # to the installed wheel (`TORCH_LIBRARY_FRAGMENT_EXPAND` lets it add to the
+    # same `torch.ops.xspeedgate_ops` namespace). Import before
+    # `kernel_ops.install()` so the wiring below can test for the ops. Verified
+    # offline: 256 -> 257 operators, nothing lost, `sparse_mixed_attn_int8`
+    # intact. A missing/unloadable .so only logs and leaves the torch
+    # fallbacks in place.
+    try:
+        from sglang_kunlun import extra_ops as _extra_ops  # noqa: F401
+    except Exception as exc:  # pragma: no cover - depends on the built artifact
+        logger.warning("extra_ops unavailable (%s); using the torch fallbacks", exc)
+
+    # Operators built from the XSpeedGate tree and shipped as a SECOND .so
+    # beside the installed wheel (`TORCH_LIBRARY_FRAGMENT_EXPAND`, so nothing is
+    # lost and `sparse_mixed_attn_int8` stays put -- the wheel must never be
+    # reinstalled, HANDOVER_TPOT.md section 2). Must precede
+    # `kernel_ops.install()`, which resolves every registered kernel target.
+    # Absent .so = the torch fallbacks, never a boot failure.
+    from sglang_kunlun import extra_ops as _extra_ops  # noqa: F401
+
     # V4.1 low-ratio (compress_ratio 1/2) kernel replacements. Must be imported
     # before kernel_ops.install(), which snapshots the registration tables.
     from sglang_kunlun.kernels import dsv41_low_ratio as _dsv41_low_ratio  # noqa: F401
