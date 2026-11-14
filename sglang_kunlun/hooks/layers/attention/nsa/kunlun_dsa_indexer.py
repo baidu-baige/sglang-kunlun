@@ -169,7 +169,7 @@ def _indexer_wk_weights(indexer, x: torch.Tensor):
         # Prefer upstream's own accessor so the split order and the dtype cast
         # stay theirs (`dsa_indexer.py:605-607`, `kw.split([head_dim,
         # n_heads])` -> key, weights).
-        x = x.to(fused.weight.dtype)
+        x = x.to(_act_dtype_for(fused, x))
         split = getattr(indexer, "_fused_k_weights", None)
         if split is not None:
             key, weights = split(x)
@@ -188,7 +188,9 @@ def _indexer_wk_weights(indexer, x: torch.Tensor):
         return key, weights
     # Non-fused layout (0.5.19/0.5.22 and any 0.5.23 build with the fusion off):
     # the two separate projections, exactly as before.
-    weights, _ = indexer.weights_proj(x.to(indexer.weights_proj.weight.dtype))
+    weights, _ = indexer.weights_proj(
+        x.to(_act_dtype_for(indexer.weights_proj, x))
+    )
     key, _ = indexer.wk(x)
     return key, weights
 
@@ -219,6 +221,27 @@ def xspeedgate_hadamard_transform(
     if scale is None:
         return torch.ops.xspeedgate_ops.hadamard_transform(x.contiguous())
     return torch.ops.xspeedgate_ops.hadamard_transform(x.contiguous(), scale)
+
+
+def _act_dtype_for(layer, x: torch.Tensor) -> torch.dtype:
+    """Dtype to feed ``layer`` with, given its (possibly quantized) weight.
+
+    The projections here used to be cast with ``x.to(layer.weight.dtype)``,
+    which is right only while the weight is a float tensor. In the
+    lm-head-quantized checkpoint (`GLM-5.3-W4A8-INT8-Dynamic`) the indexer's
+    `wk` / `wq_b` / `weights_proj` are W8A8 int8, so `weight.dtype` is int8 and
+    the cast turned the activation into int8 before the layer could quantize it
+    itself -- the dynamic quantizer then raised `quant2d not support x dtype`
+    and every decode rank died during graph capture (measured 2026-11-14 16:07).
+
+    For an integer weight the activation must stay floating point: keep its own
+    dtype, which is what the quantized ``apply_weights`` path expects.
+    """
+    weight = getattr(layer, "weight", None)
+    dtype = getattr(weight, "dtype", None)
+    if dtype is None or not dtype.is_floating_point:
+        return x.dtype
+    return dtype
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
@@ -1387,7 +1410,7 @@ def _get_q_k_bf16(
         current_stream = torch.cuda.current_stream()
         indexer.alt_stream.wait_stream(current_stream)
         # for kunlun ops
-        query, _ = indexer.wq_b(q_lora.to(indexer.wq_b.weight.dtype))
+        query, _ = indexer.wq_b(q_lora.to(_act_dtype_for(indexer.wq_b, q_lora)))
         # The DSA indexer chain runs in bf16: the Hadamard rotation is bf16-only
         # and `prefill_attention_dsa_opt` requires q/kv/out/lse_out to agree
         # (measured: passing fp16 q with bf16 kv raises `Check failed,
@@ -1417,7 +1440,7 @@ def _get_q_k_bf16(
 
         current_stream.wait_stream(indexer.alt_stream)
     else:
-        query, _ = indexer.wq_b(q_lora.to(indexer.wq_b.weight.dtype))
+        query, _ = indexer.wq_b(q_lora.to(_act_dtype_for(indexer.wq_b, q_lora)))
         # The DSA indexer chain runs in bf16: the Hadamard rotation is bf16-only
         # and `prefill_attention_dsa_opt` requires q/kv/out/lse_out to agree
         # (measured: passing fp16 q with bf16 kv raises `Check failed,
