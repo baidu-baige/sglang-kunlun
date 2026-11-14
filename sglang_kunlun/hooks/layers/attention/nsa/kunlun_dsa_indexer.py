@@ -39,6 +39,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 # ``DSV4_HISPARSE_PREFIX_SINK`` tokens, 0 = disabled (default). See the sink
 # block in ``_get_topk_paged``.
 _PREFIX_SINK = int(os.environ.get("DSV4_HISPARSE_PREFIX_SINK", "0"))
+# See `_paged_topk_transform_vendor`: the vendor decode top-k kernel is 24-60 %
+# faster but drops up to 2 of the 2048 selected positions, so it stays behind a
+# flag until an accuracy run clears it.
+_TOPK_FAST_PATH = os.environ.get("SGLANG_KUNLUN_TOPK_FAST_PATH", "0") not in ("0", "", "false", "False")
 _PREFIX_SINK_BOOST = 1.0e4
 
 try:
@@ -489,6 +493,18 @@ def _paged_topk_transform_vendor(
         cu_seqlens_q=(
             None if cu_seqlens_q is None else cu_seqlens_q.to(torch.int32).contiguous()
         ),
+        # `fast_path` picks the vendor's decode top-k kernel instead of the
+        # generic heap one. Measured offline at the production shapes (score
+        # width 77824, topk 2048): rows=8 62.8 -> 47.8 us (-24%), rows=32
+        # 367.3 -> 145.7 us (-60%), and the selection keeps 2046-2048 of the
+        # 2048 true top-k positions with the captured score mass at 1.0000 of
+        # the exact selection. Today's path is what the decode trace shows as
+        # `topk_heap_scalar_core_split_m` 1.75/step at 0.596 ms/step, against
+        # 0.5.8's cheaper `topk_transform_decode_kernelv2<float, 2048>` from the
+        # same vendor entry point. Off by default: dropping 2 of 2048 index
+        # positions is an accuracy decision and needs `acc_longbench_nothink.sh`
+        # before it can become the default.
+        fast_path=_TOPK_FAST_PATH,
     )
     return dst_page_table
 
