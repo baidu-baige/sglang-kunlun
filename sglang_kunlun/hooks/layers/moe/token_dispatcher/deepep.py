@@ -61,8 +61,13 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 logger = logging.getLogger(__name__)
 
-# See ``_dispatch_core``: the host-side layout pre-pass is dead weight for the
-# vendor runtime and is the prime suspect for the normal-dispatch tail deadlock.
+# See ``_dispatch_core``: the host-side layout pre-pass looks like dead weight
+# (``BufferV2.dispatch`` drops the four layout args). It was suspected of both
+# causing and curing ``deep_ep.cpp:410 'recv_num_tokens >= 0 and
+# bkcl_notify_dispatch_standard failed'``; neither held -- the assert fires with
+# it on and with it off, and the 0.5.8 production dispatcher ran for months with
+# all four args at None. Default off (matching 0.5.8); the knob stays so the
+# comparison can be redone.
 _DISPATCH_LAYOUT_PREPASS = get_bool_env_var(
     "SGLANG_KUNLUN_DEEPEP_DISPATCH_LAYOUT", "false"
 )
@@ -378,6 +383,16 @@ class DeepEPConfig(BaseDispatcherConfig):
         return cls._instance
 
 
+def _attn_cp_size() -> int:
+    """Prefill context-parallel width (1 when CP is off or unavailable)."""
+    try:
+        from sglang.srt.distributed import get_parallel
+
+        return int(getattr(get_parallel(), "attn_cp_size", 1) or 1)
+    except Exception:
+        return 1
+
+
 class _DeepEPDispatcherImplBase:
     """_DeepEPDispatcherImplBase"""
     def __init__(
@@ -487,9 +502,32 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             hidden_states = hidden_states.new_zeros((1, hidden_states.shape[1]))
             topk_ids = topk_ids.new_zeros((1, topk_ids.shape[1]))
             topk_weights = topk_weights.new_zeros((1, topk_weights.shape[1]))
+        else:
+            # A chunk smaller than the CP width leaves the other ranks with an
+            # empty shard; the vendor's notify then reports a negative token
+            # count and every prefill rank dies with `deep_ep.cpp:410
+            # bkcl_notify_dispatch_standard failed` (measured on
+            # `#new-seq: N, #new-token: 1` batches). Repeat rows up to the CP
+            # width and slice them back in combine_b. Repetition keeps the
+            # routed ids valid, unlike the zero pad above.
+            cp_size = _attn_cp_size()
+            if cp_size > 1 and self._normal_orig_num_tokens < cp_size:
+                from sglang_kunlun.hooks.layers.moe.cp_tiny_batch import (
+                    pad_to_cp,
+                    pad_topk_to_cp,
+                )
+
+                hidden_states, _ = pad_to_cp(hidden_states, cp_size)
+                topk_ids, topk_weights, _ = pad_topk_to_cp(
+                    topk_ids, topk_weights, cp_size
+                )
 
         import kunlun_ops
-        topk_ids = topk_ids.to(torch.int32)
+        # `.to()` returns self when the dtype already matches, so a router that
+        # produces int32 costs nothing here; the cast only fires for dtypes that
+        # would otherwise be re-converted on every layer of every forward.
+        if topk_ids.dtype is not torch.int32:
+            topk_ids = topk_ids.to(torch.int32)
         num_tokens, hidden_size = hidden_states.shape
         hidden_states_int8 = torch.empty(
                 num_tokens,
@@ -651,8 +689,12 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         event.current_stream_wait() if self.async_finish else ()
         self.handle = None
         self.src2dst = None
-        if getattr(self, "_normal_orig_num_tokens", None) == 0:
+        orig = getattr(self, "_normal_orig_num_tokens", None)
+        if orig == 0:
             hidden_states = hidden_states[:0]
+        elif orig is not None and hidden_states.shape[0] > orig:
+            # drop the rows repeated for a micro batch (see dispatch_a)
+            hidden_states = hidden_states[:orig]
         return hidden_states
 
     def _combine_core(self, x: torch.Tensor, previous_event):

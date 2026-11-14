@@ -32,6 +32,11 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 )
 def compute_lm_head_kunlun(original_fn, self, hidden_states, lm_head, *args, **kwargs):
     """Route the fp32 LM head through upstream's explicit-cast branch."""
+    # Upstream's plain path reads `lm_head.weight` and does the matmul itself,
+    # which bypasses a custom module; a rotated int8 head has to own the whole
+    # chain (rotate -> quantise -> int8 GEMM -> dequantise).
+    if lm_head.__class__.__name__ == "Int8RotatedHead":
+        return lm_head(hidden_states)
     if not getattr(self, "use_fp32_lm_head", False):
         return original_fn(self, hidden_states, lm_head, *args, **kwargs)
 

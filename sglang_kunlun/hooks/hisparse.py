@@ -40,10 +40,32 @@ _HISPARSE_COLD_POOL = "dsv4_hisparse_c4"
     type=HookType.AROUND,
 )
 def _allow_requested_kv_dtype_for_dsv4_hisparse(original_fn, server_args):
-    """Skip the DSA-only KV-dtype check for DeepSeek-V4 hisparse."""
+    """Relax the DSA-only KV-dtype check for the two Kunlun HiSparse cases.
+
+    DeepSeek-V4 hisparse owns its own KV dtype, and GLM-5.3 here runs
+    ``--kv-cache-dtype int8``: upstream only allows ``bfloat16`` / ``fp8_e4m3``
+    (``arg_groups/hisparse_hook.py:23``), which would block ``--enable-hisparse``
+    on this stack outright. int8 is not a preference -- the native int8
+    mixed-cache attention op is what keeps decode at 33 ms instead of 139
+    (HANDOVER_TPOT.md section 2), and it is half the bytes per token that bf16
+    would cost, which is the whole point of turning HiSparse on.
+
+    Both relaxations live in ONE hook on purpose: two AROUND hooks on the same
+    target made the registry warn that an outer hook skipping ``original_fn``
+    silently bypasses the inner one.
+
+    Every other HiSparse precondition keeps upstream's behaviour. The
+    device-side sparse pool and its swap kernels still have to handle int8 rows;
+    that is tracked as the next adaptation step rather than hidden here.
+    """
     from sglang.srt.arg_groups.overrides import model_config_of
     from sglang.srt.configs.model_config import is_deepseek_v4
 
+    if getattr(server_args, "kv_cache_dtype", None) == "int8":
+        logger.info(
+            "hisparse: allowing --kv-cache-dtype=int8 (Kunlun int8 mixed-cache KV)"
+        )
+        return None
     if is_deepseek_v4(model_config_of(server_args).hf_config):
         return None
     return original_fn(server_args)

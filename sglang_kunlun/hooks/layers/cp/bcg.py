@@ -36,7 +36,6 @@ from __future__ import annotations
 import logging
 
 import torch
-from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
     is_in_breakable_cuda_graph,
@@ -300,29 +299,29 @@ def can_replay_locally_single_request_kunlun(original, self, *args, **kwargs):
     type=HookType.AROUND,
 )
 def is_cp_active_kunlun(original, forward_batch) -> bool:
-    """Keep the ragged draft extend and speculative batches off the CP shard.
+    """Allow aligned Eagle prefill extends through the runner's CP boundary.
 
-    The DSPARK ragged draft extend builds its own row layout
-    (``_kunlun_ragged_draft_extend``), and target-verify / draft-extend batches
-    are special-cased by the plugin's LoD paths. Upstream's eager CP shard only
-    mirrors plain prefill extends, so sharding one side leaves the attention
-    with query rows that do not match its position rows. Those batches keep the
-    model-side DSA split.
-
-    0.5.22 renamed ``is_cp_v2_active`` to ``is_cp_active`` (strategy-based CP is
-    now the only implementation), and the upstream body is exactly the tail this
-    hook used to copy -- so this is an AROUND that only adds the Kunlun
-    early-outs and delegates the verdict.
+    Ragged drafts and verify/decode draft extends retain their own row layouts.
+    Eagle's ordinary prefill extend carries full target hidden states, which
+    cp_shard_model_inputs shards together with embeddings and positions.
     """
     if getattr(forward_batch, "_kunlun_ragged_draft_extend", False):
-        return False
-    if getattr(forward_batch, "spec_info", None) is not None:
         return False
     forward_mode = getattr(forward_batch, "forward_mode", None)
     if forward_mode is not None and (
         forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
     ):
         return False
+    spec_info = getattr(forward_batch, "spec_info", None)
+    if spec_info is not None:
+        from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+
+        if (
+            not isinstance(spec_info, EagleDraftExtendInput)
+            or forward_mode is None
+            or not forward_mode.is_context_parallel_extend()
+        ):
+            return False
     return original(forward_batch)
 
 

@@ -182,7 +182,7 @@ def install_kunlun_vision_backend() -> None:
         )
         return
     impl["kunlun"] = KunlunVisionAttention
-    logger.info(
+    logger.debug(
         "Kunlun vision backend 已装到 QKV_BACKEND_IMPL[kunlun]（kunlun_ops "
         "flash attention）；多模态加 --mm-attention-backend kunlun",
     )

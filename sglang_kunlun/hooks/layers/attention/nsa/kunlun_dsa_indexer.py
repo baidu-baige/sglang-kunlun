@@ -244,6 +244,9 @@ def _act_dtype_for(layer, x: torch.Tensor) -> torch.dtype:
     return dtype
 
 
+_HADAMARD_CACHE: dict = {}
+
+
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     """Rotate activations with a scaled Hadamard transform.
 
@@ -257,12 +260,39 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     the model dtype -- the transform keeps its own bf16 requirement internally
     and returns the caller's dtype.
     """
-    out_dtype = x.dtype
-    x = x.to(torch.bfloat16)
     hidden_size = x.size(-1)
     assert (
         hidden_size & (hidden_size - 1)
     ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
+
+    # Native-dtype path: `kunlun_ops` can build the (scaled) Hadamard matrix at
+    # the caller's dtype and apply it with one matmul, so serving at float16 no
+    # longer needs the fp16->bf16->fp16 round trip this function used to pay on
+    # every indexer call of every layer of every step. `SGLANG_KUNLUN_HADAMARD_FP16=0`
+    # restores the bf16 butterfly kernel for an A/B.
+    if os.environ.get("SGLANG_KUNLUN_HADAMARD_FP16", "1") not in ("", "0"):
+        import kunlun_ops
+
+        # One matrix per (device, dtype, size), reused for every layer and step.
+        # Building it per call allocated hidden^2 * 2 B (33 MB at 4096) on every
+        # indexer invocation, which churns the allocator during prefill and made
+        # the vendor dispatch wedge far easier to hit.
+        key = (str(x.device), x.dtype, hidden_size)
+        matrix = _HADAMARD_CACHE.get(key)
+        if matrix is None:
+            matrix = torch.empty(
+                (hidden_size, hidden_size), dtype=x.dtype, device=x.device
+            )
+            kunlun_ops.gen_hadamard_matrix(matrix, hidden_size**-0.5)
+            _HADAMARD_CACHE[key] = matrix
+        shape = x.shape
+        x2d = x.reshape(-1, hidden_size)
+        out = torch.empty_like(x2d)
+        kunlun_ops.matmul(x2d, matrix, out, False, True, 1.0, 0.0)
+        return out.reshape(shape)
+
+    out_dtype = x.dtype
+    x = x.to(torch.bfloat16)
     return xspeedgate_hadamard_transform(x, hidden_size**-0.5).to(out_dtype)
 
 

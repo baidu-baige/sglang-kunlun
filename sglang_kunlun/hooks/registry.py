@@ -99,12 +99,31 @@ def register_all() -> None:
     # be in place before any op is resolved for the first time.
     kernel_registry.install()
 
+    # Breakable prefill graphs currently only replay batches that carry a prefix
+    # (`InterleaveBCGInput.allows_replay` requires `prefix_lens is not None`), so
+    # cold chunks -- most of a 200-request SLO cell -- run eager. Gated by
+    # SGLANG_KUNLUN_BCG_ALLOW_COLD_REPLAY, off by default.
+    try:
+        from sglang_kunlun.hooks.layers import cp_bcg as _cp_bcg
+
+        _cp_bcg.install()
+    except Exception:
+        logger.warning(
+            "sglang-kunlun: CP-BCG cold-replay seam failed to install",
+            exc_info=True,
+        )
+
     # MiniMax-M3 lives in one self-contained package: importing it applies the
     # Triton compatibility patches the upstream sparse modules need at import
     # time and registers the model's JIT replacements. Must run before
     # kernel_ops.install() (which resolves every registered kernel target) and
     # before the generic hook modules pull upstream MiniMax code in.
     importlib.import_module("sglang_kunlun.hooks.models.minimax")
+
+    # QuaRot-R1 rotated checkpoints (INT8-Dynamic) carry two block-diagonal
+    # corrections for the MTP head; without them accept collapses to ~2 %.
+    importlib.import_module("sglang_kunlun.hooks.models.glm53_mtp_rotation")
+    importlib.import_module("sglang_kunlun.hooks.models.glm53_lmhead_rotation")
 
     legacy_jit_specs = [
         key

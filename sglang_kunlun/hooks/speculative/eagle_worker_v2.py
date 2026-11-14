@@ -10,6 +10,8 @@ Patch only the eager metadata-init behavior added in the patch version:
 """
 
 from __future__ import annotations
+
+import time
 import os
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
@@ -37,6 +39,25 @@ def disable_mtp_index_share_kunlun(result, self, *args, **kwargs):
     return result
 
 
+_DEW_ON = os.environ.get("SGLANG_KUNLUN_PROBE", "0") not in ("", "0")
+_DEW_N = 0
+_DEW_ACC = {"ms": 0.0}
+
+
+def _dew_report(ms, bs):
+    """Whole-method wrapper timing; prints the first call too, so a silent probe
+    can never be mistaken for "the method did not run"."""
+    _DEW_N_local = _DEW_ACC
+    _DEW_N_local["n"] = _DEW_N_local.get("n", 0) + 1
+    _DEW_N_local["ms"] += ms
+    if _DEW_N_local["n"] == 1 or _DEW_N_local["n"] % 50 == 0:
+        print(
+            f"[PROBE_DEW] n={_DEW_N_local['n']} last={ms:.2f}ms "
+            f"mean={_DEW_N_local['ms'] / _DEW_N_local['n']:.2f}ms bs={bs}",
+            flush=True,
+        )
+
+
 @plugin_hook(
     "sglang.srt.speculative.eagle_worker_v2.EagleDraftWorker._draft_extend_for_decode",
     type=HookType.AROUND,
@@ -59,10 +80,17 @@ def _draft_extend_for_decode_kunlun(
         return original_forward(*args, **kwargs)
 
     self.draft_runner.forward = patched_forward
+    _t0 = time.perf_counter()
     try:
         return original_fn(self, batch, batch_result, kv_loc_plan=kv_loc_plan)
     finally:
         self.draft_runner.forward = original_forward
+        if _DEW_ON:
+            try:
+                _bs = len(batch.seq_lens)
+            except Exception:
+                _bs = -1
+            _dew_report((time.perf_counter() - _t0) * 1000, _bs)
 
 
 @plugin_hook(

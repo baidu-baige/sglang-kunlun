@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
+import time
 
 import torch
 
@@ -19,6 +21,103 @@ from sglang_kunlun.hooks.models.mtp_input_correction import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# --- replace-hook sub-probes ----------------------------------------------
+# The REPLACE hook below is the implementation decode actually runs; the
+# upstream EagleDraftWorker._draft_extend_for_decode is dead code (probes there
+# never print). Split the ~15 ms at the four boundaries that matter:
+#   inputs   entry -> prepare call (MTP input correction + index bookkeeping)
+#   prepare  prepare_for_draft_extend_kunlun (already measured ~3.8 ms)
+#   exec     graph execute / eager draft-extend forward
+#   post     argmax + next-draft-input construction
+_DH_ON = os.environ.get("SGLANG_KUNLUN_PROBE", "0") not in ("", "0")
+_DH_ACC = {}
+_DH_N = 0
+_DH_LAST = {}
+_DH_SEGS = (
+    ("inputs", "g0", "g1"),
+    ("prepare", "g1", "g2"),
+    ("exec", "g2", "g3"),
+    ("post", "g3", "g4"),
+)
+
+
+def _dh(name):
+    if _DH_ON:
+        _DH_ACC[name] = time.perf_counter()
+
+
+def _dh_report():
+    global _DH_N
+    if not _DH_ON:
+        return
+    _dh("g4")
+    _DH_N += 1
+    if _DH_N % 50:
+        return
+    parts = [
+        f"{n}={(_DH_ACC[b] - _DH_ACC[a]) * 1000:.2f}"
+        for n, a, b in _DH_SEGS
+        if a in _DH_ACC and b in _DH_ACC
+    ]
+    total = (_DH_ACC["g4"] - _DH_ACC["g0"]) * 1000
+    print(
+        f"[PROBE_DE3] n={_DH_N} total={total:.2f}ms " + " ".join(parts)
+        + f" | can_graph={_DH_LAST.get('can_graph')} bs={_DH_LAST.get('bs')}",
+        flush=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Draft-extend prepare probes (Kunlun hook -- this is the implementation the
+# decode actually runs; the upstream `prepare_for_draft_extend` in
+# eagle_worker_common is replaced, so probes there never fire).
+#
+# The accepted-only path does device->host conversions:
+#   accept_lens.to("cpu").tolist()      (e1 -> e2)
+#   seq_lens.to("cpu").tolist()/sum()   (inside e3)
+# Each is a hard sync on whatever the verify forward just enqueued, which is why
+# the cost shows up as host time in draft_extend, vanishes under PROBE_SYNC=1,
+# and is unaffected by the plan-stream bypass.
+# ---------------------------------------------------------------------------
+_DE_ON = os.environ.get("SGLANG_KUNLUN_PROBE", "0") not in ("", "0")
+_DE_ACC = {}
+_DE_N = 0
+_DE_LAST = {"accepted_only": None}
+_DE_SEGS = (
+    ("prep", "e0", "e1"),
+    ("d2h", "e1", "e2"),
+    ("meta", "e2", "e3"),
+    ("attn", "e3", "e4"),
+)
+
+
+def _de(name):
+    if _DE_ON:
+        _DE_ACC[name] = time.perf_counter()
+
+
+def _de_report():
+    global _DE_N
+    if not _DE_ON:
+        return
+    _de("e4")
+    _DE_N += 1
+    if _DE_N % 50:
+        return
+    parts = [
+        f"{n}={(_DE_ACC[b] - _DE_ACC[a]) * 1000:.2f}"
+        for n, a, b in _DE_SEGS
+        if a in _DE_ACC and b in _DE_ACC
+    ]
+    total = (_DE_ACC["e4"] - _DE_ACC["e0"]) * 1000
+    print(
+        f"[PROBE_DE] n={_DE_N} total={total:.2f}ms " + " ".join(parts)
+        + f" | accepted_only={_DE_LAST['accepted_only']}",
+        flush=True,
+    )
+
 
 # One-shot state for the MTP input-correction diagnostics.
 _MTP_CORRECTION_LOADED = False
@@ -96,6 +195,7 @@ def prepare_for_draft_extend_kunlun(
     from sglang.srt.utils.async_probe import maybe_detect_oob
     from sglang.srt.utils.common import is_npu
 
+    _de("e0")
     batch_size = len(batch.seq_lens)
     accept_lens = draft_extend_input.num_accept_tokens
     accepted_only = accept_lens is not None and (
@@ -122,6 +222,7 @@ def prepare_for_draft_extend_kunlun(
         "v2 prepare_for_draft_extend input_ids",
     )
 
+    _de("e1")
     gpu_only = batch.seq_lens_cpu is None
     accepted_lengths_cpu = None
     if accepted_only:
@@ -129,6 +230,8 @@ def prepare_for_draft_extend_kunlun(
             accept_lens.detach().to(device="cpu", dtype=torch.int32).tolist()
         )
 
+    _de("e2")
+    _DE_LAST["accepted_only"] = accepted_only
     if gpu_only:
         batch.prefix_lens = batch.seq_lens.to(torch.int32)
         batch.extend_lens = (
@@ -180,6 +283,7 @@ def prepare_for_draft_extend_kunlun(
         return_hidden_states_before_norm=False,
         **plan_kwargs,
     )
+    _de("e3")
     increment = (
         accept_lens.to(forward_batch.seq_lens.dtype)
         if accepted_only
@@ -289,6 +393,7 @@ def prepare_for_draft_extend_kunlun(
             # site qualifies: it plans with the same backend object the forward
             # path uses and adds no view context.
             forward_batch.mark_forward_metadata_ready(replan_equivalent=True)
+    _de_report()
     return forward_batch
 
 
@@ -514,6 +619,7 @@ def correct_draft_input_hidden(worker, batch_result):
 )
 def draft_extend_for_decode_kunlun(self, batch, batch_result, *, kv_loc_plan=None):
     """Compact accepted request prefixes for synchronous DSV4 draft extend."""
+    _dh("g0")
     import sglang.srt.speculative.eagle_worker_v2 as upstream
 
     # GLM-5.3's MTP input correction (QuaRot/R1 compensation for the draft's
@@ -525,10 +631,8 @@ def draft_extend_for_decode_kunlun(self, batch, batch_result, *, kv_loc_plan=Non
     if corrected is not None:
         batch_result.logits_output.hidden_states = corrected
 
-    # Compacted path keeps ``accept_lens - 1``; the fixed-width branch below
-    # may replace it with the value 0.5.23's verify already prepared.
-    num_correct_drafts = batch_result.accept_lens - 1
     if self.server_args.disable_overlap_schedule:
+        num_correct_drafts = batch_result.accept_lens - 1
         accepted = accepted_prefix_indices(
             batch_result.accept_lens, self.speculative_num_draft_tokens
         )
@@ -561,6 +665,7 @@ def draft_extend_for_decode_kunlun(self, batch, batch_result, *, kv_loc_plan=Non
         if prepared is not None:
             num_correct_drafts, select_index, next_token_ids = prepared
         else:
+            num_correct_drafts = batch_result.accept_lens - 1
             select_index = (
                 torch.arange(len(batch.seq_lens), device=self.device)
                 * self.speculative_num_draft_tokens
@@ -593,6 +698,7 @@ def draft_extend_for_decode_kunlun(self, batch, batch_result, *, kv_loc_plan=Non
         num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
     )
     batch.out_cache_loc = out_cache_loc
+    _dh("g1")
     with self.plan_stream_ctx:
         forward_batch = prepare_for_draft_extend_kunlun(
             self,
@@ -605,6 +711,7 @@ def draft_extend_for_decode_kunlun(self, batch, batch_result, *, kv_loc_plan=Non
             kv_loc_plan=kv_loc_plan,
             write_cols=write_cols,
         )
+    _dh("g2")
     if self.plan_stream:
         torch.get_device_module(self.device).current_stream().wait_stream(
             self.plan_stream
@@ -655,6 +762,7 @@ def draft_extend_for_decode_kunlun(self, batch, batch_result, *, kv_loc_plan=Non
             if can_graph
             else self.draft_runner.forward(forward_batch).logits_output
         )
+    _dh("g3")
     upstream.maybe_detect_nan(
         output.next_token_logits,
         f"draft_extend_for_decode (cuda_graph={can_graph})",
@@ -720,3 +828,6 @@ def draft_extend_for_decode_kunlun(self, batch, batch_result, *, kv_loc_plan=Non
     next_draft_input.cuda_graph_compatible = not (
         seed_enabled and getattr(next_draft_input, "dsa_topk_indices", None) is None
     )
+    _DH_LAST["can_graph"] = can_graph
+    _DH_LAST["bs"] = len(batch.seq_lens)
+    _dh_report()

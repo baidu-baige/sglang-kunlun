@@ -81,6 +81,15 @@ from kunlun_ops import (
     silu_and_mul_mask_fwd,
     silu_and_per_token_group_quant_I8,
 )
+
+# Not every wheel ships the fp16 contiguous I4 variant; fall back to the bf16
+# one when it is missing so `MOE_FP16` never turns into a NameError.
+try:
+    from kunlun_ops import (
+        m_grouped_gemm_fp16_I4_fp16_nt_contiguous_v3 as _I4_FP16_CONTIGUOUS,
+    )
+except ImportError:  # pragma: no cover - depends on the wheel
+    _I4_FP16_CONTIGUOUS = None
 logger = logging.getLogger(__name__)
 
 # P800 computes bf16 slower than fp16, and the decode MoE chain today is
@@ -1071,7 +1080,16 @@ class DeepEPMoE(FusedMoE):
         recv_x_all = moe_buffer.recv_x_all
         dequant2d_per_token(recv_x_all_int8, input_scale, recv_x_all, is_absmax=True)
         gateup_output = moe_buffer.gateup_output
-        m_grouped_gemm_fp16_I4_bf16_nt_contiguous_v3(
+        # Same I4->fp16 choice as the masked path: the contiguous variant is what
+        # the EAGLE draft and draft-extend prefill run through, and P800 computes
+        # fp16 faster than bf16 (`reference_p800_dtype`). `_MOE_FP16_OUT` covers
+        # both so the flag means "fp16 MoE chain" rather than "decode only".
+        _gemm0 = (
+            _I4_FP16_CONTIGUOUS
+            if (_MOE_FP16_OUT and _I4_FP16_CONTIGUOUS is not None)
+            else m_grouped_gemm_fp16_I4_bf16_nt_contiguous_v3
+        )
+        _gemm0(
             recv_x_all,
             (w13_weight, self.w13_weight_scale),
             gateup_output.view(num_all_tokens, w13_weight.shape[1]),
@@ -1087,7 +1105,11 @@ class DeepEPMoE(FusedMoE):
 
         # GroupGemm-1
         down_output = moe_buffer.down_output
-        m_grouped_gemm_fp16_I4_bf16_nt_contiguous_v3(
+        (
+            _I4_FP16_CONTIGUOUS
+            if (_MOE_FP16_OUT and _I4_FP16_CONTIGUOUS is not None)
+            else m_grouped_gemm_fp16_I4_bf16_nt_contiguous_v3
+        )(
             down_input_fp16,
             (w2_weight, self.w2_weight_scale),
             down_output.view(num_all_tokens, w2_weight.shape[1]),

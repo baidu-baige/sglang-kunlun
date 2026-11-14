@@ -28,13 +28,6 @@ from sglang.srt.utils import get_bool_env_var
 logger = logging.getLogger(__name__)
 
 ENABLED = get_bool_env_var("HICACHE_SHARED_HOST_KV", "false")
-logger.info(
-    "shared_host_kv: ENABLED=%s (HICACHE_SHARED_HOST_KV=%r, "
-    "XSGL_HICACHE_SHARED_HOST_KV=%r)",
-    ENABLED,
-    os.environ.get("HICACHE_SHARED_HOST_KV"),
-    os.environ.get("XSGL_HICACHE_SHARED_HOST_KV"),
-)
 VERIFY = get_bool_env_var("HICACHE_SHARED_VERIFY", "false")
 SHARED_DIR = os.environ.get("HICACHE_SHARED_DIR", "/dev/shm")
 _HUGE_PAGE_SIZE = 2 * 1024 * 1024

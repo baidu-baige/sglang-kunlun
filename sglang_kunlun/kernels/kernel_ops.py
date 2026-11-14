@@ -167,7 +167,7 @@ def _patch_symbol(spec: KernelSpec, replacement: object) -> None:
     original = getattr(module, spec.kernel_name)
     _replace_imported_bindings(original, replacement)
     setattr(module, spec.kernel_name, replacement)
-    logger.info("kernel_ops: patched %s.%s", *key)
+    logger.debug("kernel_ops: patched %s.%s", *key)
 
 
 def dsv4_mqa_wo_a_einsum_kunlun(
@@ -4884,7 +4884,53 @@ def fused_metadata_copy_cuda(
     max_seqlen_k: int,
     seqlens_expanded_size: int,
 ) -> None:
-    """Silently fall back from CUDA fused metadata copy on Kunlun."""
+    """One XSpeedGate launch when the op is present, else the torch copies.
+
+    Upstream calls this with nine source and nine destination tensors
+    (`dsa/dsa_metadata_manager.py:113-144`); the torch fallback below issues 6-8
+    `copy_` calls per invocation, 2-3 invocations per decode step, and the 2-D
+    `page_table_1[:, :max_len].copy_()` among them expands into many
+    `memcpy_1d` launches. `xspeedgate_ops::fused_dsa_metadata_copy` takes exactly
+    this argument list and does it in one launch (measured 16.3 us against
+    72.3 us for the torch sequence, `debug/bench_new_ops.py`).
+    """
+
+    _fused = getattr(torch.ops.xspeedgate_ops, "fused_dsa_metadata_copy", None)
+    if _fused is not None:
+        try:
+            _fused(
+                cache_seqlens_src,
+                cu_seqlens_k_src,
+                page_indices_src,
+                nsa_cache_seqlens_src,
+                seqlens_expanded_src,
+                nsa_cu_seqlens_k_src,
+                real_page_table_src,
+                flashmla_num_splits_src,
+                flashmla_metadata_src,
+                cache_seqlens_dst,
+                cu_seqlens_k_dst,
+                page_table_1_dst,
+                nsa_cache_seqlens_dst,
+                seqlens_expanded_dst,
+                nsa_cu_seqlens_k_dst,
+                real_page_table_dst,
+                flashmla_num_splits_dst,
+                flashmla_metadata_dst,
+                int(forward_mode),
+                int(bs),
+                int(max_len),
+                int(max_seqlen_k),
+                int(seqlens_expanded_size),
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 - never fail a replay
+            _log_once(
+                "fused_dsa_metadata_copy",
+                "xspeedgate_ops.fused_dsa_metadata_copy unavailable (%s); using "
+                "the torch copies",
+                exc,
+            )
 
     _copy_fused_metadata_fallback(
         cache_seqlens_src,
@@ -5544,54 +5590,50 @@ def prepare_verify_commit_outputs(
 
     bs = accept_lens.numel()
     num_predict = predict.numel()
-    new_seq_lens = torch.empty(
-        (bs,),
-        device=seq_lens.device,
-        dtype=torch.promote_types(seq_lens.dtype, accept_lens.dtype),
-    )
-    bonus = torch.empty((bs,), device=predict.device, dtype=torch.int32)
-    last_steps = track_steps = correct = select = ids = None
-    if num_draft_tokens:
+    if bs == 0:
+        new_seq_lens = torch.empty(
+            (bs,),
+            device=seq_lens.device,
+            dtype=torch.promote_types(seq_lens.dtype, accept_lens.dtype),
+        )
+        bonus = torch.empty((bs,), device=predict.device, dtype=torch.int32)
+        if not num_draft_tokens:
+            return new_seq_lens, bonus
         last_steps = torch.empty((bs,), device=seq_lens.device, dtype=torch.int64)
-        if mamba_track_interval:
-            track_steps = torch.empty_like(last_steps)
+        track_steps = torch.empty_like(last_steps) if mamba_track_interval else None
         correct = torch.empty_like(accept_lens, memory_format=torch.contiguous_format)
         select = torch.empty_like(last_steps)
         ids = torch.empty((num_predict,), device=predict.device, dtype=torch.int64)
-    # Same launch guard as the launcher: an empty batch leaves the step buffers
-    # exactly as uninitialised as upstream leaves them.
-    if bs:
-        width = int(num_draft_tokens)
-        rows = torch.arange(bs, device=accept_lens.device, dtype=torch.int64)
-        accepted = accept_lens.to(torch.int64)
-        length = seq_lens.to(torch.int64)
-        # ``accept_index[row, accepted - 1]``: advanced indexing honours the
-        # same (stride(0), stride(1)) pair the kernel indexes with.
-        step = accept_index[rows, accepted - 1].to(torch.int64)
-        if width:
-            last_steps.copy_(step - rows * width)
-            correct.copy_((accepted - 1).to(correct.dtype))
-            select.copy_(rows * width + accepted - 1)
-            # Row extent covers ``predict.numel()``, so ``ids`` is a full copy.
-            ids.copy_(predict.reshape(-1).to(torch.int64))
-            if mamba_track_interval:
-                interval = int(mamba_track_interval)
-                post = length + accepted
-                # Triton's ``//`` truncates toward zero; seq/post are >= 0 here,
-                # so this only pins the semantics rather than changing them.
-                crossing = _trunc_div(length, interval) != _trunc_div(post, interval)
-                tracking_position = torch.clamp(
-                    _trunc_div(post, interval) * interval - length - 1, min=0
-                )
-                tracked = (
-                    accept_index[rows, tracking_position].to(torch.int64)
-                    - rows * width
-                )
-                track_steps.copy_(torch.where(crossing, tracked, -1))
-        # Draft slots store -1 for "no token"; it wraps to the tail of predict.
-        step = torch.where(step < 0, step + num_predict, step)
-        bonus.copy_(predict.reshape(-1)[step].to(torch.int32))
-        new_seq_lens.copy_(length + accepted)
+        return new_seq_lens, bonus, (last_steps, track_steps), (correct, select, ids)
+
+    rows = torch.arange(bs, device=accept_lens.device, dtype=torch.int64)
+    accepted = accept_lens.to(torch.int64)
+    length = seq_lens.to(torch.int64)
+    # Advanced indexing honours both strides of accept_index.
+    step = accept_index[rows, accepted - 1].to(torch.int64)
+    post = length + accepted
+    new_seq_lens = post.to(torch.promote_types(seq_lens.dtype, accept_lens.dtype))
+    last_steps = track_steps = correct = select = ids = None
+    if num_draft_tokens:
+        row_base = rows * int(num_draft_tokens)
+        last_steps = step - row_base
+        correct = (accepted - 1).to(accept_lens.dtype)
+        select = row_base + accepted - 1
+        # Always copy, including when predict is already contiguous int64.
+        ids = predict.reshape(-1).to(
+            dtype=torch.int64, copy=True, memory_format=torch.contiguous_format
+        )
+        if mamba_track_interval:
+            interval = int(mamba_track_interval)
+            crossing = _trunc_div(length, interval) != _trunc_div(post, interval)
+            tracking_position = torch.clamp(
+                _trunc_div(post, interval) * interval - length - 1, min=0
+            )
+            tracked = accept_index[rows, tracking_position].to(torch.int64) - row_base
+            track_steps = torch.where(crossing, tracked, -1)
+    # Only the bonus lookup wraps negative indices; step buffers keep raw values.
+    step = torch.where(step < 0, step + num_predict, step)
+    bonus = predict.reshape(-1)[step].to(torch.int32)
     if num_draft_tokens:
         return new_seq_lens, bonus, (last_steps, track_steps), (correct, select, ids)
     return new_seq_lens, bonus
@@ -7668,15 +7710,20 @@ def fused_dsa_draft_extend_metadata(
     _dsa_store_lens_and_cu(seq, cache_seqlens, cu_seqlens_k)
 
     ext = extend_seq_lens[:bs].to(torch.int32)
-    # ``output_size`` keeps repeat_interleave from reading the lengths back to
-    # the host, which would sync in the replay hot path.
-    req_row = torch.repeat_interleave(
-        torch.arange(bs, device=device), ext.long(), output_size=total_len
-    )
-    prefix = torch.cumsum(ext, dim=0, dtype=torch.int32) - ext
-    local_off = torch.arange(total_len, device=device, dtype=torch.int32) - (
-        prefix.index_select(0, req_row)
-    )
+    if static_extend_len and total_len == bs * max_extend_len and max_extend_len > 0:
+        # The static contract assigns exactly max_extend_len tokens per row.
+        offsets = torch.arange(total_len, device=device)
+        req_row = offsets // max_extend_len
+        local_off = (offsets - req_row * max_extend_len).to(torch.int32)
+    else:
+        # ``output_size`` avoids a lengths readback in the ragged replay path.
+        req_row = torch.repeat_interleave(
+            torch.arange(bs, device=device), ext.long(), output_size=total_len
+        )
+        prefix = torch.cumsum(ext, dim=0, dtype=torch.int32) - ext
+        local_off = torch.arange(total_len, device=device, dtype=torch.int32) - (
+            prefix.index_select(0, req_row)
+        )
     # Padded / idle rows carry the graph seq_len fill value, which can make the
     # visible kv length negative; consumers read these lengths as unsigned, so
     # clamp at 0 to keep such rows on the trivial all-(-1) top-k path.

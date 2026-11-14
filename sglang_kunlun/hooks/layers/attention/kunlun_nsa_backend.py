@@ -50,6 +50,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Diagnostic only: under the existing stage-probe switch, verify once per
+# (bs, mode) that the CPU-derived host mirrors equal what the device producer
+# wrote. The derivation is an inference from `seq_lens_cpu`; if the runner ever
+# fills the device buffer from a different tensor, the host and device LODs
+# would disagree and the kernel would read the wrong lengths. One D2H per
+# (bs, mode), never on the measured path.
+_LEN_MIRROR_PROBE = os.environ.get("SGLANG_KUNLUN_PROBE", "0") not in ("", "0")
+
 # --------------------------------------------------------------------------- #
 # Native INT8 mixed-cache sparse MLA attention
 # --------------------------------------------------------------------------- #
@@ -322,45 +330,119 @@ class KunlunDSAMetadata(DSAMetadata):
             dev = getattr(self, dev_name, None)
             object.__setattr__(self, host_name, None if dev is None else dev.cpu())
 
-    def refresh_host_mirrors(self) -> None:
+    def refresh_host_mirrors(self, *, fixed_query_lod: bool = False) -> None:
         """Update the host mirrors in place, keeping their storage stable.
 
         The graph was recorded against these host buffers, so copy into the
         existing storage and reallocate only when shape/dtype changes. Stage the
         device tensors per dtype into one buffer and take one D2H per dtype
-        instead of seven blocking ones (measured 1.16 ms/step).
+        instead of seven blocking ones.
         """
-        plan = self._mirror_plan()
+        plan = self._mirror_plan(fixed_query_lod=fixed_query_lod)
         if plan is None:
             # Shapes/dtypes changed (or a mirror had to be reallocated); the
             # mirrors are already up to date in that case.
             return
+        # The staging host buffer is pinned (`_mirror_plan` allocates it with
+        # `pin_memory=True`), so the D2H can be asynchronous: issue it on the
+        # current stream and synchronise once at the end instead of letting each
+        # `copy_` drain the queue. Measured 2026-11-14 on traces/dstack_v68:
+        # `kunlun_nsa_backend` owned 5.8 of the 8.2 blocking `cudaMemcpy` per
+        # decode step, and every one of them drains the device queue in the
+        # middle of the host's graph preparation -- which is where the 22.7
+        # ms/step of host-side device idle sits.
+        streams = []
         for dtype, entries, dev_buf, host_buf in plan:
             for _, dev, offset, numel in entries:
                 dev_buf[offset : offset + numel].copy_(dev.reshape(-1))
-            host_buf.copy_(dev_buf)
+            host_buf.copy_(dev_buf, non_blocking=True)
+            streams.append((entries, host_buf))
+        # One wait for every dtype, after all of them are in flight.
+        torch.get_device_module().current_stream().synchronize()
+        for entries, host_buf in streams:
             for host, _, offset, numel in entries:
                 host.reshape(-1).copy_(host_buf[offset : offset + numel])
 
-    def _mirror_plan(self):
+    def refresh_host_lengths_from_cpu(
+        self, seq_lens_cpu, forward_mode, num_draft_tokens, index_topk
+    ) -> bool:
+        """Derive this replay's host lengths from its current padded CPU input.
+
+        Only fixed graph layouts with index_kpool <= 1 may use this method.
+        Device metadata still gets updated by the normal producer. No device
+        tensor is read here, and every host destination keeps its storage.
+        """
+        if seq_lens_cpu is None or seq_lens_cpu.device.type != "cpu":
+            return False
+        seq = seq_lens_cpu.to(dtype=torch.int32)
+        if forward_mode.is_decode_or_idle():
+            cache = expanded = seq
+        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
+            if num_draft_tokens <= 0:
+                return False
+            offsets = torch.arange(1, num_draft_tokens + 1, dtype=torch.int32)
+            if forward_mode.is_target_verify():
+                cache = seq + num_draft_tokens
+                expanded = (seq[:, None] + offsets).reshape(-1)
+            else:
+                cache = seq
+                expanded = (
+                    seq[:, None] - num_draft_tokens + offsets
+                ).clamp(min=0).reshape(-1)
+        else:
+            return False
+        capped = expanded.clamp(max=index_topk)
+        cu_k = torch.cat(
+            (torch.zeros(1, dtype=torch.int32), cache.cumsum(0, dtype=torch.int32))
+        )
+        dsa_cu_k = torch.cat(
+            (torch.zeros(1, dtype=torch.int32), capped.cumsum(0, dtype=torch.int32))
+        )
+        updates = (
+            ("cache_seqlens_int32_cpu", cache),
+            ("cu_seqlens_k_cpu", cu_k),
+            ("dsa_seqlens_expanded_cpu", expanded),
+            ("dsa_cu_seqlens_k_cpu", dsa_cu_k),
+        )
+        # Validate all destinations before touching any of them: a different
+        # layout must fall back to the device producer's mirrors as a whole.
+        if any(
+            (host := getattr(self, name, None)) is None
+            or host.device.type != "cpu"
+            or host.shape != values.shape
+            for name, values in updates
+        ):
+            return False
+        for name, values in updates:
+            getattr(self, name).copy_(values)
+        return True
+
+    def _mirror_plan(self, *, fixed_query_lod: bool = False):
         """Return the cached staging plan, rebuilding it when shapes change.
 
         Returns ``None`` when a rebuild happened: the rebuild path already
         refreshed every mirror with a plain ``.cpu()``, so the caller is done.
         """
+        mirrored = tuple(
+            (host_name, dev_name)
+            for host_name, dev_name in self._MIRRORED
+            if not fixed_query_lod
+            or dev_name not in ("cu_seqlens_q", "dsa_cu_seqlens_q", "cum_q_lod")
+        )
         signature = tuple(
             None if (dev := getattr(self, dev_name, None)) is None
-            else (tuple(dev.shape), dev.dtype)
-            for _, dev_name in self._MIRRORED
+            else (dev_name, tuple(dev.shape), dev.dtype, dev.data_ptr())
+            for _, dev_name in mirrored
         )
         cached = getattr(self, "_mirror_staging", None)
         if cached is not None and cached[0] == signature:
             return cached[1]
 
         by_dtype: dict[torch.dtype, list] = {}
-        for host_name, dev_name in self._MIRRORED:
+        for host_name, dev_name in mirrored:
             dev = getattr(self, dev_name, None)
             if dev is None:
+                object.__setattr__(self, host_name, None)
                 continue
             host = getattr(self, host_name, None)
             if host is None or host.shape != dev.shape or host.dtype != dev.dtype:
@@ -534,13 +616,23 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
             # NOTE: shares storage with cu_seqlens_q, so graph replay (which updates
             # cu_seqlens_q in place) keeps cum_q_lod in sync.
             return self.forward_metadata.cu_seqlens_q
-        extend_seq_lens = torch.full(
-            (bs,),
-            self.speculative_num_draft_tokens,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        return compute_cu_seqlens(extend_seq_lens)
+        # Pure function of bs: every row is `speculative_num_draft_tokens`
+        # wide, so the offsets are i * draft for i in [0, bs]. Memoising is what
+        # this backend's own decode path already does for cu_seqlens_q
+        # (`_arange_buf`), and the tensor is read-only for every consumer.
+        cache = getattr(self, "_kunlun_cum_q_lod_by_bs", None)
+        if cache is None:
+            cache = self._kunlun_cum_q_lod_by_bs = {}
+        lod = cache.get(bs)
+        if lod is None:
+            lod = (
+                torch.arange(
+                    bs + 1, dtype=torch.int32, device=self.device
+                )
+                * self.speculative_num_draft_tokens
+            )
+            cache[bs] = lod
+        return lod
 
     @staticmethod
     def _to_kunlun_metadata(
@@ -596,6 +688,7 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
         actual_forward_mode: Optional[ForwardMode] = None,
     ):
         """Shared capture+replay body: upstream apply + Kunlun ``cum_q_lod``."""
+        already_built = bs in self.decode_cuda_graph_metadata
         super()._apply_cuda_graph_metadata(
             bs,
             req_pool_indices,
@@ -606,7 +699,16 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
             out_cache_loc=out_cache_loc,
             actual_forward_mode=actual_forward_mode,
         )
-        self._rewrap_graph_metadata(bs, forward_mode)
+        # On the first call, super dispatches to our build override, which
+        # already wraps the freshly built metadata and initializes its mirrors.
+        if already_built:
+            self._rewrap_graph_metadata(
+                bs, forward_mode, seq_lens_cpu=seq_lens_cpu
+            )
+
+    def _refresh_paged_mqa_schedule_metadata(self, metadata, seqlens_32_2d):
+        """Kunlun paged MQA reads context lengths directly, without this plan."""
+        return
 
     def init_forward_metadata_replay_cuda_graph_from_precomputed(
         self,
@@ -614,7 +716,7 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
         precomputed,
         forward_mode: ForwardMode,
     ):
-        """Replay-prep fast path (0.5.19): refresh the Kunlun host mirrors.
+        """Replay-prep fast path: refresh the Kunlun host mirrors.
 
         The multi-step draft backend copies precomputed metadata into
         ``decode_cuda_graph_metadata[bs]`` through this method instead of
@@ -624,13 +726,19 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
         super().init_forward_metadata_replay_cuda_graph_from_precomputed(
             bs, precomputed, forward_mode
         )
-        self._rewrap_graph_metadata(bs, forward_mode)
+        # ``precomputed`` carries the padded CPU lengths its device buffers were
+        # filled from, so the host mirrors can be derived instead of read back.
+        self._rewrap_graph_metadata(
+            bs, forward_mode, seq_lens_cpu=getattr(precomputed, "seq_lens_cpu", None)
+        )
 
-    def _rewrap_graph_metadata(self, bs: int, forward_mode: ForwardMode) -> None:
-        """Install the Kunlun metadata wrapper for this batch size, optionally updating the tensors."""
+    def _rewrap_graph_metadata(
+        self, bs: int, forward_mode: ForwardMode, seq_lens_cpu=None
+    ) -> None:
+        """Refresh mirrors after each producer update, retaining fixed Q LODs."""
         cache = self.decode_cuda_graph_metadata
         metadata = self.forward_metadata
-
+        key = (bs, int(forward_mode))
         if isinstance(metadata, KunlunDSAMetadata):
             # Upstream already handed back the wrapper (it lives in the cache);
             # refresh the Kunlun-owned tensors in place. cum_q_lod is per forward
@@ -643,16 +751,70 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
                 or cur_lod.shape != new_lod.shape
                 or cur_lod.dtype != new_lod.dtype
                 or cur_lod.data_ptr() == new_lod.data_ptr()
+                or cur_lod.data_ptr() == metadata.cu_seqlens_q.data_ptr()
+                or cur_lod.data_ptr() == metadata.dsa_cu_seqlens_q.data_ptr()
             ):
                 object.__setattr__(metadata, "cum_q_lod", new_lod)
             else:
                 cur_lod.copy_(new_lod)
-            metadata.refresh_host_mirrors()
+            # Only Q LODs are shape constants. K lengths and their prefix sums
+            # must follow every producer update, even at the same bs and step.
+            fixed_query_lod = (
+                getattr(metadata, "_kunlun_query_lod_key", None) == key
+            )
+            host_lengths_ready = (
+                fixed_query_lod
+                and self.dsa_index_kpool <= 1
+                and seq_lens_cpu is not None
+                and seq_lens_cpu.numel() >= bs
+                and metadata.refresh_host_lengths_from_cpu(
+                    seq_lens_cpu[:bs],
+                    forward_mode,
+                    self.speculative_num_draft_tokens,
+                    self.dsa_index_topk,
+                )
+            )
+            if not host_lengths_ready:
+                metadata.refresh_host_mirrors(fixed_query_lod=fixed_query_lod)
+            elif _LEN_MIRROR_PROBE and not getattr(
+                metadata, "_kunlun_len_mirror_probe_done", False
+            ):
+                object.__setattr__(metadata, "_kunlun_len_mirror_probe_done", True)
+                mismatches = 0
+                for host_name, dev_name in (
+                    ("cache_seqlens_int32_cpu", "cache_seqlens_int32"),
+                    ("cu_seqlens_k_cpu", "cu_seqlens_k"),
+                    ("dsa_seqlens_expanded_cpu", "dsa_seqlens_expanded"),
+                    ("dsa_cu_seqlens_k_cpu", "dsa_cu_seqlens_k"),
+                ):
+                    dev = getattr(metadata, dev_name, None)
+                    host = getattr(metadata, host_name, None)
+                    if dev is None or host is None:
+                        continue
+                    if not torch.equal(dev.detach().to("cpu").reshape(-1),
+                                       host.reshape(-1)):
+                        mismatches += 1
+                        logger.warning(
+                            "[PROBE_LEN_MIRROR] %s disagrees with the device "
+                            "producer (bs=%d mode=%s): host=%s device=%s",
+                            host_name, bs, forward_mode, host.tolist()[:16],
+                            dev.detach().to("cpu").reshape(-1).tolist()[:16],
+                        )
+                if not mismatches:
+                    # Positive evidence that the CPU-derived path ran, not just
+                    # that it never complained.
+                    logger.info(
+                        "[PROBE_LEN_MIRROR] derived host lengths match the device "
+                        "producer (bs=%d mode=%s)",
+                        bs, forward_mode,
+                    )
+            object.__setattr__(metadata, "_kunlun_query_lod_key", key)
             return
 
         metadata = self._to_kunlun_metadata(
             metadata, self._cum_q_lod_for_graph(bs, forward_mode)
         )
+        object.__setattr__(metadata, "_kunlun_query_lod_key", key)
         self.forward_metadata = metadata
         if isinstance(cache, dict) and cache.get(bs) is not None:
             cache[bs] = metadata
@@ -687,20 +849,7 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
         layer: RadixAttention,
         metadata: KunlunDSAMetadata,
     ) -> Optional[torch.Tensor]:
-        """Sparse MLA attention read straight off the packed INT8 rows.
-
-        Port of 0.5.8's `_native_mixed_attn`
-        (`sgl-kernel/.../attention/nsa_backend.py:1770-1856`) and its
-        `_call_mixed_attn` (`:2076-2169`), minus the decode-context-parallel
-        arm: that one needs `dcp_own_topk` / `dcp_lse_merge_reduce_scatter`
-        and this tree refuses DCP on the write side already
-        (`kunlun_pools.py`, `_write_mla_kv_buffer`), so `dcp_size` is 1 here by
-        construction.
-
-        Returns ``None`` -- never raises -- when the op is missing or rejects
-        the arguments, so the caller degrades to the dequantization chain
-        instead of taking the server down on a signature change.
-        """
+        """Sparse MLA attention read straight off the packed INT8 rows."""
         kind, op = _resolve_mixed_attn_impl()
         if op is None:
             _log_mixed_attn_fallback(
@@ -709,17 +858,6 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
             )
             return None
 
-        # Lod convention is the bf16 path's own semantics: every q row is its
-        # own segment, and `dsa_cu_seqlens_k` -- the cumsum of
-        # `dsa_cache_seqlens_int32` = min(valid_kv_len, index_topk) per row
-        # (`dsa_backend.py:273-275`, `:1361`) -- says how many LEADING entries
-        # of that row's top-k list are real; the tail is -1 padding. Same
-        # number `sparse_attn_fwd` is handed as `topk_length` in the fallback
-        # branches, only accumulated. The host mirrors are materialized once
-        # per forward batch by `KunlunDSAMetadata`, which is exactly what the
-        # op wants ("qlod_cpu must be a CPU int32 tensor" in its own checks)
-        # and what 0.5.8 had to refresh by hand on every replay
-        # (`nsa_backend.py:1348-1381`).
         ql_cpu = metadata.dsa_cu_seqlens_q_cpu
         ql_xpu = metadata.dsa_cu_seqlens_q
         kvl_cpu = metadata.dsa_cu_seqlens_k_cpu
@@ -743,11 +881,6 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
             n_lod = n_rows
         elif n_lod < n_rows:
             # TP + partial-DP padding adds q rows the metadata never saw.
-            # Extend with zero-length kv segments so those rows read nothing,
-            # and build the pads on CPU first: `.cpu()` inside a capture is an
-            # illegal D2H copy (0.5.8 `nsa_backend.py:1809-1827`). Starting the
-            # q pad at `n_lod + 1` avoids duplicating the last value, which
-            # would add a segment and make the two lods disagree on batch_num.
             pad_q = torch.arange(n_lod + 1, n_rows + 1, dtype=torch.int32)
             ql_cpu = torch.cat([ql_cpu, pad_q])
             ql_xpu = torch.cat([ql_xpu, pad_q.to(ql_xpu.device)])
@@ -759,10 +892,6 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
         idx = page_table_1
         if idx.dtype != torch.int32:
             idx = idx.to(torch.int32)
-        # -1 padding (and the EAGLE warmup's garbage ids) map to slot 0, which
-        # the pool keeps zeroed; the per-row lods bound the read anyway. Same
-        # clamp 0.5.8 applied (`nsa_backend.py:1798-1802`), done on the device
-        # so it is capture-safe.
         idx = torch.where(
             (idx < 0) | (idx >= kv_rows.shape[0]), torch.zeros_like(idx), idx
         ).contiguous()
@@ -788,7 +917,7 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
                 # launch, so a capture must not let the C++ side derive it from
                 # the (short) warmup lod -- pass the per-bucket upper bound
                 # `n_rows * topk`; eager passes -1 and lets the op compute the
-                # exact last-first value (0.5.8 `nsa_backend.py:2125-2156`).
+                # exact last-first value.
                 # `is_causal=False` in both arms, decode and prefill alike:
                 # each q row carries its own already causal-filtered top-k
                 # list, so there is no triangle left to mask.
@@ -964,52 +1093,7 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
 
         q_all = torch.cat([q_nope, q_rope], dim=-1)
 
-        # Sparse MLA prefill goes through the same vendor op the 0.5.8 baseline
-        # ran (sgl-kernel `.../attention/nsa_backend.py`, sparse-prefill arm),
-        # not through `kunlun_ops.sparse_prefill_fwd_opt`:
-        #
-        #   torch.ops.xspeedgate_ops.sparse_attn_fwd(
-        #       q, kv, indices, sm_scale, d_v, topk_length, attn_sink=None)
-        #       -> Tensor[]  # (out, max_logits, lse)
-        #
-        # `sparse_prefill_fwd_opt` is a 0.5.23-era call that has never worked on
-        # this hardware: it reaches `xfa::dsa_prefill`, whose non-zero return is
-        # what surfaces as `xops_block_ERROR ... prefill_dsa_attention_opt_block.cc
-        # line:115` -- a vendor-block status, not a wrapper dtype/shape check.
-        #
-        # Shapes/semantics below are the op's own (schema + the validation
-        # strings in its meta function), and they differ from the old call:
-        #   q           [s_q, h_q, qk_head_dim], fp16/bf16, contiguous
-        #   kv          [s_kv, qk_head_dim],     dtype == q.dtype, contiguous
-        #   indices     [s_q, topk],             int32 -- 2-D, no kv-head axis
-        #   sm_scale    float
-        #   d_v         int, value width of `out`
-        #   topk_length [s_q],                   int32
-        # No q/kv lods: the batch structure is implied by the page-1 table (every
-        # q row owns its own top-k list) and the only per-row bound is
-        # `topk_length`. So `q_all` keeps the model's dtype instead of being
-        # forced to bf16 (the op instantiates fp16 as well as bf16), and `out`
-        # consequently comes back in q's dtype.
-        #
-        # `kv` must be the flat [tokens, qk_head_dim] pool view in q's dtype.
-        #
-        # * `--kv-cache-dtype int8` stores the packed mixed row
-        #   `[int8 nope | fp32 per-128 scales | bf16 rope]`, 656 B/token
-        #   (`kernels/mixed_int8_kv.py`, written by
-        #   `KunlunNSATokenToKVPool._write_mla_kv_buffer`). This op has no scale
-        #   argument and no int8 instantiation, so those rows go to the native
-        #   mixed-cache op (`_native_mixed_attn`) and are only dequantized here
-        #   when that op is unavailable.
-        #   `mixed_int8_kv` is the pool's own answer: a *cast* int8
-        #   row (what this tree produced while the pool had no mixed-row
-        #   writer) does not advertise it and still fails the guard below,
-        #   rather than being "dequantized" into numbers nobody quantized.
-        # * fp8 DSA storage (`dsa_kv_cache_store_fp8`) packs
-        #   [fp8 nope | fp32 per-128 scales | bf16 rope] into 656 u8 elements.
-        #   It is not the int8 row (different element dtype, different scale
-        #   tiling) and it is refused below: its row width is not
-        #   `qk_head_dim` (`calculate_mla_kv_cache_dim`,
-        #   `kv_cache_configurator.py:3464-3482`).
+    
         if getattr(self.token_to_kv_pool, "mixed_int8_kv", False):
             # The op instantiates bf16/fp16 only, so a model served in either
             # runs in its own dtype. The fp32 projections the dense branch
@@ -1044,28 +1128,10 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
                     "a dense fp16/bf16 row are usable here; fp8 DSA storage "
                     "belongs to dsa_prefill_with_mixed_cache."
                 )
-            # Match `q` to the KV pool's dtype, not the other way round. On P800
-            # the projections come out of the vendor GEMV in fp32 (`q=float` in
-            # the op's own error), and `sparse_attn_fwd` instantiates only bf16
-            # and fp16. The pool dtype is already the configured KV dtype, so
-            # this is the one cast both sides can agree on.
-            # Everything the op touches goes to the KV pool's dtype, and the
-            # result comes back in the same dtype. The pool dtype is the
-            # configured `--kv-cache-dtype` (model dtype for a dense pool), so
-            # this is what the residual stream and the W8A8 projections
-            # downstream expect -- their `kunlun_ops.matmul` rejects anything
-            # else with `Check failed, matmul unimplemented`.
             out_dtype = kv_cache.dtype
             q_all = q_all.to(out_dtype)
             kv = kv_cache.contiguous().view(-1, layer.head_dim)
 
-        # `dsa_cache_seqlens_int32` is this tree's `nsa_cache_seqlens_int32`: one
-        # int32 per q row holding `min(valid_kv_len, index_topk)`
-        # (`compute_dsa_seqlens` clamps to `dsa_index_topk`, `dsa/utils.py:159-161`),
-        # i.e. the "how many LEADING entries of `indices` are real, the tail is
-        # -1 padding" contract this op wants. Upstream reads the same field for
-        # the same purpose (`_forward_flashmla_sparse`, `dsa_backend.py:2854-2868`).
-        # DP/CP padding rows are already zero-length segments in it.
         topk_length = metadata.dsa_cache_seqlens_int32
         if topk_length.shape[0] != q_all.shape[0]:
             # Metadata rows are expected to match q rows, but this op has no
