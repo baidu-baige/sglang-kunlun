@@ -407,7 +407,18 @@ def _get_topk_paged(
     if q_fp8.dtype is torch.int8:
         k_scale /= 127
         
-    fused_kv_cache = [k_fp8.contiguous(), k_scale.contiguous()]
+    # The deployed native API accepts a strided page axis; avoid copying the
+    # whole index-K pool on every decode. Keep the packed fallback outside the
+    # independently validated INT8-query / packed-inner-dim contract.
+    direct_key = (
+        forward_batch.forward_mode.is_decode()
+        and q_fp8.dtype == torch.int8
+        and k_fp8.dtype == torch.int8
+        and k_fp8.stride(3) == 1
+        and k_fp8.stride(2) == head_dim
+        and k_fp8.stride(1) == num_heads_kv * head_dim
+    )
+    fused_kv_cache = [k_fp8 if direct_key else k_fp8.contiguous(), k_scale.contiguous()]
     logits = torch.empty(
         (q_offset, q_fp8.shape[1], max_seq_len),
         dtype=torch.float32,
