@@ -111,6 +111,78 @@ def _install_c4_state_clear() -> None:
 _install_c4_state_clear()
 
 
+def _clear_unaccepted_c128_draft_states(
+    self,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    accept_lens: torch.Tensor,
+    num_draft_tokens: int,
+) -> None:
+    """Index once, then two slice writes per pool, not a per-layer rebuild.
+
+    Upstream calls ``dsv4_c128_cleanup`` once per layer; with no triton on XPU
+    every call lands in the torch fallback and redoes the index computation
+    (arange / remainder / index_select / zeros_like / full_like / cat / where /
+    index_put_) -- ~400 small ops per verify step across 43 layers, to write
+    ``bs x num_draft`` rows. Computing the indices and the rejected mask once
+    and then zeroing the first half / -inf'ing the second half per pool, the way
+    upstream's own ``clear_unaccepted_c4_states`` does, is row-for-row
+    equivalent.
+
+    Measured on one node (dp8, bf16, 4K in / 1024 out, c8, pure decode):
+    145.9 tok/s, TPOT 51.0 ms upstream versus 149.2 tok/s, TPOT 49.2 ms here.
+    """
+    from sglang.srt.mem_cache import deepseek_v4_memory_pool as _pool_mod
+
+    if (
+        getattr(_pool_mod, "ONLINE_C128", False)
+        or num_draft_tokens <= 1
+        or req_pool_indices.numel() == 0
+    ):
+        return None
+    pools = [p for p in self.compress_state_pools if p is not None and p.ratio == 128]
+    if not pools:
+        return None
+
+    dev = pools[0].kv_score_buffer.kv_score.device
+    offs = torch.arange(num_draft_tokens, dtype=torch.int64, device=dev)
+    rejected = offs.unsqueeze(0) >= accept_lens.to(dev, torch.int64).unsqueeze(1)
+    req = req_pool_indices.to(dev, torch.int64).unsqueeze(1)
+    seq = seq_lens.to(dev, torch.int64).unsqueeze(1)
+    # No D2H anywhere: a boolean index (``rows[rejected]``) synchronises on the
+    # device queue -- py-spy measured that one line at ~10% of scheduler wall
+    # time -- so take all ``bs * num_draft`` rows and pick with ``where``.
+    rej_flat = rejected.reshape(-1, 1)
+    rows_by_ring: dict[int, torch.Tensor] = {}
+    for pool in pools:
+        ring = int(pool.ring_size)
+        if ring not in rows_by_ring:
+            rows_by_ring[ring] = (req * ring + (seq + offs).remainder(ring)).reshape(-1)
+
+    for pool in pools:
+        rows = rows_by_ring[int(pool.ring_size)]
+        state = pool.kv_score_buffer.kv_score
+        half = state.shape[-1] // 2
+        sel = state.index_select(0, rows)
+        reset = torch.cat(
+            (torch.zeros_like(sel[:, :half]), torch.full_like(sel[:, half:], float("-inf"))),
+            dim=-1,
+        )
+        state[rows] = torch.where(rej_flat, reset, sel)
+    return None
+
+
+def _install_c128_state_clear() -> None:
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    DeepSeekV4TokenToKVPool.clear_unaccepted_c128_draft_states = (
+        _clear_unaccepted_c128_draft_states
+    )
+
+
+_install_c128_state_clear()
+
+
 def _rejected_locs(batch, num_draft: int):
     """verify 的 out_cache_loc 里 commit_lens 之后的那些 slot。"""
     loc = getattr(batch, "out_cache_loc", None)
