@@ -34,30 +34,44 @@ SHELL ["bash", "-c"]
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-# 构建上下文里两个源码目录的名字，随 --build-arg 覆盖：
-#   本仓库 README 约定 <ctx>/sglang + <ctx>/sglang-kunlun；
-#   构建时传 --build-arg SGLANG_DIR=sglang-0.5.23 --build-arg SGLANG_KUNLUN_DIR=sglang-kunlun-0.5.23
-# 落到镜像里仍然是 /workspace/sglang 和 /workspace/sglang-kunlun
-ARG SGLANG_DIR=sglang
-ARG SGLANG_KUNLUN_DIR=sglang-kunlun
-
-# Kunlun artifacts. Keep the versions aligned with the Kunlun release notes:
+# ── ARG 摆放约定（改这个文件前先读）─────────────────────────────────────
+# docker 把「声明在某个 RUN 之上的所有 ARG」都算进那个 RUN 的 cache key，
+# 不论这个 RUN 有没有引用它。所以版本号类 ARG 一律紧贴在用到它的 RUN 上方，
+# 禁止再把它们收成一个块放在文件开头 —— 那样 bump 任意一个组件，下面的
+# apt / uv venv / torch / sglang deps（约 4h）会全部重建。
+# 新加组件也照此办理：ARG 写在自己的 RUN 上方，再到底下的索引里补一行。
+#
+# ── 组件版本号索引 ────────────────────────────────────────────────────────
+# 纯注释，不是 ARG：这里是全文件唯一的总览入口，分段与文件里的先后一致。
+# 这里不抄版本号 —— 版本只以 ARG 那一行为准，免得两边不一致。
+# 按名字 grep 跳过去改：
+#     grep -n '^ARG KUNLUN_OPS_ADDR' dockerfile/Dockerfile
+#
+#   变量名                 组件 / 小节
+#   ── 随昆仑 release 走，不常改 ──
+#   XRE_ADDR               XPU runtime (peermem)
+#   XCCL_ADDR              XPU 集合通信库
+#   XMOONCAKE_ADDR         KV transfer engine
+#   XDLL_ADDR              xdll_ops
+#   CHEN_OPS_ADDR          chen_ops
+#   COCOPOD_ADDR           cocopod
+#   DEEPEP_ADDR            deep_ep
+#   XTRITON_ADDR           xtriton（cp310，跳过）
+#   XFLASH_MLA_ADDR        flash_mla（cp310，跳过）
+#   ── 常改：按重建代价从高到低排，别打乱这个相对顺序 ──
+#   XPYTORCH_ADDR          Kunlun PyTorch 后端（最贵）
+#   KUNLUN_OPS_ADDR        kunlun_ops
+#   XSPEEDGATE_OPS_ADDR    xspeedgate_ops
+#   HYDRAX_ADDR            hydrax daily（最便宜）
+#   ── 镜像环境 / 源码 ──
+#   TORCH_C_DLPACK_EXT     tvm_ffi 扩展
+#   SGLANG_DIR             engine 源码目录名（偶尔重拉）
+#   SGLANG_KUNLUN_DIR      插件源码目录名（每轮都改，排最后）
+#
+# 版本号对齐昆仑 release notes：
 # https://ku.baidu-int.com/knowledge/HFVrC7hq1Q/BeQck0ZK7s/wsEROHhNNf/_mpWzFJuSciXhX
-ARG XRE_ADDR=https://klx-sdk-release-public.su.bcebos.com/xre/kl3-release/5.45.0.0/peermem/xre-Linux-x86_64-5.45.0.0.tar.gz
-ARG XCCL_ADDR=https://klx-sdk-release-public.su.bcebos.com/xccl/release/3.2.9.0/xccl_Linux_x86_64.tar.gz
-ARG XDLL_ADDR=https://aihc-private-hcd.bj.bcebos.com/zhangchi/xdll/xdll_ops-1.0.0%2B8bf033d.torch29-cp312-cp312-linux_x86_64.whl
-ARG XPYTORCH_ADDR=https://klx-sdk-release-public.su.bcebos.com/kunlun2jituan/20260930/xpytorch-cp312-torch290-ubuntu2004-x64.run
-ARG KUNLUN_OPS_ADDR=https://aihc-private-hcd.bj.bcebos.com/chengxiaokang/ernie/ernie-5.5-flash/ops/kunlun_ops-0.1.273+6ef9e06f-cp312-cp312-linux_x86_64.whl
-ARG CHEN_OPS_ADDR=https://aihc-private-hcd.bj.bcebos.com/zhz/chen_ops-0.2.0%2Bflashmla.20261028-cp312-cp312-linux_x86_64.whl
-ARG XSPEEDGATE_OPS_ADDR=https://aihc-private-hcd.bj.bcebos.com/xspeedgate_release/torch29-cp312/20261112_181816/xspeedgate_ops-1.7.0+8f96a8d.torch29-cp312-cp312-linux_x86_64.whl
-ARG COCOPOD_ADDR=https://aihc-private-hcd.bj.bcebos.com/zhz/cocopod-1.7.0%2Bf98939a.torch29.dev-cp312-cp312-linux_x86_64.whl
-ARG DEEPEP_ADDR=https://klx-sdk-release-public.su.bcebos.com/xccl/release/3.2.9.0/deep_ep-cp312-cp312-linux_x86_64_cuda12.tar.gz
-ARG XMOONCAKE_ADDR=https://aihc-private-hcd.bj.bcebos.com/tangshiwen/kvcache/mooncake_transfer_engine-0.3.12.post1-cp312-cp312-manylinux_2_31_x86_64.whl
-# hydrax (Hydra): MegaMoE 的融合 MoE 算子。xpytorch 的 .run 里自带一个旧版，
-# 这里要用 daily 包覆盖它，见下面单独那一步。
-ARG HYDRAX_ADDR=https://klx-sdk-release-public.su.bcebos.com/Hydra/daily/20261105/hydrax_py312_torch290.tar.gz
-ARG XTRITON_ADDR=https://su.bcebos.com/v1/klx-sdk-release-public/DS_PD/xtriton/20250624/output.tar.gz
-ARG XFLASH_MLA_ADDR=https://su.bcebos.com/v1/klx-sdk-release-public/DS_PD/flash_mla/20250529/output.tar.gz
+# XRE/XCCL/XPYTORCH/KUNLUN_OPS 是一组配套版本，混用会在加载权重前 segfault，
+# 见 dockerfile/README.md。
 
 ARG PIP_INDEX=http://mirrors.baidubce.com/pypi/simple/
 ARG PIP_HOST=mirrors.baidubce.com
@@ -141,10 +155,14 @@ RUN set -eux; \
 # Both downloads in this step are pinned to github.com. Everything Astral ships
 # is served by default through releases.astral.sh, which measures ~60 KB/s
 # through the outbound proxy against 2.4-12 MB/s for github.com:
-#   - UV_INSTALLER_GITHUB_BASE_URL covers the uv tarball (16.8 MB). The
-#     installer's default source list is "releases.astral.sh github.com" and it
-#     only falls back to the second entry when the first one *fails*, not when
-#     it is slow.
+#   - the uv tarball (16.7 MB) is fetched straight from
+#     github.com/astral-sh/uv/releases. Do NOT go back to
+#     `curl https://astral.sh/uv/install.sh | sh`: on at least one build host
+#     astral.sh completes the proxy CONNECT and then sends zero bytes forever,
+#     and the installer's own curl has no --max-time, so the step hangs instead
+#     of failing. The release asset is actually served by
+#     objects.githubusercontent.com, which works there. UV_VERSION pins a tag;
+#     empty follows .../releases/latest/download/, same as the old script did.
 #   - UV_PYTHON_INSTALL_MIRROR covers the managed CPython build that
 #     `uv venv --python 3.12` downloads (32.9 MB), because step 23 deleted the
 #     base image's miniconda and no 3.12 interpreter is left on the image. uv
@@ -153,14 +171,38 @@ RUN set -eux; \
 # Measured: 20s for the whole step with both pinned, 5-10 min without.
 ENV PATH=${VENV}/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     VIRTUAL_ENV=${VENV}
+# The name is kept from the installer-script era so existing --build-arg lines
+# keep working; it is now just the GitHub base for the release asset.
 ARG UV_INSTALLER_GITHUB_BASE_URL=https://github.com
+ARG UV_VERSION=
 ARG UV_PYTHON_INSTALL_MIRROR=https://github.com/astral-sh/python-build-standalone/releases/download
+# uv does not read PIP_INDEX_URL (see the note above the PATH ENV), and its own
+# default index https://pypi.org/simple/ is unreachable from the build network:
+# `uv venv --seed` died with "Failed to fetch: https://pypi.org/simple/pip/".
+# --seed only resolves `pip`, so hand uv the internal index explicitly. It is
+# https, so uv's plain-http restriction (--allow-insecure-host) does not apply.
+ARG UV_PIP_INDEX=https://pip.baidu-int.com/simple/
 RUN set -eux; \
-    curl -LsSf --retry 5 --retry-delay 5 https://astral.sh/uv/install.sh \
-        | UV_INSTALLER_GITHUB_BASE_URL="${UV_INSTALLER_GITHUB_BASE_URL}" sh; \
+    cd /tmp; \
+    if [ -n "${UV_VERSION}" ]; then \
+        uv_url="${UV_INSTALLER_GITHUB_BASE_URL}/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz"; \
+    else \
+        uv_url="${UV_INSTALLER_GITHUB_BASE_URL}/astral-sh/uv/releases/latest/download/uv-x86_64-unknown-linux-gnu.tar.gz"; \
+    fi; \
+    # --connect-timeout/--max-time so an unreachable source fails the build
+    # instead of hanging it (that is what the installer script did).
+    curl -fsSL --retry 5 --retry-delay 5 --connect-timeout 30 --max-time 600 \
+        -o uv.tar.gz "${uv_url}"; \
+    tar -xzf uv.tar.gz; \
+    install -m 0755 uv-x86_64-unknown-linux-gnu/uv /usr/local/bin/uv; \
+    if [ -f uv-x86_64-unknown-linux-gnu/uvx ]; then install -m 0755 uv-x86_64-unknown-linux-gnu/uvx /usr/local/bin/uvx; fi; \
+    rm -rf uv.tar.gz uv-x86_64-unknown-linux-gnu; \
+    uv --version; \
+    UV_DEFAULT_INDEX="${UV_PIP_INDEX}" \
     UV_PYTHON_INSTALL_MIRROR="${UV_PYTHON_INSTALL_MIRROR}" \
         uv venv --seed --python 3.12 "${VENV}"; \
-    rm -rf /root/.cache/uv
+    rm -rf /root/.cache/uv; \
+    echo "uv=$(uv --version)" >> /versions
 
 # torch must match the xpytorch build (torch 2.9.0).
 # torchaudio MUST come from the same cu129 index as torch: the PyPI mirror
@@ -236,6 +278,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         ipython easydict distro watchfiles zstandard
 
 # Kunlun runtime: XPU runtime and collective communication library.
+# 与 xpytorch / kunlun_ops 是一组配套版本，一般一起动。xpytorch 的 ARG 为了让
+# 常改的那组集中在文件后半段，排在了下面算子库那组的末尾 —— 见文件头的索引。
+ARG XRE_ADDR=https://klx-sdk-release-public.su.bcebos.com/xre/kl3-release/5.45.0.0/peermem/xre-Linux-x86_64-5.45.0.0.tar.gz
+ARG XCCL_ADDR=https://klx-sdk-release-public.su.bcebos.com/xccl/release/3.2.9.0/xccl_Linux_x86_64.tar.gz
 RUN set -eux; \
     cd /tmp; \
     curl -fsSL --retry 5 -o xre.tar.gz "${XRE_ADDR}"; \
@@ -260,39 +306,46 @@ RUN set -eux; \
     rm -rf /tmp/*; \
     { echo "xre=${XRE_ADDR}"; echo "xccl=${XCCL_ADDR}"; } >> /versions
 
-# Kunlun PyTorch backend. The installer also brings in xmlir (torch_xmlir),
-# apex, flash_attn, transformer_engine, xformers, proteus, hydrax, torch_xray
-# and the xcudart shim libraries.
-RUN set -eux; \
-    cd /tmp; \
-    # torch_xmlir (shipped by the xpytorch .run) imports these at module level;
-    # the SGLang deps layer does not provide all of them, and the .run installs
-    # its own packages with --no-deps. Install the whole set up front so the
-    # installer's final `XFLAGS --reset` cannot fail one module at a time.
-    pip install --index-url https://pip.baidu-int.com/simple/ \
-        hyperparameter==0.5.6 colorama==0.4.6 matplotlib==3.10.8 openpyxl==3.1.5 \
-        prettytable==3.17.0 tabulate==0.9.0 wcwidth==0.6.0 regex==2026.9.29; \
-    curl -fsSL --retry 5 -o xpytorch.run "${XPYTORCH_ADDR}"; \
-    bash xpytorch.run; \
-    rm -rf /tmp/* /root/.cache/pip; \
-    echo "xpytorch=${XPYTORCH_ADDR}" >> /versions
+# ── Kunlun 算子库 / KV 传输引擎 ────────────────────────────────────────────
+# 一个组件一个 RUN：只有被改的那个组件（及其之后的层）会重建，前面的全部命中。
+# 整段分两层：先「随昆仑 release 走、不常改」的（mooncake/xdll/chen_ops/
+# cocopod/deep_ep），再「常改」的（xpytorch/kunlun_ops/xspeedgate/hydrax）。
+# 新加组件不要合回循环里，按这两层挑位置。
 
-# Kunlun operator libraries and KV transfer engine.
+# NOTE: XMOONCAKE_ADDR is a *.whl*, not a tarball -- it must not go through the
+# tar-based steps below, where `tar -xzf` fails with "gzip: stdin has more than
+# one entry". Install straight from the URL so pip derives the real wheel
+# filename; downloading to a fixed name first makes pip reject the archive as
+# "Invalid wheel filename (wrong number of parts)".
+ARG XMOONCAKE_ADDR=https://aihc-private-hcd.bj.bcebos.com/tangshiwen/kvcache/mooncake_transfer_engine-0.3.12.post1-cp312-cp312-manylinux_2_31_x86_64.whl
+RUN set -eux; \
+    pip install --no-deps --retries 5 "${XMOONCAKE_ADDR}"; \
+    echo "xmooncake=${XMOONCAKE_ADDR}" >> /versions; \
+    rm -rf /root/.cache/pip
+
+ARG XDLL_ADDR=https://aihc-private-hcd.bj.bcebos.com/zhangchi/xdll/xdll_ops-1.0.0%2B8bf033d.torch29-cp312-cp312-linux_x86_64.whl
+RUN set -eux; \
+    pip install --no-deps --retries 5 "${XDLL_ADDR}"; \
+    echo "xdll_ops=${XDLL_ADDR}" >> /versions; \
+    rm -rf /root/.cache/pip
+
+ARG CHEN_OPS_ADDR=https://aihc-private-hcd.bj.bcebos.com/zhz/chen_ops-0.2.0%2Bflashmla.20261028-cp312-cp312-linux_x86_64.whl
+RUN set -eux; \
+    pip install --no-deps --retries 5 "${CHEN_OPS_ADDR}"; \
+    echo "chen_ops=${CHEN_OPS_ADDR}" >> /versions; \
+    rm -rf /root/.cache/pip
+
+ARG COCOPOD_ADDR=https://aihc-private-hcd.bj.bcebos.com/zhz/cocopod-1.7.0%2Bf98939a.torch29.dev-cp312-cp312-linux_x86_64.whl
+RUN set -eux; \
+    pip install --no-deps --retries 5 "${COCOPOD_ADDR}"; \
+    echo "cocopod=${COCOPOD_ADDR}" >> /versions; \
+    rm -rf /root/.cache/pip
+
+ARG DEEPEP_ADDR=https://klx-sdk-release-public.su.bcebos.com/xccl/release/3.2.9.0/deep_ep-cp312-cp312-linux_x86_64_cuda12.tar.gz
+ARG XTRITON_ADDR=https://su.bcebos.com/v1/klx-sdk-release-public/DS_PD/xtriton/20250624/output.tar.gz
+ARG XFLASH_MLA_ADDR=https://su.bcebos.com/v1/klx-sdk-release-public/DS_PD/flash_mla/20250529/output.tar.gz
 RUN set -eux; \
     cd /tmp; \
-    # NOTE: XMOONCAKE_ADDR is a *.whl*, not a tarball -- keep it in this
-    # URL-install loop. Putting it in the tar loop below makes `tar -xzf`
-    # fail with "gzip: stdin has more than one entry".
-    for spec in "kunlun_ops=${KUNLUN_OPS_ADDR}" "xspeedgate_ops=${XSPEEDGATE_OPS_ADDR}" \
-                "chen_ops=${CHEN_OPS_ADDR}" "cocopod=${COCOPOD_ADDR}" \
-                "xdll_ops=${XDLL_ADDR}" "xmooncake=${XMOONCAKE_ADDR}"; do \
-        name="${spec%%=*}"; url="${spec#*=}"; \
-        # Install straight from the URL: pip derives the real wheel filename.
-        # Downloading to "${name}.whl" first makes pip reject the archive as
-        # "Invalid wheel filename (wrong number of parts)".
-        pip install --no-deps --retries 5 "${url}"; \
-        echo "${name}=${url}" >> /versions; \
-    done; \
     for spec in "deep_ep=${DEEPEP_ADDR}" \
                 "xtriton=${XTRITON_ADDR}" "flash_mla=${XFLASH_MLA_ADDR}"; do \
         name="${spec%%=*}"; url="${spec#*=}"; \
@@ -310,11 +363,50 @@ RUN set -eux; \
         rm -rf unpack pkg.tar.gz; \
         echo "${name}=${url}" >> /versions; \
     done; \
+    rm -rf /tmp/* /root/.cache/pip
+
+# ── 常改组件：按「重建代价从高到低」排 ─────────────────────────────────────
+# 便宜的 bump 不应该把贵的拖着重跑，所以 xpytorch（.run 装一整栈，最贵）在最
+# 前，kunlun_ops / xspeedgate / hydrax 依次在后。bump 尾部组件只重跑它自己和
+# 后面的层；bump xpytorch 会重跑这一整组，但不会重跑上面随 release 走的 wheel。
+# 新增常改组件时，比谁便宜就排在谁后面。
+
+# Kunlun PyTorch backend. The installer also brings in xmlir (torch_xmlir),
+# apex, flash_attn, transformer_engine, xformers, proteus, hydrax, torch_xray
+# and the xcudart shim libraries.
+ARG XPYTORCH_ADDR=https://klx-sdk-release-public.su.bcebos.com/kunlun2jituan/20260930/xpytorch-cp312-torch290-ubuntu2004-x64.run
+RUN set -eux; \
+    cd /tmp; \
+    # torch_xmlir (shipped by the xpytorch .run) imports these at module level;
+    # the SGLang deps layer does not provide all of them, and the .run installs
+    # its own packages with --no-deps. Install the whole set up front so the
+    # installer's final `XFLAGS --reset` cannot fail one module at a time.
+    pip install --index-url https://pip.baidu-int.com/simple/ \
+        hyperparameter==0.5.6 colorama==0.4.6 matplotlib==3.10.8 openpyxl==3.1.5 \
+        prettytable==3.17.0 tabulate==0.9.0 wcwidth==0.6.0 regex==2026.9.29; \
+    curl -fsSL --retry 5 -o xpytorch.run "${XPYTORCH_ADDR}"; \
+    bash xpytorch.run; \
     rm -rf /tmp/* /root/.cache/pip; \
+    echo "xpytorch=${XPYTORCH_ADDR}" >> /versions
+
+# kunlun_ops：适配期常改，且必须在 xpytorch 之后 —— 下面那两个 symlink 要
+# 落在 xpytorch 建好的 torch_xmlir 目录里。
+ARG KUNLUN_OPS_ADDR=https://aihc-private-hcd.bj.bcebos.com/chengxiaokang/ernie/ernie-5.5-flash/ops/kunlun_ops-0.1.273+6ef9e06f-cp312-cp312-linux_x86_64.whl
+RUN set -eux; \
+    pip install --no-deps --retries 5 "${KUNLUN_OPS_ADDR}"; \
+    echo "kunlun_ops=${KUNLUN_OPS_ADDR}" >> /versions; \
+    rm -rf /root/.cache/pip; \
+    # torch_xmlir 按 soname dlopen 这两个 .so，指到 kunlun_ops 里的那份。
     sp="$(python -c 'import sysconfig;print(sysconfig.get_paths()["purelib"])')"; \
     for so in libapiinfer.so libinnerinfer.so; do \
         ln -sf "${sp}/kunlun_ops/${so}" "${sp}/torch_xmlir/${so}"; \
     done
+
+ARG XSPEEDGATE_OPS_ADDR=https://aihc-private-hcd.bj.bcebos.com/xspeedgate_release/torch29-cp312/20261112_181816/xspeedgate_ops-1.7.0+8f96a8d.torch29-cp312-cp312-linux_x86_64.whl
+RUN set -eux; \
+    pip install --no-deps --retries 5 "${XSPEEDGATE_OPS_ADDR}"; \
+    echo "xspeedgate_ops=${XSPEEDGATE_OPS_ADDR}" >> /versions; \
+    rm -rf /root/.cache/pip
 
 # hydrax (Hydra) daily：MegaMoE 的融合 MoE 算子（`int8_int4_mega_moe`）。
 #
@@ -328,6 +420,9 @@ RUN set -eux; \
 #
 # 这个 tarball 里只有一个 cp312 的 whl（`hydrax_py312_torch290/hydrax-*.whl`），
 # 所以没套上面那个跳过非 cp312 的循环。
+#
+# 发的是 daily 包，版本动得比其它组件勤，所以排在算子库之后。
+ARG HYDRAX_ADDR=https://klx-sdk-release-public.su.bcebos.com/Hydra/daily/20261105/hydrax_py312_torch290.tar.gz
 RUN set -eux; \
     cd /tmp; \
     curl -fsSL --retry 5 -o hydrax.tar.gz "${HYDRAX_ADDR}"; \
@@ -338,32 +433,9 @@ RUN set -eux; \
     rm -rf unpack hydrax.tar.gz /root/.cache/pip; \
     echo "hydrax=${HYDRAX_ADDR}" >> /versions
 
-# SGLang and this plugin are used from source through PYTHONPATH, so only the
-# plugin is installed (for its entry points) and SGLang itself is not.
-RUN rm -rf /workspace/* /workspace/.[!.]* 2>/dev/null || true
-COPY ${SGLANG_DIR} /workspace/sglang
-COPY ${SGLANG_KUNLUN_DIR} /workspace/sglang-kunlun
-RUN set -eux; \
-    # sglang's version comes from git through setuptools-scm (pyproject sets
-    # fallback_version 0.0.0.dev0 for the no-.git case). Pin the 8.x line:
-    # setuptools-scm 10.x delegates to a brand-new `vcs-versioning` distribution
-    # (`from vcs_versioning import Configuration`), which a --no-deps install
-    # does not bring in, and 8.x is what sglang's build-system declares
-    # (setuptools-scm>=8.0). 8.x needs only packaging+setuptools, both already
-    # in the seeded venv.
-    # setuptools-rust must NOT be installed: setup.py only builds the ../rust
-    # extensions when it can import setuptools_rust, and otherwise falls back to
-    # a pure-Python install -- there is no cargo in this image. `git` is in the
-    # apt list for this step as well as for the rev-parse below.
-    pip install --no-deps "setuptools-scm==8.3.1"; \
-    pip install --no-deps --no-build-isolation -e /workspace/sglang/python; \
-    # sglang-kunlun keeps build isolation: its build-system only wants
-    # setuptools>=68, and sglang's does NOT (torch==2.14.1 + setuptools-rust).
-    pip install --no-deps -e /workspace/sglang-kunlun; \
-    pip install --no-deps --force-reinstall -i https://pip.baidu-int.com/simple/ sglang-router; \
-    echo "sglang=$(git -C /workspace/sglang rev-parse --short HEAD 2>/dev/null || echo unknown)" >> /versions; \
-    echo "sglang_kunlun=$(git -C /workspace/sglang-kunlun rev-parse --short HEAD 2>/dev/null || echo unknown)" >> /versions; \
-    rm -rf /root/.cache/pip
+# ── 稳定尾巴：镜像级环境 + 与源码无关的 wheel ──────────────────────────────
+# 两步都放在源码 COPY 之前，改插件源码时不该被重跑（c-dlpack 是一次网络 pip
+# install）。源码段见文件末尾。
 
 # Only LD_LIBRARY_PATH is baked in.
 #
@@ -418,11 +490,51 @@ RUN set -eux; \
 
 WORKDIR /workspace
 
+# ── 源码层：engine 与插件分两个 COPY + 两个 RUN，互不牵连 ──────────────────
+# SGLang and this plugin are used from source through PYTHONPATH, so only the
+# plugin is installed (for its entry points) and SGLang itself is not.
+# 适配期只改插件（最常见）时，下面 sglang 的 COPY/RUN 全部命中缓存，不会再把
+# 整棵 sglang 树重传一遍。
+RUN rm -rf /workspace/* /workspace/.[!.]* 2>/dev/null || true
+
+# 构建上下文里两个源码目录的名字，随 --build-arg 覆盖：
+#   本仓库 README 约定 <ctx>/sglang + <ctx>/sglang-kunlun；
+#   构建时传 --build-arg SGLANG_DIR=sglang-0.5.23 --build-arg SGLANG_KUNLUN_DIR=sglang-kunlun-0.5.23
+# 落到镜像里仍然是 /workspace/sglang 和 /workspace/sglang-kunlun
+ARG SGLANG_DIR=sglang
+COPY ${SGLANG_DIR} /workspace/sglang
+RUN set -eux; \
+    # sglang's version comes from git through setuptools-scm (pyproject sets
+    # fallback_version 0.0.0.dev0 for the no-.git case). Pin the 8.x line:
+    # setuptools-scm 10.x delegates to a brand-new `vcs-versioning` distribution
+    # (`from vcs_versioning import Configuration`), which a --no-deps install
+    # does not bring in, and 8.x is what sglang's build-system declares
+    # (setuptools-scm>=8.0). 8.x needs only packaging+setuptools, both already
+    # in the seeded venv.
+    # setuptools-rust must NOT be installed: setup.py only builds the ../rust
+    # extensions when it can import setuptools_rust, and otherwise falls back to
+    # a pure-Python install -- there is no cargo in this image. `git` is in the
+    # apt list for this step as well as for the rev-parse below.
+    pip install --no-deps "setuptools-scm==8.3.1"; \
+    pip install --no-deps --no-build-isolation -e /workspace/sglang/python; \
+    pip install --no-deps --force-reinstall -i https://pip.baidu-int.com/simple/ sglang-router; \
+    echo "sglang=$(git -C /workspace/sglang rev-parse --short HEAD 2>/dev/null || echo unknown)" >> /versions; \
+    rm -rf /root/.cache/pip
+
+ARG SGLANG_KUNLUN_DIR=sglang-kunlun
+COPY ${SGLANG_KUNLUN_DIR} /workspace/sglang-kunlun
+RUN set -eux; \
+    # sglang-kunlun keeps build isolation: its build-system only wants
+    # setuptools>=68, and sglang's does NOT (torch==2.14.1 + setuptools-rust).
+    pip install --no-deps -e /workspace/sglang-kunlun; \
+    echo "sglang_kunlun=$(git -C /workspace/sglang-kunlun rev-parse --short HEAD 2>/dev/null || echo unknown)" >> /versions; \
+    rm -rf /root/.cache/pip
+
 # Keep the JIT caches (tvm-ffi / sglang / triton); drop only package manager ones.
 #
 # Also strip two things that only matter during the build:
 #   - .git (sglang/.git is 384M): the revision is already recorded in /versions
-#     two steps above and nothing at runtime shells out to git;
+#     by the two RUNs just above and nothing at runtime shells out to git;
 #   - the second copy of libxdnn_pytorch.so: the xpytorch installer drops the
 #     same 230M file both in site-packages/lib/ and in torch_xmlir/, so replace
 #     one with a relative symlink instead of shipping it twice;

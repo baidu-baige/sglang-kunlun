@@ -13,6 +13,11 @@ DOCKER_BUILDKIT=1 docker build -f sglang-kunlun/dockerfile/Dockerfile \
 
 `DOCKER_BUILDKIT=1` is required for `Dockerfile` only: its pip layers use `--mount=type=cache` so a failed build resumes from the wheels it already fetched.
 
+Two build-host prerequisites, both easy to trip over:
+
+- **The `docker-buildx` CLI plugin must be installed.** Since Docker CLI 23, `DOCKER_BUILDKIT=1 docker build` is proxied to buildx, and a CLI without the plugin dies with `ERROR: BuildKit is enabled but the buildx component is missing or broken` — while the legacy fallback (`DOCKER_BUILDKIT=0`) then refuses the `--mount` lines. Drop the static binary at `/usr/libexec/docker/cli-plugins/docker-buildx` (`chmod +x`; the release asset is named `buildx-v<ver>.linux-amd64`, the file on disk must be `docker-buildx`). v0.11.2 pairs fine with a 20.10 daemon. Check with `docker buildx inspect --bootstrap`: you want `Driver: docker` plus a `Buildkit:` line.
+- **Docker 20.10's embedded BuildKit is 0.8.2**, so keep this Dockerfile inside that feature set. Do not introduce `RUN <<EOF` heredocs (0.10+), `COPY --link` (0.11+), `RUN --mount=type=bind,from=...`, or a leading `# syntax=docker/dockerfile:...` line — the last one makes the daemon pull a frontend image instead of using the built-in frontend, which fails on an isolated network.
+
 ---
 
 `Dockerfile.xpu` builds the inference image from `ubuntu:20.04` in 6 stages (os → torch → XPU runtime → Kunlun plugins → sglang layer → cleanup). It does not depend on the Kunlun base image. Every tunable is an `ARG` at the top of the file.
