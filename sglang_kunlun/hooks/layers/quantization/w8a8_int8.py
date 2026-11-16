@@ -466,6 +466,19 @@ def w8a8_int8_config_get_quant_method_kunlun(
             ignore=self.ignore,
             fused_mapping=self.packed_modules_mapping,
         ):
+            # EB5's checkpoint only carries INT8 for the routed experts, so its
+            # `ignore` regex sends every dense projection here and they run
+            # BF16 GEMMs (31-39% of 64K-prefill device time, measured in
+            # REPORT_PD_ACG_20261113.md §13.4). EB5_INT8_DENSE opts the dense
+            # prefixes into online INT8 instead; unset, this is a no-op.
+            from sglang_kunlun.hooks.layers.quantization.int8_dense_online import (
+                method_for as _int8_dense_method_for,
+            )
+
+            online = _int8_dense_method_for(layer, prefix)
+            if online is not None:
+                online.prefix = prefix
+                return online
             return UnquantizedLinearMethod()
         return W8A8Int8LinearMethod(self)
     if isinstance(layer, FusedMoE):

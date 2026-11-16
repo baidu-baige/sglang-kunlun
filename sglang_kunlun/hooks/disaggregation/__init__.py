@@ -13,6 +13,9 @@ Implementation note: this patch wraps an instance-level method bound at
 runtime (after ``self.token_to_kv_pool`` exists), not a class-level method.
 The plugin framework's REPLACE works on class targets only, so we install
 this with an AROUND hook on the queue's ``_init_kv_manager`` class method.
+
+The MR *start* needs the same alignment; that half lives in
+``mooncake/conn.py``, which reuses ``ALIGNMENT_2M`` from here.
 """
 
 from __future__ import annotations
@@ -180,6 +183,7 @@ async def _skip_hisparse_pd_warmup(original_fn, *args, **kwargs):
     return await original_fn(*args, **kwargs)
 
 
-# The DSPARK draft seed across the PD boundary lives in its own module; importing
-# it here registers its hooks with the rest of the disaggregation package.
+# Imported here so their hooks register with the rest of the package. Must stay
+# at the bottom: ``mooncake.conn`` reads ``ALIGNMENT_2M`` from this module.
 from sglang_kunlun.hooks.disaggregation import dspark_hidden_states  # noqa: E402,F401
+from sglang_kunlun.hooks.disaggregation import mooncake  # noqa: E402,F401
