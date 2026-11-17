@@ -1133,6 +1133,32 @@ def fused_store_cache_kunlun(
                 input.contiguous(), cache, indices.contiguous(), page_size
             )
             return
+        # The page pool is already a plain 512-element half cache. Reuse the
+        # byte-preserving writer when the BF16-to-FP16 fused writer above does
+        # not cover this dtype pair. Keep the original cache-dtype conversion.
+        if (
+            dim == 512
+            and input.ndim == 2
+            and input.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and indices.ndim == 1
+            and indices.dtype in (torch.int32, torch.int64)
+            and indices.numel() == input.shape[0]
+            and cache.ndim == 2
+            and cache.is_contiguous()
+            and input.device == indices.device == cache.device
+            and input.is_cuda
+            and hasattr(torch.ops.xspeedgate_ops, "set_k_and_s_v4")
+        ):
+            # Legal Torch locations are [-capacity, capacity). Preserve negative
+            # page indexing as well as dummy slot 0. Allocator locations must
+            # satisfy that contract; out-of-range locations are not supported.
+            loc = indices.to(torch.int64).reshape(-1)
+            loc = loc.remainder(num_pages * page_size).contiguous()
+            torch.ops.xspeedgate_ops.set_k_and_s_v4(
+                cache.view(torch.uint8), loc, input.to(cache.dtype).contiguous(), page_size
+            )
+            note_op_path("fused_store_cache", "xspeedgate:set_k_and_s_v4")
+            return
         note_op_path("fused_store_cache", f"torch half-cache ({reason})")
         loc = indices.to(torch.int64).reshape(-1)
         page = loc // page_size
