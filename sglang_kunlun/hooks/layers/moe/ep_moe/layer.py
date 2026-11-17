@@ -356,6 +356,34 @@ class W8A8NormalMoeBuffer:
 _SITU_SCRATCH: dict = {}
 
 
+def _situ_static_rows(bucket: int) -> int:
+    """Row bound for the sliced SiTU chain under graph capture, or 0 to skip it.
+
+    Capture cannot read ``masked_m`` back, so the bound has to be static. The LL
+    receive buffer is ``[num_local_experts, M * num_ranks, hidden]`` with
+    ``M = SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK``, and under attention
+    DP that M *is* the whole step's global token budget (max_running x draft
+    tokens), so one expert cannot receive more than M rows -- a factor
+    ``num_ranks`` below the padded bucket. Without attention DP every rank
+    carries its own full batch, the bound no longer holds, and the chain keeps
+    the whole bucket.
+    """
+    try:
+        from sglang.srt.runtime_context import get_parallel
+
+        if int(getattr(get_parallel(), "attn_dp_size", 1) or 1) <= 1:
+            return 0
+    except Exception:  # noqa: BLE001 - no runtime context: stay on the safe path
+        return 0
+    try:
+        from sglang.srt import environ as _environ
+
+        m = int(_environ.envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get())
+    except Exception:  # noqa: BLE001
+        return 0
+    return m if 0 < m < bucket else 0
+
+
 def _situ_scratch(key, shape, dtype, device, rows):
     """Return a shared zero buffer whose rows past ``rows`` are guaranteed 0."""
     buf = _SITU_SCRATCH.get(key)
@@ -1449,14 +1477,16 @@ class DeepEPMoE(FusedMoE):
         # M=128 on 8 cards -- while only masked_m rows carry data (4-16 in
         # decode). The two masked GEMMs keep the full bucket shape: they address
         # by the fixed layout and ignore stride, so shrinking them is garbage.
-        # Row count is max(masked_m), one D2H and exact; graph capture cannot
-        # read it back, so a captured step keeps the whole bucket, which is the
-        # worst case the unsliced path already computes.
+        # Outside graph capture the count is max(masked_m), one D2H and exact;
+        # under capture it comes from the static bound below.
         _rows = 0
         _bucket = gateup_output.shape[1]
-        if activation == "situ" and not torch.cuda.is_current_stream_capturing():
-            _rows = max(1, int(masked_m.max().item()))
-            if _rows >= _bucket:
+        if activation == "situ":
+            if torch.cuda.is_current_stream_capturing():
+                _rows = _situ_static_rows(_bucket)
+            else:
+                _rows = max(1, int(masked_m.max().item()))
+            if _rows <= 0 or _rows >= _bucket:
                 _rows = 0
         if _rows:
             _half = gateup_output.shape[2] // 2
