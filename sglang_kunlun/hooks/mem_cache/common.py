@@ -15,6 +15,118 @@ from sglang.srt.utils import get_num_new_pages, next_power_of_2
 logger = logging.getLogger(__name__)
 
 
+_INDEX_K_INT8: bool | None = None
+
+# Upstream's own DeepSeek-V4.1 discriminator (`arg_groups/deepseek_v4_hook.py`
+# `validate_deepseek_v41_features`). `is_deepseek_v4()` cannot stand in for it:
+# V4 and V4.1 share `architectures`, `model_type` is the only separator.
+# `DeepseekV41TextConfig` keeps its own class-level `model_type`, hence both.
+_DSV41_MODEL_TYPES = ("deepseek_v41", "deepseek_v41_text")
+
+
+def _model_is_dsv41() -> bool | None:
+    """Whether the served checkpoint is DeepSeek-V4.1; None while not knowable.
+
+    Read through `model_config_of(get_server_args())`, which memoises a
+    `ModelConfig` built from the server args alone. `get_model()` is the wrong
+    source here -- it is not published while the pools are being built, which is
+    exactly when the layout gets decided (see `dsv41_engram_int8.py` for the
+    same trap).
+    """
+    try:
+        from sglang.srt.arg_groups.overrides import model_config_of
+        from sglang.srt.runtime_context import get_server_args
+
+        model_type = getattr(
+            model_config_of(get_server_args()).hf_config, "model_type", None
+        )
+    except Exception:  # noqa: BLE001 - server args not published yet
+        return None
+    return None if model_type is None else model_type in _DSV41_MODEL_TYPES
+
+
+def _index_k_int8_op_available() -> bool:
+    """Probe the scatter op that the int8 132 B layout is written with."""
+    try:
+        import xspeedgate_ops  # noqa: F401  # registers torch.ops.xspeedgate_ops
+
+        return hasattr(torch.ops.xspeedgate_ops, "set_k_and_s_paged_quant")
+    except Exception:  # noqa: BLE001 - no wheel just means fp4
+        return False
+
+
+def _resolve_index_k_int8() -> tuple[bool, bool]:
+    """Resolve the layout as `(int8?, settled?)`.
+
+    `settled` is False only while the model config is still unreadable, so the
+    caller can retry instead of pinning fp4 on a V4.1 run for good.
+    """
+    requested = os.environ.get("DSV4_LOW_RATIO_INDEX_KCACHE", "").strip().lower()
+    if requested and requested not in ("int8", "fp4"):
+        logger.warning(
+            "DSV4_LOW_RATIO_INDEX_KCACHE=%r is neither int8 nor fp4; ignoring it",
+            requested,
+        )
+        requested = ""
+    if requested == "fp4":
+        return False, True
+
+    # An explicit `int8` skips the model gate on purpose: that is how a new
+    # model gets its first run on this layout.
+    if requested != "int8":
+        is_dsv41 = _model_is_dsv41()
+        if is_dsv41 is None:
+            return False, False
+        if not is_dsv41:
+            return False, True
+
+    if not _index_k_int8_op_available():
+        logger.warning(
+            "int8 low-ratio index-K cache needs "
+            "torch.ops.xspeedgate_ops.set_k_and_s_paged_quant, which this "
+            "xspeedgate_ops build does not export; using fp4"
+        )
+        return False, True
+    return True, True
+
+
+def low_ratio_index_k_int8_enabled() -> bool:
+    """Select the int8 low-ratio index cache consistently for sizing and IO.
+
+    int8 is the default on DeepSeek-V4.1, the only model it has been validated
+    on. Every other checkpoint that reaches these hooks -- V4.0 and the other
+    `DeepseekV4ForCausalLM*` variants, which share V4.1's `architectures` --
+    keeps the 68 B fp4 rows. `DSV4_LOW_RATIO_INDEX_KCACHE` overrides either way:
+    `fp4` for an A/B run on V4.1, `int8` to try the layout on a new model.
+
+    Resolved once and then frozen. The row width is baked into the pool when it
+    allocates, while the scoring paths re-read this flag on every forward -- an
+    answer that changed mid-run would price one layout against a buffer written
+    in the other, silently and with no error.
+    """
+    global _INDEX_K_INT8
+    if _INDEX_K_INT8 is not None:
+        return _INDEX_K_INT8
+    value, settled = _resolve_index_k_int8()
+    if settled:
+        _INDEX_K_INT8 = value
+    return value
+
+
+def _freeze_index_k_int8() -> bool:
+    """Pin the layout before the first pool bakes it into a row width."""
+    global _INDEX_K_INT8
+    if _INDEX_K_INT8 is None:
+        value, settled = _resolve_index_k_int8()
+        if not settled:
+            logger.warning(
+                "low-ratio index-K layout frozen before the model config was "
+                "readable; using fp4"
+            )
+        _INDEX_K_INT8 = value
+    return _INDEX_K_INT8
+
+
 @plugin_hook(
     "sglang.srt.mem_cache.kv_cache_dtype.configure_kv_cache_dtype",
     type=HookType.AROUND,
@@ -216,7 +328,17 @@ def dsv4_pool_configurator_kv_bytes_kunlun(result, self, kvc):
     which stopped matching the formula in 0.5.22.
     """
     del kvc
+    if low_ratio_index_k_int8_enabled():
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            get_dsv4_indexer_bytes_per_token,
+        )
+
+        self.low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
+            self.indexer_head_dim, use_fp4_indexer=False
+        )
     if not _kunlun_half_cache_applies(self):
+        if low_ratio_index_k_int8_enabled():
+            self.bytes_per_full_token = self._get_bytes_per_full_token() * self._spec_infl
         return result
 
     old_kv_bytes = self.kv_bytes
@@ -242,6 +364,49 @@ def dsv4_pool_configurator_kv_bytes_kunlun(result, self, kvc):
         self.bytes_per_full_token,
     )
     return result
+
+
+@plugin_hook(
+    "sglang.srt.mem_cache.deepseek_v4_memory_pool.DeepSeekV4IndexerPool.__init__",
+    type=HookType.AROUND,
+)
+def dsv4_indexer_pool_init_kunlun(original_fn, self, *args, **kwargs):
+    """Use 132-byte int8 rows for explicitly forced low-ratio pools.
+
+    C4 leaves use_fp4_indexer unspecified in 0.5.22 and retains its own layout.
+    Bind the signature to support both positional and keyword callers.
+    """
+    import inspect
+
+    bound = inspect.signature(original_fn).bind(self, *args, **kwargs)
+    self.index_k_int8 = (
+        _freeze_index_k_int8()
+        and bound.arguments.get("use_fp4_indexer") is True
+    )
+    if self.index_k_int8:
+        bound.arguments["use_fp4_indexer"] = False
+    result = original_fn(*bound.args, **bound.kwargs)
+    if self.index_k_int8:
+        logger.info("Low-ratio index-K cache: int8, %d B/token", self.get_bytes_per_token())
+    return result
+
+
+@plugin_hook(
+    "sglang.srt.mem_cache.deepseek_v4_memory_pool.DeepSeekV4IndexerPool.get_index_k_dequant",
+    type=HookType.AROUND,
+)
+def dsv4_indexer_pool_index_k_dequant_kunlun(original_fn, self, layer_id, slots=None):
+    """Read int8 payloads and fp32 scales without FP4 reinterpretation."""
+    if not getattr(self, "index_k_int8", False):
+        return original_fn(self, layer_id, slots)
+    from sglang_kunlun.kernels.dsv41_low_ratio import load_index_k_cache_int8
+
+    buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+    if slots is None:
+        slots = torch.arange(self.size, device=buf.device)
+    return load_index_k_cache_int8(
+        buf, slots, page_size=self.page_size, dim=self.index_head_dim
+    )
 
 
 @plugin_hook(

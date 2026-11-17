@@ -1,65 +1,102 @@
-# 昆仑芯 SGLang 推理镜像构建
+# Kunlun P800 SGLang inference image
 
-本目录用于构建昆仑 XPU 版本的 `sglang-kunlun` 推理镜像：在昆仑芯官方基础镜像上装好 XPU 运行时与算子库，并以 editable 方式安装本仓库的 SGLang 插件。
+Two image definitions live here, kept side by side on purpose while we decide which one to keep. Everything below this section describes `Dockerfile.xpu`.
 
-## 物料来源
-
-昆仑芯的主要物料产出（xpytorch、kunlun_ops、xre、xccl、deep_ep、xmooncake 等组件的版本与下载地址）来自如下文档。升级版本前请以该文档为准核对：
-
-<https://ku.baidu-int.com/knowledge/HFVrC7hq1Q/BeQck0ZK7s/wsEROHhNNf/_mpWzFJuSciXhX>
-
-## 目录文件
-
-- `Dockerfile`：镜像定义。基础镜像 `iregistry.baidu-int.com/xmlir/xmlir_ubuntu_2004_x86_64:v0.42`，将仓库拷贝到 `/workspace/sglang_kunlun` 后执行 `install.sh`。
-- `install.sh`：全部安装逻辑，见下文「安装内容」。
-- `sources.list` / `pip.conf`：构建期替换的 apt 与 pip 源。
-- `enterpoint.sh`：容器内启动 JupyterLab（默认端口 8600，`JUPYTER_TOKEN` 未设置时随机生成）。
-- `sync_bos.sh`：把产出包上传到 BOS，用法 `bash sync_bos.sh <package_path> <bos_project>`，结尾输出 `final_bos_addr`。
-- `ssh/`：构建期访问内部代码库所需的 ssh 配置。
-
-## 构建
-
-`Dockerfile` 中的 `COPY sglang-kunlun /workspace/sglang_kunlun` 要求构建上下文为**仓库的上一级目录**：
+- **`Dockerfile.xpu`** — Python 3.10 / cp310 wheels, built from `ubuntu:20.04` in 6 stages, no Kunlun base image. Component URLs also live in `kunlun-components.env`.
+- **`Dockerfile`** — Python 3.12 / cp312 wheels, built **from** the Kunlun base image `xpytorch:torch29-py312-ubuntu20.04-v0.45`, two stages, flattened to a single layer by a trailing `FROM scratch`. Migrated from `dev-kunlun-0.5.19-dsv4.1`; its wheels (`xspeedgate_ops 1.6.0+d3d0ba2`, `xdll_ops 1.0.0+80958d8`) are the ones the int8 low-ratio index-K cache needs. **Not yet built or run against 0.5.22.**
 
 ```bash
-# 在 sglang-kunlun 的父目录执行
-docker build -f sglang-kunlun/dockerfile/Dockerfile -t iregistry.baidu-int.com/aicapx/sglang-kunlun:dev .
-```
-
-三个物料地址可通过 `--build-arg` 覆盖，不传则使用 `Dockerfile` 中的默认值：
-
-```bash
-docker build -f sglang-kunlun/dockerfile/Dockerfile \
-  --build-arg XPYTORCH_DOWNLOAD_ADDR=<xpytorch .run 地址> \
-  --build-arg KUNLUN_OPS_DOWNLOAD_ADDR=<kunlun_ops .whl 地址> \
-  --build-arg XSPEEDGATE_OPS_DOWNLOAD_ADDR=<xspeedgate_ops .whl 地址> \
+# py3.12 image -- same two-sibling context as below, different -f
+DOCKER_BUILDKIT=1 docker build -f sglang-kunlun/dockerfile/Dockerfile \
   -t iregistry.baidu-int.com/aicapx/sglang-kunlun:dev .
 ```
 
-其余组件（xre、xccl、deep_ep、xmooncake、cocopod）的地址目前硬编码在 `install.sh` 的 `install_dep` 中，升级需直接改脚本。
+`DOCKER_BUILDKIT=1` is required for `Dockerfile` only: its pip layers use `--mount=type=cache` so a failed build resumes from the wheels it already fetched.
 
-## 安装内容
+---
 
-`install.sh` 在 conda 环境 `python310_torch29_cuda`（Python 3.10 + torch 2.9）中依次执行：
+`Dockerfile.xpu` builds the inference image from `ubuntu:20.04` in 6 stages (os → torch → XPU runtime → Kunlun plugins → sglang layer → cleanup). It does not depend on the Kunlun base image. Every tunable is an `ARG` at the top of the file.
 
-1. `install_base_env`：替换 apt/pip 源，设置时区 Asia/Shanghai，安装 net-tools、lsof、libarchive-dev、pwgen 等基础包。
-2. `install_sight`：安装 Nsight Systems CLI。
-3. `install_dep xpytorch`：执行 xpytorch `.run` 安装包。
-4. `install_dep kunlun_ops`：安装 kunlun_ops whl。
-5. `install_dep xspeedgate_ops`：安装 xspeedgate_ops 与 cocopod whl。
-6. `install_dep runtime`：安装 xre 5.19.0.0 到 `/usr/local/xre`，并把 `libcuda.so` / `libcuda.so.1` 软链到 `libxpucuda.so`。
-7. `install_dep lib_tmp`：安装 xccl 3.1.8.1 到 `/usr/local/xccl`，以及 deep_ep 与 `portalocker`。
-8. `install_dep xmooncake`：安装 xmooncake whl。
-9. `file_soft_chain`：为 mooncake 补 `torch_xmlir` 下的 `libapiinfer.so` / `libinnerinfer.so` 软链，并修正 `libffi.so.7`。
-10. `install_sglang_kunlun`：`pip install -r requirements.txt`，`pip install -e . --no-deps`，另装 `compressed_tensors`、`tilelang`。
+Verified on 2026-10-30 (192.168.32.2): `docker build -f Dockerfile.xpu -t klx-sglang:test .` with no `--build-arg` produces a 13.6 GB image; DeepSeek-V4-Flash-0731 started with the single-node qualification SOP was healthy in 250 s and answered a single request with `--speculative-algorithm DSPARK` and thinking enabled (`reasoning_tokens=97`). Concurrency, long context, function call and PD disaggregation are untested.
 
-`flash_mla`、`xsgl_kernel`、`xtriton`、`attentionstore`、performance tool 相关调用当前在脚本末尾被注释，如需启用请取消对应注释并传入版本参数。
+## The two repositories
 
-## 运行环境说明
+The stack is two **sibling** repositories, neither contains the other:
 
-- `LD_LIBRARY_PATH` 已包含 `/usr/local/xre/so`、`/usr/local/xccl/so`、`/usr/local/lib/`。
-- 镜像内 `/versions` 记录本次构建实际使用的各组件下载地址，排查版本问题时优先查看该文件。
-- 启动服务的环境变量与命令行参考仓库根目录 `README.md` 的「启动」章节。
+- `sglang` (`baidu/aicapx/sglang`) — the engine. Only copied to `/workspace/sglang`, **never pip installed**, picked up at runtime through `PYTHONPATH`. Its own `python/pyproject.toml` targets CUDA (`torch==2.11.0`, `flashinfer[cu13]`, `sglang-kernel`) and would replace the Kunlun torch and xtriton, so the image ignores it.
+- `sglang-kunlun` (this repo) — the Kunlun plugin, installed with `pip install -e . --no-deps`.
 
-## 镜像仓库
-iregistry.baidu-int.com/aicapx/sglang-kunlun:dev
+The `PYTHONPATH` order is fixed, plugin before engine, because `sglang_kunlun/bootstrap/pre_shim.py` has to stub `sgl_kernel` and patch triton before sglang is imported:
+
+```bash
+export PYTHONPATH=/workspace/sglang-kunlun:/workspace/sglang/python
+```
+
+## Build
+
+The build context needs both repositories side by side:
+
+```
+<build-context>/
+├── Dockerfile.xpu
+├── sglang/
+└── sglang-kunlun/
+```
+
+```bash
+docker build -f Dockerfile.xpu -t klx-sglang:test .
+```
+
+Seven Kunlun artifact URLs (`XPYTORCH_URL`, `KUNLUN_OPS_URL`, `XRE_URL`, `XCCL_URL`, `DEEPEP_URL`, `MOONCAKE_URL`, `XSPEEDGATE_URL`) have defaults; override them with `--build-arg`. An empty value fails the build at the start of stage 3 / stage 4 instead of at download time.
+
+Behind a restricted network: `uv` bootstraps from `astral.sh` and GitHub, so point `UV_INSTALL_URL` and `UV_PYTHON_INSTALL_MIRROR` at internal mirrors; if Docker Hub is unreachable, set `BASE_IMAGE`.
+
+## Version constraints
+
+Artifact versions and URLs follow the Kunlun release notes ([`_mpWzFJuSciXhX`](https://ku.baidu-int.com/knowledge/HFVrC7hq1Q/BeQck0ZK7s/wsEROHhNNf/_mpWzFJuSciXhX)); xspeedgate_ops has its own release log with per-version operator lists ([`kQX1KNQa74ft9E`](https://ku.baidu-int.com/knowledge/HFVrC7hq1Q/vMri-fRViV/G4ag4GvOr4/kQX1KNQa74ft9E)).
+
+> The `/versions` file inside a qualified image only logs the first install address and can disagree with what is actually shipped (the SOP image records xspeedgate 1.4.0 but ships 1.6.0). Verify with `pip list`.
+
+**`XPYTORCH_URL` + `KUNLUN_OPS_URL` + `XRE_URL` + `XCCL_URL` are one matched set.** Measured outcomes of mixing them:
+
+- xpytorch `kunlun2jituan/20260806` + kunlun_ops 0.1.227, with XRE 5.0.21.43.6 / 5.19.0.0 / 5.34.0.0 → segfault at `parallel_state.py:359 init_world_group`, before any weight loads
+- same, with XRE 5.42.0.0 + XCCL 3.2.8.0 → passes distributed init, then segfaults at `dspark_draft_sampler.py:105` (`exponential_()`) during CUDA graph capture
+- xpytorch `kunlun2aiak_output/20260629` + kunlun_ops 0.1.204 + XRE 5.0.21.43.6 + XCCL 3.1.8.1 → works; these are the current defaults
+
+xpytorch is published under two BOS directories, `kunlun2jituan` and `kunlun2aiak_output`. Identical filenames, different packages.
+
+`XSPEEDGATE_URL` must be 1.5.1 or newer — `kernel_ops.py` calls `init_compressed_attn_metadata_v2`, missing in 1.4.0. To check a wheel:
+
+```bash
+unzip -q xspeedgate_ops-*.whl -d x && strings x/xspeedgate_ops/*.so | grep -c init_compressed_attn_metadata_v2
+```
+
+`PYTHON_VERSION` and `TORCH_VERSION` must match the `cpXXX` / `torchXXX` tags in `XPYTORCH_URL` (`cp310` / `torch290` → `3.10` / `2.9.0`).
+
+## sglang dependencies
+
+Three `ARG` groups, which must stay separate:
+
+- `SGLANG_PIP_PINNED` — with deps, versions locked. `torch` / `torchaudio` / `torchvision` are an ABI-matched triple (`torchaudio 2.11.0` fails with `OSError: Could not load _torchaudio.abi3.so`). Keeping `torch` here stops resolution from replacing it.
+- `SGLANG_PIP_PLAIN` — with deps, versions open. Two entries are easy to miss: `ipython` (top-level import in `sglang/utils.py:26`, pulls 9 transitive deps) and `python-multipart` (FastAPI checks it at runtime, so static import scans never find it).
+- `SGLANG_PIP_NODEPS` — `--no-deps`, versions locked. `flashinfer-python` must be `0.6.15.post1`: 0.7.x reaches `cute_dsl` and pulls `nvidia-cutlass-dsl 4.8.x`, whose toolkit probe reads the Kunlun libcuda shim as "CUDA 10.2" and aborts on import.
+
+Never add `tilelang` — it drags stock triton in and shadows xtriton, which must be the last wheel installed because `torch==2.9.0` hard-depends on `triton==3.5.0`.
+
+## Runtime notes
+
+- Python lives in `/opt/klx` (uv venv, not conda); `PATH` already points there.
+- `PYTHONPATH` / `SGLANG_PLATFORM` / `SGLANG_USE_XPU` are exported by the launch script, not baked into the image — in `ENV` they would make every python process in the container load the `sitecustomize.py` pre-shim.
+- `TVM_FFI_DISABLE_TORCH_C_DLPACK=1` is in the image `ENV`. `tvm_ffi` (pulled in by xgrammar / flashinfer) JIT compiles a CUDA dlpack addon on import; there is no nvcc here, so it fails and respawns forever, stalling start-up before any weight loads.
+- Launch args: see the repository root `README.md`, or the DeepSeek-V4-Flash SOPs `meg7RU45kTNHtt` (single node) and `0KLAmRAmTbeFQA` (2-node PD).
+- The SOP mounts weights as `-v /home/models:/home/models`; adjust the host side per machine (on .2 the weights are in `/ssd3/models`, so use `-v /ssd3/models:/home/models` — the container path and launch command stay unchanged).
+
+## Troubleshooting by crash site
+
+- segfault at `parallel_state.py:359 init_world_group` → the four artifacts above are not a matched set
+- segfault at `dspark_draft_sampler.py:105` during graph capture → xpytorch / kunlun_ops are not the qualified pair
+- `AttributeError ... 'xspeedgate_ops' object has no attribute` → xspeedgate older than 1.5.1
+- process neither exits nor progresses, `ps` gains a `_build_optional_torch_c_dlpack` every few seconds → `TVM_FFI_DISABLE_TORCH_C_DLPACK` is missing
+- chained `ModuleNotFoundError` (orjson → IPython → traitlets → ...) → `SGLANG_PIP_PLAIN` was emptied or failed
+- `RuntimeError: Form data requires "python-multipart"` → same, that one is a FastAPI runtime check
+

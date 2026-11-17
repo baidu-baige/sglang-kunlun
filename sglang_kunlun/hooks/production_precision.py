@@ -11,6 +11,17 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 logger = logging.getLogger(__name__)
 
 
+@plugin_hook("sglang.srt.layers.engram.EngramHasher.forward", type=HookType.AROUND)
+def engram_hash_ids_idle_kunlun(original_fn, self, input_ids, forward_batch):
+    """Padded IDLE ranks need valid dummy hashes during eager DSPARK forwards."""
+    if forward_batch.forward_mode.is_idle():
+        return torch.zeros(
+            (input_ids.shape[0], self.primes.shape[0], self.offsets.shape[1]),
+            dtype=torch.int64, device=input_ids.device,
+        )
+    return original_fn(self, input_ids, forward_batch)
+
+
 @plugin_hook(
     "sglang.srt.managers.schedule_batch.ScheduleBatch._evict_swa",
     type=HookType.REPLACE,

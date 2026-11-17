@@ -144,25 +144,31 @@ class DeepEPDispatchMode(IntEnum):
 class DeepEPBuffer:
     """DeepEPBuffer
 
-    Normal-mode buffers are kept per ``slot`` so that each two-batch-overlap
-    sub-batch owns one. The Kunlun DeepEP normal port keeps only the last
-    dispatch's layout, so two sub-batches sharing a single buffer clobber each
-    other as soon as both have a ``dispatch -> combine`` transaction in flight.
+    One buffer can only serve one (hidden_size, num_max_dispatch_tokens_per_rank,
+    num_experts): low_latency's recv segmentation, counter/signal offsets and
+    ``clean_low_latency_buffer``'s sizing are all functions of num_local_experts, while
+    the kernel uses the ``num_experts`` passed at each call (see ``_dispatch_core``).
+    Under DSV4.1 DSPARK, target has 384 experts and draft has 128; a singleton buffer
+    lets draft reuse the one target built, and dispatch DMAs at misaligned addresses --
+    error code=700. So keep one per key, at the cost of the draft one occupying an extra
+    chunk of symmetric memory.
 
-    ``slot=0`` is the only slot used when TBO is off, and low-latency always
-    stays on slot 0: its ``return_recv_hook`` API is designed to be in flight,
-    and the low-latency buffer is expensive.
+    normal mode further splits by ``slot``: each two-batch-overlap sub-batch owns its own.
+    Kunlun DeepEP's normal port only keeps the layout of the last dispatch; if two
+    sub-batches share one buffer, they will overwrite each other whenever both
+    ``dispatch -> combine`` transactions are in flight at once.
+
+    ``slot=0`` is the only slot used when TBO is off; low_latency always stays in slot 0 --
+    its ``return_recv_hook`` API is designed to be in-flight anyway, and the LL buffer is
+    expensive.
     """
 
-    # slot -> Buffer. Process-wide, like the single buffer this replaces.
-    _buffers = {}
-    # How many normal-mode slots to keep. Set from the dispatcher construction
-    # site (``create_moe_dispatcher_kunlun``) once the sub-batch count is known.
+    # (slot, hidden_size, num_max_dispatch_tokens_per_rank, num_experts) -> Buffer
+    _buffers: dict = {}
+    # How many normal-mode slots to keep; set by ``create_moe_dispatcher_kunlun`` once the
+    # sub-batch count is known.
     _num_slots: int = 1
     _dispatch_mode: Optional[DeepEPDispatchMode] = None
-    _hidden_size: Optional[int] = None
-    _num_max_dispatch_tokens_per_rank: Optional[int] = None
-    _num_experts: Optional[int] = None
 
     @classmethod
     def set_num_slots(cls, num_slots: int):
@@ -181,13 +187,10 @@ class DeepEPBuffer:
         slot: int = 0,
     ):
         """get_deepep_buffer"""
-        buffer = cls._buffers.get(slot)
+        key = (slot, hidden_size, num_max_dispatch_tokens_per_rank, num_experts)
+        buffer = cls._buffers.get(key)
         if buffer is not None:
             return buffer
-
-        cls._hidden_size = hidden_size
-        cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
-        cls._num_experts = num_experts
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
@@ -250,7 +253,7 @@ class DeepEPBuffer:
                 f"Consider using --deepep-config to change the behavior."
             )
         
-        cls._buffers[slot] = Buffer(
+        buffer = Buffer(
             group,
             num_nvl_bytes,
             num_rdma_bytes,
@@ -260,11 +263,26 @@ class DeepEPBuffer:
             allow_mnnvl=True,
             num_experts=num_experts,
         )
+        cls._buffers[key] = buffer
+        logger.info(
+            "Initialized DeepEP buffer: ep_size=%s mode=%s slot=%s hidden_size=%s "
+            "num_max_dispatch_tokens_per_rank=%s num_experts=%s "
+            "num_local_experts=%s num_qps_per_rank=%s total_buffers=%s",
+            group.size(),
+            deepep_mode,
+            slot,
+            hidden_size,
+            num_max_dispatch_tokens_per_rank,
+            num_experts,
+            num_experts // group.size() if num_experts > 0 else -1,
+            num_qps_per_rank,
+            len(cls._buffers),
+        )
 
-        # ``Buffer.__init__`` runs an all_gather_object, so every rank has to
-        # build the same set of buffers at the same program point. Build the
-        # remaining sub-batch slots right here instead of lazily on their first
-        # dispatch, which would diverge across ranks and hang the collective.
+        # ``Buffer.__init__`` performs an all_gather_object, so all ranks must build the
+        # same set of buffers at the same program point. Build the remaining sub-batch
+        # slots all at once here rather than lazily on their first dispatch -- otherwise
+        # the ranks' call sites would diverge and the collective would hang.
         if slot == 0 and deepep_mode.enable_normal():
             for extra_slot in range(1, cls._num_slots):
                 cls.get_deepep_buffer(
@@ -277,18 +295,23 @@ class DeepEPBuffer:
                     slot=extra_slot,
                 )
 
-        return cls._buffers[slot]
+        return buffer
 
     @classmethod
     def clean_buffer(cls):
-        """clean_buffer"""
-        for buffer in cls._buffers.values():
+        """clean_buffer: clear each buffer according to its own key's sizing; they must not be mixed."""
+        for (
+            _slot,
+            hidden_size,
+            num_max_dispatch_tokens_per_rank,
+            num_experts,
+        ), buffer in cls._buffers.items():
             if not buffer.low_latency_mode:
                 continue
             buffer.clean_low_latency_buffer(
-                cls._num_max_dispatch_tokens_per_rank,
-                cls._hidden_size,
-                cls._num_experts,
+                num_max_dispatch_tokens_per_rank,
+                hidden_size,
+                num_experts,
             )
 
     @classmethod

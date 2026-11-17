@@ -600,6 +600,22 @@ class DeepEPMoE(FusedMoE):
                 "non-standard DispatchOutput)"
             )
 
+        # MegaMoE fuses dispatch / grouped GEMM / SwiGLU / down GEMM / combine
+        # into one call, so it replaces the three steps below rather than
+        # slotting into them. Opt-in and decode-only: see
+        # `sglang_kunlun/hooks/layers/moe/mega_moe.py` for why only one weight
+        # layout can exist in a process.
+        from sglang_kunlun.hooks.layers.moe import mega_moe
+
+        if mega_moe.mega_moe_enabled() and getattr(self, "_mega_moe_layout", False):
+            hidden_states = mega_moe.forward(self, hidden_states, topk_output)
+            if server_arg("dtype") in ["float16", "fp16", "half"]:
+                limit = int(os.environ.get("SGLANG_FP16_LIMIT_IN_MOE", "10"))
+                hidden_states = hidden_states.clamp(min=-limit, max=limit).to(
+                    torch.float16
+                )
+            return hidden_states
+
         # TODO: can we call super().forward here?
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output

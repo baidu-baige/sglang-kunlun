@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 
 import torch
@@ -17,11 +18,29 @@ from sglang.srt.utils import set_weight_attrs
 from ..utils import (
     INT4_SIGNED_SCALE_MULT,
     check_standard_routed_moe_layer,
+    dynamic_quantize_int8,
     moe_fc,
     moe_post,
     moe_pre_sorted,
+    quantize_before_sort_enabled,
     scale_to_kernel_max,
+    sorted_row_scales,
 )
+
+# SwiGLU clamping for routed experts: the fused op vs "2 clamp_ + swiglu".
+# DSV4.1 requires clamping gate/up to swiglu_limit, otherwise BOS/attention-sink
+# activations amplify across layers into fp16 Inf/NaN and greedy decoding collapses to
+# repeated token 0. The two paths are mathematically identical; the fused version saves
+# two passes of large-tensor reads/writes. Set DSV4_MOE_SWIGLU_CLAMP_FUSION=0 to switch
+# back to the fallback path for comparison.
+_FUSED_SWIGLU_CLAMP = os.environ.get("DSV4_MOE_SWIGLU_CLAMP_FUSION", "1") == "1"
+
+logger = logging.getLogger(__name__)
+
+# Log the activation-quantization placement once per process, so a benchmark can be
+# attributed to the path that actually ran.
+_LOGGED_QUANT_PLACEMENT = False
+
 
 __all__ = ["KunlunCompressedTensorsWNA16MoE"]
 
@@ -153,41 +172,30 @@ class KunlunCompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         layer.register_parameter("w13_weight_shape", w13_weight_shape)
         set_weight_attrs(w13_weight_shape, extra_weight_attrs)
 
-        w13_g_idx = torch.nn.Parameter(
-            torch.empty(num_experts, hidden_size, dtype=torch.int32),
-            requires_grad=False,
+        # Channel quantization without act-order has no checkpoint group indices.
+        # Keep the attribute/shape/loader interface until postprocessing deletes
+        # these unused placeholders, but do not advertise them as checkpoint
+        # parameters. Zero initialization also avoids retaining undefined data.
+        internal_indices = (
+            strategy_value == QuantizationStrategy.CHANNEL.value
+            and self.actorder is None
         )
-        layer.register_parameter("w13_weight_g_idx", w13_g_idx)
-        set_weight_attrs(w13_g_idx, extra_weight_attrs)
-
-        w2_g_idx = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                intermediate_size_per_partition,
-                dtype=torch.int32,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_weight_g_idx", w2_g_idx)
-        set_weight_attrs(w2_g_idx, extra_weight_attrs)
-
-        w13_g_idx_sort_indices = torch.nn.Parameter(
-            torch.empty(num_experts, hidden_size, dtype=torch.int32),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_g_idx_sort_indices", w13_g_idx_sort_indices)
-        set_weight_attrs(w13_g_idx_sort_indices, extra_weight_attrs)
-
-        w2_g_idx_sort_indices = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                intermediate_size_per_partition,
-                dtype=torch.int32,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_g_idx_sort_indices", w2_g_idx_sort_indices)
-        set_weight_attrs(w2_g_idx_sort_indices, extra_weight_attrs)
+        for name, width in (
+            ("w13_weight_g_idx", hidden_size),
+            ("w2_weight_g_idx", intermediate_size_per_partition),
+            ("w13_g_idx_sort_indices", hidden_size),
+            ("w2_g_idx_sort_indices", intermediate_size_per_partition),
+        ):
+            if internal_indices:
+                indices = torch.zeros(num_experts, width, dtype=torch.int32)
+                layer.register_buffer(name, indices, persistent=False)
+            else:
+                indices = torch.nn.Parameter(
+                    torch.empty(num_experts, width, dtype=torch.int32),
+                    requires_grad=False,
+                )
+                layer.register_parameter(name, indices)
+            set_weight_attrs(indices, extra_weight_attrs)
 
         layer.a13_scale = None
         layer.a2_scale = None
@@ -227,6 +235,16 @@ class KunlunCompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 f"{self.strategy}"
             )
 
+        from sglang_kunlun.hooks.layers.moe import mega_moe
+
+        if mega_moe.mega_moe_enabled() and mega_moe.convert_layer_weights(layer):
+            # MegaMoE wants gate/up interleaved by 256, moe_fc_v3 wants them
+            # contiguous. The expert weights are far too large to keep both, so
+            # a converted layer commits to the MegaMoE layout and its forward
+            # must go through MegaMoE. `convert_layer_weights` returns False for
+            # the DSPARK draft model, which stays on DeepEP.
+            return
+
         for weight_name, scale_name in (
             ("w13_weight_packed", "w13_weight_scale"),
             ("w2_weight_packed", "w2_weight_scale"),
@@ -245,6 +263,7 @@ class KunlunCompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
     def apply_weights(self, layer: torch.nn.Module, dispatch_output):
         """Apply packed INT4 MoE weights to dispatched tokens."""
         import kunlun_ops
+        import xspeedgate_ops  # noqa: F401  # registers torch.ops.xspeedgate_ops
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
@@ -257,13 +276,35 @@ class KunlunCompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         top_k = topk_ids.shape[1]
         index_have_neg = getattr(layer, "moe_ep_size", 1) > 1
         num_experts = layer.w13_weight_packed.shape[0]
+
+        # Quantize before the expand when the GEMM wants INT8 activations anyway: a
+        # token's top_k copies share one per-token scale, so sorting int8 rows and
+        # scattering the scales is bit-identical to sorting fp16 and quantizing the
+        # [m*top_k, n] result, while never materializing the fp16 expanded tensor.
+        sorted_scale = None
+        pre_quantize = self.quantize_activations and quantize_before_sort_enabled()
+        global _LOGGED_QUANT_PLACEMENT
+        if not _LOGGED_QUANT_PLACEMENT:
+            _LOGGED_QUANT_PLACEMENT = True
+            logger.info(
+                "[kunlun] MoE activation quant %s the expand "
+                "(quantize_activations=%s, DSV4_MOE_QUANT_BEFORE_SORT=%s)",
+                "BEFORE" if pre_quantize else "AFTER",
+                self.quantize_activations,
+                quantize_before_sort_enabled(),
+            )
+        presort_in = x
+        if pre_quantize:
+            presort_in, x_scale = dynamic_quantize_int8(x, keepdim=True)
         sorted_x, sorted_tokens_idx, sorted_tokens_num_lod = moe_pre_sorted(
-            x,
+            presort_in,
             topk_ids,
             num_experts,
             index_have_neg=index_have_neg,
             block_statistic=getattr(topk_output, "block_statistic", None),
         )
+        if pre_quantize:
+            sorted_scale = sorted_row_scales(x_scale, sorted_tokens_idx, top_k)
 
         num_tokens = x.shape[0]
         gate_up = moe_fc(
@@ -277,22 +318,39 @@ class KunlunCompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             x.dtype,
             quantize_input=self.quantize_activations,
             packed_int4=True,
+            x_scale=sorted_scale,
         )
 
-        if (
-            self.moe_runner_config is not None
+        limit = (
+            float(self.moe_runner_config.swiglu_limit)
+            if self.moe_runner_config is not None
             and self.moe_runner_config.swiglu_limit is not None
-        ):
-            limit = float(self.moe_runner_config.swiglu_limit)
-            gate, up = gate_up.chunk(2, dim=-1)
-            gate.clamp_(max=limit)
-            up.clamp_(min=-limit, max=limit)
-        hidden = torch.empty(
-            gate_up.shape[:-1] + (gate_up.shape[-1] // 2,),
-            dtype=gate_up.dtype,
-            device=gate_up.device,
+            else None
         )
-        kunlun_ops.swiglu(gate_up, hidden)
+        if limit is not None and _FUSED_SWIGLU_CLAMP:
+            # One op does clamp + silu + mul. The fallback path is 2 clamp_ + 1 swiglu,
+            # which reads/writes the large [num_tokens, top_k, 2I] tensor two extra times
+            # -- in the P-side 16k prefill trace, clamp alone is 115 ms / 2.0% (240 calls
+            # = 2 per layer).
+            # Semantics match the fallback path word for word, pinned by
+            # test_dsv4_silu_and_mul_clamp_matches_058_contract in test_kernel_ops.py:
+            #     silu(gate.clamp(max=limit)) * up.clamp(min=-limit, max=limit)
+            # Use the op's return value directly as hidden, saving the output.copy_() in the
+            # dsv4_silu_and_mul_clamp_kunlun wrapper.
+            hidden = torch.ops.xspeedgate_ops.silu_and_mul_with_swiglu_limit(
+                gate_up.reshape(-1, gate_up.shape[-1]), limit
+            )
+        else:
+            if limit is not None:
+                gate, up = gate_up.chunk(2, dim=-1)
+                gate.clamp_(max=limit)
+                up.clamp_(min=-limit, max=limit)
+            hidden = torch.empty(
+                gate_up.shape[:-1] + (gate_up.shape[-1] // 2,),
+                dtype=gate_up.dtype,
+                device=gate_up.device,
+            )
+            kunlun_ops.swiglu(gate_up, hidden)
         hidden = hidden.reshape(num_tokens * top_k, -1)
 
         down = moe_fc(
@@ -308,8 +366,9 @@ class KunlunCompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             packed_int4=True,
         )
 
-        # int8 grouped 路径下 down 是 bf16，这里要落回模型 dtype，
-        # 否则下面的 fp16 clamp 判断会被跳过、且会把 bf16 传给后续 fp16 的层。
+        # On the int8 grouped path, `down` is bf16; cast it back to the model dtype here,
+        # otherwise the fp16 clamp check below is skipped and bf16 leaks into the fp16
+        # layers that follow.
         output = moe_post(
             down, sorted_tokens_idx, topk_weights, x.shape, output_dtype=x.dtype
         )

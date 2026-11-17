@@ -149,6 +149,80 @@ def _get_numa_cores(node: int) -> List[int]:
         return list(range(psutil.cpu_count(logical=False)))
 
 
+def _contiguous_ranges(cores: List[int]) -> List[List[int]]:
+    """Split a sorted core list into its contiguous blocks (SMT halves stay apart)."""
+    blocks: List[List[int]] = []
+    for c in sorted(cores):
+        if blocks and c == blocks[-1][-1] + 1:
+            blocks[-1].append(c)
+        else:
+            blocks.append([c])
+    return blocks
+
+
+def _topo_cpu_affinity_strings():
+    """``{gpu_id: cpu_affinity_string}`` from a single ``xpu-smi topo -m`` call."""
+    out = {}
+    try:
+        result = subprocess.run(
+            ["xpu-smi", "topo", "-m"], capture_output=True, text=True, check=True
+        )
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if not parts or not parts[0].startswith("XPU"):
+                continue
+            try:
+                gid = int(parts[0][3:])
+            except ValueError:
+                continue
+            out[gid] = parts[-2]
+    except Exception as e:  # noqa: BLE001 - topology is advisory
+        logger.warning("Failed to read XPU topology for affinity split: %s", e)
+    return out
+
+
+def _split_shared_numa(gpu_id: int, cores: List[int]) -> List[int]:
+    """Give each XPU sharing a NUMA node its own slice of that node's cores.
+
+    `xpu-smi topo -m` reports the whole NUMA-local core list per XPU, so on a
+    host where two XPUs hang off one node (measured on the Hygon C86 P455 box:
+    8 XPUs over 4 nodes, DP0/DP1 both pinned to `16-31,144-159`) both schedulers
+    get the same 16 physical cores and fight over them. Decode is a lockstep
+    collective, so that contention shows up as arrival skew inside the deepep
+    dispatch/combine kernels -- measured `mean-min` 6.36 ms/step on Hygon versus
+    2.90 ms on the Intel reference, with isolated 10 ms spikes.
+
+    The slice keeps each contiguous block (physical cores and their SMT
+    siblings are separate blocks) split in the same proportion, so a process
+    keeps whole SMT pairs, and it never widens the binding past the node, so no
+    cross-NUMA traffic is introduced. Measured on 206 at 256 concurrency over
+    three runs each: 4921.7 tok/s mean (spread 4908-4948) with the split versus
+    4841.2 (spread 4756-4932) sharing, i.e. +1.7% mean and 4x tighter spread;
+    220 concurrency is a wash (4479.8 vs 4489.2). Set the env to 0 to restore
+    the shared binding.
+    """
+    if os.environ.get(
+        "SGLANG_KUNLUN_SPLIT_NUMA_AFFINITY", "1"
+    ).strip().lower() in ("0", "false", "no"):
+        return cores
+    topo = _topo_cpu_affinity_strings()
+    mine = topo.get(gpu_id)
+    if mine is None:
+        return cores
+    peers = sorted(g for g, a in topo.items() if a == mine)
+    if len(peers) <= 1 or gpu_id not in peers:
+        return cores
+    k, r = len(peers), peers.index(gpu_id)
+    sliced: List[int] = []
+    for block in _contiguous_ranges(cores):
+        n = len(block)
+        if n < k:
+            sliced.extend(block)
+            continue
+        sliced.extend(block[r * n // k : (r + 1) * n // k])
+    return sliced or cores
+
+
 @plugin_hook(
     "sglang.srt.utils.common.set_gpu_proc_affinity",
     type=HookType.REPLACE,
@@ -175,6 +249,7 @@ def set_gpu_proc_affinity_kunlun(gpu_id: int):
     gpu_numa_node, bind_cores = _get_gpu_topo_affinity(gpu_id)
     if not bind_cores:
         bind_cores = _get_numa_cores(gpu_numa_node or 0)
+    bind_cores = _split_shared_numa(gpu_id, bind_cores)
 
     p.cpu_affinity(bind_cores)
     logger.info(
@@ -269,4 +344,52 @@ def get_device_capability_kunlun(device_id: int = 0):
 def get_device_name_kunlun(device_id: int = 0) -> str:
     """Stable identifier used for cache keys & logs."""
     return "Kunlun-XPU"
+
+
+# ---------------------------------------------------------------------------
+# async_h2d → stage the small host vectors through pinned memory
+# ---------------------------------------------------------------------------
+
+
+@plugin_hook(
+    "sglang.srt.utils.common.async_h2d",
+    type=HookType.REPLACE,
+)
+def async_h2d_kunlun(args, *, dtype, device):
+    """Enqueue the list copy instead of draining the stream for it.
+
+    Upstream only stages through pinned memory when
+    ``current_platform.is_pin_memory_available()`` says so, and
+    ``KunlunDeviceMixin`` inherits the ``DeviceMixin`` default of ``False``.
+    That turns every call into ``torch.tensor(args).to(device)`` -- a pageable,
+    host-blocking copy that first waits for everything already queued on the
+    stream. Measured on this deployment: 31 ms per call behind a loaded queue,
+    and the P-side 64K prefill step pays it nine times (once per compressed
+    layer in ``_make_low_ratio_prefill_indexer_inputs``, plus
+    ``get_tail_row_indices``) -- ~212 ms of an 838 ms step with the host
+    stalled and the device draining.
+
+    Pinned staging makes the same copy asynchronous (0.06 ms behind the same
+    queue) and leaves the values bit-identical; it is what the CUDA platform
+    does. The staging buffer is kept alive on the returned tensor so it cannot
+    be recycled while the copy is still in flight.
+
+    Pinned host memory is only unavailable on this platform for the multi-GB
+    registrations that fail with vendor error 712 (see
+    ``hooks/hisparse.py:_skip_host_register_for_hisparse_cold_pool``); these
+    vectors are a few hundred bytes. ``SGLANG_KUNLUN_ASYNC_H2D=0`` restores the
+    blocking pageable copy.
+    """
+    import torch
+
+    if os.environ.get("SGLANG_KUNLUN_ASYNC_H2D", "1").strip().lower() in (
+        "0",
+        "false",
+        "no",
+    ):
+        return torch.tensor(args, dtype=dtype).to(device)
+    host = torch.tensor(args, dtype=dtype, pin_memory=True)
+    out = host.to(device, non_blocking=True)
+    out._kunlun_h2d_staging = host
+    return out
 

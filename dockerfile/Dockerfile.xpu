@@ -1,0 +1,399 @@
+#
+# Kunlun P800 SGLang inference image
+#
+# ubuntu:20.04 -> python3.10 (uv venv) -> torch -> Kunlun runtime (xre/xccl)
+#   -> Kunlun plugins (xpytorch/kunlun_ops/flash_mla/mooncake/deepep/xspeedgate)
+#   -> sglang-kunlun plugin + xtriton -> cleanup
+#
+# All tunables are ARGs with defaults; override with --build-arg.
+#
+# Build context must contain two sibling repos:
+#   sglang/         SGLang engine source (baidu/aicapx/sglang). Copied only,
+#                   not installed; referenced at runtime via PYTHONPATH.
+#   sglang-kunlun/  Kunlun plugin (baidu/aicapx/sglang-kunlun). Installed with
+#                   `pip install -e . --no-deps`.
+#
+# Build:
+#   docker build -f Dockerfile.xpu -t klx-sglang:test .
+#
+# Slow-network sites can mirror the uv bootstrap:
+#   --build-arg UV_INSTALL_URL=<mirror>/uv-install.sh
+#   --build-arg UV_PYTHON_INSTALL_MIRROR=<mirror>/python-build-standalone
+
+# --- base image and package indexes ---
+ARG BASE_IMAGE=ubuntu:20.04
+# ARG BASE_IMAGE=iregistry.baidu-int.com/aicapx/ubuntu:20.04
+
+ARG UBUNTU_MIRROR=http://mirrors.baidubce.com/ubuntu
+ARG PYPI_INDEX=http://mirrors.baidubce.com/pypi/simple/
+ARG PYPI_HOST=mirrors.baidubce.com
+
+# --- python / torch ---
+# PYTHON_VERSION must match the cpXXX tag in the xpytorch package name,
+# TORCH_VERSION must match its torchXXX tag (torch290 -> 2.9.0). xpytorch is a
+# patch package: it installs torch_xmlir on top of an existing torch and does
+# not ship torch itself.
+ARG PYTHON_VERSION=3.10
+ARG UV_INSTALL_URL=https://astral.sh/uv/install.sh
+ARG UV_PYTHON_INSTALL_MIRROR=
+ARG TORCH_INDEX=http://mirrors.baidubce.com/pypi/simple/
+ARG TORCH_VERSION=2.9.0
+ARG NUMPY_SPEC=numpy<2
+ARG VENV=/opt/klx
+
+# --- Kunlun component URLs ---
+# Defaults mirror the qualified DeepSeek-V4-Flash SOP image. Override any of
+# them with --build-arg when a newer release is qualified. A missing or empty
+# value fails the build early instead of at download time.
+#
+# XPYTORCH_URL: its cpXXX / torchXXX tags must match PYTHON_VERSION and
+#   TORCH_VERSION above (cp310 / torch290 -> 3.10 / 2.9.0).
+# XRE_URL: both the .tar.gz and the Makeself .run flavor are accepted; the
+#   unpack path is picked from the suffix.
+# XPYTORCH_URL + KUNLUN_OPS_URL + XRE_URL + XCCL_URL are one matched set. Mixing
+#   releases segfaults when sglang builds its world group, or later inside the
+#   DSPARK draft sampler during CUDA graph capture.
+# XSPEEDGATE_URL: sglang-kunlun calls init_compressed_attn_metadata_v2, which
+#   only exists from 1.5.1 on. The SOP image /versions file still records 1.4.0,
+#   which is stale - do not copy that value back.
+ARG XPYTORCH_URL=https://klx-sdk-release-public.su.bcebos.com/kunlun2aiak_output/20260629/xpytorch-cp310-torch290-ubuntu2004-x64.run
+ARG KUNLUN_OPS_URL=https://aihc-private-hcd.bj.bcebos.com/zhouzhengsen/aicapx-1174_dsv4pro/kunlun_ops-0.1.204%2Ba65d931d-cp310-cp310-linux_x86_64.whl
+ARG XRE_URL=https://klx-sdk-release-public.su.bcebos.com/xre/kl3-release/5.0.21.43.6/peermem/xre-Linux-x86_64-5.0.21.43.6.tar.gz
+ARG XCCL_URL=https://su.bcebos.com/v1/klx-sdk-release-public/xccl/release/3.1.8.1/xccl_Linux_x86_64_cuda12.tar.gz
+ARG DEEPEP_URL=https://su.bcebos.com/v1/klx-sdk-release-public/DS_PD/deepep/3.1.8.1/deep_ep-cp310-cp310-linux_x86_64_cuda12.tar.gz
+ARG MOONCAKE_URL=https://su.bcebos.com/v1/klx-sdk-release-public/DS_PD/xmooncake/20250912_9/output.tar.gz
+ARG XSPEEDGATE_URL=https://aihc-private-hcd.bj.bcebos.com/xspeedgate_release/torch29/20261016_101619/xspeedgate_ops-1.6.0%2B67be7af.torch29-cp310-cp310-linux_x86_64.whl
+
+# --- other component URLs ---
+ARG FLASH_MLA_URL=https://su.bcebos.com/v1/klx-sdk-release-public/DS_PD/flash_mla/20250529/output.tar.gz
+ARG XTRITON_URL=https://su.bcebos.com/v1/klx-sdk-release-public/DS_PD/xtriton/20250624/output.tar.gz
+ARG COCOPOD_URL=
+ARG TUNE_FILE_URL=https://su.bcebos.com/v1/klx-sdk-release-public/DS_PD/tune_file/tune_file_0812
+ARG TUNE_FILE_FLASH_URL=https://su.bcebos.com/v1/klx-sdk-release-public/DS_PD/tune_file/tune_file_flash_0821
+ARG EPLB_INIT_PT_URL=https://vllm-ai-models.bj.bcebos.com/lidonghua/expert_distribution_init.pt
+ARG NSIGHT_DEB_URL=
+
+# --- engine source and framework layer ---
+ARG SGLANG_SRC=sglang
+ARG SGLANG_KUNLUN_SRC=sglang-kunlun
+# sgl_kernel is optional. sglang-kunlun stubs it before sglang imports, and a
+# qualified single-node run succeeds without it (verified). The SOP image does
+# ship 0.3.21, but installs it from a wheel inside the aiak_sglang repo, which
+# is not part of this build context. Set this if a standalone wheel URL exists.
+ARG SGL_KERNEL_URL=
+# sglang runtime deps. These three groups must stay separate:
+#   PINNED  installed with deps, versions locked. torch/torchaudio/torchvision are
+#           an ABI-matched triple; transformers/xgrammar/outlines/soxr follow the
+#           qualified sglang 0.5.17 set. Keeping torch here stops dependency
+#           resolution from replacing it.
+#   PLAIN   installed with deps, versions open.
+#   NODEPS  installed with --no-deps, versions locked. flashinfer 0.7.x reaches
+#           cute_dsl -> nvidia-cutlass-dsl 4.8.x, whose toolkit flavor probe reads
+#           the Kunlun libcuda shim as "CUDA 10.2" and aborts at import time.
+#           Do NOT add tilelang: it drags in stock triton and shadows xtriton.
+ARG SGLANG_PIP_PINNED="torch==2.9.0 torchaudio==2.9.0 torchvision==0.24.0 transformers==5.3.0 xgrammar==0.2.1 outlines==0.1.11 soxr==1.0.0"
+ARG SGLANG_PIP_PLAIN="accelerate aiohttp compressed_tensors dill fastapi gguf httpx interegular ipython jsonschema llguidance loguru lxml modelscope msgspec numba nvtx openai openai-harmony orjson partial-json-parser pillow polars prometheus-client pybase64 pydantic python-multipart pyzmq requests sentencepiece setproctitle soundfile starlette torch-memory-saver uvicorn uvloop watchfiles zstandard"
+ARG SGLANG_PIP_NODEPS="flashinfer-python==0.6.15.post1 nvidia-cutlass-dsl==4.5.2 nvidia-cutlass-dsl-libs-base==4.5.2"
+
+# ===========================================================================
+# stage 1: OS + runtime system libs + python venv
+# ===========================================================================
+FROM ${BASE_IMAGE} AS os-base
+
+ARG UBUNTU_MIRROR
+ARG PYPI_INDEX
+ARG PYPI_HOST
+ARG PYTHON_VERSION
+ARG UV_INSTALL_URL
+ARG UV_PYTHON_INSTALL_MIRROR
+ARG VENV
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=Asia/Shanghai \
+    LANG=en_US.UTF-8 \
+    LANGUAGE=en_US:en \
+    LC_ALL=en_US.UTF-8 \
+    TERM=xterm-256color
+
+RUN sed -i "s|http://archive.ubuntu.com/ubuntu|${UBUNTU_MIRROR}|g; \
+            s|http://security.ubuntu.com/ubuntu|${UBUNTU_MIRROR}|g" /etc/apt/sources.list && \
+    rm -rf /etc/apt/sources.list.d/*
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates tzdata locales \
+        libstdc++6 libgcc-s1 libgomp1 libomp5-10 libquadmath0 libgmp10 \
+        libnuma1 numactl \
+        libibverbs1 librdmacm1 libnl-3-200 libnl-route-3-200 \
+        libcurl4 libssl1.1 libsqlite3-0 libffi7 zlib1g liblzma5 libbz2-1.0 \
+        libuuid1 libexpat1 libreadline8 libncursesw6 libtinfo6 \
+        libjpeg-turbo8 libpng16-16 \
+        libgoogle-glog0v5 libarchive13 \
+        pciutils kmod fuse procps lsof net-tools iproute2 \
+        curl wget vim-tiny && \
+    sed -i "s/^# *\(en_US.UTF-8\|zh_CN.UTF-8\)/\1/" /etc/locale.gen && \
+    locale-gen en_US.UTF-8 zh_CN.UTF-8 && \
+    ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /usr/share/doc/* /usr/share/man/* /tmp/*
+
+# Mount point required by the qualification SOP (libxpunvidia-ml.so.1 bind mount).
+RUN mkdir -p /usr/local/cuda-11.7
+
+# uv installs into /root/.local/bin, so extend PATH before calling it.
+# --seed is required: xpytorch setup.sh calls bare `pip`.
+# Seed packages must come from PYPI_INDEX too, otherwise uv falls back to pypi.org.
+ENV PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+RUN curl -LsSf "${UV_INSTALL_URL}" | sh && \
+    uv python install ${PYTHON_VERSION} && \
+    UV_DEFAULT_INDEX="${PYPI_INDEX}" UV_INSECURE_HOST="${PYPI_HOST}" \
+      uv venv --seed --python ${PYTHON_VERSION} ${VENV} && \
+    rm -rf /root/.cache/uv /tmp/*
+
+# CONDA_PREFIX tells xpytorch setup.sh where to install xcudart shadow libs.
+ENV VIRTUAL_ENV=${VENV} \
+    CONDA_PREFIX=${VENV} \
+    PATH=${VENV}/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# ===========================================================================
+# stage 2: torch + numpy + build tools
+# ===========================================================================
+FROM os-base AS torch-base
+
+ARG PYPI_INDEX
+ARG PYPI_HOST
+ARG TORCH_INDEX
+ARG TORCH_VERSION
+ARG NUMPY_SPEC
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_INDEX_URL=${PYPI_INDEX} \
+    PIP_TRUSTED_HOST=${PYPI_HOST} \
+    UV_INSECURE_HOST=${PYPI_HOST} \
+    UV_DEFAULT_INDEX=${PYPI_INDEX}
+
+# torch must be a CUDA build: libtorch_cuda.so hard-depends on the cublas/cudnn/
+# cusparse/cufft/nccl/curand/nvrtc libs at load time. The default PyPI wheel is
+# already a CUDA build; a specific variant needs the pytorch index, e.g.
+# TORCH_INDEX=https://download.pytorch.org/whl/cu129 TORCH_VERSION=2.9.0+cu129.
+RUN uv pip install --index-url ${TORCH_INDEX} torch==${TORCH_VERSION} "${NUMPY_SPEC}" && \
+    uv pip install build wheel setuptools && \
+    rm -rf /root/.cache/uv /tmp/*
+
+# ===========================================================================
+# stage 3: Kunlun runtime (xre + xccl + tune files)
+# ===========================================================================
+FROM torch-base AS kunlun-runtime
+
+ARG XRE_URL
+ARG XCCL_URL
+ARG TUNE_FILE_URL
+ARG TUNE_FILE_FLASH_URL
+
+RUN set -eux; \
+    for v in XRE_URL XCCL_URL; do \
+        eval "u=\$$v"; \
+        [ -n "$u" ] || { echo "ERROR: $v is empty"; exit 2; }; \
+    done; \
+    cd /tmp; \
+    mkdir -p /usr/local/xre; \
+    if echo "${XRE_URL}" | grep -q '[.]run$'; then \
+        curl -fsSL -o xre.run "${XRE_URL}"; \
+        chmod +x xre.run; \
+        ./xre.run --noexec --target /usr/local/xre; \
+    else \
+        curl -fsSL -o xre.tar.gz "${XRE_URL}"; \
+        tar -xzf xre.tar.gz -C /usr/local/xre --strip-components=1; \
+    fi; \
+    cd /usr/local/xre/so; \
+    ln -sf libxpucuda.so libcuda.so; \
+    ln -sf libxpucuda.so libcuda.so.1; \
+    cd /tmp; \
+    curl -fsSL -o xccl.tar.gz "${XCCL_URL}"; \
+    mkdir -p /usr/local/xccl; \
+    tar -xzf xccl.tar.gz -C /usr/local/xccl --strip-components=1; \
+    find /usr/local/xre /usr/local/xccl -name '*.a' -delete; \
+    mkdir -p /usr/local/tune_file; \
+    if [ -n "${TUNE_FILE_URL}" ]; then \
+        curl -fsSL -o "/usr/local/tune_file/$(basename "${TUNE_FILE_URL}")" "${TUNE_FILE_URL}"; fi; \
+    if [ -n "${TUNE_FILE_FLASH_URL}" ]; then \
+        curl -fsSL -o "/usr/local/tune_file/$(basename "${TUNE_FILE_FLASH_URL}")" "${TUNE_FILE_FLASH_URL}"; fi; \
+    echo /usr/local/xre/so  > /etc/ld.so.conf.d/kunlun.conf; \
+    echo /usr/local/xccl/so >> /etc/ld.so.conf.d/kunlun.conf; \
+    ldconfig; \
+    rm -rf /tmp/*
+
+# ===========================================================================
+# stage 4: Kunlun plugins
+# ===========================================================================
+FROM kunlun-runtime AS kunlun-plugins
+
+ARG VENV
+ARG XPYTORCH_URL
+ARG KUNLUN_OPS_URL
+ARG FLASH_MLA_URL
+ARG DEEPEP_URL
+ARG MOONCAKE_URL
+ARG XSPEEDGATE_URL
+ARG COCOPOD_URL
+
+# xpytorch (torch_xmlir). torch_plugin is a C++ extension built on the spot, so
+# build-essential is installed and purged in the same layer. setup.sh imports
+# torch_xmlir at the end, which needs the third-party modules installed here.
+RUN set -eux; \
+    for v in XPYTORCH_URL KUNLUN_OPS_URL DEEPEP_URL MOONCAKE_URL XSPEEDGATE_URL; do \
+        eval "u=\$$v"; \
+        [ -n "$u" ] || { echo "ERROR: $v is empty"; exit 2; }; \
+    done; \
+    apt-get update && \
+    apt-get install -y --no-install-recommends build-essential && \
+    uv pip install \
+        colorama einops 'hyperparameter<0.6' packaging psutil pynvml \
+        regex tabulate transformers PyYAML; \
+    cd /tmp; \
+    curl -fL -o xpytorch.run "${XPYTORCH_URL}"; \
+    chmod +x xpytorch.run; \
+    bash xpytorch.run; \
+    apt-get purge -y build-essential && apt-get autoremove -y && apt-get clean; \
+    rm -rf /var/lib/apt/lists/* /tmp/* /root/.cache/pip /root/.cache/uv
+
+# Keep the original wheel filename: uv parses name and version from it.
+RUN set -eux; cd /tmp; \
+    url="${KUNLUN_OPS_URL}"; \
+    fn="$(basename "$url" | sed 's/%2B/+/g')"; \
+    curl -fL -o "$fn" "$url"; \
+    uv pip install --no-deps "$fn"; \
+    rm -rf /tmp/* /root/.cache/uv
+
+# flash_mla / deepep / mooncake: each tarball contains one wheel.
+RUN set -eux; cd /tmp; \
+    for pair in "flash_mla:${FLASH_MLA_URL}" "deepep:${DEEPEP_URL}" "mooncake:${MOONCAKE_URL}"; do \
+        name="${pair%%:*}"; url="${pair#*:}"; \
+        if [ -z "$url" ]; then echo "skip $name (no url)"; continue; fi; \
+        curl -fL -o "$name.tar.gz" "$url"; \
+        mkdir -p "x_$name"; \
+        tar -xzf "$name.tar.gz" -C "x_$name" ; \
+        whl="$(find "x_$name" -name '*.whl' | head -n1)"; \
+        if [ -z "$whl" ]; then echo "no whl in $name"; exit 3; fi; \
+        uv pip install --no-deps "$whl"; \
+        rm -rf "$name.tar.gz" "x_$name"; \
+    done; \
+    uv pip install portalocker; \
+    rm -rf /tmp/* /root/.cache/uv
+
+RUN set -eux; cd /tmp; \
+    for pair in "xspeedgate:${XSPEEDGATE_URL}" "cocopod:${COCOPOD_URL}"; do \
+        name="${pair%%:*}"; url="${pair#*:}"; \
+        if [ -z "$url" ]; then echo "skip $name (no url)"; continue; fi; \
+        fn="$(basename "$url" | sed 's/%2B/+/g')"; \
+        curl -fL -o "$fn" "$url"; \
+        uv pip install --no-deps "$fn"; \
+        rm -f "$fn"; \
+    done; \
+    rm -rf /tmp/* /root/.cache/uv
+
+# ===========================================================================
+# stage 5: sglang sources + plugin + xtriton
+# ===========================================================================
+FROM kunlun-plugins AS sglang-layer
+
+ARG VENV
+ARG PYTHON_VERSION
+ARG SGLANG_SRC
+ARG SGLANG_KUNLUN_SRC
+ARG SGL_KERNEL_URL
+ARG SGLANG_PIP_PINNED
+ARG SGLANG_PIP_PLAIN
+ARG SGLANG_PIP_NODEPS
+ARG XTRITON_URL
+ARG EPLB_INIT_PT_URL
+ARG NSIGHT_DEB_URL
+
+COPY ${SGLANG_SRC}/        /workspace/sglang/
+COPY ${SGLANG_KUNLUN_SRC}/ /workspace/sglang-kunlun/
+
+RUN set -eux; cd /tmp; \
+    if [ -n "${SGL_KERNEL_URL}" ]; then \
+        fn="$(basename "${SGL_KERNEL_URL}" | sed 's/%2B/+/g')"; \
+        curl -fL -o "$fn" "${SGL_KERNEL_URL}"; \
+        uv pip install --no-deps --reinstall "$fn"; \
+        rm -f "$fn"; \
+    fi; \
+    uv pip install ${SGLANG_PIP_PINNED} ${SGLANG_PIP_PLAIN}; \
+    uv pip install --no-deps ${SGLANG_PIP_NODEPS}; \
+    uv pip install hatchling; \
+    uv pip install -e /workspace/sglang-kunlun --no-deps; \
+    rm -rf /root/.cache/uv /root/.cache/pip /tmp/*
+
+# xtriton replaces stock triton and has to be installed after every pip step
+# above: torch==2.9.0 hard-depends on triton==3.5.0, so anything that touches
+# torch pulls the stock wheel back in. triton/backends/{nvidia,amd} must stay
+# because _discover_backends() unconditionally deletes the nvidia entry.
+RUN set -eux; cd /tmp; \
+    if [ -n "${XTRITON_URL}" ]; then \
+        curl -fL -o xtriton.tar.gz "${XTRITON_URL}"; \
+        mkdir -p x_triton && tar -xzf xtriton.tar.gz -C x_triton; \
+        whl="$(find x_triton -name '*.whl' | head -n1)"; \
+        [ -n "$whl" ] || { echo "no whl in xtriton"; exit 3; }; \
+        uv pip install --no-deps --reinstall "$whl"; \
+    fi; \
+    if [ -n "${EPLB_INIT_PT_URL:-}" ]; then \
+        curl -fL -o /workspace/expert_distribution_init.pt "${EPLB_INIT_PT_URL}"; fi; \
+    if [ -n "${NSIGHT_DEB_URL:-}" ]; then \
+        curl -fL -o ns.deb "${NSIGHT_DEB_URL}" && dpkg -i ns.deb && rm -f ns.deb; fi; \
+    rm -rf /tmp/* /root/.cache/uv
+
+# Expose kunlun_ops shared libs under torch_xmlir.
+RUN set -eux; SP="${VENV}/lib/python${PYTHON_VERSION}/site-packages"; \
+    for so in libapiinfer.so libinnerinfer.so; do \
+        if [ -f "$SP/kunlun_ops/$so" ] && [ ! -e "$SP/torch_xmlir/$so" ]; then \
+            ln -sf "$SP/kunlun_ops/$so" "$SP/torch_xmlir/$so"; fi; \
+    done
+
+# ===========================================================================
+# stage 6: final image (cleanup + runtime env)
+# ===========================================================================
+FROM sglang-layer AS runtime
+
+ARG VENV
+ARG PYTHON_VERSION
+
+# Do not remove: torch/bin, torch/_C_flatbuffer*.so, triton/backends/{nvidia,amd},
+# flashinfer, soxr, polars, modelscope.
+RUN set -eux; \
+    apt-get update && apt-get install -y --no-install-recommends binutils && \
+    SP="${VENV}/lib/python${PYTHON_VERSION}/site-packages"; \
+    find "$SP/nvidia" -name '*.a' -delete 2>/dev/null || true; \
+    rm -rf "$SP"/nvidia/*/include; \
+    rm -f  "$SP"/nvidia/cudnn/lib/libcudnn_engines_precompiled.so* \
+           "$SP"/nvidia/cudnn/lib/libcudnn_adv.so* \
+           "$SP"/nvidia/cudnn/lib/libcudnn_heuristic.so*; \
+    rm -rf "$SP"/nvidia/cusolver "$SP"/nvidia/nvtx; \
+    rm -f  "$SP"/torch/lib/libtorch_cuda_linalg.so; \
+    rm -rf "$SP"/torch/include "$SP"/torch/test; \
+    if [ -f "$SP/triton/_C/libtriton.so" ]; then strip --strip-unneeded "$SP/triton/_C/libtriton.so"; fi; \
+    rm -rf "$SP"/gradio "$SP"/gradio_client "$SP"/litellm "$SP"/wandb \
+           "$SP"/tensorboard "$SP"/tensorboard_data_server "$SP"/evalscope \
+           "$SP"/plotly "$SP"/matplotlib "$SP"/mpl_toolkits "$SP"/seaborn \
+           "$SP"/altair "$SP"/nltk "$SP"/jieba "$SP"/boto3 "$SP"/botocore \
+           "$SP"/s3fs "$SP"/webdataset "$SP"/onnx "$SP"/onnxruntime \
+           "$SP"/black "$SP"/blib2to3; \
+    find "$SP" -maxdepth 1 -name 'gradio*-*.dist-info' -o -maxdepth 1 -name 'litellm-*.dist-info' \
+         -o -maxdepth 1 -name 'wandb-*.dist-info' -o -maxdepth 1 -name 'tensorboard*-*.dist-info' \
+         -o -maxdepth 1 -name 'onnx*-*.dist-info' -o -maxdepth 1 -name 'matplotlib-*.dist-info' \
+         | xargs -r rm -rf; \
+    find "$SP" -name '*.pyc' -delete; \
+    find "$SP" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true; \
+    apt-get purge -y binutils && apt-get autoremove -y && apt-get clean; \
+    rm -rf /var/lib/apt/lists/* /root/.cache/uv /root/.cache/pip /tmp/*
+
+# Do not add site-packages/nvidia/cuda_runtime/lib: it shadows the xre libcudart
+# shadow library. PYTHONPATH / SGLANG_PLATFORM / SGLANG_USE_XPU are exported by
+# the launch script, not here (sitecustomize.py pre-shim would hook every python).
+# TVM_FFI_DISABLE_TORCH_C_DLPACK: tvm_ffi (pulled in by xgrammar/flashinfer) JIT
+# compiles a CUDA dlpack addon on import. There is no nvcc here, so the build
+# fails and respawns forever, stalling startup before any weight is loaded.
+ENV LD_LIBRARY_PATH=/usr/local/xre/so:/usr/local/xccl/so:/usr/local/lib/:/usr/lib/x86_64-linux-gnu:/usr/lib64: \
+    TUNE_FILE_PATH=/usr/local/tune_file \
+    TVM_FFI_DISABLE_TORCH_C_DLPACK=1
+
+WORKDIR /workspace
+CMD ["/bin/bash"]
