@@ -62,6 +62,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 #   XPYTORCH_ADDR          Kunlun PyTorch 后端（最贵）
 #   KUNLUN_OPS_ADDR        kunlun_ops
 #   XSPEEDGATE_OPS_ADDR    xspeedgate_ops
+#   PROTEUS_ADDR           proteus（覆盖 xpytorch 自带的那份，供 hydrax 用）
 #   HYDRAX_ADDR            hydrax daily（最便宜）
 #   ── 镜像环境 / 源码 ──
 #   TORCH_C_DLPACK_EXT     tvm_ffi 扩展
@@ -408,30 +409,48 @@ RUN set -eux; \
     echo "xspeedgate_ops=${XSPEEDGATE_OPS_ADDR}" >> /versions; \
     rm -rf /root/.cache/pip
 
-# hydrax (Hydra) daily：MegaMoE 的融合 MoE 算子（`int8_int4_mega_moe`）。
-#
-# 必须单独一步、必须 --force-reinstall：上面那个 xpytorch 的 .run 已经装过一个
-# hydrax，版本偏旧、没有我们要用的 MegaMoE 入口。普通 `pip install` 看到
-# 版本号相同就直接跳过，所以只有 --force-reinstall 才能盖掉。
-#
-# --no-deps 不能省：--force-reinstall 会连依赖一起强制重装，而 hydrax 声明了
-# torch。那会把上面钉死的 torch 2.9.0+cu129（xpytorch 配套的那份）换成 PyPI 的
-# 普通构建，整个昆仑后端随之报废。两个参数必须一起给。
-#
-# 这个 tarball 里只有一个 cp312 的 whl（`hydrax_py312_torch290/hydrax-*.whl`），
-# 所以没套上面那个跳过非 cp312 的循环。
-#
-# 发的是 daily 包，版本动得比其它组件勤，所以排在算子库之后。
-ARG HYDRAX_ADDR=https://klx-sdk-release-public.su.bcebos.com/Hydra/daily/20261105/hydrax_py312_torch290.tar.gz
+# ── hydrax + proteus（1113situ 同批产出，必须成对换）──────────────────────
+# 两者都必须排在 xpytorch 之后：xpytorch 的 .run 自带一份 proteus 和一份旧
+# hydrax，先让它装完，再用 --force-reinstall 覆盖；放在它前面会被 .run 盖掉。
+# 内部顺序也固定：proteus 先、hydrax 后 —— hydrax 的 import 检查会立刻 dlopen
+# libHydraOps.so，它要的 proteus_xpu_ops 符号得先就位（换新 hydrax 时见过
+# "undefined symbol: ...proteus_xpu_ops...pre_init(...)"）。
+ARG PROTEUS_ADDR=https://klx-sdk-release-public.su.bcebos.com/guoxiaokang/mega_moe/1113situ/proteus-0.1.0-cp312-cp312-linux_x86_64.whl
+ARG HYDRAX_ADDR=https://klx-sdk-release-public.su.bcebos.com/guoxiaokang/mega_moe/1113situ/hydrax-0.1.0-cp312-cp312-linux_x86_64.whl
+
+# 一个 RUN 装完两者：proteus → hydrax 的顺序是硬约束，「新 proteus + 旧 hydrax」
+# 这个中间态没有可用场景，也就没有单独缓存的必要；合成一层还能避免中途失败后
+# 留下半套状态。
 RUN set -eux; \
-    cd /tmp; \
-    curl -fsSL --retry 5 -o hydrax.tar.gz "${HYDRAX_ADDR}"; \
-    mkdir -p unpack && tar -xzf hydrax.tar.gz -C unpack; \
-    whl="$(find unpack -name 'hydrax-*cp312*.whl' | head -n 1)"; test -n "${whl}"; \
+    pip install --no-deps --force-reinstall --retries 5 "${PROTEUS_ADDR}"; \
+    # import torch first: xpytorch_import_hook turns `import torch` into
+    # `import torch_xmlir`; starting the process with proteus/hydrax instead
+    # trips a circular import that the hook only logs as a warning.
+    python -c "import torch, torch_xmlir; import proteus; import importlib.metadata as m; print('proteus', m.version('proteus'))"; \
+    # hydrax 两种发布形式都吃：.whl 直接装，.tar.gz 解开再找 whl。
+    case "${HYDRAX_ADDR}" in \
+      *.whl) \
+        # Installing straight from the URL keeps the real wheel filename; a copy
+        # renamed to something fixed is rejected as "Invalid wheel filename
+        # (wrong number of parts)".
+        whl="${HYDRAX_ADDR}" ;; \
+      *) \
+        cd /tmp; \
+        # /tmp/unpack would otherwise survive from an earlier attempt and make
+        # the find below return a stale wheel.
+        rm -rf unpack hydrax.tar.gz; \
+        curl -fsSL --retry 5 -o hydrax.tar.gz "${HYDRAX_ADDR}"; \
+        mkdir -p unpack && tar -xzf hydrax.tar.gz -C unpack; \
+        # cp312 first -- a tarball may carry several ABIs; fall back to any whl
+        # so the error comes from pip instead of a silent skip.
+        whl="$(find unpack -name 'hydrax-*cp312*.whl' | head -n 1)"; \
+        [ -n "${whl}" ] || whl="$(find unpack -name 'hydrax-*.whl' | head -n 1)"; \
+        test -n "${whl}" ;; \
+    esac; \
     pip install --no-deps --force-reinstall --retries 5 "${whl}"; \
-    python -c "from hydrax.xaccelerator.mega_moe_fusion import int8_int4_mega_moe, get_symm_buffer; import hydrax; print('hydrax', hydrax.__version__)"; \
-    rm -rf unpack hydrax.tar.gz /root/.cache/pip; \
-    echo "hydrax=${HYDRAX_ADDR}" >> /versions
+    python -c "import torch, torch_xmlir; from hydrax.xaccelerator.mega_moe_fusion import int8_int4_mega_moe, get_symm_buffer; import hydrax; print('hydrax', hydrax.__version__)"; \
+    rm -rf /root/.cache/pip /tmp/unpack /tmp/hydrax.tar.gz; \
+    { echo "proteus=${PROTEUS_ADDR}"; echo "hydrax=${HYDRAX_ADDR}"; } >> /versions
 
 # ── 稳定尾巴：镜像级环境 + 与源码无关的 wheel ──────────────────────────────
 # 两步都放在源码 COPY 之前，改插件源码时不该被重跑（c-dlpack 是一次网络 pip
