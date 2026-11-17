@@ -211,6 +211,7 @@ supported; it is not a complete compatibility matrix.
 | GLM5.3 | `w8a8_int8`, `w4a8` | Supports W4A8 in addition to W8A8 INT8. |
 | DeepSeek-V4-Flash-0731 | `w8a8_int8` | Current DSPARK launch example (Attention W8A8, MoE W4A8 INT8 Dynamic). |
 | MiniMax-M3 | `w8a8_int8` | Validate with the target SGLang/Kunlun versions. |
+| Qwen3.8-27B | `None` | Validate with the target SGLang/Kunlun versions. |
 
 ## Version Matrix
 
