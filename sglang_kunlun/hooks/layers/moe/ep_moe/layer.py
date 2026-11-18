@@ -83,6 +83,24 @@ from kunlun_ops import (
 logger = logging.getLogger(__name__)
 
 
+def _situ_mask_params(config):
+    """``(beta, linear_beta)`` for a SiTU activation, else None."""
+    if config.activation != "situ":
+        return None
+    beta = getattr(config, "gemm1_alpha", None)
+    linear_beta = getattr(config, "gemm1_clamp_limit", None)
+    return (
+        1.0 if beta is None else float(beta),
+        -1.0 if linear_beta is None else float(linear_beta),
+    )
+
+
+def _situ_kernel_supported(params) -> bool:
+    """The masked SiTU kernels only implement the ERNIE 5.5 constants."""
+    beta, linear_beta = params
+    return abs(beta - 4.0) <= 1e-9 and abs(linear_beta - 25.0) <= 1e-9
+
+
 class _DSV4ClampedSiluAndMul(torch.nn.Module):
     """SiluAndMul with the DeepSeek-V4 swiglu_limit clamp on the gate/up inputs.
 
@@ -1210,23 +1228,26 @@ class DeepEPMoE(FusedMoE):
             device=gateup_output.device,
             dtype=gateup_output.dtype,
         )
-        if self.moe_runner_config.activation == "situ":
-            # XiSpeedGate SiTU over the gate/up halves. Rows past masked_m are
-            # uninitialized torch.empty memory, so zero them; the masked GEMM
-            # never reads them.
+        situ_params = _situ_mask_params(self.moe_runner_config)
+        if situ_params is not None and _situ_kernel_supported(situ_params):
+            # One masked kernel for SiTU + multiply; invalid rows are zeroed
+            # from the device counts without a host round trip.
+            import kunlun_ops
+
+            kunlun_ops.situ_and_mul_masked(
+                gateup_output, down_input, masked_m, *situ_params
+            )
+        elif situ_params is not None:
             import xspeedgate_ops  # noqa: F401  # registers torch.ops.xspeedgate_ops
 
-            beta = getattr(self.moe_runner_config, "gemm1_alpha", None)
-            linear_beta = getattr(self.moe_runner_config, "gemm1_clamp_limit", None)
-            act = torch.ops.xspeedgate_ops.situ_and_mul(
-                gateup_output.view(-1, n),
-                1.0 if beta is None else float(beta),
-                -1.0 if linear_beta is None else float(linear_beta),
-            ).view(num_groups, m, n // 2)
-            expert_rows = torch.arange(m, device=act.device)
-            valid = expert_rows[None, :] < masked_m.to(torch.int64)[:, None]
-            act.masked_fill_(~valid.unsqueeze(-1), 0.0)
-            down_input = act
+            _counts = masked_m
+            if _counts.dtype != torch.int32:
+                _counts = _counts.to(torch.int32)
+            activated = torch.zeros_like(down_input)
+            torch.ops.xspeedgate_ops.masked_situ_and_mul(
+                activated, gateup_output, _counts, *situ_params
+            )
+            down_input = activated
         else:
             silu_and_mul_mask_fwd(
                 gateup_output.view(-1, n),
@@ -1298,31 +1319,32 @@ class DeepEPMoE(FusedMoE):
             device=gateup_output.device,
             dtype=torch.float32,
         )
-        if self.moe_runner_config.activation == "situ":
-            # XiSpeedGate SiTU over the gate/up halves, then per-row absmax
-            # INT8 quant. Rows past masked_m are uninitialized torch.empty
-            # memory and make the quant kernel raise, so zero them first; the
-            # masked GEMM never reads them.
+        situ_params = _situ_mask_params(self.moe_runner_config)
+        if situ_params is not None and _situ_kernel_supported(situ_params):
+            # SiTU + per-token INT8 requant in one masked kernel, the SiTU
+            # counterpart of silu_and_per_token_group_quant_I8 below.
             import kunlun_ops
-            import xspeedgate_ops  # noqa: F401  # registers torch.ops.xspeedgate_ops
 
-            beta = getattr(self.moe_runner_config, "gemm1_alpha", None)
-            linear_beta = getattr(self.moe_runner_config, "gemm1_clamp_limit", None)
-            act = torch.ops.xspeedgate_ops.situ_and_mul(
-                gateup_output.view(-1, n),
-                1.0 if beta is None else float(beta),
-                -1.0 if linear_beta is None else float(linear_beta),
-            ).view(num_groups, m, half)
-            expert_rows = torch.arange(m, device=act.device)
-            valid = expert_rows[None, :] < masked_m.to(torch.int64)[:, None]
-            act.masked_fill_(~valid.unsqueeze(-1), 0.0)
+            kunlun_ops.situ_quant_masked(
+                gateup_output, down_input, down_input_scale, masked_m, *situ_params
+            )
+        elif situ_params is not None:
+            import kunlun_ops
+            import xspeedgate_ops  # noqa: F401
+
+            _counts = masked_m
+            if _counts.dtype != torch.int32:
+                _counts = _counts.to(torch.int32)
+            activated = torch.zeros_like(gateup_output[..., : down_input.shape[-1]])
+            torch.ops.xspeedgate_ops.masked_situ_and_mul(
+                activated, gateup_output, _counts, *situ_params
+            )
             kunlun_ops.quant2d(
-                act.view(-1, half),
-                down_input.view(-1, half),
+                activated.contiguous().view(-1, activated.shape[-1]),
+                down_input.view(-1, down_input.shape[-1]),
                 down_input_scale.view(-1),
                 force_sdnn=False,
             )
-            del act
         else:
             silu_and_per_token_group_quant_I8(
                 gateup_output,

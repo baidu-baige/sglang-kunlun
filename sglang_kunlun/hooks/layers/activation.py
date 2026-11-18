@@ -6,6 +6,55 @@ import torch
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
+# multimax reads eight scalar parameters from device tensors. They are loaded
+# once from the checkpoint and never written after that, so the host copy is
+# cached on (data_ptr, version) instead of paying a D2H sync per logit step.
+_MULTIMAX_SCALARS: dict[tuple, tuple[float, ...] | None] = {}
+
+
+def _multimax_scalars(ranges: torch.Tensor, ts: torch.Tensor):
+    if ranges.numel() != 4 or ts.numel() != 4:
+        return None
+    key = (
+        ranges.data_ptr(),
+        ts.data_ptr(),
+        ranges._version,
+        ts._version,
+        ranges.dtype,
+        ts.dtype,
+    )
+    if key not in _MULTIMAX_SCALARS:
+        if len(_MULTIMAX_SCALARS) >= 16:
+            _MULTIMAX_SCALARS.clear()
+        try:
+            _MULTIMAX_SCALARS[key] = tuple(
+                float(v) for v in (*ranges.tolist(), *ts.tolist())
+            )
+        except (RuntimeError, TypeError):
+            _MULTIMAX_SCALARS[key] = None
+    return _MULTIMAX_SCALARS[key]
+
+
+def _sigmoid_mul_kernel_supported(
+    attn_output: torch.Tensor, gate: torch.Tensor
+) -> bool:
+    """Mirror the fused_sigmoid_mul input contract before calling the kernel."""
+    if attn_output.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        return False
+    if gate.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        return False
+    if attn_output.device != gate.device or attn_output.layout != torch.strided:
+        return False
+    if attn_output.ndim < 1 or not attn_output.is_contiguous():
+        return False
+    if any(s < 0 for s in gate.stride()):
+        return False
+    if gate.ndim == 3 and attn_output.ndim == 2:
+        return attn_output.shape == (gate.shape[0], gate.shape[1] * gate.shape[2])
+    if gate.shape != attn_output.shape:
+        return False
+    return gate.ndim <= 3 or gate.is_contiguous()
+
 
 @plugin_hook(
     "sglang.srt.layers.activation.SituAndMul.forward_cuda",
@@ -140,6 +189,14 @@ def fused_sigmoid_mul_kunlun(
         raise NotImplementedError(
             "Kunlun fused_sigmoid_mul does not implement quant=True"
         )
+    if _sigmoid_mul_kernel_supported(attn_output, gate):
+        # One XPU3 kernel for sigmoid + multiply; accepts the strided 2D/3D
+        # gates the EB5 gated-attention path produces without a contiguous copy.
+        import kunlun_ops
+
+        return kunlun_ops.fused_sigmoid_mul(
+            attn_output, gate, inplace=inplace, round_sigmoid=round_sigmoid
+        )
     if gate.ndim == 3 and attn_output.ndim == 2:
         gate = gate.reshape(gate.shape[0], -1)
     if round_sigmoid:
@@ -164,13 +221,32 @@ def multimax_kunlun(x: torch.Tensor, ranges: torch.Tensor, ts: torch.Tensor):
     """Torch-native replacement for the Triton ERNIE 5.5 ``multimax`` logit head.
 
     ERNIE 5.5's ``_compute_lm_head`` calls ``multimax`` (``activation/multimax.py``),
-    which launches ``_multimax_kernel[grid]`` for bf16 inputs (a bare stub on
+    which launches ``_multimax_kernel[grid]`` for bf16/fp16 inputs (a bare stub on
     Kunlun). The module already ships ``multimax_torch`` as the eager reference
     (``x + t0*relu(r0-x) + t1*relu(x-r1) + t2*relu(r2-x)^2 + t3*relu(x-r3)^2``);
-    reuse it for every dtype. The Triton path rounds each primitive to bf16 for
-    bit-identical output; the eager accumulation differs slightly, to be checked
-    at the phase-3 precision step.
+    reuse it for every dtype. The Triton path rounds each primitive to the input
+    dtype for bit-identical output; the eager accumulation differs slightly, to
+    be checked at the phase-3 precision step.
     """
+    if x.dtype in (torch.bfloat16, torch.float16) and x.is_contiguous():
+        scalars = _multimax_scalars(ranges, ts)
+        if scalars is not None:
+            import kunlun_ops
+
+            # Kernel order is t0..t3 then r0..r3; cached order is ranges+ts.
+            out = torch.empty_like(x)
+            try:
+                kunlun_ops.multimax(x, out, *scalars[4:8], *scalars[0:4])
+                return out
+            except RuntimeError as exc:
+                # Fused kernel unsupported for this shape/dtype (ret=1);
+                # fall back to the eager reference, matching "when supported".
+                logger.warning(
+                    "multimax_fused_fallback dtype=%s shape=%s reason=%s",
+                    x.dtype,
+                    tuple(x.shape),
+                    exc,
+                )
     from sglang.kernels.ops.activation.multimax import multimax_torch
 
     return multimax_torch(x, ranges, ts)
