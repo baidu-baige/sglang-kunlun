@@ -1210,12 +1210,30 @@ class DeepEPMoE(FusedMoE):
             device=gateup_output.device,
             dtype=gateup_output.dtype,
         )
-        silu_and_mul_mask_fwd(
-            gateup_output.view(-1, n),
-            down_input.view(-1, n // 2),
-            masked_m,
-            limit=self.swiglu_limit,
-        )
+        if self.moe_runner_config.activation == "situ":
+            # XiSpeedGate SiTU over the gate/up halves. Rows past masked_m are
+            # uninitialized torch.empty memory, so zero them; the masked GEMM
+            # never reads them.
+            import xspeedgate_ops  # noqa: F401  # registers torch.ops.xspeedgate_ops
+
+            beta = getattr(self.moe_runner_config, "gemm1_alpha", None)
+            linear_beta = getattr(self.moe_runner_config, "gemm1_clamp_limit", None)
+            act = torch.ops.xspeedgate_ops.situ_and_mul(
+                gateup_output.view(-1, n),
+                1.0 if beta is None else float(beta),
+                -1.0 if linear_beta is None else float(linear_beta),
+            ).view(num_groups, m, n // 2)
+            expert_rows = torch.arange(m, device=act.device)
+            valid = expert_rows[None, :] < masked_m.to(torch.int64)[:, None]
+            act.masked_fill_(~valid.unsqueeze(-1), 0.0)
+            down_input = act
+        else:
+            silu_and_mul_mask_fwd(
+                gateup_output.view(-1, n),
+                down_input.view(-1, n // 2),
+                masked_m,
+                limit=self.swiglu_limit,
+            )
         del gateup_output
 
         # GroupGemm-1
@@ -1267,7 +1285,7 @@ class DeepEPMoE(FusedMoE):
         )
         dispose_tensor(hidden_states)
 
-        # Act: SwiGLU + per-token INT8 quant.
+        # Act: SiTU (situ checkpoints) or SwiGLU + per-token INT8 quant.
         half = n // 2
         down_input = torch.empty(
             (num_groups, m, half),
@@ -1280,13 +1298,39 @@ class DeepEPMoE(FusedMoE):
             device=gateup_output.device,
             dtype=torch.float32,
         )
-        silu_and_per_token_group_quant_I8(
-            gateup_output,
-            down_input,
-            down_input_scale,
-            masked_m,
-            limit=self.swiglu_limit,
-        )
+        if self.moe_runner_config.activation == "situ":
+            # XiSpeedGate SiTU over the gate/up halves, then per-row absmax
+            # INT8 quant. Rows past masked_m are uninitialized torch.empty
+            # memory and make the quant kernel raise, so zero them first; the
+            # masked GEMM never reads them.
+            import kunlun_ops
+            import xspeedgate_ops  # noqa: F401  # registers torch.ops.xspeedgate_ops
+
+            beta = getattr(self.moe_runner_config, "gemm1_alpha", None)
+            linear_beta = getattr(self.moe_runner_config, "gemm1_clamp_limit", None)
+            act = torch.ops.xspeedgate_ops.situ_and_mul(
+                gateup_output.view(-1, n),
+                1.0 if beta is None else float(beta),
+                -1.0 if linear_beta is None else float(linear_beta),
+            ).view(num_groups, m, half)
+            expert_rows = torch.arange(m, device=act.device)
+            valid = expert_rows[None, :] < masked_m.to(torch.int64)[:, None]
+            act.masked_fill_(~valid.unsqueeze(-1), 0.0)
+            kunlun_ops.quant2d(
+                act.view(-1, half),
+                down_input.view(-1, half),
+                down_input_scale.view(-1),
+                force_sdnn=False,
+            )
+            del act
+        else:
+            silu_and_per_token_group_quant_I8(
+                gateup_output,
+                down_input,
+                down_input_scale,
+                masked_m,
+                limit=self.swiglu_limit,
+            )
         del gateup_output
 
         # GroupGemm-1
