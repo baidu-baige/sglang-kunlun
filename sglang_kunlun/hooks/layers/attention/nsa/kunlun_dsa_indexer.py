@@ -719,9 +719,14 @@ def _get_topk_paged(
         num_draft > 1
         and bs * num_draft == q_offset
         and block_tables.shape[0] == bs * num_draft
-        and len(extend_lens) == bs * num_draft
-        and all(int(e) == 1 for e in extend_lens)
-        and q_fp8.is_contiguous()
+        # ``get_dsa_extend_len_cpu`` is request-major: verify metadata is
+        # ``[num_draft] * bs``, while a ragged draft-extend batch is
+        # ``[accepted_0, ..., accepted_{bs-1}]``.  The old condition treated
+        # this as one entry per query token (``[1] * (bs * num_draft)``), so
+        # every fixed-width verify batch missed the fold and launched the
+        # vendor MQA kernel once per draft token.
+        and len(extend_lens) == bs
+        and all(int(e) == num_draft for e in extend_lens)
         and (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
@@ -745,7 +750,7 @@ def _get_topk_paged(
             seqlens_32 = req_lens[:bs]
             seqlens_32_cpu = req_lens_cpu[:bs]
             block_tables = block_tables[::num_draft].contiguous()
-            q_in = q_fp8[:q_offset].view(
+            q_in = q_fp8[:q_offset].reshape(
                 bs, num_draft, q_fp8.shape[2], q_fp8.shape[3]
             )
         else:
