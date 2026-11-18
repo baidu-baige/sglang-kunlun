@@ -42,7 +42,19 @@ _T1 = [
     "mlp.down_proj",
 ]
 _T2 = _T1 + ["self_attn"]
-_ALWAYS_BF16 = ("wo_a", "lm_head", "embed_tokens", "indexer", "mhc")
+_ALWAYS_BF16 = (
+    "wo_a",
+    "lm_head",
+    "embed_tokens",
+    "indexer",
+    "mhc",
+    # DSpark draft stages: with the W4A8 draft support from
+    # dev-kunlun-0.5.23-ernie-5.5 (772d3ba) the draft's commit_kv_proj hands
+    # quant2d a dtype it rejects ("quant2d not support x dtype"). The draft is
+    # three layers, so INT8 there buys nothing measurable.
+    "stages.",
+    "commit_kv_proj",
+)
 _ALIGN = 128
 _LOGGED = False
 

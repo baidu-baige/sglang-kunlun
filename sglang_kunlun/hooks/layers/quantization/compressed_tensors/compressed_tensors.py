@@ -203,6 +203,19 @@ class KunlunCompressedTensorsConfig(CompressedTensorsConfig):
                 return Fp8LinearMethod(self.linear_fp8_config)
             scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
             if scheme is None:
+                # A compressed-tensors checkpoint that only quantizes the routed
+                # experts (ERNIE 5.5 W4A8) sends every dense projection here, so
+                # they would run FP16/BF16 GEMMs. EB5_INT8_DENSE opts the dense
+                # prefixes into online INT8 instead -- the same knob and the same
+                # method the w8a8_int8 config path already offers
+                # (w8a8_int8.py:474). Unset/0, this is a no-op.
+                from sglang_kunlun.hooks.layers.quantization.int8_dense_online import (
+                    method_for as _int8_dense_method_for,
+                )
+
+                online = _int8_dense_method_for(layer, prefix)
+                if online is not None:
+                    return online
                 return UnquantizedLinearMethod()
             if isinstance(scheme, CompressedTensorsWNA16):
                 raise NotImplementedError("Not supported yet")
