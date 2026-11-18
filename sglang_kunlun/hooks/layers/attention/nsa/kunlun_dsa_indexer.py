@@ -195,6 +195,34 @@ def _indexer_wk_weights(indexer, x: torch.Tensor):
     return key, weights
 
 
+def _indexer_key_dtype(indexer, fallback: torch.dtype) -> torch.dtype:
+    """Dtype the index-key projection will produce.
+
+    The rotary requires q and k to agree, so the query has to follow the key,
+    not a hardcoded bf16. Which dtype that is depends on the layout upstream
+    built: the fused ``wk_weights_proj`` is ``params_dtype=bfloat16``
+    unconditionally (``dsa_indexer.py:352-358``), while the non-fused ``wk``
+    follows the served dtype -- which is what 0.5.8 had, and what makes the
+    index scores bitwise comparable against it (0.5.8 dumps
+    ``indexer.wk`` as fp16, 0.5.23 ``wk_weights_proj`` as bf16, and that one
+    difference is the first divergence in the whole prefill chain:
+    ``layers.0.self_attn.indexer.wk`` max 3.1e-2 / 94 % of elements, with every
+    tensor before it bit-identical).
+
+    An integer weight (W8A8 indexer checkpoints) carries no usable dtype, so
+    fall back to the activation's.
+    """
+    for name in ("wk", "wk_weights_proj"):
+        layer = getattr(indexer, name, None)
+        if layer is None:
+            continue
+        dtype = getattr(getattr(layer, "weight", None), "dtype", None)
+        if dtype is not None and dtype.is_floating_point:
+            return dtype
+        return fallback
+    return fallback
+
+
 def _resolve_deps(indexer) -> None:
     """Fail loudly (once per call) if upstream renamed something we depend on."""
     missing = [a for a in REQUIRED_INDEXER_ATTRS if not hasattr(indexer, a)]
@@ -345,8 +373,14 @@ def _get_logits_head_gate(indexer, x: torch.Tensor, q_scale: torch.Tensor):
     _, weights = _indexer_wk_weights(indexer, x)
     # GLM 5掉点
     weights = weights.float()
-    weights = weights * indexer.n_heads**-0.5
-    weights = weights * q_scale * indexer.softmax_scale
+    # Same multiply order as 0.5.8 (`sgl_kernel/patch/.../nsa_indexer.py:150-158`):
+    # the two constants collapse into one scalar, then one multiply by the
+    # per-(token, head) `q_scale`. Upstream splits it the other way
+    # (`* n_heads**-0.5`, then `* q_scale * softmax_scale`), which is one extra
+    # fp32 rounding per element on a value that feeds a top-k -- enough to flip
+    # near-ties and so enough to break a bitwise comparison against 0.5.8.
+    weights = weights * (indexer.n_heads**-0.5 * indexer.softmax_scale)
+    weights = weights * q_scale
     return weights
 
 
@@ -1441,16 +1475,17 @@ def _get_q_k_bf16(
         indexer.alt_stream.wait_stream(current_stream)
         # for kunlun ops
         query, _ = indexer.wq_b(q_lora.to(_act_dtype_for(indexer.wq_b, q_lora)))
-        # The DSA indexer chain runs in bf16: the Hadamard rotation is bf16-only
-        # and `prefill_attention_dsa_opt` requires q/kv/out/lse_out to agree
-        # (measured: passing fp16 q with bf16 kv raises `Check failed,
-        # prefill_attention_dsa_opt not support q/kv/out/lse_out/indices dtype`,
-        # and passing fp16 q with bf16 k raises `query and key must have same
-        # dtype` in the rotary). 0.5.23 builds the fused `wk_weights_proj` at
-        # `params_dtype=bfloat16` while this run serves GLM-5.3 at
-        # `--dtype float16`, so the projection's own dtype is the one to follow
-        # rather than the model dtype.
-        query = query.to(torch.bfloat16)
+        # Follow the key projection's dtype, which the rotary requires q and k
+        # to share (fp16 q against bf16 k raises `query and key must have same
+        # dtype`). With upstream's fused `wk_weights_proj` that is bf16
+        # (`params_dtype=bfloat16`, `dsa_indexer.py:352-358`); with
+        # `SGLANG_DISABLE_DSA_INDEXER_FUSION=1` upstream builds `wk` at the
+        # served dtype and the whole index chain is fp16, which is the 0.5.8
+        # layout and the only way the index scores can match it bitwise.
+        # Downstream is dtype-agnostic: q and k are both int8 by the time they
+        # reach `dsa_mqa_logits` (`kunlun_ops.quant2d`), and the Hadamard has a
+        # native fp16 path (`SGLANG_KUNLUN_HADAMARD_FP16`, default on).
+        query = query.to(_indexer_key_dtype(indexer, torch.bfloat16))
         query = rearrange(query, "l (h d) -> l h d", d=indexer.head_dim)
         q_rope, _ = torch.split(
             query,
@@ -1471,16 +1506,17 @@ def _get_q_k_bf16(
         current_stream.wait_stream(indexer.alt_stream)
     else:
         query, _ = indexer.wq_b(q_lora.to(_act_dtype_for(indexer.wq_b, q_lora)))
-        # The DSA indexer chain runs in bf16: the Hadamard rotation is bf16-only
-        # and `prefill_attention_dsa_opt` requires q/kv/out/lse_out to agree
-        # (measured: passing fp16 q with bf16 kv raises `Check failed,
-        # prefill_attention_dsa_opt not support q/kv/out/lse_out/indices dtype`,
-        # and passing fp16 q with bf16 k raises `query and key must have same
-        # dtype` in the rotary). 0.5.23 builds the fused `wk_weights_proj` at
-        # `params_dtype=bfloat16` while this run serves GLM-5.3 at
-        # `--dtype float16`, so the projection's own dtype is the one to follow
-        # rather than the model dtype.
-        query = query.to(torch.bfloat16)
+        # Follow the key projection's dtype, which the rotary requires q and k
+        # to share (fp16 q against bf16 k raises `query and key must have same
+        # dtype`). With upstream's fused `wk_weights_proj` that is bf16
+        # (`params_dtype=bfloat16`, `dsa_indexer.py:352-358`); with
+        # `SGLANG_DISABLE_DSA_INDEXER_FUSION=1` upstream builds `wk` at the
+        # served dtype and the whole index chain is fp16, which is the 0.5.8
+        # layout and the only way the index scores can match it bitwise.
+        # Downstream is dtype-agnostic: q and k are both int8 by the time they
+        # reach `dsa_mqa_logits` (`kunlun_ops.quant2d`), and the Hadamard has a
+        # native fp16 path (`SGLANG_KUNLUN_HADAMARD_FP16`, default on).
+        query = query.to(_indexer_key_dtype(indexer, torch.bfloat16))
         query = rearrange(query, "l (h d) -> l h d", d=indexer.head_dim)
         q_rope, _ = torch.split(
             query, [indexer.rope_head_dim, indexer.head_dim - indexer.rope_head_dim], dim=-1

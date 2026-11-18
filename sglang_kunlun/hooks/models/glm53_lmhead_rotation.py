@@ -176,6 +176,7 @@ class Int8RotatedHead(torch.nn.Module):
         return self._block_scale
 
     def forward(self, x):
+        """Run the rotated int8 chain: Hadamard, quantise, int8 GEMM, dequantise."""
         import kunlun_ops
 
         out_dtype = x.dtype
