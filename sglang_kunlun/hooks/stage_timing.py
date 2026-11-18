@@ -78,7 +78,15 @@ _SUB = (
     "graph_replay",
 )
 
+# Segments reported with their per-step call count (see `_report`).
+_COUNTED = (
+    "refresh_host_mirrors",
+    "refresh_host_lengths_from_cpu",
+    "init_forward_metadata",
+)
+
 _acc = {}
+_cnt = {}
 _n = 0
 _bs_sum = 0
 _wall_ms = 0.0
@@ -90,6 +98,7 @@ _in_decode = False
 def _add(name, dt_ms):
     if _in_decode:
         _acc[name] = _acc.get(name, 0.0) + dt_ms
+        _cnt[name] = _cnt.get(name, 0) + 1
 
 
 def _timed(name):
@@ -124,9 +133,19 @@ def _report():
     rb = _acc.get("run_batch", 0.0) / n
     top = {k: _acc.get(k, 0.0) / n for k in _TOP}
     sub = {k: _acc.get(k, 0.0) / n for k in _SUB}
+    # Segments whose CALL COUNT is the question, not just their time: the host
+    # mirrors are refreshed either from the padded CPU lengths (cheap) or by
+    # reading the device back (not), and which one runs is a property of the
+    # graph layout, so the per-step call count has to be measured rather than
+    # assumed. `n=` is calls per decode step.
+    extra = " ".join(
+        f"{k}={_acc[k] / n:.2f}(n={_cnt.get(k, 0) / n:.2f})"
+        for k in _COUNTED
+        if k in _acc
+    )
     print(
         "[SEG] r=%d steps=%d bs=%.2f wall=%.2f run_batch=%.2f outside=%.2f "
-        "resid=%.2f | %s | %s"
+        "resid=%.2f | %s | %s | %s"
         % (
             _rank(),
             n,
@@ -137,6 +156,7 @@ def _report():
             rb - sum(top.values()),
             " ".join(f"{k}={v:.2f}" for k, v in top.items()),
             " ".join(f"{k}={v:.2f}" for k, v in sub.items()),
+            extra,
         ),
         flush=True,
     )
@@ -205,3 +225,13 @@ if _ON:
         "eagle_prepare_for_verify",
     )
     _register(f"{_FULL_CG}.replay", "graph_replay")
+    # Which host-mirror path the backend actually takes, and how often. The
+    # cheap one derives the lengths from the padded CPU input; the other reads
+    # seven device tensors back. Measured in isolation at the two operating
+    # shapes (`test/test_decode_host_segments.py`): 0.22-0.25 vs 0.37-0.39
+    # ms/step, so the split matters only if the expensive one runs.
+    _NSA = "sglang_kunlun.hooks.layers.attention.kunlun_nsa_backend.KunlunDSAMetadata"
+    _register(f"{_NSA}.refresh_host_mirrors", "refresh_host_mirrors")
+    _register(
+        f"{_NSA}.refresh_host_lengths_from_cpu", "refresh_host_lengths_from_cpu"
+    )

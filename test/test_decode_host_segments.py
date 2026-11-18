@@ -69,6 +69,13 @@ CALLS_PER_STEP = {
     "page_table_mask_op": 3,
     "metadata_copy_torch": 3,
     "metadata_copy_op": 3,
+    # `init_forward_metadata` runs once per forward and there are three
+    # forwards per decode step (draft / verify / draft-extend).
+    "store_lens_and_cu_torch": 3,
+    "host_mirror_staged_d2h": 3,
+    "host_mirror_7_blocking": 3,
+    "host_mirror_7_direct": 3,
+    "host_lengths_from_cpu": 3,
 }
 
 
@@ -254,6 +261,120 @@ def case_async_d2h(bs, device):
     }
 
 
+def case_metadata(bs, device):
+    """What `fused_dsa_decode_metadata` costs besides the page-table write.
+
+    `kernel_ops.py:7561-7604` is: two `_dsa_store_lens_and_cu` (a cumsum plus
+    three small copies each) and one `_dsa_write_page_tables` (measured
+    separately in `case_page_table_mask`). The question this answers is whether
+    the lens/cu half is worth an operator of its own -- it is three tiny
+    cumsums over `bs` elements, so the expectation is that it is launch-bound,
+    not work-bound, and an op would only remove launches.
+    """
+    seq = torch.randint(1, CONTEXT, (bs,), device=device, dtype=torch.int32)
+    cache_seqlens = torch.zeros(bs, device=device, dtype=torch.int32)
+    cu_k = torch.zeros(bs + 1, device=device, dtype=torch.int32)
+    dsa_cache = torch.zeros(bs, device=device, dtype=torch.int32)
+    dsa_cu_k = torch.zeros(bs + 1, device=device, dtype=torch.int32)
+    topk = 2048
+
+    def store(lengths, out_lengths, out_cu):
+        n = lengths.numel()
+        out_lengths[:n].copy_(lengths)
+        out_cu[:1].zero_()
+        out_cu[1 : n + 1].copy_(torch.cumsum(lengths, dim=0, dtype=torch.int32))
+
+    def torch_path():
+        store(seq, cache_seqlens, cu_k)
+        store(torch.clamp(seq, max=topk), dsa_cache, dsa_cu_k)
+
+    return {"store_lens_and_cu_torch": torch_path}
+
+
+def case_host_mirrors(bs, device):
+    """The three ways this backend can land the per-step host lengths.
+
+    K lengths and their prefix sums are NOT shape constants: every decode step
+    they grow by that row's accept length, so something has to refresh them
+    once per forward. The three variants are the ones the code actually has:
+
+    * `host_mirror_7_blocking` -- seven separate `.cpu()` reads, the form before
+      the 2026-11-13 batching (`HANDOVER_TPOT.md` section 4, 1.16 ms/step).
+    * `host_mirror_staged_d2h` -- `refresh_host_mirrors`: stage per dtype into
+      one buffer, one pinned D2H per dtype, then ONE
+      `current_stream().synchronize()` (`kunlun_nsa_backend.py:333-364`). The
+      synchronize is the part worth pricing: it drains the device queue in the
+      middle of host graph prep.
+    * `host_lengths_from_cpu` -- `refresh_host_lengths_from_cpu`
+      (`:366-418`): derive the same four vectors from the padded
+      `seq_lens_cpu` with no device read at all. This is the path the backend
+      prefers when the graph layout is fixed and `dsa_index_kpool <= 1`.
+    """
+    rows = bs * NEXT_N
+    dev32 = lambda n: torch.randint(1, CONTEXT, (n,), device=device, dtype=torch.int32)
+    mirrored = [dev32(bs), dev32(bs + 1), dev32(bs + 1), dev32(rows), dev32(bs + 1),
+                dev32(rows + 1), dev32(bs + 1)]
+    hosts = [torch.empty_like(t, device="cpu") for t in mirrored]
+    total = sum(t.numel() for t in mirrored)
+    dev_buf = torch.empty(total, device=device, dtype=torch.int32)
+    host_buf = torch.empty(total, dtype=torch.int32, pin_memory=True)
+    stream_mod = torch.get_device_module()
+
+    def seven_blocking():
+        for i, t in enumerate(mirrored):
+            hosts[i].copy_(t.cpu())
+
+    def seven_direct():
+        """The same seven reads, straight into the stable host storage.
+
+        `t.cpu()` allocates a fresh host tensor per mirror and then copies it
+        into the buffer the graph was recorded against; `host.copy_(t)` skips
+        that intermediate. Both keep the destination storage, which is the only
+        invariant `refresh_host_mirrors` has to hold.
+        """
+        for i, t in enumerate(mirrored):
+            hosts[i].copy_(t)
+
+    def staged():
+        off = 0
+        spans = []
+        for t in mirrored:
+            n = t.numel()
+            dev_buf[off : off + n].copy_(t.reshape(-1))
+            spans.append((off, n))
+            off += n
+        host_buf.copy_(dev_buf, non_blocking=True)
+        stream_mod.current_stream().synchronize()
+        for host, (off, n) in zip(hosts, spans):
+            host.reshape(-1).copy_(host_buf[off : off + n])
+
+    seq_cpu = torch.randint(1, CONTEXT, (bs,), dtype=torch.int32)
+    offsets = torch.arange(1, NEXT_N + 1, dtype=torch.int32)
+    dst = [torch.empty(bs, dtype=torch.int32), torch.empty(bs + 1, dtype=torch.int32),
+           torch.empty(rows, dtype=torch.int32), torch.empty(rows + 1, dtype=torch.int32)]
+
+    def from_cpu():
+        # The target-verify branch, i.e. the widest of the three the method has.
+        cache = seq_cpu + NEXT_N
+        expanded = (seq_cpu[:, None] + offsets).reshape(-1)
+        capped = expanded.clamp(max=2048)
+        cu_k = torch.cat(
+            (torch.zeros(1, dtype=torch.int32), cache.cumsum(0, dtype=torch.int32))
+        )
+        dsa_cu_k = torch.cat(
+            (torch.zeros(1, dtype=torch.int32), capped.cumsum(0, dtype=torch.int32))
+        )
+        for d, v in zip(dst, (cache, cu_k, expanded, dsa_cu_k)):
+            d.copy_(v)
+
+    return {
+        "host_mirror_7_blocking": seven_blocking,
+        "host_mirror_7_direct": seven_direct,
+        "host_mirror_staged_d2h": staged,
+        "host_lengths_from_cpu": from_cpu,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--iters", type=int, default=50)
@@ -283,6 +404,8 @@ def main():
         shape = f"bs={bs} rows={rows}"
         cases = dict(case_copy_to_cpu(bs, device))
         cases.update(case_async_d2h(bs, device))
+        cases.update(case_metadata(bs, device))
+        cases.update(case_host_mirrors(bs, device))
         pt_cases, pt_check = case_page_table_mask(bs, device)
         cases.update(pt_cases)
         for name, fn in cases.items():
@@ -293,11 +416,110 @@ def main():
         print()
     for line in checks:
         print(line)
+    print()
+    for line in check_refresh_host_mirrors(device):
+        print(line)
     print(
         "\nms/step = us/call x calls/step, so a row can be read straight against\n"
         "the matching `[SEG]` column (`draft`, `draft_extend`, `copy_result_to_cpu`).\n"
         "A candidate that does not win here does not get an end-to-end run."
     )
+
+
+
+
+def check_refresh_host_mirrors(device):
+    """Correctness gate for `KunlunDSAMetadata.refresh_host_mirrors`.
+
+    The invariants that matter, in the order they broke historically:
+
+    1. after a refresh every host mirror equals its device tensor;
+    2. a producer that writes IN PLACE is picked up -- this is the one a cached
+       plan can silently miss, and a stale K length under-plans the kernel's kv
+       window (0.5.8 shipped exactly that bug on its MTP precompute replay
+       path, `nsa_backend.py:1443-1512`);
+    3. the host storage is stable across refreshes, because the CUDA graph was
+       recorded against those buffers;
+    4. a producer that SWAPS a device buffer invalidates the cache.
+
+    Built on a stub carrying the real methods: the metadata is a frozen
+    dataclass with a long field list, and none of it is reachable from here.
+    """
+    from sglang_kunlun.hooks.layers.attention.kunlun_nsa_backend import (
+        KunlunDSAMetadata,
+    )
+
+    class _Stub:
+        _MIRRORED = KunlunDSAMetadata._MIRRORED
+        _mirror_pairs = KunlunDSAMetadata._mirror_pairs
+        refresh_host_mirrors = KunlunDSAMetadata.refresh_host_mirrors
+
+    stub = _Stub()
+    sizes = {name: 3 + i for i, (_, name) in enumerate(_Stub._MIRRORED)}
+    for host_name, dev_name in _Stub._MIRRORED:
+        dev = torch.randint(
+            1, 9999, (sizes[dev_name],), device=device, dtype=torch.int32
+        )
+        setattr(stub, dev_name, dev)
+        setattr(stub, host_name, None)
+
+    results = []
+    stub.refresh_host_mirrors()          # first call rebuilds and refreshes
+    stub.refresh_host_mirrors()          # second call takes the cached path
+    equal = all(
+        torch.equal(getattr(stub, h), getattr(stub, d).cpu())
+        for h, d in _Stub._MIRRORED
+    )
+    results.append(f"(1) mirrors equal after refresh: {equal}")
+
+    ptrs = {h: getattr(stub, h).data_ptr() for h, _ in _Stub._MIRRORED}
+    for _, dev_name in _Stub._MIRRORED:
+        getattr(stub, dev_name).add_(7)  # in-place producer update
+    stub.refresh_host_mirrors()
+    equal = all(
+        torch.equal(getattr(stub, h), getattr(stub, d).cpu())
+        for h, d in _Stub._MIRRORED
+    )
+    results.append(f"(2) in-place device update picked up: {equal}")
+    stable = all(
+        getattr(stub, h).data_ptr() == ptrs[h] for h, _ in _Stub._MIRRORED
+    )
+    results.append(f"(3) host storage stable: {stable}")
+
+    for _, dev_name in _Stub._MIRRORED:
+        old = getattr(stub, dev_name)
+        setattr(stub, dev_name, old.clone() + 1)  # swapped buffer, same shape
+    stub.refresh_host_mirrors()
+    equal = all(
+        torch.equal(getattr(stub, h), getattr(stub, d).cpu())
+        for h, d in _Stub._MIRRORED
+    )
+    results.append(f"(4) swapped device buffer picked up: {equal}")
+
+    # The fixed-Q-LOD filter must leave those three mirrors alone.
+    for _, dev_name in _Stub._MIRRORED:
+        getattr(stub, dev_name).add_(5)
+    stub.refresh_host_mirrors(fixed_query_lod=True)
+    skipped = [
+        h
+        for h, d in _Stub._MIRRORED
+        if d in ("cu_seqlens_q", "dsa_cu_seqlens_q", "cum_q_lod")
+    ]
+    untouched = all(
+        not torch.equal(getattr(stub, h), getattr(stub, d).cpu())
+        for h, d in _Stub._MIRRORED
+        if h in skipped
+    )
+    refreshed = all(
+        torch.equal(getattr(stub, h), getattr(stub, d).cpu())
+        for h, d in _Stub._MIRRORED
+        if h not in skipped
+    )
+    results.append(
+        f"(5) fixed_query_lod skips the Q lods: {untouched} and refreshes the "
+        f"rest: {refreshed}"
+    )
+    return results
 
 
 if __name__ == "__main__":

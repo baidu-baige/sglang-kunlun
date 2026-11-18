@@ -334,34 +334,36 @@ class KunlunDSAMetadata(DSAMetadata):
         """Update the host mirrors in place, keeping their storage stable.
 
         The graph was recorded against these host buffers, so copy into the
-        existing storage and reallocate only when shape/dtype changes. Stage the
-        device tensors per dtype into one buffer and take one D2H per dtype
-        instead of seven blocking ones.
+        existing storage and reallocate only when shape/dtype changes.
+
+        One ``host.copy_(dev)`` per mirror, not a staged transfer. The staged
+        form this replaces (seven device-to-device packs into one buffer per
+        dtype, one pinned D2H each, then a single
+        ``current_stream().synchronize()``) was written for bs 8; at the batch
+        this cell actually decodes it is slower, because the packing costs more
+        launches than the seven small reads it saves. Measured at the two
+        operating shapes with ``test/test_decode_host_segments.py``
+        (us per call, three calls per decode step):
+
+            bs=2  staged 230.1 | 7x .cpu() 172.4 | 7x copy_ 126.1
+            bs=3  staged 219.6 | 7x .cpu() 168.3 | 7x copy_ 124.5
+
+        i.e. 0.69 -> 0.38 ms/step at bs=2 and 0.66 -> 0.37 at bs=3. The
+        ``.cpu()`` variant is the middle column: it allocates a host tensor per
+        mirror and then copies it into the recorded buffer, so it pays an extra
+        allocation this form does not.
+
+        A blocking copy into pageable host memory is still correct without an
+        explicit synchronise -- each ``copy_`` is ordered and waits for its own
+        transfer, which is the same guarantee the single synchronise gave.
         """
-        plan = self._mirror_plan(fixed_query_lod=fixed_query_lod)
-        if plan is None:
+        pairs = self._mirror_pairs(fixed_query_lod=fixed_query_lod)
+        if pairs is None:
             # Shapes/dtypes changed (or a mirror had to be reallocated); the
             # mirrors are already up to date in that case.
             return
-        # The staging host buffer is pinned (`_mirror_plan` allocates it with
-        # `pin_memory=True`), so the D2H can be asynchronous: issue it on the
-        # current stream and synchronise once at the end instead of letting each
-        # `copy_` drain the queue. Measured 2026-11-14 on traces/dstack_v68:
-        # `kunlun_nsa_backend` owned 5.8 of the 8.2 blocking `cudaMemcpy` per
-        # decode step, and every one of them drains the device queue in the
-        # middle of the host's graph preparation -- which is where the 22.7
-        # ms/step of host-side device idle sits.
-        streams = []
-        for dtype, entries, dev_buf, host_buf in plan:
-            for _, dev, offset, numel in entries:
-                dev_buf[offset : offset + numel].copy_(dev.reshape(-1))
-            host_buf.copy_(dev_buf, non_blocking=True)
-            streams.append((entries, host_buf))
-        # One wait for every dtype, after all of them are in flight.
-        torch.get_device_module().current_stream().synchronize()
-        for entries, host_buf in streams:
-            for host, _, offset, numel in entries:
-                host.reshape(-1).copy_(host_buf[offset : offset + numel])
+        for host, dev in pairs:
+            host.copy_(dev)
 
     def refresh_host_lengths_from_cpu(
         self, seq_lens_cpu, forward_mode, num_draft_tokens, index_topk
@@ -417,11 +419,13 @@ class KunlunDSAMetadata(DSAMetadata):
             getattr(self, name).copy_(values)
         return True
 
-    def _mirror_plan(self, *, fixed_query_lod: bool = False):
-        """Return the cached staging plan, rebuilding it when shapes change.
+    def _mirror_pairs(self, *, fixed_query_lod: bool = False):
+        """Return the cached ``(host, dev)`` list, rebuilding when shapes change.
 
         Returns ``None`` when a rebuild happened: the rebuild path already
-        refreshed every mirror with a plain ``.cpu()``, so the caller is done.
+        refreshed every mirror, so the caller is done. The signature includes
+        each device tensor's ``data_ptr`` so a producer that swaps a buffer
+        (rather than writing into it) invalidates the list.
         """
         mirrored = tuple(
             (host_name, dev_name)
@@ -438,7 +442,7 @@ class KunlunDSAMetadata(DSAMetadata):
         if cached is not None and cached[0] == signature:
             return cached[1]
 
-        by_dtype: dict[torch.dtype, list] = {}
+        pairs = []
         for host_name, dev_name in mirrored:
             dev = getattr(self, dev_name, None)
             if dev is None:
@@ -450,27 +454,8 @@ class KunlunDSAMetadata(DSAMetadata):
                 object.__setattr__(self, host_name, host)
             else:
                 host.copy_(dev)
-            by_dtype.setdefault(dev.dtype, []).append((host, dev))
-
-        plan = []
-        for dtype, pairs in by_dtype.items():
-            entries = []
-            offset = 0
-            for host, dev in pairs:
-                numel = dev.numel()
-                entries.append((host, dev, offset, numel))
-                offset += numel
-            dev_buf = torch.empty(offset, dtype=dtype, device=pairs[0][1].device)
-            try:
-                host_buf = torch.empty(
-                    offset, dtype=dtype, device="cpu", pin_memory=True
-                )
-            except RuntimeError:
-                # Pinning is unavailable on some runtimes; a pageable staging
-                # buffer still collapses the seven transfers into one.
-                host_buf = torch.empty(offset, dtype=dtype, device="cpu")
-            plan.append((dtype, entries, dev_buf, host_buf))
-        object.__setattr__(self, "_mirror_staging", (signature, plan))
+            pairs.append((host, dev))
+        object.__setattr__(self, "_mirror_staging", (signature, pairs))
         return None
 
 
