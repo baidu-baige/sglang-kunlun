@@ -1060,6 +1060,20 @@ def _fused_store_latent_unsupported(
     return None
 
 
+
+_WRITER_IDENTITY_MAPS = {}
+
+def _writer_identity_mapping(device, capacity):
+    key = (str(device), capacity)
+    mapping = _WRITER_IDENTITY_MAPS.get(key)
+    if mapping is None:
+        if capacity >= 2**31:
+            raise ValueError("identity mapping requires capacity < 2**31")
+        mapping = torch.arange(capacity + 1, device=device, dtype=torch.int32)
+        mapping[-1:].zero_()
+        _WRITER_IDENTITY_MAPS[key] = mapping
+    return mapping
+
 @register_jit_op(
     "sglang.kernels.ops.attention.dsv4.attn", "fused_store_cache"
 )
@@ -1149,15 +1163,27 @@ def fused_store_cache_kunlun(
             and input.is_cuda
             and hasattr(torch.ops.xspeedgate_ops, "set_k_and_s_v4")
         ):
-            # Legal Torch locations are [-capacity, capacity). Preserve negative
-            # page indexing as well as dummy slot 0. Allocator locations must
-            # satisfy that contract; out-of-range locations are not supported.
-            loc = indices.to(torch.int64).reshape(-1)
-            loc = loc.remainder(num_pages * page_size).contiguous()
-            torch.ops.xspeedgate_ops.set_k_and_s_v4(
-                cache.view(torch.uint8), loc, input.to(cache.dtype).contiguous(), page_size
-            )
-            note_op_path("fused_store_cache", "xspeedgate:set_k_and_s_v4")
+            # Slot 0 is reserved for dummy writes. Never wrap an invalid
+            # location into live KV: saturate to [0, capacity], then map the
+            # upper sentinel to 0. Valid locations remain unchanged.
+            capacity = num_pages * page_size
+            loc = indices.reshape(-1).clamp(min=0, max=capacity).contiguous()
+            values = input.to(cache.dtype).contiguous()
+            if capacity < 2**31 and hasattr(
+                torch.ops.xspeedgate_ops, "set_k_and_s_v4_with_mapping"
+            ):
+                mapping = _writer_identity_mapping(cache.device, capacity)
+                torch.ops.xspeedgate_ops.set_k_and_s_v4_with_mapping(
+                    cache.view(torch.uint8), loc, mapping, values, page_size
+                )
+                note_op_path("fused_store_cache", "xspeedgate:set_k_and_s_v4_with_mapping")
+            else:
+                # Safe compatibility path for wheels without the mapping op.
+                loc = loc.to(torch.int64).remainder(capacity)
+                torch.ops.xspeedgate_ops.set_k_and_s_v4(
+                    cache.view(torch.uint8), loc, values, page_size
+                )
+                note_op_path("fused_store_cache", "xspeedgate:set_k_and_s_v4")
             return
         note_op_path("fused_store_cache", f"torch half-cache ({reason})")
         loc = indices.to(torch.int64).reshape(-1)
