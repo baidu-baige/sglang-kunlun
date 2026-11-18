@@ -306,6 +306,47 @@ def _install_ernie55_nextn_mapper() -> None:
     )
 
 
+def _install_ernie55_dspark_mapper() -> None:
+    """ERNIE 5.5 Flash DSpark (MTP self-draft): align compressed-tensors names.
+
+    The DSpark draft module tree uses ``stages.<i>.self_attn/mlp/...`` and hoists
+    the MTP heads to the draft root (``markov_head`` / ``confidence_head`` / ``norm``
+    / ...), while the checkpoint's compressed-tensors targets/ignore use checkpoint
+    naming (``model.mtp.<i>.block_sparse_moe/self_attn/...`` and ``model.mtp.<head>``).
+    Without this rewrite find_matched_target throws "Unable to find matching target
+    for stages.0.self_attn.wq_a".
+
+    Only routed experts are W4A8 (target ``model.mtp.<i>.block_sparse_moe.experts``);
+    attn / gate / shared_experts / layernorms / heads are bf16 in the ignore list, so
+    these rewrites keep them ignored under the draft module names.
+    """
+    try:
+        from sglang.srt.models.ernie55_dspark import Ernie5_5_MoeForCausalLMDSpark
+    except ImportError:
+        return
+    from sglang.srt.models.utils import WeightsMapper
+
+    if getattr(Ernie5_5_MoeForCausalLMDSpark, "hf_to_sglang_mapper", None) is not None:
+        return
+    Ernie5_5_MoeForCausalLMDSpark.hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={
+            # Longest key wins and only one substr rule fires per name: the routed
+            # experts target folds block_sparse_moe -> mlp and mtp.<i> -> stages.<i>
+            # in one shot.
+            r"model\.mtp\.\d+\.block_sparse_moe": r"stages\.\d+\.mlp",
+            # per-stage attn / layernorms / hyper-connections
+            r"model\.mtp\.\d+\.": r"stages\.\d+\.",
+            # model-level MTP heads hoisted to the draft root
+            r"model\.mtp\.": r"",
+        }
+    )
+    _log_once(
+        "ernie55_dspark_mapper",
+        "sglang-kunlun: installed ERNIE5.5 DSpark quant name mapper "
+        "(model.mtp.<i> -> stages.<i>, MTP heads -> root)",
+    )
+
+
 @plugin_hook(
     "sglang.srt.model_loader.loader._get_quantization_config",
     type=HookType.BEFORE,
@@ -325,6 +366,7 @@ def inject_quant_names_kunlun(*args, **kwargs):
         _install_dsv4_nextn_mapper()
         _install_ernie55_quant_name_mapper()
         _install_ernie55_nextn_mapper()
+        _install_ernie55_dspark_mapper()
     except Exception:
         logger.exception("sglang-kunlun: failed to inject quant name mappings")
     return None

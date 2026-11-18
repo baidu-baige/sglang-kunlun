@@ -554,3 +554,45 @@ def disable_dspark_draft_cuda_graph_kunlun(original_fn, self, *args, **kwargs):
         self._decode_graph_allowed = False
     return original_fn(self, *args, **kwargs)
 
+
+
+@plugin_hook(
+    "sglang.srt.models.ernie55_dspark.Ernie5_5_MoeForCausalLMDSpark.load_weights",
+    type=HookType.AFTER,
+)
+def restore_ernie55_dspark_fp16_dtype_kunlun(result, self, *args, **kwargs):
+    """fp16 服务下，把 ERNIE DSpark 草稿里所有未量化 Linear 恢复到 fp16。
+
+    草稿权重出厂是 bf16，而 target 跑 fp16；基类的 MqaAttentionBase hook 只恢复了
+    ``wo_a``，``wq_a`` / ``wkv`` / ``main_proj`` / markov / confidence 等仍是 bf16。
+    首个 prefill 的 ``commit_kv_proj``（``F.linear(fp16 main_x, bf16 wkv)``）就会在
+    XPU 上报 "lhs and rhs have different data type"。这里在 load_weights 之后统一把
+    草稿内所有未量化 Linear 拉到 fp16（W4A8 路由专家是 int8 量化方法，不受影响）。
+    """
+    from sglang_kunlun.hooks.layers.attention.dsv4.dtype_restore import (
+        restore_requested_fp16_parameter_dtype,
+    )
+
+    restore_requested_fp16_parameter_dtype(*self.modules())
+    return result
+
+
+@plugin_hook(
+    "sglang.srt.models.ernie55_dspark.Ernie5_5_MoeForCausalLMDSpark.project_commit_kv",
+    type=HookType.REPLACE,
+)
+def ernie55_dspark_project_commit_kv_kunlun(self, *, main_hidden, pool):
+    """Kunlun: 复用 base 的非融合 commit-KV 投影，激活对齐到 wkv 权重 dtype。
+
+    上游 ``CommitKvProj.execute`` 在 ``main_x.is_cuda`` 时走 CUDA-only 的 stacked
+    融合路径（``commit_kv_proj_fused``），昆仑上会因 fp16 激活 / bf16 权重不一致报
+    "lhs and rhs have different data type"。这里直接复用 base 的逐 stage torch 实现
+    ``CommitKvProj.torch``（等价于 ``[wkv(main_x)[0] for wkv in wkv_linears]``），只在
+    调用前把 main_x cast 到草稿 wkv 的 dtype（各 stage 同 dtype），既避开融合 / triton
+    路径，又不重复造轮子。
+    """
+    from sglang.kernels.ops.speculative.dspark.dspark_draft_model import CommitKvProj
+
+    wkv_linears = [stage.self_attn.wkv for stage in self.stages]
+    main_x = self.project_target_hidden(main_hidden).to(wkv_linears[0].weight.dtype)
+    return CommitKvProj.torch(main_x=main_x, wkv_linears=wkv_linears)
