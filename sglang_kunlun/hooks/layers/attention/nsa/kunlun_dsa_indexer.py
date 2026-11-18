@@ -715,18 +715,24 @@ def _get_topk_paged(
     # ``<.., false, false, true, false>`` on both versions.
     bs = int(getattr(forward_batch, "batch_size", 0) or 0)
     num_draft = (block_tables.shape[0] // bs) if bs else 1
+    # Eager metadata stores one extend width per request (``[K] * bs``),
+    # while graph-captured metadata stores one unit row per query
+    # (``[1] * (bs * K)``). They describe the same fixed-width layout.
+    # Ragged accepted-only batches remain ``[accepted_i] * bs`` and must
+    # stay unfolded because there is no one request-major K to reshape to.
+    request_major_fixed = (
+        len(extend_lens) == bs
+        and all(int(e) == num_draft for e in extend_lens)
+    )
+    graph_major_fixed = (
+        len(extend_lens) == bs * num_draft
+        and all(int(e) == 1 for e in extend_lens)
+    )
     batched_draft = (
         num_draft > 1
         and bs * num_draft == q_offset
         and block_tables.shape[0] == bs * num_draft
-        # ``get_dsa_extend_len_cpu`` is request-major: verify metadata is
-        # ``[num_draft] * bs``, while a ragged draft-extend batch is
-        # ``[accepted_0, ..., accepted_{bs-1}]``.  The old condition treated
-        # this as one entry per query token (``[1] * (bs * num_draft)``), so
-        # every fixed-width verify batch missed the fold and launched the
-        # vendor MQA kernel once per draft token.
-        and len(extend_lens) == bs
-        and all(int(e) == num_draft for e in extend_lens)
+        and (request_major_fixed or graph_major_fixed)
         and (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
