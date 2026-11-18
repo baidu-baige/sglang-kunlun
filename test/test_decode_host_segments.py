@@ -76,6 +76,13 @@ CALLS_PER_STEP = {
     "host_mirror_7_blocking": 3,
     "host_mirror_7_direct": 3,
     "host_lengths_from_cpu": 3,
+    # The three step_* rows already include their own repetition, so their
+    # ms/step column is the number to read directly.
+    "step_host_lengths_current": 1,
+    "step_host_lengths_dedup": 1,
+    "step_host_lengths_lean_dedup": 1,
+    "store_lens_and_cu_lean": 3,
+    "op_launch_floor": 3,
 }
 
 
@@ -288,7 +295,60 @@ def case_metadata(bs, device):
         store(seq, cache_seqlens, cu_k)
         store(torch.clamp(seq, max=topk), dsa_cache, dsa_cu_k)
 
-    return {"store_lens_and_cu_torch": torch_path}
+    # Same values, fewer launches: write the leading zero directly into the
+    # destination and accumulate with `out=`, which drops the `torch.cat`
+    # allocation and its copy (2 of the 8 launches).
+    def lean():
+        capped = torch.clamp(seq, max=topk)
+        cache_seqlens.copy_(seq)
+        dsa_cache.copy_(capped)
+        cu_k[0].zero_()
+        dsa_cu_k[0].zero_()
+        torch.cumsum(seq, dim=0, dtype=torch.int32, out=cu_k[1 : bs + 1])
+        torch.cumsum(capped, dim=0, dtype=torch.int32, out=dsa_cu_k[1 : bs + 1])
+
+    def check():
+        """Byte-exactness of the lean form against the current one."""
+        cache_seqlens.zero_()
+        cu_k.zero_()
+        dsa_cache.zero_()
+        dsa_cu_k.zero_()
+        torch_path()
+        ref = [t.clone() for t in (cache_seqlens, cu_k, dsa_cache, dsa_cu_k)]
+        for t in (cache_seqlens, cu_k, dsa_cache, dsa_cu_k):
+            t.zero_()
+        lean()
+        same = all(
+            torch.equal(a, b)
+            for a, b in zip(ref, (cache_seqlens, cu_k, dsa_cache, dsa_cu_k))
+        )
+        return f"lens/cu lean form byte-exact: {same}"
+
+    return {"store_lens_and_cu_torch": torch_path, "store_lens_and_cu_lean": lean}, check
+
+
+def case_op_launch_floor(bs, device):
+    """What one fused XSpeedGate launch costs, to bound a future lens/cu op.
+
+    A fused lens/cu operator would do the arithmetic the torch path spreads
+    over 8 launches, so its cost is dominated by the launch, not the work. The
+    smallest shipped fused op on a table this size is the floor: measured
+    against `store_lens_and_cu_torch` it says how much a new operator could
+    possibly return.
+    """
+    op = getattr(torch.ops.xspeedgate_ops, "dsa_write_page_tables", None)
+    if op is None:
+        return {}
+    req_to_token = torch.zeros((bs, 64), device=device, dtype=torch.int32)
+    req_pool_indices = torch.arange(bs, device=device, dtype=torch.int32)
+    req_row = torch.arange(bs, device=device, dtype=torch.int32)
+    kv_lens = torch.full((bs,), 32, device=device, dtype=torch.int32)
+    pt = torch.zeros((bs, 64), device=device, dtype=torch.int32)
+
+    def floor():
+        op(req_to_token, req_pool_indices, req_row, kv_lens, pt, None, 64, 1)
+
+    return {"op_launch_floor": floor}
 
 
 def case_host_mirrors(bs, device):
@@ -367,12 +427,72 @@ def case_host_mirrors(bs, device):
         for d, v in zip(dst, (cache, cu_k, expanded, dsa_cu_k)):
             d.copy_(v)
 
+    def from_cpu_lean():
+        """Same four vectors, writing straight into the destinations.
+
+        Drops the `torch.cat` allocations (two allocs plus two copies become a
+        zeroed first element and a `cumsum(out=...)`), so it is 6 launches
+        instead of 8 with identical values.
+        """
+        cache = seq_cpu + NEXT_N
+        expanded = (seq_cpu[:, None] + offsets).reshape(-1)
+        capped = expanded.clamp(max=2048)
+        dst[0].copy_(cache)
+        dst[2].copy_(expanded)
+        dst[1][0].zero_()
+        dst[3][0].zero_()
+        torch.cumsum(cache, dim=0, dtype=torch.int32, out=dst[1][1:])
+        torch.cumsum(capped, dim=0, dtype=torch.int32, out=dst[3][1:])
+
+    # The model's own observation is 3.89 calls per decode step
+    # (`[SEG] ... refresh_host_lengths_from_cpu=0.43(n=3.89)`), i.e. the same
+    # vectors are derived more than once per step. These two step-level
+    # variants price that: 4 recomputes versus 1 recompute behind a signature
+    # check. The check is `(forward_mode, data_ptr, last element)` on a CPU
+    # tensor, so it cannot cost anything on its own.
+    sig = [0, 0, 0]
+
+    def signature_ok():
+        key = (7, seq_cpu.data_ptr(), int(seq_cpu[-1]))
+        if key == tuple(sig):
+            return True
+        sig[:] = key
+        return False
+
+    def step_current():
+        for _ in range(4):
+            from_cpu()
+
+    def step_dedup():
+        for _ in range(4):
+            if not signature_ok():
+                from_cpu()
+
+    def step_lean_dedup():
+        for _ in range(4):
+            if not signature_ok():
+                from_cpu_lean()
+
+    def check_host_lengths():
+        """Byte-exactness of the lean form against the current body."""
+        want = []
+        from_cpu()
+        want = [d.clone() for d in dst]
+        for d in dst:
+            d.zero_()
+        from_cpu_lean()
+        same = all(torch.equal(a, b) for a, b in zip(want, dst))
+        return f"host_lengths lean form byte-exact: {same}"
+
     return {
         "host_mirror_7_blocking": seven_blocking,
         "host_mirror_7_direct": seven_direct,
         "host_mirror_staged_d2h": staged,
         "host_lengths_from_cpu": from_cpu,
-    }
+        "step_host_lengths_current": step_current,
+        "step_host_lengths_dedup": step_dedup,
+        "step_host_lengths_lean_dedup": step_lean_dedup,
+    }, check_host_lengths
 
 
 def main():
@@ -404,8 +524,11 @@ def main():
         shape = f"bs={bs} rows={rows}"
         cases = dict(case_copy_to_cpu(bs, device))
         cases.update(case_async_d2h(bs, device))
-        cases.update(case_metadata(bs, device))
-        cases.update(case_host_mirrors(bs, device))
+        md_cases, md_check = case_metadata(bs, device)
+        cases.update(md_cases)
+        hm_cases, hm_check = case_host_mirrors(bs, device)
+        cases.update(hm_cases)
+        cases.update(case_op_launch_floor(bs, device))
         pt_cases, pt_check = case_page_table_mask(bs, device)
         cases.update(pt_cases)
         for name, fn in cases.items():
@@ -413,11 +536,17 @@ def main():
             per_step = med * CALLS_PER_STEP.get(name, 1) / 1000.0
             print(f"{name:<34}{shape:<22}{med:>10.1f}{p90:>9.1f}{per_step:>10.3f}")
         checks.append(f"{label}: {pt_check()}")
+        checks.append(f"{label}: {hm_check()}")
+        checks.append(f"{label}: {md_check()}")
         print()
     for line in checks:
         print(line)
     print()
     for line in check_refresh_host_mirrors(device):
+        print(line)
+    from check_shipped_helpers import check_real_helpers
+
+    for line in check_real_helpers(device):
         print(line)
     print(
         "\nms/step = us/call x calls/step, so a row can be read straight against\n"

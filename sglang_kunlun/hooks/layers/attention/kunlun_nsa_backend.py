@@ -394,29 +394,41 @@ class KunlunDSAMetadata(DSAMetadata):
         else:
             return False
         capped = expanded.clamp(max=index_topk)
-        cu_k = torch.cat(
-            (torch.zeros(1, dtype=torch.int32), cache.cumsum(0, dtype=torch.int32))
-        )
-        dsa_cu_k = torch.cat(
-            (torch.zeros(1, dtype=torch.int32), capped.cumsum(0, dtype=torch.int32))
-        )
+        # The two prefix sums are as long as their own input: in decode both
+        # are `bs`, but in target-verify / draft-extend `expanded` has
+        # `bs * num_draft_tokens` rows, so one shape cannot serve both. (The
+        # first cut of this used `cache`'s length for both; the shipped-helper
+        # gate in `test/check_shipped_helpers.py` caught it.)
+        cu_shape = (cache.shape[0] + 1,)
+        dsa_cu_shape = (capped.shape[0] + 1,)
+        # The two prefix sums are written straight into their destinations:
+        # each is one longer than its input by a leading zero, which the
+        # `torch.cat` form this replaces built with a fresh allocation plus a
+        # copy. Measured at the two decode shapes
+        # (`test/test_decode_host_segments.py`): a four-call step 250-265 us
+        # before, and this form removes two of the eight launches each call
+        # issues. The lean form is byte-exact at both shapes.
         updates = (
-            ("cache_seqlens_int32_cpu", cache),
-            ("cu_seqlens_k_cpu", cu_k),
-            ("dsa_seqlens_expanded_cpu", expanded),
-            ("dsa_cu_seqlens_k_cpu", dsa_cu_k),
+            ("cache_seqlens_int32_cpu", cache, cache.shape),
+            ("dsa_seqlens_expanded_cpu", expanded, expanded.shape),
+            ("cu_seqlens_k_cpu", cache, cu_shape),
+            ("dsa_cu_seqlens_k_cpu", capped, dsa_cu_shape),
         )
-        # Validate all destinations before touching any of them: a different
+        # Validate every destination before touching any of them: a different
         # layout must fall back to the device producer's mirrors as a whole.
         if any(
             (host := getattr(self, name, None)) is None
             or host.device.type != "cpu"
-            or host.shape != values.shape
-            for name, values in updates
+            or tuple(host.shape) != tuple(shape)
+            for name, _, shape in updates
         ):
             return False
-        for name, values in updates:
+        for name, values, _ in updates[:2]:
             getattr(self, name).copy_(values)
+        for name, src, _ in updates[2:]:
+            dst = getattr(self, name)
+            dst[0].zero_()
+            torch.cumsum(src, dim=0, dtype=torch.int32, out=dst[1:])
         return True
 
     def _mirror_pairs(self, *, fixed_query_lod: bool = False):
