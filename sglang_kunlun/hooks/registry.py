@@ -37,6 +37,10 @@ HOOK_MODULES = (
     "sglang_kunlun.hooks.ragged_draft_extend",
     "sglang_kunlun.hooks.function_call",
     "sglang_kunlun.hooks.parser",
+    # Last of the in-package modules: it wraps call sites the others REPLACE,
+    # so it must not be the function a production hook resolves against.
+    # Inert unless SGLANG_KUNLUN_SEG=1.
+    "sglang_kunlun.hooks.stage_timing",
 )
 
 # Diagnostics live outside ``sglang_kunlun``. They register last so that no
