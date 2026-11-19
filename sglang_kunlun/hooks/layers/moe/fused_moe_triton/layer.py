@@ -61,7 +61,10 @@ def create_moe_dispatcher_kunlun(moe_runner_config, quant_method=None):
     )
 
     a2a_backend = get_moe_a2a_backend()
-    if a2a_backend.is_none():
+    if a2a_backend.is_none() or a2a_backend.is_megamoe():
+        # megamoe keeps the plain FusedMoE weights and runs dispatch/combine
+        # inside the fused hydrax op, so no dispatcher is ever invoked. Same
+        # arrangement as the 0.5.8 fork (commit b89a38acd).
         return StandardDispatcher(moe_runner_config)
     if a2a_backend.is_deepep() or a2a_backend.is_mooncake():
         dispatcher = MaybeTboDeepEPDispatcher(
