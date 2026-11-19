@@ -48,7 +48,6 @@ HOOK_MODULES = (
 # optional: a deployment without the ``debug`` package simply skips them.
 DEBUG_HOOK_MODULES = (
     "debug.tensor_dump_hooks",
-    "debug.dsv4_mtp_nextn_probes",
     "debug.mtp_alignment_plugin",
     "debug.ragged_draft_attention_probe",
 )
@@ -84,14 +83,6 @@ def register_all() -> None:
         from sglang_kunlun import extra_ops as _extra_ops  # noqa: F401
     except Exception as exc:  # pragma: no cover - depends on the built artifact
         logger.warning("extra_ops unavailable (%s); using the torch fallbacks", exc)
-
-    # Operators built from the XSpeedGate tree and shipped as a SECOND .so
-    # beside the installed wheel (`TORCH_LIBRARY_FRAGMENT_EXPAND`, so nothing is
-    # lost and `sparse_mixed_attn_int8` stays put -- the wheel must never be
-    # reinstalled, HANDOVER_TPOT.md section 2). Must precede
-    # `kernel_ops.install()`, which resolves every registered kernel target.
-    # Absent .so = the torch fallbacks, never a boot failure.
-    from sglang_kunlun import extra_ops as _extra_ops  # noqa: F401
 
     # V4.1 low-ratio (compress_ratio 1/2) kernel replacements. Must be imported
     # before kernel_ops.install(), which snapshots the registration tables.

@@ -768,8 +768,11 @@ class DeepEPMoE(FusedMoE):
                 hidden_size,
                 ffn_hidden_size,
                 recv_x_int8.device,
-                is_bfp16=self.w13_weight.dtype == torch.bfloat16
-                or self.moe_castte_mode,
+                # The buffer's dtype follows the weights. An earlier fork also
+                # OR-ed in `self.moe_castte_mode`, but nothing in this tree ever
+                # sets that attribute, so the read was an AttributeError waiting
+                # for the first W8A8/FP8 DeepEP checkpoint (unreachable for W4A8).
+                is_bfp16=self.w13_weight.dtype == torch.bfloat16,
             )
 
         if get_bool_env_var("XSGL_NATIVE_DEEPEP_NORMAL"):
