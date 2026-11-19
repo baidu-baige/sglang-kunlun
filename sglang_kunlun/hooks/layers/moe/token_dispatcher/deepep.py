@@ -748,6 +748,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
+        if hidden_states.dtype is torch.float16:
+            hidden_states = hidden_states.to(torch.bfloat16)
+
         # KUNLUN_LL_IDLE_PAD: the native low_latency dispatch/combine faults -714 when a
         # dp-attention DP rank is idle (0 tokens). Pad to a single dummy token so this rank
         # still joins the collective with a valid shape; combine_b drops the dummy row.
@@ -819,12 +822,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             use_fp8 = True
 
         buffer = self._get_buffer()
-        # Kunlun deep_ep low_latency_dispatch asserts a 2-D contiguous bfloat16
-        # input; the float16 model hidden_states must be cast to bf16 first.
-        if isinstance(hidden_states, torch.Tensor):
-            if hidden_states.dtype != torch.bfloat16:
-                hidden_states = hidden_states.to(torch.bfloat16)
-            hidden_states = hidden_states.contiguous()
         packed_recv_hidden, self.packed_recv_count, self.handle, _, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
@@ -903,12 +900,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             overlap_args_dict = {}
 
         with ctx:
-            if isinstance(hidden_states, torch.Tensor):
-                if hidden_states.dtype != torch.bfloat16:
-                    hidden_states = hidden_states.to(torch.bfloat16)
-                hidden_states = hidden_states.contiguous()
-            if topk_weights.dtype != torch.float32:
-                topk_weights = topk_weights.to(torch.float32)
             combined_hidden_states, _, hook = buffer.low_latency_combine(
                 x=hidden_states,
                 topk_idx=topk_ids,
@@ -920,9 +911,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             )
 
         self.packed_recv_count = self.handle = None
-        if self.params_dtype is not None and isinstance(combined_hidden_states, torch.Tensor) \
-                and combined_hidden_states.dtype != self.params_dtype:
-            combined_hidden_states = combined_hidden_states.to(self.params_dtype)
         return combined_hidden_states, hook
 
     def _get_buffer(self):
