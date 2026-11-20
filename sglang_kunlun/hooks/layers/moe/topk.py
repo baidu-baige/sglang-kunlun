@@ -1,6 +1,6 @@
 """Kunlun MoE top-k hooks.
 
-One functional difference vs upstream:
+Functional differences vs upstream:
   * The fused sigmoid+grouped-topk+norm JIT kernel
     (``sglang.jit_kernel.grouped_topk.grouped_topk``) is replaced with
     ``kunlun_ops.moe_sigmoid_group_topk_norm`` — the upstream JIT path nvcc-
@@ -9,6 +9,10 @@ One functional difference vs upstream:
     exactly like upstream; the per-block routing statistic that Kunlun's MoE
     needs is regenerated on demand in ``unquant.py`` via
     ``kunlun_ops.gen_block_statistic`` (so dropping it here is fine).
+  * ERNIE 5.5's multi-router top-k (``multi_router_topk``) runs on the
+    ``kunlun_ops.multi_router_topk`` XPU3 kernel when the wheel provides it
+    and the inputs match its contract; otherwise the eager composite below
+    keeps the Triton replacement working on any wheel/device.
 
 ``select_experts`` MUST return the upstream
 ``sglang.srt.layers.moe.topk.StandardTopKOutput``. Defining a same-named
@@ -22,6 +26,8 @@ turn wedges the C2C fabric). Consumers that want the per-block routing
 statistic regenerate it on demand via ``kunlun_ops.gen_block_statistic``.
 """
 from __future__ import annotations
+
+import logging
 
 import torch
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
@@ -44,6 +50,8 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 import kunlun_ops
 from sglang_kunlun.kernels.moe_router import route_k3_torch
+
+logger = logging.getLogger(__name__)
 
 
 # NOTE: the JIT replacement for ``sglang.jit_kernel.grouped_topk.grouped_topk``
@@ -365,6 +373,58 @@ def select_experts_kunlun(
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
 
+def _multi_router_kernel_supported(
+    logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    per_expert_scale: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_routers: int,
+) -> bool:
+    """Mirror the ``kunlun_ops.multi_router_topk`` input contract.
+
+    The kernel picks experts with a stable smaller-id argmax and reads the
+    scores in fp32; returning False keeps the eager path for anything outside
+    that contract (older wheels without the op, CPU, non-power-of-two E).
+    """
+    if not hasattr(kunlun_ops, "multi_router_topk"):
+        return False
+    if type(topk) is not int or type(num_routers) is not int:
+        return False
+    if type(renormalize) is not bool:
+        return False
+    if logits.ndim != 2 or logits.layout != torch.strided:
+        return False
+    if logits.device.type != "cuda":
+        return False
+    if logits.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        return False
+    if not 0 < num_routers:
+        return False
+    width = logits.shape[1]
+    if width % num_routers:
+        return False
+    experts = width // num_routers
+    if experts == 0 or experts & (experts - 1) or experts > (1 << 31) - 1:
+        return False
+    if not 1 <= topk <= experts:
+        return False
+    if logits.stride(1) != 1 or logits.stride(0) < width:
+        return False
+    for tensor in (correction_bias, per_expert_scale):
+        if tensor.device != logits.device or tensor.device.type != "cuda":
+            return False
+        if tensor.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+            return False
+        if (
+            tensor.ndim != 1
+            or tensor.numel() != experts
+            or not tensor.is_contiguous()
+        ):
+            return False
+    return True
+
+
 @plugin_hook(
     "sglang.kernels.ops.moe.multi_router.multi_router_topk",
     type=HookType.REPLACE,
@@ -378,7 +438,7 @@ def multi_router_topk_kunlun(
     *,
     num_routers: int,
 ):
-    """Torch-native replacement for the Triton ERNIE 5.5 multi-router top-k.
+    """Kunlun replacement for the Triton ERNIE 5.5 multi-router top-k.
 
     Base launches ``_multi_router_topk_kernel[(num_tokens,)]`` which is a plain
     stub on Kunlun ('function' object is not subscriptable). ERNIE 5.5's MoE gate
@@ -387,7 +447,36 @@ def multi_router_topk_kunlun(
     (not the biased values) at those ids, optionally renormalizes, then scales by
     ``per_expert_scale[id]``. ``logits`` is ``[T, num_routers * E]`` router-major
     with inner stride 1. Returns ``(weights fp32 [T, topk], ids int32 [T, topk])``.
+
+    ``kunlun_ops.multi_router_topk`` implements exactly that contract as one
+    XPU3 kernel (block-winner resident selection, stable smaller-id ties), so
+    the eager composite below only runs for inputs or wheels the kernel does
+    not cover.
     """
+    if _multi_router_kernel_supported(
+        logits, correction_bias, per_expert_scale, topk, renormalize, num_routers
+    ):
+        try:
+            return kunlun_ops.multi_router_topk(
+                logits,
+                correction_bias,
+                per_expert_scale,
+                topk,
+                renormalize,
+                num_routers=num_routers,
+            )
+        except RuntimeError as exc:
+            # Fused kernel refused this shape/device (ret=1); fall back to the
+            # eager reference, matching the "when supported" contract.
+            logger.warning(
+                "multi_router_topk_fused_fallback shape=%s num_routers=%s topk=%s "
+                "renormalize=%s reason=%s",
+                tuple(logits.shape),
+                num_routers,
+                topk,
+                renormalize,
+                exc,
+            )
     num_tokens, width = logits.shape
     num_experts = width // num_routers
     weights = torch.empty(
