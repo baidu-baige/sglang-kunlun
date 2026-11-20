@@ -73,9 +73,11 @@ def interleave_rows_kunlun(
     in_rows = x.shape[0]
     if in_rows == 0:
         return x.new_zeros((output_rows, *x.shape[1:]))
-    valid = source < in_rows
-    if bool(valid.all()):
+    # In sequence order, every source lies in the rank-major input.
+    # In rank order, every source is valid when no padding was added.
+    if not to_rank_major or sequence_total == rank_total:
         return x[source].contiguous()
+    valid = source < in_rows
     # Past-the-input rows are the rank padding and must read back as zero.
     out = x.new_zeros((output_rows, *x.shape[1:]))
     out[valid] = x[source[valid]]
