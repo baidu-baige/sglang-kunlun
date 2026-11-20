@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import logging
+
 import torch
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+
+logger = logging.getLogger(__name__)
 
 # multimax reads eight scalar parameters from device tensors. They are loaded
 # once from the checkpoint and never written after that, so the host copy is
@@ -228,6 +232,12 @@ def multimax_kunlun(x: torch.Tensor, ranges: torch.Tensor, ts: torch.Tensor):
     dtype for bit-identical output; the eager accumulation differs slightly, to
     be checked at the phase-3 precision step.
     """
+    # Idle attention-DP ranks may have no logit rows. The native kernel rejects
+    # empty tensors (ret=1); this pointwise transform has an empty output too.
+    # Return a fresh tensor, preserving the reference's non-aliasing contract.
+    if x.numel() == 0:
+        return torch.empty_like(x)
+
     if x.dtype in (torch.bfloat16, torch.float16) and x.is_contiguous():
         scalars = _multimax_scalars(ranges, ts)
         if scalars is not None:
