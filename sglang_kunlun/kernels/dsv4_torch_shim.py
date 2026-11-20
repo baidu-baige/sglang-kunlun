@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -745,7 +747,7 @@ def _fused_rope_inplace_kunlun(
 ) -> None:
     """Kunlun-native fused GPT-J RoPE via ``xspeedgate_ops.flashinfer_rotary_embedding``.
 
-    Mirrors aiak's ``fused_rope_kunlun``: converts complex ``freqs_cis`` into a
+    Mirrors the reference ``fused_rope_kunlun``: converts complex ``freqs_cis`` into a
     real ``[cos | sin]`` cache (cached), then rotates q/k **in place**.  q/k are
     normally non-contiguous tail views (``q[..., -64:]``); the op runs on the
     view's strides and writes back into the caller's storage, so the old
@@ -1377,7 +1379,7 @@ def _compress_norm_rope_store_kunlun(
 # ---------------------------------------------------------------------------
 # create_paged_compress_data (v1 legacy compressor.py write_loc/extra_data
 # builder). Upstream: sglang.jit_kernel.dsv4.attn.triton_create_paged_compress_data
-# (Triton kernel, unsupported on Kunlun). Mirrors aiak_sglang's
+# (Triton kernel, unsupported on Kunlun). Mirrors the reference
 # kunlun_create_paged_compress_data: route directly to the native
 # xspeedgate_ops.create_paged_compress_data kernel instead of a pure-torch
 # fallback, since the op is confirmed present on Kunlun.
@@ -1399,7 +1401,7 @@ def _create_paged_compress_data_kunlun(
     """Kunlun-native replacement for ``triton_create_paged_compress_data``.
 
     Routes to ``xspeedgate_ops.create_paged_compress_data`` (same op used by
-    aiak_sglang's ``kunlun_create_paged_compress_data``), avoiding the
+    the reference ``kunlun_create_paged_compress_data``), avoiding the
     unsupported Triton kernel entirely. ``block`` is accepted for signature
     compatibility with the upstream Triton helper but unused: the native op
     does its own internal launch planning.

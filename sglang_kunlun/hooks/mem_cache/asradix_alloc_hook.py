@@ -14,7 +14,7 @@
 """Hooks for ``sglang.srt.mem_cache.allocation`` -- AttentionStore staging slots.
 
 Ports ``_alloc_chunk_tail_slots_for_batch`` plus its call at the end of
-``alloc_for_extend`` from aiak_sglang 1d855da5 (luno-5195).
+``alloc_for_extend`` from the reference implementation.
 
 The hook targets the name as bound in ``managers.schedule_batch``, not
 ``mem_cache.allocation`` where ``alloc_for_extend`` is defined.

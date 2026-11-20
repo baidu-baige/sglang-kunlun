@@ -13,7 +13,7 @@
 # limitations under the License.
 """Hooks for the ``mem_cache`` wiring that selects the AttentionStore cache.
 
-Three injection points from aiak_sglang 1d855da5 (luno-5195):
+Three injection points from the reference implementation:
 
 * ``KVCacheConfigurator._build_dsv4_kv_pool`` -- upstream threads
   ``max_context_length=self.model_config.context_len`` into the DSV4 pool so the

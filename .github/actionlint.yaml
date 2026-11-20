@@ -1,5 +1,0 @@
-self-hosted-runner:
-  # Custom labels of self-hosted runners that actionlint cannot discover from
-  # GitHub must be declared here.
-  labels:
-    - ai-review

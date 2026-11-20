@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -19,7 +21,7 @@
 
 One REPLACE hook on the CP-path SWA-KV fp8 pack kernel. The stock triton
 implementation has no XPU backend ("0 compatible backends for target cuda"), so
-mirror AIAK's ``nsa/quant_k_cache_v4.quant_to_nope_fp8_rope_bf16_pack_triton``:
+mirror the reference's ``nsa/quant_k_cache_v4.quant_to_nope_fp8_rope_bf16_pack_triton``:
 when the KV cache dtype is bf16/fp16, skip fp8 quantization entirely and just
 cast the input to the cache dtype (no separate rope split, no scale).
 

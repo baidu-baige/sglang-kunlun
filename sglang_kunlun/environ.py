@@ -34,7 +34,7 @@ class Envs:
     # ---------------------------------------------------------------------
     # AttentionStore (asradix) secondary KV cache.
     #
-    # Upstream aiak_sglang declares these as ``--enable-asradix-cache`` and
+    # The upstream reference declares these as ``--enable-asradix-cache`` and
     # friends on the ``memory`` namespace, but a plugin cannot add fields to a
     # ``msgspec.Struct`` after the class is built, so the same knobs are env
     # vars here. Names and semantics track the CLI flags one-for-one; see
@@ -62,7 +62,7 @@ envs = Envs()
 EnvField._allow_set_name = original_allow_set_name
 
 
-# AttentionStore diagnostics that upstream aiak_sglang declares on sglang's own
+# AttentionStore diagnostics that the upstream reference declares on sglang's own
 # ``Envs``: content digest (D2H + hash per page) and the producer-event barrier
 # check. The vendored asradix code reads them as ``envs.SGLANG_LOG_AS_*`` off
 # sglang's environ, so inject them there rather than rewriting those reads --

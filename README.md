@@ -312,12 +312,6 @@ dependencies installed:
 python3 -m pytest -q
 ```
 
-The CI packaging script creates `output/sglang_kunlun.tar.gz`:
-
-```bash
-sh build/build.sh
-```
-
 For changes affecting runtime behavior, validate on the target Kunlun
 environment with the relevant model, quantization mode, parallelism, and
 graph/disaggregation settings. A passing unit-test run alone does not establish

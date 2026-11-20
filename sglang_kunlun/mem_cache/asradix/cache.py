@@ -81,7 +81,7 @@ class AttentionStoreIntegrationMixin:
         self.ascli = None
         # getattr, not params.disable_finished_insert: this engine is built on
         # community sglang, whose CacheInitParams never carried that field (it
-        # is an aiak dsv41-lineage addition consumed by radix_cache /
+        # is a dsv41-lineage addition consumed by radix_cache /
         # pure_swa_radix_cache). Its upstream default is False, and the other
         # read of it further down is already defensive, so behaviour is unchanged.
         self.disable_finished_insert = getattr(params, "disable_finished_insert", False)

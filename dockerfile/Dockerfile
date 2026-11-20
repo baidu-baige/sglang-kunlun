@@ -2,7 +2,7 @@ ARG BASE_IMAGE=iregistry.baidu-int.com/hac_test/aiak_sgl_ubuntu2204_base:v0.1
 FROM ${BASE_IMAGE}
 
 # 推理引擎类型
-ARG engine_type="aiak_sglang"
+ARG engine_type="sglang_src"
 
 # Engine source: "wheel" downloads the reviewed community sglang wheel from
 # PyPI; "source" clones SGLANG_REPO at SGLANG_REF/SGLANG_COMMIT instead and
@@ -35,7 +35,7 @@ ARG LIB_TMP_VERSION=""
 
 ARG ATTENTION_STORE_VERSION=""
 
-ARG aiak_ds_tool_download_addr=""
+ARG ds_tool_download_addr=""
 
 ARG performance_tool_download_addr=""
 
@@ -52,7 +52,7 @@ RUN bash /workspace/sglang_kunlun/dockerfile/install.sh \
     --SGLANG_REF="${SGLANG_REF}" \
     --SGLANG_COMMIT="${SGLANG_COMMIT}" \
     --performance_tool_download_addr=${performance_tool_download_addr} \
-    --aiak_ds_tool_download_addr="${aiak_ds_tool_download_addr}" \
+    --ds_tool_download_addr="${ds_tool_download_addr}" \
     --XPYTORCH_VERSION="${XPYTORCH_VERSION}" \
     --XFLASH_MLA_VERSION="${XFLASH_MLA_VERSION}" \
     --XDEEPEP_VERSION="${XDEEPEP_VERSION}" \

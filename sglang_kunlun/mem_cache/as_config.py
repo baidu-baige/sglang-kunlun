@@ -13,7 +13,7 @@
 # limitations under the License.
 """Config adapter for the AttentionStore (asradix) secondary KV cache.
 
-Upstream aiak_sglang puts these knobs on the ``memory`` namespace, so its code
+The reference implementation puts these knobs on the ``memory`` namespace, so its code
 reads them off the object ``get_memory()`` returns. A plugin cannot add fields
 to that ``msgspec.Struct`` once the class is built, so the knobs live in
 ``sglang_kunlun.environ`` instead and this module presents them under the

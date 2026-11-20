@@ -13,7 +13,7 @@
 # limitations under the License.
 """Hooks for ``sglang.srt.disaggregation.prefill`` -- AttentionStore SWA rescue.
 
-Upstream (aiak_sglang 1d855da5, luno-5195) calls
+The upstream reference implementation calls
 ``self.detect_and_may_copy_as_swa(req)`` from two places inside
 ``SchedulerDisaggregationPrefillMixin``: once in
 ``process_batch_result_disagg_prefill`` right after the final chunk finishes,

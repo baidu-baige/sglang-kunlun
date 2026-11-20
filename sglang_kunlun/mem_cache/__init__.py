@@ -14,7 +14,7 @@
 """Kunlun-local copies of mem_cache modules that upstream sglang lacks.
 
 The AttentionStore (asradix) secondary KV cache and its two sibling
-modules are ported from aiak_sglang 1d855da5ee (luno-5195).
+modules are ported from the reference implementation.
 The engine image ships community sglang, whose lineage never carried
 them, so the plugin vendors them instead of patching sglang in place.
 """

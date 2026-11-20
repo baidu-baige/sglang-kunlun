@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -951,7 +953,7 @@ def clamp_position(seq_lens: torch.Tensor) -> torch.Tensor:
 def hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     """Apply Kunlun Hadamard transform replacement.
 
-    Mirrors aiak_sglang's implementation: build the Hadamard matrix via
+    Mirrors the reference implementation: build the Hadamard matrix via
     ``kunlun_ops.gen_hadamard_matrix`` and apply it with ``kunlun_ops.matmul``,
     instead of the fused ``xspeedgate_ops.hadamard_transform`` op.
     """
@@ -2844,7 +2846,7 @@ def triton_create_paged_compress_data(
 ):
     """Kunlun-native replacement for the v1 legacy compressor's Triton
     write_loc/extra_data builder. Routes to
-    ``xspeedgate_ops.create_paged_compress_data`` (same op aiak_sglang uses)
+    ``xspeedgate_ops.create_paged_compress_data`` (same op the reference uses)
     instead of the unsupported Triton kernel.
 
     ``use_req_ring`` (added by newer v1 ``compressor.py``) is accepted for

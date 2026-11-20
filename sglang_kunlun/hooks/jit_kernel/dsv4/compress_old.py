@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -101,7 +103,7 @@ def _prefill_plan_generate_v1_kunlun(
 
 
 # ---------------------------------------------------------------------------
-# compress_forward. Mirrors aiak_sglang's compress_forward_kunlun: route
+# compress_forward. Mirrors the reference compress_forward_kunlun: route
 # directly to the native xspeedgate_ops.compress_forward_fast kernel (confirmed
 # present on Kunlun), using the legacy calling convention
 # (indices=req_pool_indices, seq_lens/compress_plan, write_plan, extra_data).
@@ -134,7 +136,7 @@ def _compress_forward_v1_kunlun(
     assert head_dim % 128 == 0
     num_q_tokens = kv_score_input.shape[0]
     if out is None:
-        # === FIX (mirrors aiak_sglang's CP c4 cross-rank divergence fix) ===
+        # === FIX (mirrors the reference CP c4 cross-rank divergence fix) ===
         # compress_forward_fast does NOT fully overwrite its output buffer;
         # an uninitialized `new_empty` out leaves per-allocation HBM garbage
         # in untouched positions, which differs run-to-run and across ranks,
@@ -165,7 +167,7 @@ def _compress_forward_v1_kunlun(
 
 
 # ---------------------------------------------------------------------------
-# compress_fused_norm_rope_inplace. Mirrors aiak_sglang's
+# compress_fused_norm_rope_inplace. Mirrors the reference
 # compress_fused_norm_rope_inplace_kunlun: route directly to the native
 # kunlun_ops.dpsk_v4_norm_rope_gptj fused op (confirmed present on Kunlun).
 # ---------------------------------------------------------------------------

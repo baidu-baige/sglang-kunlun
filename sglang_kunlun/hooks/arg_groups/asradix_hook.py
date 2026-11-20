@@ -13,7 +13,7 @@
 # limitations under the License.
 """Hooks for ``sglang.srt.arg_groups.kv_cache_hook`` -- AttentionStore guards.
 
-Ports the ``--enable-asradix-cache`` validation block that upstream aiak_sglang
+Ports the ``--enable-asradix-cache`` validation block that the upstream reference
 adds to ``handle_cache_compatibility``. The knobs themselves are env vars here
 (a plugin cannot extend the ``memory`` msgspec namespace), so the messages name
 the env var rather than a CLI flag, but the four constraints are unchanged:

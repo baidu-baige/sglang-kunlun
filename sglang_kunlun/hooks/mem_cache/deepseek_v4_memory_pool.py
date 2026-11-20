@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -20,7 +22,7 @@
 Three groups, all AROUND:
 
 1. bf16 KV pool layout. Upstream ``DeepSeekV4SingleKVPool`` lays the KV cache out as
-   fp8-584. Aligning to the AIAK float16 reference, ``get_bytes_per_token`` /
+   fp8-584. Aligning to the float16 reference, ``get_bytes_per_token`` /
    ``create_buffer`` switch it to a bf16-512 layout (1024 bytes/token: nope 448 +
    rope 64, no fp8 scale) so the decode store can use the native,
    cuda-graph-capturable ``torch.ops.xspeedgate_ops.set_k_and_s_v4``. Only activates

@@ -13,7 +13,7 @@
 # limitations under the License.
 """Hooks for ``sglang.srt.managers.scheduler`` / ``Req`` -- AttentionStore.
 
-Ports the scheduler side of aiak_sglang 1d855da5 (luno-5195): the five new
+Ports the scheduler side of the reference implementation: the five new
 ``Scheduler`` methods, the per-request AS state on ``Req``, and the four
 injection points in the event loops and flush path.
 

@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -25,7 +27,7 @@ cache on Kunlun:
    ``k_rope_bf16`` / ``scale_k_nope_ue8m0`` tensors (no None support). Under a
    bf16/fp16 cache the Kunlun pack (see ``quant_k_cache.py``) skips fp8
    quantization entirely and leaves both None, so the dataclass gains
-   ``kv_cache_dtype`` plus dtype-conditional asserts. Mirrors aiak_sglang's
+   ``kv_cache_dtype`` plus dtype-conditional asserts. Mirrors the reference
    ``index_buf_accessor_v4.NopeFp8RopeBf16Pack``.
 
 2. ``_set_k_and_s_triton`` (function REPLACE). The triton store splits
@@ -99,7 +101,7 @@ def set_k_and_s_triton_kunlun(buf, loc, nope_fp8_rope_bf16_pack, page_size):
     k_val = nope_fp8_rope_bf16_pack.k_nope_fp8
     assert k_val.dtype in (torch.bfloat16, torch.float16), \
         f"in this kernel, kv dtype is bf16/fp16, got {k_val.dtype}"
-    # TEMP FIX: the pack doesn't receive the real kv_cache_dtype (aiak_sglang's
+    # TEMP FIX: the pack doesn't receive the real kv_cache_dtype (the reference's
     # quant_to_nope_fp8_rope_bf16_pack_triton gets it from
     # token_to_kv_pool.store_dtype; our pack infers it from the input tensor's
     # own dtype, which is wrong when the input is bf16 but the cache is fp16).

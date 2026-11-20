@@ -13,7 +13,7 @@
 # limitations under the License.
 """Hooks for ``sglang.srt.mem_cache.deepseek_v4_memory_pool`` -- AttentionStore.
 
-Ports the ``DeepSeekV4TokenToKVPool`` side of aiak_sglang 1d855da5 (luno-5195):
+Ports the ``DeepSeekV4TokenToKVPool`` side of the reference implementation:
 
 * ``init_as_swa_pool`` allocates the ``ChunkTailSWAPool`` staging pool. The AS
   write path can only persist a SWA window that still exists in HBM, but

@@ -121,7 +121,7 @@ class SPACacheCoordinator(CheckpointedPageCacheCoordinator):
         self, cache, req, is_insert: bool
     ) -> AttentionStoreWriteContext:
         """Snapshot SPA slots for a finished request."""
-        # The aiak dsv41 lineage names this ``effective_kv_committed_len``; this
+        # The dsv41 lineage names this ``effective_kv_committed_len``; this
         # engine's community lineage carries the identical body under the older
         # name ``owned_kv_len``. Same semantics (report only the prompt prefix
         # when strip_thinking_cache trimmed reasoning tokens), just a rename.

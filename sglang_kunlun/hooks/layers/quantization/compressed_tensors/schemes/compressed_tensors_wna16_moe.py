@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -170,7 +172,7 @@ class KunlunCompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         layer.register_parameter("w13_weight_shape", w13_weight_shape)
         set_weight_attrs(w13_weight_shape, extra_weight_attrs)
 
-        # [REVERT luno-5395] These four buffers are load-bearing on this build.
+        # These four buffers are load-bearing on this build.
         # Dropping their registration silently corrupts the W4A8 MoE output,
         # even though nothing reads them and the checkpoint indeed carries no
         # `_g_idx` tensors (measured: 0 of 143317 tensors in
