@@ -6293,19 +6293,26 @@ def _dsv4_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
         # every rotation with the wrong cos/sin, which left greedy decoding
         # fluent for the first few high-confidence tokens and then collapsed into
         # repeated punctuation.
-        if freqs_cis.is_complex():
-            parts = torch.view_as_real(_plain_copy(freqs_cis))
-            half = parts.shape[-2]
-            cached = torch.empty(
-                parts.shape[:-2] + (half * 2,),
-                dtype=parts.dtype,
-                device=parts.device,
-            )
-            cached[..., :half].copy_(parts[..., 0])
-            cached[..., half:].copy_(parts[..., 1])
-        else:
-            # Already real-valued: the real/imag split is an identity.
-            cached = _plain_copy(freqs_cis)
+        #
+        # ``view_as_real`` is a view op, and while ``inference_mode`` is *active* any
+        # such view is rejected ("Cannot set version_counter for inference tensor")
+        # even when its input is a normal tensor -- copying the input is not enough.
+        # Build the cache with inference mode suspended; that also keeps the cached
+        # tensor a normal one, so reusing it outside inference_mode stays legal.
+        with torch.inference_mode(False), torch.no_grad():
+            if freqs_cis.is_complex():
+                parts = torch.view_as_real(_plain_copy(freqs_cis))
+                half = parts.shape[-2]
+                cached = torch.empty(
+                    parts.shape[:-2] + (half * 2,),
+                    dtype=parts.dtype,
+                    device=parts.device,
+                )
+                cached[..., :half].copy_(parts[..., 0])
+                cached[..., half:].copy_(parts[..., 1])
+            else:
+                # Already real-valued: the real/imag split is an identity.
+                cached = _plain_copy(freqs_cis)
         _DSV4_FREQS_REAL_CACHE[key] = cached
     return cached
 
