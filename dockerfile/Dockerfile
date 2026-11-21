@@ -403,7 +403,7 @@ RUN set -eux; \
         ln -sf "${sp}/kunlun_ops/${so}" "${sp}/torch_xmlir/${so}"; \
     done
 
-ARG XSPEEDGATE_OPS_ADDR=https://aihc-private-hcd.bj.bcebos.com/xspeedgate_release/torch29-cp312/20261112_181816/xspeedgate_ops-1.7.0+8f96a8d.torch29-cp312-cp312-linux_x86_64.whl
+ARG XSPEEDGATE_OPS_ADDR=https://aihc-private-hcd.bj.bcebos.com/xspeedgate_release/torch29-cp312/20261121_113752/xspeedgate_ops-1.7.0+2eb8077.torch29-cp312-cp312-linux_x86_64.whl
 RUN set -eux; \
     pip install --no-deps --retries 5 "${XSPEEDGATE_OPS_ADDR}"; \
     echo "xspeedgate_ops=${XSPEEDGATE_OPS_ADDR}" >> /versions; \
