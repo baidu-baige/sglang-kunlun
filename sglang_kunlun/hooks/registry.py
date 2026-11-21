@@ -98,6 +98,22 @@ def register_all() -> None:
     kernel_registry.log_resolution_report_once()
     for module_name in HOOK_MODULES:
         importlib.import_module(module_name)
+
+    # Kunlun: under the torch profiler the custom_op fast path forces ops onto the
+    # dispatcher, where Kunlun XPU tensors (CPU dispatch key under XMLIR) miss every
+    # registered backend and fall to CPU -> crash (inplace_all_reduce etc.). The only way to
+    # avoid the crash is to stay on the direct-eager path even while profiling: neutralize
+    # `_profiling`. Trade-off: a few sglang custom ops lose their host-side name label in
+    # the trace; all XPU kernels are still captured. Done here (after base import) to dodge
+    # the custom_op circular-import seen in pre_shim.
+    try:
+        from sglang.srt.utils import custom_op as _cop
+
+        _cop._profiling = lambda: False
+    except Exception:
+        logger.warning(
+            "sglang-kunlun: custom_op profiling-path patch failed", exc_info=True
+        )
     debug_modules = 0
     for module_name in DEBUG_HOOK_MODULES:
         try:
