@@ -18,6 +18,7 @@ disables itself on the first exception rather than per call.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Optional, Tuple
 
 import torch
@@ -167,6 +168,7 @@ def _split_sinkhorn_flat(
     pre_eps: float,
     sinkhorn_eps: float,
     post_mult: float,
+    mhc_align_fleet: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Split-Sinkhorn on a flat `[n, hc*(2+hc)]` mix tensor.
 
@@ -176,7 +178,8 @@ def _split_sinkhorn_flat(
     """
     rows = mixes.shape[0]
     fused = (
-        _OK["sinkhorn"]
+        not mhc_align_fleet
+        and _OK["sinkhorn"]
         and rows > 0
         and float(pre_eps) == float(sinkhorn_eps)
         and float(post_mult) == 2.0
@@ -212,7 +215,13 @@ def _split_sinkhorn_flat(
         flat[:, hc : 2 * hc] * scale[1] + base[hc : 2 * hc]
     )
     comb = (flat[:, 2 * hc :] * scale[2] + base[2 * hc :]).view(-1, hc, hc)
-    comb = comb.softmax(-1) + sinkhorn_eps
+    if mhc_align_fleet:
+        comb = torch.exp2(
+            (comb - comb.amax(dim=-1, keepdim=True)) * math.log2(math.e)
+        )
+        comb = comb / comb.sum(dim=-1, keepdim=True) + sinkhorn_eps
+    else:
+        comb = comb.softmax(-1) + sinkhorn_eps
     comb = comb / (comb.sum(-2, keepdim=True) + sinkhorn_eps)
     for _ in range(max(int(sinkhorn_iters) - 1, 0)):
         comb = comb / (comb.sum(-1, keepdim=True) + sinkhorn_eps)
@@ -313,6 +322,7 @@ def _mhc_pre_fused(
     sinkhorn_repeat: int,
     norm_weight: Optional[torch.Tensor] = None,
     norm_eps: Optional[float] = None,
+    mhc_align_fleet: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Same contract as `_mhc_pre_torch` plus the optional tail RMSNorm.
 
@@ -335,11 +345,18 @@ def _mhc_pre_fused(
     else:
         x_flat = residual.reshape(s, k).float()
 
-    mixes = _prenorm_gemm(x_flat, _fp32_cached(fn), rms_eps)
+    mixes = None if mhc_align_fleet else _prenorm_gemm(
+        x_flat, _fp32_cached(fn), rms_eps
+    )
     if mixes is None:
+        mapping_rms = (
+            1.0 / (torch.sqrt(x_flat.square().mean(-1, keepdim=True)) + rms_eps)
+            if mhc_align_fleet
+            else _row_rms_recip(x_flat, rms_eps)
+        )
         mixes = torch.nn.functional.linear(
             x_flat, _fp32_cached(fn)
-        ) * _row_rms_recip(x_flat, rms_eps)
+        ) * mapping_rms
 
     pre, post, comb = _split_sinkhorn_flat(
         mixes,
@@ -350,6 +367,7 @@ def _mhc_pre_fused(
         hc_pre_eps,
         hc_sinkhorn_eps,
         hc_post_mult_value,
+        mhc_align_fleet,
     )
     layer_input = _hc_combine(
         residual.reshape(s, k), pre, hc, dtype, norm_weight, norm_eps
@@ -430,6 +448,7 @@ def get_mhc_ops_kunlun():
         sinkhorn_repeat,
         norm_weight=None,
         norm_eps=None,
+        mhc_align_fleet=False,
     ):
         """Kernel-signature wrapper over the fused chain above.
 
@@ -449,6 +468,7 @@ def get_mhc_ops_kunlun():
             sinkhorn_repeat=sinkhorn_repeat,
             norm_weight=norm_weight,
             norm_eps=norm_eps,
+            mhc_align_fleet=mhc_align_fleet,
         )
 
     return MhcOps(
@@ -481,6 +501,7 @@ def mhc_pre_kunlun(
     norm_weight=None,
     norm_eps=None,
     eps_outside_sqrt=False,
+    mhc_align_fleet=False,
 ):
     """Fused replacement for the TileLang public ``mhc_pre``.
 
@@ -501,6 +522,7 @@ def mhc_pre_kunlun(
         sinkhorn_repeat=sinkhorn_repeat,
         norm_weight=norm_weight,
         norm_eps=norm_eps,
+        mhc_align_fleet=mhc_align_fleet,
     )
 
 
