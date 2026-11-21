@@ -392,15 +392,37 @@ def _get_topk_paged(
         kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim
     ).to(torch.int8)
     
-    k_scale = torch.ops.xspeedgate_ops.gather_paged_scale(
-        kv_cache=kv_cache_fp8,
-        block_tables=block_tables,
-        page_size=page_size,
-        head_dim=head_dim,
-        max_seq_len=max_seq_len,
-        scale_offset=page_size * head_dim,
-        context_lens=seqlens_32,
-    )
+    # KUNLUN_PERF: gather_paged_scale takes a slow path when a single call carries
+    # more than 8 rows (101.7 us -> 22543.9 us per call under graph replay); that is
+    # the concurrency cliff at 8 -> 9 requests per rank. The op is per-row, so issuing
+    # it in 8-row chunks is bit-exact. Disable with ERNIE55_GATHER_SCALE_CHUNK=0.
+    _gs_chunk = int(os.environ.get("ERNIE55_GATHER_SCALE_CHUNK", "8"))
+    _gs_rows = block_tables.shape[0]
+    if _gs_chunk > 0 and _gs_rows > _gs_chunk:
+        _gs_parts = []
+        for _gs_i in range(0, _gs_rows, _gs_chunk):
+            _gs_parts.append(
+                torch.ops.xspeedgate_ops.gather_paged_scale(
+                    kv_cache=kv_cache_fp8,
+                    block_tables=block_tables[_gs_i:_gs_i + _gs_chunk],
+                    page_size=page_size,
+                    head_dim=head_dim,
+                    max_seq_len=max_seq_len,
+                    scale_offset=page_size * head_dim,
+                    context_lens=seqlens_32[_gs_i:_gs_i + _gs_chunk],
+                )
+            )
+        k_scale = torch.cat(_gs_parts, dim=0)
+    else:
+        k_scale = torch.ops.xspeedgate_ops.gather_paged_scale(
+            kv_cache=kv_cache_fp8,
+            block_tables=block_tables,
+            page_size=page_size,
+            head_dim=head_dim,
+            max_seq_len=max_seq_len,
+            scale_offset=page_size * head_dim,
+            context_lens=seqlens_32,
+        )
 
     # NOTE: reverted luno-4142 (1830d8ea) -- scale the gathered k scales here
     # instead of relying on the kernel's q_is_int8 argument.

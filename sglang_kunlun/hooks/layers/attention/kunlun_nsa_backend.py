@@ -6,6 +6,9 @@ import math
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, List, Optional
 
+import logging
+import os
+
 import torch
 
 import kunlun_ops
@@ -80,6 +83,52 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 
+logger = logging.getLogger(__name__)
+
+_PAGED_TOPK_PATH_SEEN: set = set()
+_PAGED_TOPK_FUSED_DISABLED = False
+_PAGED_TOPK_SELFCHECK_DONE = False
+
+
+def _mark_fused_disabled(reason):
+    """Disable the fused path for good and log why."""
+    global _PAGED_TOPK_FUSED_DISABLED
+    if not _PAGED_TOPK_FUSED_DISABLED:
+        _PAGED_TOPK_FUSED_DISABLED = True
+        logger.warning("ERNIE55 paged topk: fused path disabled (%s), falling back to torch", reason)
+
+
+def _selfcheck_fused(dst, score, lengths, src_page_table, topk, cu_seqlens_q):
+    """Compare the fused result against the torch path once, row by row (sets, any order).
+
+    A mismatch disables the fused path permanently: this path decides which tokens
+    attention reads, so a wrong result is an accuracy bug. Runs once, cost is negligible.
+    """
+    global _PAGED_TOPK_SELFCHECK_DONE
+    _PAGED_TOPK_SELFCHECK_DONE = True
+    try:
+        os.environ["ERNIE55_FUSED_PAGED_TOPK"] = "0"      # make the recursive call take the torch branch
+        ref = _paged_topk_transform(score, lengths, src_page_table, topk, cu_seqlens_q)
+        bad = 0
+        for r in range(dst.shape[0]):
+            if (set(dst[r].tolist()) - {-1}) != (set(ref[r].tolist()) - {-1}):
+                bad += 1
+        if bad:
+            _mark_fused_disabled("selfcheck mismatch on %d/%d rows" % (bad, dst.shape[0]))
+        else:
+            logger.warning(
+                "ERNIE55 paged topk selfcheck passed: fused and torch select the same set per row "
+                "(rows=%s topk=%s width=%s table_width=%s)",
+                dst.shape[0], topk, score.shape[1], src_page_table.shape[1],
+            )
+    except Exception as exc:
+        _mark_fused_disabled("selfcheck itself raised " + repr(exc)[:140])
+    finally:
+        os.environ["ERNIE55_FUSED_PAGED_TOPK"] = "1"
+
+
+
+
 def _paged_topk_transform(
     score: torch.Tensor,
     lengths: torch.Tensor,
@@ -100,12 +149,71 @@ def _paged_topk_transform(
     device = score.device
     table_width = src_page_table.shape[1]
 
-    positions = torch.arange(width, device=device)
-    valid = positions.unsqueeze(0) < lengths.unsqueeze(1)
-    k = min(topk, width)
-    selected = score.masked_fill(~valid, float("-inf")).topk(k, dim=1).indices
-    selected, _ = selected.sort(dim=1)
-    selected_valid = valid.gather(1, selected)
+    # KUNLUN_PERF: prefer the fused xspeedgate topk, which does top-K search, length
+    # masking and page-table mapping in one op with no [rows, width] torch temporaries
+    # (the torch port below costs 615 ms / 20 steps, 20% of device time). Guarded at
+    # runtime, falls back to torch when the contract does not hold, one log line per
+    # outcome. The score is narrowed to table_width first: the tail columns are page
+    # padding with no legal position (all seq_len <= table_width) and the fused op only
+    # scans the first seq_lens[row] columns. Cost then follows the actual sequence
+    # length instead of the context_length-sized buffer width.
+    # Disable with ERNIE55_FUSED_PAGED_TOPK=0.
+    _score_fused = score[:, :table_width] if width > table_width else score
+    _fused_ok = (
+        os.environ.get("ERNIE55_FUSED_PAGED_TOPK", "1") != "0"
+        and not _PAGED_TOPK_FUSED_DISABLED
+        and src_page_table.shape[0] == rows
+        and table_width >= _score_fused.shape[1]
+        and hasattr(torch.ops.xspeedgate_ops, "topk_transform")
+    )
+    _key = (bool(_fused_ok), rows == src_page_table.shape[0], table_width >= width)
+    if _key not in _PAGED_TOPK_PATH_SEEN:
+        _PAGED_TOPK_PATH_SEEN.add(_key)
+        logger.warning(
+            "ERNIE55 paged topk path=%s rows=%s width=%s table_width=%s topk=%s lengths_dtype=%s",
+            "xspeedgate_fused" if _fused_ok else "torch",
+            rows, width, table_width, topk, lengths.dtype,
+        )
+    if _fused_ok:
+        dst_page_table = score.new_full((rows, topk), -1, dtype=torch.int32)
+        _sf = _score_fused if _score_fused.is_contiguous() else _score_fused.contiguous()
+        try:
+            torch.ops.xspeedgate_ops.topk_transform(
+                _sf,
+                lengths.clamp(max=_sf.shape[1]).to(torch.int32),
+                src_page_table,
+                dst_page_table,
+                topk,
+                None,
+                1,      # page_size: this path's page table is already page-1 cache slots
+                True,   # fast_path
+            )
+        except Exception as exc:  # shape not accepted: fall back to torch for good
+            _mark_fused_disabled("topk_transform raised: " + repr(exc)[:160])
+            return _paged_topk_transform(score, lengths, src_page_table, topk, cu_seqlens_q)
+        if not _PAGED_TOPK_SELFCHECK_DONE:
+            _selfcheck_fused(dst_page_table, score, lengths, src_page_table, topk, cu_seqlens_q)
+        return dst_page_table
+
+    # KUNLUN_PERF: the torch path used to build an int64 [rows, width] mask and gather
+    # through it; aten::lt alone cost 512 ms / 20 steps (17% of device time). Compare in
+    # int32 and derive selected_valid on [rows, k] directly (k=2048 vs width~32k).
+    # Element-wise equivalent on the selected set. Disable with ERNIE55_INT32_TOPK_MASK=0.
+    if os.environ.get("ERNIE55_INT32_TOPK_MASK", "1") != "0":
+        positions = torch.arange(width, device=device, dtype=torch.int32)
+        lengths_i32 = lengths.to(torch.int32)
+        valid = positions.unsqueeze(0) < lengths_i32.unsqueeze(1)
+        k = min(topk, width)
+        selected = score.masked_fill(~valid, float("-inf")).topk(k, dim=1).indices
+        selected, _ = selected.sort(dim=1)
+        selected_valid = selected.to(torch.int32) < lengths_i32.unsqueeze(1)
+    else:
+        positions = torch.arange(width, device=device)
+        valid = positions.unsqueeze(0) < lengths.unsqueeze(1)
+        k = min(topk, width)
+        selected = score.masked_fill(~valid, float("-inf")).topk(k, dim=1).indices
+        selected, _ = selected.sort(dim=1)
+        selected_valid = valid.gather(1, selected)
 
     if src_page_table.shape[0] == rows:
         table = src_page_table
