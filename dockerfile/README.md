@@ -18,6 +18,7 @@ The open-source release ships this build recipe instead of a prebuilt image.
 | `pip.conf` / `sources.list` | Build-time package mirrors. |
 | `vendor/requirements.txt` | Python dependencies of the engine wheel. |
 | `vendor/sgl_kernel-*.whl` | Prebuilt `sgl-kernel` wheel the runtime needs. |
+| `vendor/common_ops*.so` | Prebuilt `common_ops` module copied into the engine source tree when `SGLANG_ENGINE_SOURCE=source`. |
 
 ## Build
 
@@ -31,17 +32,19 @@ docker build -f sglang-kunlun/dockerfile/Dockerfile \
 ```
 
 By default the build downloads the reviewed community `sglang==0.5.21` wheel
-from PyPI and verifies its sha256. To build the engine from source instead, pass
-an explicit commit:
+and verifies its sha256. To build the engine from source instead, pass an
+explicit commit:
 
 ```bash
 docker build -f sglang-kunlun/dockerfile/Dockerfile \
     --build-arg SGLANG_ENGINE_SOURCE=source \
     --build-arg SGLANG_REF=v0.5.21 \
     --build-arg SGLANG_COMMIT=<commit> \
-    --build-arg GITHUB_PROXY=<optional http(s) proxy> \
     -t sglang-kunlun:0.5.21 .
 ```
+
+The default `BASE_IMAGE` comes from the Kunlun base-image registry; override it
+with `--build-arg BASE_IMAGE=<image>` when building against a different base.
 
 The remaining runtime package versions are read from `xpu_requirements.env`;
 override them with the matching `--build-arg` when moving to a newer runtime.

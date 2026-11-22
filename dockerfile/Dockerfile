@@ -1,19 +1,14 @@
-ARG BASE_IMAGE=iregistry.baidu-int.com/hac_test/aiak_sgl_ubuntu2204_base:v0.1
+ARG BASE_IMAGE=iregistry.baidu-int.com/xmlir/xmlir_ubuntu_2004_x86_64:v0.42
 FROM ${BASE_IMAGE}
 
-# 推理引擎类型
-ARG engine_type="sglang_src"
+# Inference engine type
+ARG engine_type="sglang"
 
-# Engine source: "wheel" downloads the reviewed community sglang wheel from
-# PyPI; "source" clones SGLANG_REPO at SGLANG_REF/SGLANG_COMMIT instead and
-# requires an explicit commit.
+# Default: verified vendored Pod engine; source builds require an explicit commit.
 ARG SGLANG_ENGINE_SOURCE="wheel"
 ARG SGLANG_REPO="https://github.com/sgl-project/sglang.git"
 ARG SGLANG_REF="v0.5.21"
 ARG SGLANG_COMMIT=""
-# Optional HTTP(S) proxy used when SGLANG_ENGINE_SOURCE=source clones GitHub.
-ARG GITHUB_PROXY=""
-ENV GITHUB_PROXY=${GITHUB_PROXY}
 
 ARG XPYTORCH_VERSION=""
 
@@ -35,14 +30,12 @@ ARG LIB_TMP_VERSION=""
 
 ARG ATTENTION_STORE_VERSION=""
 
-ARG ds_tool_download_addr=""
-
 ARG performance_tool_download_addr=""
 
 RUN rm -rf /workspace/*
 RUN mkdir -p /workspace/
 
-# Build from the local plugin tree; the engine is fetched at build time.
+# Build from the local plugin tree, including the vendored engine wheel.
 COPY sglang-kunlun /workspace/sglang_kunlun
 
 RUN bash /workspace/sglang_kunlun/dockerfile/install.sh \
@@ -52,7 +45,6 @@ RUN bash /workspace/sglang_kunlun/dockerfile/install.sh \
     --SGLANG_REF="${SGLANG_REF}" \
     --SGLANG_COMMIT="${SGLANG_COMMIT}" \
     --performance_tool_download_addr=${performance_tool_download_addr} \
-    --ds_tool_download_addr="${ds_tool_download_addr}" \
     --XPYTORCH_VERSION="${XPYTORCH_VERSION}" \
     --XFLASH_MLA_VERSION="${XFLASH_MLA_VERSION}" \
     --XDEEPEP_VERSION="${XDEEPEP_VERSION}" \

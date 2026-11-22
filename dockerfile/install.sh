@@ -9,7 +9,7 @@ function usage()
 	echo -e "bash $0 [args]"
 	echo -e ""
     echo -e "Optional Arguments:"
-    echo -e "--engine_type=<engine_type>                  engine type, e.g., sglang_src"
+    echo -e "--engine_type=<engine_type>                  engine type, e.g., sglang"
     echo -e "--XPYTORCH_VERSION=<XPYTORCH_VERSION>        XPYTORCH_VERSION"
     echo -e "--XFLASH_MLA_VERSION=<XFLASH_MLA_VERSION>    XFLASH_MLA_VERSION"
     echo -e "--XDEEPEP_VERSION=<XDEEPEP_VERSION>          XDEEPEP_VERSION"
@@ -22,7 +22,6 @@ function usage()
     echo -e "--SGLANG_REF=<SGLANG_REF>                    SGLANG_REF"
     echo -e "--SGLANG_COMMIT=<SGLANG_COMMIT>              SGLANG_COMMIT, if set, checkout this commit after clone"
     echo -e "--performance_tool_download_addr=<performance_tool_download_addr>    performance_tool_download_addr"
-    echo -e "--ds_tool_download_addr=<ds_tool_download_addr>    ds_tool_download_addr"
     echo -e ""
     
 }
@@ -134,22 +133,21 @@ if [[ -z "${SGLANG_REF:-}" || "${SGLANG_REF}" == "NA" ]]; then
 fi
 ############################################################# 基础环境开始 ###########################################################
 
-# 插件仓库（构建上下文），引擎源码由 clone_sglang 在构建期 git clone 到 sglang_src_dir
+# 插件仓库（构建上下文），社区引擎源码由 clone_sglang 在构建期 git clone 到 sglang_upstream_dir
 plugin_dir="/workspace/sglang_kunlun"
-sglang_src_dir="/workspace/sglang_src"
+sglang_upstream_dir="/workspace/sglang-upstream"
 
 function install_base_env() {
     rm -rf /etc/apt/sources.list && cp ${plugin_dir}/dockerfile/sources.list /etc/apt/sources.list
     # 设置时区
-    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y tzdata && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
-    apt-get install -y curl wget net-tools patch git
+    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install tzdata && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+    apt-get install net-tools -y
     apt-get install lsof -y
     apt-get install libarchive-dev zlib1g-dev -y
     apt-get install bc tree pwgen nodejs -y
     apt-get install libgoogle-glog-dev -y
 
     # 安装 cmake
-    # bash /cmake-3.28.6-linux-x86_64.sh --prefix=/usr/local --exclude-subdir && rm -rf /cmake-3.28.6-linux-x86_64.sh
     
     rm -rf /opt/conda/pip.conf /root/.config/pip/pip.conf /root/.pip/pip.conf /etc/pip.conf /etc/xdg/pip/pip.conf /usr/pip.conf
     cp ${plugin_dir}/dockerfile/pip.conf /etc/pip.conf
@@ -161,7 +159,7 @@ function install_base_env() {
 }
 
 function install_sight() {
-    # 安装 sight
+    # 安装 Nsight Systems（NVIDIA 官方公开下载；2025.1.1 CLI-only amd64）
     wget -qO /workspace/NsightSystems-linux-cli-public-2025.1.1.103-3542797.deb https://cce-ai-datasets.bj.bcebos.com/hac-aiacc/deepseek/NsightSystems-linux-cli-public-2025.1.1.103-3542797.deb
     dpkg -i /workspace/NsightSystems-linux-cli-public-2025.1.1.103-3542797.deb
     rm -rf /workspace/NsightSystems-linux-cli-public-2025.1.1.103-3542797.deb
@@ -197,7 +195,7 @@ PYCODE
 }
 
 function clone_sglang() {
-    # 从社区 github 拉取 sglang 引擎源码（构建机直连 github 会超时，走代理）。
+    # 从社区 github 拉取 sglang 引擎源码。
     # Explicit source route only; failure aborts without wheel fallback.
     local repo="${1:-}"
     local ref="${2:-}"
@@ -211,52 +209,39 @@ function clone_sglang() {
         return 1
     fi
 
-    # Optional HTTP(S) proxy for the source clone; set GITHUB_PROXY to use one.
-    local github_http_proxy="${GITHUB_PROXY:-}"
-
-    # 指定 commit 时不能直接用 --branch（git 不接受 SHA），先按 ref 克隆再 checkout
     local -a clone_args=(--filter=blob:none)
     if [[ -z "${commit}" || "${commit}" == "NA" ]]; then
         clone_args+=(--branch "${ref}")
     fi
 
-    rm -rf ${sglang_src_dir}
-    echo "Clone sglang (${github_http_proxy:-direct}): ${repo} @ ${ref}"
-    if [[ -n "${github_http_proxy}" ]]; then
-        export http_proxy="${github_http_proxy}" https_proxy="${github_http_proxy}"
-    fi
+    rm -rf ${sglang_upstream_dir}
+    echo "Clone sglang: ${repo} @ ${ref}"
     # Source clone timeout; failure aborts this explicitly requested route.
-    # -c http.version=HTTP/1.1：squid 代理下大流量/回源走 HTTP/2 会报 "curl 16 HTTP2 framing layer"
-    # -c http.lowSpeed*：代理出现半死连接（低速）时也能提前失败
     local clone_timeout=300
     if ! timeout "${clone_timeout}" git -c http.version=HTTP/1.1 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 \
-             clone "${clone_args[@]}" "${repo}" ${sglang_src_dir}; then
+             clone "${clone_args[@]}" "${repo}" ${sglang_upstream_dir}; then
         echo "Error: failed to clone sglang from github within ${clone_timeout}s"
-        rm -rf ${sglang_src_dir}
-        unset http_proxy https_proxy
+        rm -rf ${sglang_upstream_dir}
         return 1
     fi
 
     # 强制 HTTP/1.1：blob 回源大流量传输走 HTTP/2 会报 "curl 16 HTTP2 framing layer"
-    git -C ${sglang_src_dir} config http.version HTTP/1.1
+    git -C ${sglang_upstream_dir} config http.version HTTP/1.1
 
     if [[ -n "${commit}" && "${commit}" != "NA" ]]; then
         echo "Checking out sglang commit: ${commit}"
-        # --filter=blob:none 部分克隆下 checkout 会现场回源抓 blob，需要代理，同样 5 分钟超时
-        if ! timeout "${clone_timeout}" git -C ${sglang_src_dir} checkout ${commit}; then
+        if ! timeout "${clone_timeout}" git -C ${sglang_upstream_dir} checkout ${commit}; then
             echo "Error: failed to checkout sglang commit ${commit} within ${clone_timeout}s"
-            unset http_proxy https_proxy
             return 1
         fi
     fi
-    unset http_proxy https_proxy
     cd /workspace
 }
 
 function patch_sglang_disable_rust() {
     # 昆仑镜像无 Rust 工具链；剥离社区版 sglang 的 PyO3 Rust 扩展(sglang.srt.grpc._core)，
-    # 以纯 Python 方式构建 wheel（对齐社区构建的做法，避免 build_rust 报 "can't find Rust compiler"）
-    local pyproject="${sglang_src_dir}/python/pyproject.toml"
+    # 以纯 Python 方式构建 wheel（避免 build_rust 报 "can't find Rust compiler"）
+    local pyproject="${sglang_upstream_dir}/python/pyproject.toml"
     # 1) 从 build-system.requires 去掉 setuptools-rust
     sed -i -E 's/"setuptools-rust[^"]*",?[[:space:]]*//g' "${pyproject}"
     # 2) 删除 [[tool.setuptools-rust.ext-modules]] 整段（到下一个空行为止）
@@ -468,9 +453,6 @@ PY
         rm -f /tmp/xspeedgate_ops_stock.whl
         fi
 
-        # download cocopod
-        # pip3 install cocopod-1.4.0%2B059d312.torch29-cp310-cp310-linux_x86_64.whl --force-reinstall
-        # rm cocopod-1.4.0%2B059d312.torch29-cp310-cp310-linux_x86_64.whl
 
     elif [[ "$project" == "attentionstore" ]]; then
         whl_file="attentionstore_sdk-${version}-py310-none-linux_x86_64.whl"
@@ -499,7 +481,7 @@ PY
 }
 
 
-function install_sglang_from_source() {
+function install_sglang_engine() {
     # 先装 sglang 的 Python 依赖（与引擎来源无关，vendored wheel / 源码构建两条路都要）
     # 锁定 xpytorch 的 torch 版本，禁止后续 pip 安装替换/升级 torch，
     # 否则 torch_xmlir/libxpytorch.so 会与被换掉的 libtorch ABI 不匹配 -> import torch 段错误
@@ -538,40 +520,27 @@ PYCODE
 
     # Explicit source builds must match the reviewed wheel version.
     if [[ "${SGLANG_ENGINE_SOURCE}" == "source" ]]; then
-        echo "Build sglang from source tree ${sglang_src_dir}"
-        cd ${sglang_src_dir}/python
+        echo "Build sglang from source tree ${sglang_upstream_dir}"
+        cd ${sglang_upstream_dir}/python
         rm -rf dist
         python3 -m build --wheel
         local built_wheels=(dist/*.whl)
         [[ "${#built_wheels[@]}" -eq 1 ]] || return 1
         validate_sglang_wheel "${built_wheels[0]}" || return 1
-        if [[ -n "${GITHUB_PROXY:-}" ]]; then
-            export http_proxy="${GITHUB_PROXY}" https_proxy="${GITHUB_PROXY}"
-        fi
         # --no-deps: 社区版 pyproject 的依赖是 CUDA13 GPU 全家桶(torch==2.11 等)，会冲掉昆仑 xpytorch；
         # 依赖统一由上面的 requirements.txt + install_dep(xpytorch/kunlun_ops…) 提供
         pip3 install --no-deps "${built_wheels[0]}"
-        unset http_proxy https_proxy
 
-        # rm -rf ${sglang_src_dir}
+        # rm -rf ${sglang_upstream_dir}
         # 拷贝common_ops依赖（源文件由 sglang-kunlun 仓库提供）：
-        # 部分版本的 sglang 源码树自带真实的 sgl-kernel/ 目录，需覆盖它的编译产物；
+        # 旧版社区 sglang 自带真实的 sgl-kernel/ 目录，需覆盖它的编译产物；
         # 新版社区 sglang 不再 vendor 该目录，插件完全靠 sgl_kernel_stub.py 在运行期打桩替代，目录不存在时跳过拷贝。
-        if [[ -d "${sglang_src_dir}/sgl-kernel/python/sgl_kernel" ]]; then
-            # The prebuilt common_ops blob is not shipped in the open-source
-            # tree (`.gitignore` excludes *.so); without it the plugin falls
-            # back to sgl_kernel_stub.py at runtime.
-            local common_ops="${plugin_dir}/dockerfile/vendor/common_ops.cpython-310-x86_64-linux-gnu.so"
-            if [[ -f "${common_ops}" ]]; then
-                cp "${common_ops}" "${sglang_src_dir}/sgl-kernel/python/sgl_kernel/common_ops.cpython-310-x86_64-linux-gnu.so"
-                rm "${common_ops}"
-            else
-                echo "vendor common_ops not shipped; relying on sgl_kernel_stub at runtime"
-            fi
+        if [[ -d "${sglang_upstream_dir}/sgl-kernel/python/sgl_kernel" ]]; then
+            cp ${plugin_dir}/dockerfile/vendor/common_ops.cpython-310-x86_64-linux-gnu.so ${sglang_upstream_dir}/sgl-kernel/python/sgl_kernel/common_ops.cpython-310-x86_64-linux-gnu.so
+            rm ${plugin_dir}/dockerfile/vendor/common_ops.cpython-310-x86_64-linux-gnu.so
         else
             echo "sgl-kernel/python/sgl_kernel not found in engine source (community sglang no longer vendors it); skip common_ops copy, relying on sgl_kernel_stub at runtime"
         fi
-        #/workspace/sglang_src/sgl-kernel/python/sgl_kernel/
         # 因上面的目录已经删除，所以后续执行目录需要再存在的目录下执行，不然会遇到莫名其妙的报错
         cd /workspace
         return 0
@@ -617,22 +586,14 @@ PYCODE
 }
 
 function install_performance_tool() {
-    local performance_tool_download_addr="${1:-}"
-    if [[ -z "${performance_tool_download_addr}" || "${performance_tool_download_addr}" == "NA" ]]; then
-        echo "performance_tool_download_addr not set; skip"
-        return 0
-    fi
-    pip3 install "${performance_tool_download_addr}"
+    local performance_tool_download_addr=$1
+    pip3 install ${performance_tool_download_addr}
     echo "performance_tool=${performance_tool_download_addr}" >> /versions
 }
 
 function install_ds_tool() {
-    local ds_tool_download_addr="${1:-}"
-    if [[ -z "${ds_tool_download_addr}" || "${ds_tool_download_addr}" == "NA" ]]; then
-        echo "ds_tool_download_addr not set; skip"
-        return 0
-    fi
-    pip3 install "${ds_tool_download_addr}"
+    local ds_tool_download_addr=$1
+    pip3 install ${ds_tool_download_addr}
     echo "ds_tool_download_addr=${ds_tool_download_addr}" >> /versions
 }
 
@@ -654,7 +615,7 @@ conda activate python310_torch29_cuda
 
 install_base_env
 
-if [ "$engine_type" == "sglang_src" ]; then
+if [ "$engine_type" == "sglang" ]; then
     case "${SGLANG_ENGINE_SOURCE}" in
         wheel) : ;;
         source)
@@ -673,15 +634,12 @@ if [ "$engine_type" == "sglang_src" ]; then
     install_dep xsgl_kernel ${SGL_KERNEL_VERSION}
     #install_dep runtime ${RUNTIME_VERSION}
     install_dep lib_tmp ${LIB_TMP_VERSION}
-    install_sglang_from_source
+    install_sglang_engine
     install_dep xtriton ${XTRITON_VERSION}
     install_dep attentionstore ${ATTENTION_STORE_VERSION}
     file_soft_chain
     install_sglang_kunlun_plugin
     apply_engine_patches
-else
-    echo "Error: unsupported engine_type '${engine_type}' (expected sglang_src)" >&2
-    exit 1
 fi
 
 ############################################################# 基础环境结束 ###########################################################
