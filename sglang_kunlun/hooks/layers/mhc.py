@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -30,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 # Set to False on the first failure of the corresponding op.
 _OK = {"prenorm": True, "sinkhorn": True, "combine": True, "norm": True}
+
+# Set KUNLUN_MHC_FUSE_FLEET_SINKHORN=0 to fall back to the torch loop.
+# todo：when new op is available, KUNLUN_MHC_FUSE_FLEET_SINKHORN will be removed
+_FUSE_FLEET_SINKHORN = os.environ.get("KUNLUN_MHC_FUSE_FLEET_SINKHORN", "1") == "1"
 _LOGGED: dict = {}
 
 
@@ -69,6 +74,17 @@ def _fp32_cached(w: torch.Tensor) -> torch.Tensor:
     return cast
 
 
+def _neutral_ctx():
+    """Suspend ``inference_mode`` (keeping grad off) for a long-lived allocation.
+
+    A tensor allocated under ``inference_mode`` is permanently marked, and writing to
+    it from a ``no_grad`` forward raises "Inplace update to inference tensor outside
+    InferenceMode"; the scheduler mixes both contexts, so these cross-forward memos
+    must be allocated with the mode suspended. ``no_grad`` keeps grad off meanwhile.
+    """
+    return torch.inference_mode(False)
+
+
 def _view(base: torch.Tensor, shape, slot: str) -> torch.Tensor:
     """`base.view(shape)` memoised while `base` is the same object.
 
@@ -78,7 +94,8 @@ def _view(base: torch.Tensor, shape, slot: str) -> torch.Tensor:
     ent = _VIEWS.get(slot)
     if ent is not None and ent[0] is base and ent[1] == shape:
         return ent[2]
-    v = base.view(shape)
+    with _neutral_ctx(), torch.no_grad():
+        v = base.view(shape)
     _VIEWS[slot] = (base, shape, v)
     return v
 
@@ -92,9 +109,13 @@ def _xflat_f32(residual_flat: torch.Tensor, rows: int, k: int) -> torch.Tensor:
     key = (rows, k, residual_flat.device)
     buf = _XFLAT_BUF.get(key)
     if buf is None:
-        buf = torch.empty(rows, k, dtype=torch.float32, device=residual_flat.device)
+        with _neutral_ctx(), torch.no_grad():
+            buf = torch.empty(
+                rows, k, dtype=torch.float32, device=residual_flat.device
+            )
         _XFLAT_BUF[key] = buf
-    _view(buf, residual_flat.shape, "xflat").copy_(residual_flat)
+    with _neutral_ctx(), torch.no_grad():
+        _view(buf, residual_flat.shape, "xflat").copy_(residual_flat)
     return buf
 
 
@@ -130,18 +151,21 @@ def _prenorm_gemm(
     n = w_f32.shape[0]
     try:
         dev = x_flat.device
-        gamma = _GAMMA_ONES.get((k, dev))
-        if gamma is None:
-            gamma = torch.ones(k, dtype=torch.float32, device=dev)
-            _GAMMA_ONES[(k, dev)] = gamma
-        scratch = _GEMM_SCRATCH.get((rows, k, dev))
-        if scratch is None:
-            scratch = torch.empty((1, rows, k), dtype=torch.float32, device=dev)
-            _GEMM_SCRATCH[(rows, k, dev)] = scratch
-        out = _GEMM_OUT_BUF.get((rows, n, dev))
-        if out is None:
-            out = torch.empty((1, rows, n), dtype=torch.float32, device=dev)
-            _GEMM_OUT_BUF[(rows, n, dev)] = out
+        with _neutral_ctx(), torch.no_grad():
+            gamma = _GAMMA_ONES.get((k, dev))
+            if gamma is None:
+                gamma = torch.ones(k, dtype=torch.float32, device=dev)
+                _GAMMA_ONES[(k, dev)] = gamma
+            scratch = _GEMM_SCRATCH.get((rows, k, dev))
+            if scratch is None:
+                scratch = torch.empty(
+                    (1, rows, k), dtype=torch.float32, device=dev
+                )
+                _GEMM_SCRATCH[(rows, k, dev)] = scratch
+            out = _GEMM_OUT_BUF.get((rows, n, dev))
+            if out is None:
+                out = torch.empty((1, rows, n), dtype=torch.float32, device=dev)
+                _GEMM_OUT_BUF[(rows, n, dev)] = out
         kunlun_ops.rms_qkv_gemm(
             _view(x_flat, (1, rows, k), "gemm_in"),
             w_f32,
@@ -178,7 +202,7 @@ def _split_sinkhorn_flat(
     """
     rows = mixes.shape[0]
     fused = (
-        not mhc_align_fleet
+        (not mhc_align_fleet or _FUSE_FLEET_SINKHORN)
         and _OK["sinkhorn"]
         and rows > 0
         and float(pre_eps) == float(sinkhorn_eps)
@@ -202,7 +226,11 @@ def _split_sinkhorn_flat(
                 int(sinkhorn_iters),
                 float(sinkhorn_eps),
             )
-            _once("sinkhorn", f"mhc: mhc_split_sinkhorn fusion active (hc={hc})")
+            _once(
+                "sinkhorn",
+                f"mhc: mhc_split_sinkhorn fusion active (hc={hc}, "
+                f"align_fleet={bool(mhc_align_fleet)})",
+            )
             return pre, post, comb.view(rows, hc, hc)
         except Exception as exc:
             _disable("sinkhorn", exc)

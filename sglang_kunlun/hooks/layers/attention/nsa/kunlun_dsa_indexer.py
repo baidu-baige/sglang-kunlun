@@ -705,11 +705,15 @@ def _get_topk_ragged(
     cu_k_cpu = context_k_lens_cpu.reshape(-1)
     cu_k_xpu = context_k_lens_xpu.reshape(-1)
 
+    # Chunk on the host only. Running ``chunk_cu_seqlens`` over the device
+    # mirror as well recomputed identical values (the two tensors are a
+    # ``.cpu()`` pair) while forcing ~19 ``.item()`` syncs per step -- measured
+    # 124 ms/step of host block on a 64k prefill. What the kernels need from the
+    # device is just ``new_cu_seqlens``, a tens-of-bytes H2D.
     q_interval_cpu = chunk_cu_seqlens(context_q_lens_cpu, chunk_size=max_rows)
-    q_interval_xpu = chunk_cu_seqlens(context_q_lens_xpu, chunk_size=max_rows)
     for i in range(len(q_interval_cpu)):
         chunk_q_cpu, _, chunk_range = q_interval_cpu[i]
-        chunk_q_xpu, _, _ = q_interval_xpu[i]
+        chunk_q_xpu = chunk_q_cpu.to(device=device, non_blocking=True)
         start = int(chunk_range[0].item())
         end = int(chunk_range[1].item())
 
@@ -766,7 +770,7 @@ def _get_topk_ragged(
         topk_result[start:end] = dst_page_table
         del logits_chunk
     del ks, q_fp8, k_fp8, k_scale
-    del q_interval_cpu, q_interval_xpu
+    del q_interval_cpu
     return topk_result
 
 def _get_topk_ragged_with_cp(
