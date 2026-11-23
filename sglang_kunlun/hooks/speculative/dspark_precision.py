@@ -111,6 +111,30 @@ def _install_c4_state_clear() -> None:
 _install_c4_state_clear()
 
 
+# KUNLUN_PERF(ERNIE55 1121): a cached reset template plus index_copy_ instead of
+# rebuilding the template per pool and writing through the sliced scatter. Same values,
+# measured 4.212 -> 0.137 ms/step on the decode trace. ERNIE55_C128_CLEAR_FAST=0 restores
+# the slow path.
+_C128_CLEAR_FAST = os.environ.get("ERNIE55_C128_CLEAR_FAST", "1") != "0"
+_C128_TMPL: dict = {}
+
+
+def _c128_reset_template(state: torch.Tensor, rows: int, half: int) -> torch.Tensor:
+    """``[rows, cols]`` with the first half zeroed and the second half at -inf.
+
+    Cached per (dtype, device, cols, rows): the DSPARK verify step calls this once per
+    compress-state pool (37 of them) with identical shapes.
+    """
+    key = (state.dtype, state.device, int(state.shape[-1]), int(rows))
+    tmpl = _C128_TMPL.get(key)
+    if tmpl is None:
+        tmpl = torch.empty((rows, state.shape[-1]), dtype=state.dtype, device=state.device)
+        tmpl[:, :half] = 0
+        tmpl[:, half:] = float("-inf")
+        _C128_TMPL[key] = tmpl
+    return tmpl
+
+
 def _clear_unaccepted_c128_draft_states(
     self,
     req_pool_indices: torch.Tensor,
@@ -163,12 +187,23 @@ def _clear_unaccepted_c128_draft_states(
         rows = rows_by_ring[int(pool.ring_size)]
         state = pool.kv_score_buffer.kv_score
         half = state.shape[-1] // 2
-        sel = state.index_select(0, rows)
-        reset = torch.cat(
-            (torch.zeros_like(sel[:, :half]), torch.full_like(sel[:, half:], float("-inf"))),
-            dim=-1,
-        )
-        state[rows] = torch.where(rej_flat, reset, sel)
+        if _C128_CLEAR_FAST:
+            # KUNLUN_PERF(ERNIE55 1121): the reset template does not depend on the pool, and
+            # the sliced ``state[rows] = ...`` lands on the generic scatter. In the decode
+            # trace this loop costs 4.6 ms/step across 37 pools: index_put_ alone is
+            # 3987 us/step (740 calls, [17024,1024] <- [128,1024]), plus one
+            # index_select + zeros_like + full_like + cat + where per pool. Build the
+            # template once per (dtype, cols, rows) and write with index_copy_.
+            reset = _c128_reset_template(state, rows.numel(), half)
+            sel = state.index_select(0, rows)
+            state.index_copy_(0, rows, torch.where(rej_flat, reset, sel))
+        else:
+            sel = state.index_select(0, rows)
+            reset = torch.cat(
+                (torch.zeros_like(sel[:, :half]), torch.full_like(sel[:, half:], float("-inf"))),
+                dim=-1,
+            )
+            state[rows] = torch.where(rej_flat, reset, sel)
     return None
 
 

@@ -17,6 +17,9 @@ logger = logging.getLogger(__name__)
 _MEGA_SYMM_BUFFERS = {}
 
 
+_MEGA_FP16_OUT = os.environ.get("ERNIE55_MEGA_FP16_OUT", "0") != "0"
+
+
 def _mega_moe_cap():
     """Per-rank token capacity of the symmetric buffer (the op rounds it up).
     """
@@ -150,6 +153,12 @@ def ernie55_forward_megamoe_experts_kunlun(original_fn, self, latent, topk_outpu
         int8_int4_mega_moe,
     )
 
+    # KUNLUN_PERF(ERNIE55 1121): the wheel also ships
+    # ``int8_int4_mega_moe_fully_overlapped``; measured on the decode path it produced an
+    # identical kernel mix (171.3 vs 170.4 ms/step, same dispatch/combine relay), so this
+    # stays on the plain call.
+    _mega_fn = int8_int4_mega_moe
+
     from sglang.srt.distributed.parallel_state import get_moe_ep_group
 
     experts = self.experts
@@ -208,8 +217,14 @@ def ernie55_forward_megamoe_experts_kunlun(original_fn, self, latent, topk_outpu
     if topk_weights.dtype != torch.float32:
         topk_weights = topk_weights.to(torch.float32)
 
-    y = torch.empty((rows, hidden), dtype=torch.bfloat16, device=latent.device)
-    int8_int4_mega_moe(
+    # KUNLUN_PERF(ERNIE55 1121): the output buffer was pinned to bf16 while the server
+    # runs --dtype float16, so every MoE layer paid a bf16->fp16 cast on the way out
+    # (cluster_cast_kl3, ~1.1 ms/step for the three cast kernels in the decode trace).
+    # ERNIE55_MEGA_FP16_OUT=1 allocates it in the activation dtype instead; off by
+    # default until the numbers and the accuracy gate are in.
+    _y_dtype = latent.dtype if _MEGA_FP16_OUT else torch.bfloat16
+    y = torch.empty((rows, hidden), dtype=_y_dtype, device=latent.device)
+    _mega_fn(
         y,
         x=q,
         x_sf=x_sf,
@@ -222,4 +237,4 @@ def ernie55_forward_megamoe_experts_kunlun(original_fn, self, latent, topk_outpu
         situ_beta=self._mega_beta,
         situ_linear_beta=self._mega_linear_beta,
     )
-    return y.to(latent.dtype)
+    return y if y.dtype == latent.dtype else y.to(latent.dtype)

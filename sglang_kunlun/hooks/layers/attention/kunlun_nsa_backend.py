@@ -88,6 +88,7 @@ logger = logging.getLogger(__name__)
 _PAGED_TOPK_PATH_SEEN: set = set()
 _PAGED_TOPK_FUSED_DISABLED = False
 _PAGED_TOPK_SELFCHECK_DONE = False
+_MIRROR_COALESCE_LOGGED = False
 
 
 def _mark_fused_disabled(reason):
@@ -96,6 +97,18 @@ def _mark_fused_disabled(reason):
     if not _PAGED_TOPK_FUSED_DISABLED:
         _PAGED_TOPK_FUSED_DISABLED = True
         logger.warning("ERNIE55 paged topk: fused path disabled (%s), falling back to torch", reason)
+
+
+def _capturing() -> bool:
+    """True while the decode cuda graph is being captured."""
+    try:
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+
+        return bool(get_is_capture_mode())
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _selfcheck_fused(dst, score, lengths, src_page_table, topk, cu_seqlens_q):
@@ -191,7 +204,10 @@ def _paged_topk_transform(
         except Exception as exc:  # shape not accepted: fall back to torch for good
             _mark_fused_disabled("topk_transform raised: " + repr(exc)[:160])
             return _paged_topk_transform(score, lengths, src_page_table, topk, cu_seqlens_q)
-        if not _PAGED_TOPK_SELFCHECK_DONE:
+        # Never under capture: the reference path's kernels would be recorded into the
+        # graph and replayed every step. The int64 probe caught exactly that -- a
+        # [rows, context] masked_fill + topk + sort baked into one decode bucket.
+        if not _PAGED_TOPK_SELFCHECK_DONE and not _capturing():
             _selfcheck_fused(dst_page_table, score, lengths, src_page_table, topk, cu_seqlens_q)
         return dst_page_table
 
@@ -261,10 +277,79 @@ class KunlunDSAMetadata(DSAMetadata):
     )
 
     def __post_init__(self):
-        """Materialize the host mirrors used by the Kunlun kernels."""
+        """Materialize the host mirrors used by the Kunlun kernels.
+
+        Build them through the coalesced path as well, so a mirror's storage is
+        decided once here and never moves: the graph records these host pointers,
+        and swapping them on the first refresh would leave it reading a freed
+        buffer.
+        """
+        for host_name, _dev_name in self._MIRRORED:
+            object.__setattr__(self, host_name, None)
+        if self._refresh_coalesced():
+            return
         for host_name, dev_name in self._MIRRORED:
             dev = getattr(self, dev_name, None)
             object.__setattr__(self, host_name, None if dev is None else dev.cpu())
+
+    def _refresh_coalesced(self) -> bool:
+        """One D2H for every mirror instead of one per tensor.
+
+        Seven small transfers cost seven times the fixed latency: measured 221 us
+        each, 1.55 ms/step out of graph, for a few hundred bytes of payload. Stage
+        the device tensors into one buffer, copy once, and expose each mirror as a
+        view of the same host buffer so the pointers the graph recorded stay put.
+        Returns False (caller falls back to per-tensor copies) when the mirrors do
+        not share a dtype or the layout changed.
+        """
+        if os.environ.get("ERNIE55_COALESCE_MIRRORS", "1") == "0":
+            return False
+        plan, total, dtype = [], 0, None
+        for host_name, dev_name in self._MIRRORED:
+            dev = getattr(self, dev_name, None)
+            if dev is None:
+                continue
+            if dtype is None:
+                dtype = dev.dtype
+            elif dev.dtype != dtype:
+                return False
+            if not dev.is_contiguous():
+                return False
+            plan.append((host_name, dev, total, dev.numel(), tuple(dev.shape)))
+            total += dev.numel()
+        if not plan:
+            return True
+        key = (dtype, total, tuple((p[0], p[2], p[4]) for p in plan))
+        if getattr(self, "_mirror_key", None) != key:
+            dev0 = plan[0][1]
+            object.__setattr__(
+                self, "_mirror_stage", torch.empty(total, dtype=dtype, device=dev0.device)
+            )
+            try:
+                host_flat = torch.empty(total, dtype=dtype, pin_memory=True)
+            except Exception:  # noqa: BLE001  # pinned host memory is optional
+                host_flat = torch.empty(total, dtype=dtype)
+            object.__setattr__(self, "_mirror_host", host_flat)
+            object.__setattr__(self, "_mirror_key", key)
+            for host_name, _dev, off, numel, shape in plan:
+                object.__setattr__(
+                    self, host_name, self._mirror_host[off : off + numel].view(shape)
+                )
+        stage = self._mirror_stage
+        for _host_name, dev, off, numel, _shape in plan:
+            stage[off : off + numel].copy_(dev.reshape(-1))
+        self._mirror_host.copy_(stage)
+        global _MIRROR_COALESCE_LOGGED
+        if not _MIRROR_COALESCE_LOGGED:
+            _MIRROR_COALESCE_LOGGED = True
+            # setproctitle wipes /proc/<pid>/environ for the schedulers, so the only
+            # reliable readback of this path is a line in the server log.
+            print(
+                "[ERNIE55] dsa host mirrors coalesced: %d tensors -> 1 D2H (%d elems %s)"
+                % (len(plan), total, dtype),
+                flush=True,
+            )
+        return True
 
     def refresh_host_mirrors(self) -> None:
         """Update the host mirrors *in place*, keeping their storage stable.
@@ -275,6 +360,8 @@ class KunlunDSAMetadata(DSAMetadata):
         lengths. Copy into the existing storage instead, and only reallocate when
         the shape/dtype actually changes.
         """
+        if self._refresh_coalesced():
+            return
         for host_name, dev_name in self._MIRRORED:
             dev = getattr(self, dev_name, None)
             if dev is None:

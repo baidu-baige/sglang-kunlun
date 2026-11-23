@@ -22,6 +22,23 @@ _MC_RC_OVERLAPPED = -7
 
 logger = logging.getLogger(__name__)
 
+# Ranges this process actually got registered, per engine: {id(engine): [(lo, hi)]}.
+# Needed because the 2MiB round-down below makes neighbouring host buffers share a
+# page, so the second one comes back as "overlapped" (-7). That is only harmless when
+# the earlier MR really covers it -- see _covered().
+_REGISTERED: dict = {}
+
+
+def _covered(engine, lo: int, hi: int) -> bool:
+    for r_lo, r_hi in _REGISTERED.get(id(engine), ()):
+        if r_lo <= lo and hi <= r_hi:
+            return True
+    return False
+
+
+def _remember(engine, lo: int, hi: int) -> None:
+    _REGISTERED.setdefault(id(engine), []).append((lo, hi))
+
 
 def _register_region(engine, ptr, length):
     """Register one buffer with a 2MiB-aligned start and length.
@@ -36,8 +53,24 @@ def _register_region(engine, ptr, length):
     span = (span + ALIGNMENT_2M - 1) // ALIGNMENT_2M * ALIGNMENT_2M
     try:
         rc = engine.batch_register([base], [span])
-        if rc == 0 or rc is None or rc == _MC_RC_OVERLAPPED:
+        if rc == 0 or rc is None:
+            _remember(engine, base, base + span)
             return 0
+        if rc == _MC_RC_OVERLAPPED:
+            # KUNLUN_FIX(ERNIE55 1123): do not take -7 on faith. If an earlier MR
+            # covers this buffer, it is a real no-op; if it does not, the buffer has
+            # no resolvable segment and every peer write into it fails -- which is
+            # how greedy draft "broke" the PD aux transfer: it shifts the host-side
+            # allocation layout, so a metadata buffer lands in a 2MiB page whose
+            # registration was swallowed as overlapped without covering it.
+            if _covered(engine, p0, p0 + int(length)):
+                return 0
+            logger.warning(
+                "kunlun mooncake: overlapped rc=-7 for ptr=0x%x len=%d is NOT covered "
+                "by an earlier MR; retrying with the exact range",
+                p0,
+                int(length),
+            )
     except Exception as exc:  # noqa: BLE001
         rc = exc
     # KUNLUN_FIX(ERNIE55 1121): when the 2MiB-expanded range is refused, retry with
@@ -55,6 +88,8 @@ def _register_region(engine, ptr, length):
     except Exception as exc:  # noqa: BLE001
         rc2 = exc
     ok2 = rc2 == 0 or rc2 is None or rc2 == _MC_RC_OVERLAPPED
+    if ok2:
+        _remember(engine, p0, p0 + int(length))
     logger.warning(
         "kunlun mooncake: aligned register base=0x%x span=%d rc=%s -> exact "
         "ptr=0x%x len=%d rc=%s (%s)",
