@@ -216,7 +216,7 @@ role behind `sglang-router`.
 | --- | --- | --- |
 | Encoder (E) | 8 single-card workers in one Pod, ports 8000-8007; `--encoder-only --mm-attention-backend sdpa --image-processor-backend pil` | `pil` avoids the wheel's Rust image extension, which is built against a different torch ABI |
 | Prefill (P) | tp8 / ep8 / cp8; `--language-only`; `--chunked-prefill-size 32768` | CP interleave; does not build the ViT / aligner / image modules; sends KV over mooncake |
-| Decode (D) | tp8 / ep8; `--deepep-mode low_latency --cuda-graph-bs-decode 8 --max-running-requests 8` | `XSHMEM_SYMMETRIC_SIZE=536870912` |
+| Decode (D) | tp8 / ep8 / dp8 with DP attention; `--deepep-mode low_latency --mem-fraction-static 0.70 --chunked-prefill-size 2048 --max-running-requests 128 --swa-full-tokens-ratio 0.06` | Same pose as the validated 0.5.21 release |
 | Router | `sglang-router 0.3.2` | Start it inside the prefill container on port 8101 and keep its `--prometheus-port` off the engine ports |
 
 ### Optimized paths in this release

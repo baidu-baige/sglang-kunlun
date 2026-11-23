@@ -25,6 +25,7 @@ unset XPU_DUMMY_EVENT
 
 source /root/miniconda/etc/profile.d/conda.sh
 conda activate python310_torch29_cuda
+export LD_LIBRARY_PATH="/root/miniconda/envs/python310_torch29_cuda/xcudart/lib:${LD_LIBRARY_PATH:-}"
 
 # --- Kunlun platform and DSV4 kernel / torch-shim selection -----------------
 export SGLANG_PLATFORM="kunlun"

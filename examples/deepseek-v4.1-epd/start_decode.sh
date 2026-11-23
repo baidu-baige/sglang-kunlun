@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Decode role: 8 XPUs (tp8/ep8), disaggregated decode, low-latency DeepEP with
-# CUDA graphs.
+# Decode role: 8 XPUs (tp8/ep8/dp8 with DP attention), disaggregated decode,
+# low-latency DeepEP with CUDA graphs.
 #
 # Required:
 #   MODEL_PATH   DeepSeek-V4.1-Flash W4A8 checkpoint
@@ -158,21 +158,20 @@ echo "[decode] host=${POD_IP} ib=${IB_DEVICES}"
 cd /workspace
 exec python3 -u -m sglang.launch_server \
   --model-path "${MODEL_PATH}" \
-  --tp 8 --ep 8 \
+  --tp 8 --ep 8 --dp-size 8 --enable-dp-attention --enable-dp-lm-head \
   --port "${HTTP_PORT}" --host "${POD_IP}" \
   --trust-remote-code \
   --kv-cache-dtype float16 --dtype float16 \
-  --mem-fraction-static 0.90 \
-  --chunked-prefill-size 8192 \
-  --max-running-requests 8 \
+  --mem-fraction-static 0.70 \
+  --chunked-prefill-size 2048 \
+  --max-running-requests 128 \
   --max-prefill-tokens 250000 \
   --context-length 114688 \
   --max-total-tokens 1048576 \
-  --swa-full-tokens-ratio 0.1 \
+  --swa-full-tokens-ratio 0.06 \
   --disable-radix-cache \
   --cuda-graph-backend-prefill disabled \
   --cuda-graph-max-bs 16 \
-  --cuda-graph-bs-decode 8 \
   --attention-backend compressed \
   --grammar-backend xgrammar \
   --reasoning-parser deepseek-v41 \
