@@ -1,4 +1,4 @@
-"""Torch replacement for the ``interleave_rows`` Triton kernel.
+"""Kunlun replacement for the ``interleave_rows`` Triton kernel.
 
 ``sglang/kernels/ops/memory/interleave_rows.py`` launches
 ``_interleave_rows_kernel[grid](...)``, and Triton is a noop here, so the
@@ -50,6 +50,22 @@ def interleave_rows_kunlun(
     sequence_total = x.shape[0] if to_rank_major else output_rows
     assert rank_total % cp_size == 0 and sequence_total <= rank_total
 
+    width = math.prod(x.shape[1:])
+    if output_rows == 0 or width == 0:
+        return x.new_empty((output_rows, *x.shape[1:]))
+
+    # The native operator restores sequence order and preserves the row count.
+    if (
+        not to_rank_major
+        and sequence_total == rank_total
+        and cp_size == 8
+        and x.ndim == 2
+        and x.dtype in (torch.float16, torch.float32)
+    ):
+        rerange = getattr(torch.ops.xspeedgate_ops, "cp_round_robin_rerange", None)
+        if rerange is not None:
+            return rerange(x, cp_size)
+
     if not _logged:
         _logged = True
         logger.info(
@@ -58,10 +74,6 @@ def interleave_rows_kunlun(
             x.shape[0],
             output_rows,
         )
-
-    width = math.prod(x.shape[1:])
-    if output_rows == 0 or width == 0:
-        return x.new_empty((output_rows, *x.shape[1:]))
 
     rank_rows = rank_total // cp_size
     row = torch.arange(output_rows, device=x.device)
