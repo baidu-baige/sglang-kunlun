@@ -392,7 +392,7 @@ RUN set -eux; \
 
 # kunlun_ops：适配期常改，且必须在 xpytorch 之后 —— 下面那两个 symlink 要
 # 落在 xpytorch 建好的 torch_xmlir 目录里。
-ARG KUNLUN_OPS_ADDR=https://aihc-private-hcd.bj.bcebos.com/chengxiaokang/ernie/ernie-5.5-flash/ops/kunlun_ops-0.1.282+09a476b5-cp312-cp312-linux_x86_64.whl
+ARG KUNLUN_OPS_ADDR=https://aihc-private-hcd.bj.bcebos.com/opensource/sglang-kunlun/ernie/ops/kunlun_ops-0.1.284+33c8c83a-cp312-cp312-linux_x86_64.whl
 RUN set -eux; \
     pip install --no-deps --retries 5 "${KUNLUN_OPS_ADDR}"; \
     echo "kunlun_ops=${KUNLUN_OPS_ADDR}" >> /versions; \
