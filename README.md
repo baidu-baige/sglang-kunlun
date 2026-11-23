@@ -294,7 +294,9 @@ sglang-kunlun/
 │   ├── models/                 # External model package registration
 │   └── launch.py               # Explicit Kunlun launcher
 ├── test/                       # Unit and contract tests
-├── build/                      # Repository packaging scripts
+├── examples/
+│   └── deepseek-v4.1-epd/      # Encoder / prefill / decode launch scripts
+├── dockerfile/                 # Container build recipe (Dockerfile, patches, vendor assets)
 ├── pyproject.toml              # Package metadata and SGLang entry points
 ├── requirements.txt            # Build and test dependencies
 ├── LICENSE                     # Apache License 2.0
