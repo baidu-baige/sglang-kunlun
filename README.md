@@ -9,6 +9,7 @@ specific bootstrap, runtime hooks, and kernels outside the SGLang source tree.
 
 ## Latest News
 
+- **2026/11/24** — Support ERNIE-5.5-Flash-Preview model.
 - **2026/06** — The `sglang-kunlun` package was created at version `0.1.0`.
 - **Current development** — Kunlun platform registration, runtime bootstrap,
   attention, KV-cache, MoE, quantization, speculative decoding, and
@@ -211,6 +212,7 @@ supported; it is not a complete compatibility matrix.
 | GLM5.3 | `w8a8_int8`, `w4a8` | Supports W4A8 in addition to W8A8 INT8. |
 | DeepSeek-V4-Flash-0731 | `w8a8_int8` | Current DSPARK launch example (Attention W8A8, MoE W4A8 INT8 Dynamic). |
 | MiniMax-M3 | `w8a8_int8` | Validate with the target SGLang/Kunlun versions. |
+| ERNIE-5.5-Flash | `w4a8` | Supports W4A8. |
 
 ## Version Matrix
 
