@@ -200,9 +200,51 @@ than for single-stream latency, the useful range ends near the knee.
 
 ### 2. A measured expert layout is worth a few percent
 
-`--init-expert-location` defaults to `trivial`. Replacing it with a layout
-derived from observed expert load gave **+3-7% prefill input tok/s** (median
-about 5%, same sign across three rounds).
+`--init-expert-location` defaults to `trivial`, which maps logical expert `i` to
+physical expert `i` and repeats the same map for every layer. Replacing it with a
+layout derived from observed expert load gave **+3-7% prefill input tok/s** on a
+PD-disaggregated prefill role (median about 5%, same sign across three rounds).
+
+**Why the accounting has to be per layer.** The expert all-to-all is a collective
+within each MoE layer, so every layer waits for its slowest peer. On our workload
+the cumulative imbalance over the whole model (max/mean across ranks) was only
+**1.203**, while the **per-layer** imbalance was **1.917**: hot experts move
+between layers, so summing over layers cancels them out. Judging this by the
+cumulative figure leads to the conclusion that it is not worth doing.
+
+**How to produce the input.**
+
+1. Start the server with `--expert-distribution-recorder-mode stat`
+   (`--enable-eplb` sets this implicitly).
+2. `POST /start_expert_distribution_record`, drive a *representative* load, then
+   `POST /stop_expert_distribution_record` and
+   `POST /dump_expert_distribution_record`. This writes
+   `expert_distribution_recorder_<timestamp>_<rank>.pt`.
+3. Restart with `--init-expert-location <that file>`.
+
+The dumped file holds **observed counts, not a layout**. The rebalancing itself
+runs at startup, where `init_by_eplb` calls `rebalance_experts`, so the layout you
+get is whatever the in-tree algorithm derives from your counts. A 2-D
+`[layers, experts]` tensor is accepted as well and is equivalent to the raw 3-D
+dump, because the algorithm sums over the pass dimension; pre-summing it only
+saves tens of megabytes. Both `.pt` and `.json` are accepted.
+
+**Two traps.**
+
+| Trap | What happens |
+| --- | --- |
+| Recording needs an explicit `--deepep-mode normal` | With a DeepEP a2a backend, `_SinglePassGatherer.init_new` accepts only `normal` or `low_latency` and raises `NotImplementedError` on `auto`. `normal` also disables CUDA graphs, so the throughput of the recording run is **not** comparable to your baseline: use that run to measure skew, not performance. |
+| `--init-expert-location` can change two things, not one | If you have not set `--ep-dispatch-algorithm` explicitly, setting `--init-expert-location` to anything other than `trivial` also resolves that algorithm for you: to `static` when an a2a backend is in use, or to `dynamic` when `--moe-a2a-backend` is `none`. |
+
+That second one is why the number above needs a control arm. We measured the
+`static` switch on its own at **-0.7% (within noise)** in a configuration with no
+redundant replicas, which is what lets the gain be attributed to the layout rather
+than to the algorithm switch. If you reproduce this, measure that arm too.
+
+**Scope.** The counts have to match *your* traffic, since expert load is a
+property of the model's gate interacting with your inputs. A layout derived from a
+different workload can be worse than `trivial`, so treat a dump as
+workload-specific.
 
 ### 3. `--chunked-prefill-size` is a per-attention-DP-rank budget
 
