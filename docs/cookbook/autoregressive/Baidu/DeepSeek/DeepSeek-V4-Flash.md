@@ -79,6 +79,129 @@ property of the model's gate interacting with your inputs. A layout derived from
 different workload can be worse than `trivial`, so treat a dump as
 workload-specific.
 
+#### Launch commands used for this measurement
+
+This configuration belongs to this item only. The other items on this page were
+measured on different deployments.
+
+The measurement was a PD-disaggregated deployment, 8 cards for prefill and 8 for
+decode, each side being 2 nodes x 4 cards at TP8 / EP8 / DP8. **The two arms
+differ by exactly one flag on the prefill side**; the decode side and the router
+are identical in both.
+
+`SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` is an environment variable, not
+a server flag. Apart from it we set no `SGLANG_OPT_*`, `XMLIR_*` or `XPU_*`
+overrides in any of these runs: the environment is the image's own default block,
+unmodified.
+
+**Prefill role.** Run once per node, with `--node-rank` 0 and 1.
+
+```bash
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
+
+python3 -u -m sglang.launch_server \
+  --model-path "${MODEL_PATH}" \
+  --tp 8 --dp 8 --enable-dp-attention --ep 8 \
+  --nnodes 2 --node-rank "${NODE_RANK}" \
+  --dist-init-addr "${RANK0_IP}:${DIST_PORT}" \
+  --host "${HOST_IP}" --port 8000 \
+  --quantization w8a8_int8 --dtype float16 --kv-cache-dtype float16 \
+  --page-size 256 \
+  --attention-backend compressed \
+  --moe-a2a-backend deepep --deepep-mode auto \
+  --disable-shared-experts-fusion \
+  --mem-fraction-static 0.72 \
+  --chunked-prefill-size 65536 \
+  --max-running-requests 256 \
+  --cuda-graph-max-bs 64 \
+  --skip-server-warmup \
+  --max-prefill-tokens 16384 \
+  --swa-full-tokens-ratio 0.50 \
+  --disaggregation-mode prefill \
+  --disaggregation-bootstrap-port "${BOOTSTRAP_PORT}" \
+  --disaggregation-ib-device "${IB_DEVICE}" \
+  --decode-log-interval 5 \
+  --enable-metrics --collect-tokens-histogram --enable-cache-report \
+  --served-model-name dsv4 --trust-remote-code \
+  --model-loader-extra-config '{"enable_multithread_load": "true", "num_threads": 64}' \
+  --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4 \
+  --watchdog-timeout 30000
+```
+
+The measured arm is the command above **plus one flag**; the baseline arm is the
+command above without it. Everything else is identical:
+
+```bash
+  --init-expert-location "${LOGICAL_COUNT_FILE}"
+```
+
+**Decode role**, identical in both arms:
+
+```bash
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+
+python3 -u -m sglang.launch_server \
+  --model-path "${MODEL_PATH}" \
+  --tp 8 --dp 8 --enable-dp-attention --ep 8 \
+  --nnodes 2 --node-rank "${NODE_RANK}" \
+  --dist-init-addr "${RANK0_IP}:${DIST_PORT}" \
+  --host "${HOST_IP}" --port 8000 \
+  --quantization w8a8_int8 --dtype float16 --kv-cache-dtype float16 \
+  --page-size 256 \
+  --attention-backend compressed \
+  --moe-a2a-backend deepep --deepep-mode auto \
+  --disable-shared-experts-fusion \
+  --mem-fraction-static 0.80 \
+  --chunked-prefill-size 65536 \
+  --max-running-requests 640 \
+  --cuda-graph-max-bs 128 \
+  --skip-server-warmup \
+  --max-prefill-tokens 16384 \
+  --swa-full-tokens-ratio 0.50 \
+  --disaggregation-mode decode \
+  --disaggregation-ib-device "${IB_DEVICE}" \
+  --decode-log-interval 5 \
+  --enable-metrics --collect-tokens-histogram --enable-cache-report \
+  --served-model-name dsv4 --trust-remote-code \
+  --model-loader-extra-config '{"enable_multithread_load": "true", "num_threads": 64}' \
+  --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4 \
+  --watchdog-timeout 30000
+```
+
+**Router:**
+
+```bash
+python3 -m sglang_router.launch_router \
+  --mini-lb --pd-disaggregation \
+  --prefill "http://${PREFILL_RANK0_HOST}:8000" "${BOOTSTRAP_PORT}" \
+  --decode "http://${DECODE_RANK0_HOST}:8000" \
+  --host 0.0.0.0 --port 9800
+```
+
+> **Note:** two of these values are per-attention-DP-rank budgets once `--dp 8` is
+> on, so read them divided by 8 rather than as written:
+>
+> - `--chunked-prefill-size 65536` is 8192 tokens per rank, and the quotient has to
+>   be a whole number of `--page-size 256` pages. This is the trap described in
+>   item 3.
+> - `--max-running-requests` is 32 per rank on the prefill side and 80 per rank on
+>   the decode side. On the decode side `--cuda-graph-max-bs 128` and
+>   `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128` are both above that 80, as
+>   they have to be: if the per-rank request count exceeds the graph batch, decode
+>   falls back to eager.
+
+**How the two arms were compared.** The arms were run alternately inside one
+session, redeploying the prefill side for each arm while leaving the decode side
+up. Two things were checked before trusting a result, because a flag can be
+present and still not take effect: that `init-expert-location` actually appears in
+the launch line of both prefill ranks, and that the server log reports the
+expert-location initialisation on the measured arm and not on the baseline arm.
+
+One caveat on how precisely this is known: the values above are the ones the
+driver scripts expand to, taken from the scripts used for those runs. They were
+not read back from a server-side `server_args` dump, so treat them as the launch
+configuration rather than as a verified runtime snapshot.
+
 ### 3. `--chunked-prefill-size` is a per-attention-DP-rank budget
 
 With data-parallel attention enabled, the value you pass is not the global chunk
