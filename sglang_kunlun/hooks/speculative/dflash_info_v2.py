@@ -53,3 +53,79 @@ def evict_swa_before_dflash_decode(self, batch, *args, **kwargs):
         req.decode_batch_idx += 1
 
     return None
+
+
+# `create_idle_input()` builds zero-*width* tensors (`topk_p`, `topk_index` and
+# `hidden_states` are all `(0, 0)`), but `merge_batch` cats them with a live
+# batch's `[bs, topk]` / `[bs, hidden]` along dim 0, where every other dimension
+# has to agree. It does not, so merging an idle side kills the scheduler with
+#   RuntimeError: Sizes of tensors must match except in dimension 0.
+#                 Expected size 0 but got size 16 for tensor number 1 in the list.
+# Reached on the PD decode role with DSPARK when a newly bootstrapped request
+# group is merged into a running batch, which depends on how max_running and the
+# live concurrency relate: on P800 8-card fake-KV decode, max_running 16 with 12
+# concurrent requests crashes all eight schedulers, while 16/8 and 12/12 are fine.
+# This keeps upstream's logic and adds the empty-side short-circuit.
+@plugin_hook(
+    "sglang.srt.speculative.dflash_info_v2.DFlashDraftInputV2.merge_batch",
+    type=HookType.REPLACE,
+)
+def merge_batch_kunlun(self, spec_info) -> None:
+    """Merge two draft inputs, tolerating an idle (zero-width) side."""
+    import torch
+
+    if self.nxt_kv_lens_cpu is not None:
+        assert spec_info.nxt_kv_lens_cpu is not None
+        self.nxt_kv_lens_cpu = torch.cat(
+            [self.nxt_kv_lens_cpu, spec_info.nxt_kv_lens_cpu]
+        )
+        self.nxt_kv_lens_sum = int(self.nxt_kv_lens_cpu.sum().item())
+    elif spec_info.nxt_kv_lens_cpu is not None:
+        self.nxt_kv_lens_cpu = spec_info.nxt_kv_lens_cpu
+        self.nxt_kv_lens_sum = spec_info.nxt_kv_lens_sum
+
+    if self.future_indices is not None:
+        assert spec_info.future_indices is not None
+        self.future_indices = torch.cat(
+            [self.future_indices, spec_info.future_indices]
+        )
+        return
+
+    # Two shapes of "no draft state yet" reach this call and neither can go into
+    # torch.cat: an idle side with no rows at all (create_idle_input), and a side
+    # whose rows exist but whose per-row width is still 0, which is how a request
+    # that has not run a draft step yet is carried. The first is dropped, the
+    # second is widened with zeros -- a zero draft is simply rejected by verify,
+    # so at most one step's acceptance is lost, whereas a crash takes the node.
+    if spec_info.topk_p.shape[0] == 0:
+        return
+    if self.topk_p.shape[0] == 0:
+        self.topk_p = spec_info.topk_p
+        self.topk_index = spec_info.topk_index
+        self.bonus_tokens = spec_info.bonus_tokens
+        self.new_seq_lens = spec_info.new_seq_lens
+        self.hidden_states = spec_info.hidden_states
+        return
+
+    def _widen(t, like):
+        """Give a zero-width `[n, 0]` tensor the width of `like`."""
+        if t.dim() == 2 and like.dim() == 2 and t.shape[1] == 0 < like.shape[1]:
+            return torch.zeros(
+                (t.shape[0], like.shape[1]), dtype=t.dtype, device=t.device
+            )
+        return t
+
+    self.topk_p = _widen(self.topk_p, spec_info.topk_p)
+    self.topk_index = _widen(self.topk_index, spec_info.topk_index)
+    self.hidden_states = _widen(self.hidden_states, spec_info.hidden_states)
+    spec_info.topk_p = _widen(spec_info.topk_p, self.topk_p)
+    spec_info.topk_index = _widen(spec_info.topk_index, self.topk_index)
+    spec_info.hidden_states = _widen(spec_info.hidden_states, self.hidden_states)
+
+    self.topk_p = torch.cat([self.topk_p, spec_info.topk_p], dim=0)
+    self.topk_index = torch.cat([self.topk_index, spec_info.topk_index], dim=0)
+    self.bonus_tokens = torch.cat([self.bonus_tokens, spec_info.bonus_tokens], dim=0)
+    self.new_seq_lens = torch.cat([self.new_seq_lens, spec_info.new_seq_lens], dim=0)
+    self.hidden_states = torch.cat(
+        [self.hidden_states, spec_info.hidden_states], dim=0
+    )

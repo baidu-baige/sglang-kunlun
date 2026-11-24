@@ -1,6 +1,7 @@
 """Kunlun plugin hooks for ``sglang.srt.layers.moe.token_dispatcher.deepep``."""
 from __future__ import annotations
 
+import os
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -141,6 +142,58 @@ class DeepEPDispatchMode(IntEnum):
     LOW_LATENCY = auto()
 
 
+# DeepEP low-latency QP contract: ``num_qps_per_rank`` "requires that this
+# number equals to the number of local experts" (vendor wheel's own
+# ``deep_ep/buffer_v2.py``), and the only channel reaching the runtime is
+# ``XSHMEM_QP_NUM_PER_RANK`` -- ``BufferV2.__init__`` never forwards the keyword
+# argument to C++. Violating it does not degrade gracefully: xshmem locks the
+# value into IBGDA at init while ``init_low_latency_buffer`` raises GlobalConf
+# later, the two disagree for the rest of the process, and
+# ``kl3_low_latency_combine`` writes to a mis-computed remote address (``axi
+# wresp error`` + ``KL_XID64_AXI_ADDR_ERROR``), which needs a platform reboot.
+# Rewriting the variable here is too late (IBGDA is already connected), so the
+# only useful behaviour is to refuse to start.
+def _check_ll_qp_contract(num_experts: int, ep_size: int) -> int:
+    """Verify XSHMEM_QP_NUM_PER_RANK == num_experts // ep_size, or raise."""
+    if ep_size <= 0 or num_experts <= 0:
+        return 0
+    expected = num_experts // ep_size
+    hint = (
+        f"export XSHMEM_QP_NUM_PER_RANK={expected} before starting the process"
+        " (the launcher must do it; env.sh must not overwrite it)"
+    )
+    if num_experts % ep_size:
+        raise RuntimeError(
+            f"low-latency QP contract: num_experts={num_experts} is not divisible by "
+            f"ep_size={ep_size}, so DeepEP low-latency cannot satisfy "
+            '"num_qps_per_rank == number of local experts". Use an ep size that '
+            "divides the expert count, or run --deepep-mode normal."
+        )
+    raw = os.environ.get("XSHMEM_QP_NUM_PER_RANK")
+    if raw is None:
+        raise RuntimeError(
+            "low-latency QP contract: XSHMEM_QP_NUM_PER_RANK is unset while "
+            f"deepep low-latency is enabled; it must be {expected} "
+            f"(num_experts={num_experts} / ep_size={ep_size}). {hint}"
+        )
+    try:
+        actual = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"low-latency QP contract: XSHMEM_QP_NUM_PER_RANK={raw!r} is not an int. {hint}"
+        ) from exc
+    if actual != expected:
+        raise RuntimeError(
+            f"low-latency QP contract: XSHMEM_QP_NUM_PER_RANK={actual} but the "
+            f"low-latency contract requires {expected} "
+            f"(num_experts={num_experts} / ep_size={ep_size}). Starting anyway "
+            "would build IBGDA queue pairs for the wrong count and fault inside "
+            "kl3_low_latency_combine with axi wresp / KL_XID64_AXI_ADDR_ERROR, "
+            f"which needs a platform reboot to clear. {hint}."
+        )
+    return expected
+
+
 class DeepEPBuffer:
     """DeepEPBuffer
 
@@ -187,13 +240,20 @@ class DeepEPBuffer:
         slot: int = 0,
     ):
         """get_deepep_buffer"""
-        key = (slot, hidden_size, num_max_dispatch_tokens_per_rank, num_experts)
+        if deepep_mode == DeepEPMode.AUTO:
+            enable_low_latency = cls._dispatch_mode == DeepEPDispatchMode.LOW_LATENCY
+            enable_normal = not enable_low_latency
+        else:
+            enable_normal = deepep_mode.enable_normal()
+            enable_low_latency = deepep_mode.enable_low_latency()
+        mode_tag = "ll" if enable_low_latency else "normal"
+        key = (mode_tag, slot, hidden_size, num_max_dispatch_tokens_per_rank, num_experts)
         buffer = cls._buffers.get(key)
         if buffer is not None:
             return buffer
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
-        if deepep_mode.enable_normal():
+        if enable_normal:
             hidden_bytes = hidden_size * param_bytes
             for config in (
                 DeepEPConfig.get_instance().normal_dispatch_config
@@ -209,7 +269,9 @@ class DeepEPBuffer:
                     config.get_rdma_buffer_size_hint(hidden_bytes, group.size()),
                     num_rdma_bytes,
                 )
-        if deepep_mode.enable_low_latency():
+        if enable_low_latency:
+            # QP count must equal the local expert count; see the note above.
+            _check_ll_qp_contract(num_experts, group.size())
             assert num_max_dispatch_tokens_per_rank != -1
             assert num_experts != -1 and num_experts % group.size() == 0
             num_rdma_bytes = max(
@@ -257,7 +319,7 @@ class DeepEPBuffer:
             group,
             num_nvl_bytes,
             num_rdma_bytes,
-            low_latency_mode=deepep_mode.enable_low_latency(),
+            low_latency_mode=enable_low_latency,
             num_qps_per_rank=num_qps_per_rank,
             # TODO can be false when unneeded
             allow_mnnvl=True,
@@ -283,7 +345,7 @@ class DeepEPBuffer:
         # same set of buffers at the same program point. Build the remaining sub-batch
         # slots all at once here rather than lazily on their first dispatch -- otherwise
         # the ranks' call sites would diverge and the collective would hang.
-        if slot == 0 and deepep_mode.enable_normal():
+        if slot == 0 and enable_normal:
             for extra_slot in range(1, cls._num_slots):
                 cls.get_deepep_buffer(
                     group,
@@ -301,6 +363,7 @@ class DeepEPBuffer:
     def clean_buffer(cls):
         """clean_buffer: clear each buffer according to its own key's sizing; they must not be mixed."""
         for (
+            _mode_tag,
             _slot,
             hidden_size,
             num_max_dispatch_tokens_per_rank,
@@ -1007,18 +1070,20 @@ class DeepEPDispatcher(BaseDispatcher):
 
     def _get_impl(self) -> _DeepEPDispatcherImplBase:
         """_get_impl"""
-        # KUNLUN_LL_IDLE_PAD: use the NORMAL dispatcher only for AUTO/NORMAL modes. An explicit
-        # --deepep-mode low_latency decode MUST use the capturable LL path: NORMAL dispatch calls
-        # bkcl_notify_dispatch_standard (dynamic, blocking) which deadlocks inside the decode
-        # CUDA-graph capture -> notify_dispatch timeout. Idle DP ranks (the reason the old code
-        # force-fell-back to NORMAL under dp-attention) are handled by the 1-token padding in
-        # _DeepEPDispatcherImplLowLatency.dispatch_a/combine_b above, so LL is now idle-tolerant.
-        if self.deepep_mode.enable_normal():
+        # KUNLUN_AUTO_DECODE_LL (port of kimi 0.5.19 commit e6b094968df82): route by phase.
+        # Pure NORMAL mode always uses the normal dispatcher. AUTO MUST use the capturable LL
+        # path for decode -- NORMAL dispatch calls bkcl_notify_dispatch_standard (dynamic,
+        # blocking) which DEADLOCKS inside the decode CUDA-graph capture -> notify_dispatch
+        # timeout -- and the normal path for prefill/extend. The previous
+        # ``if self.deepep_mode.enable_normal()`` sent AUTO (enable_normal() is True) down the
+        # normal path unconditionally, so decode-graph capture hung. Idle DP ranks under
+        # dp-attention are handled by the 1-token padding in the LL impl above.
+        if self.deepep_mode == DeepEPMode.NORMAL:
             return self._ensure_normal_dispatcher()
         is_extend_in_batch = get_is_extend_in_batch()
         resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
         if resolved_deepep_mode == DeepEPMode.NORMAL:
-            return self._normal_dispatcher
+            return self._ensure_normal_dispatcher()
         elif resolved_deepep_mode == DeepEPMode.LOW_LATENCY:
             return self._low_latency_dispatcher
         else:

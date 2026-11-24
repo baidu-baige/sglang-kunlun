@@ -52,7 +52,7 @@ def _xpusmi_path() -> Optional[str]:
 
 
 @plugin_hook(
-    "sglang.srt.utils.common.get_nvgpu_memory_capacity",
+    "sglang.srt.utils.device.get_nvgpu_memory_capacity",
     type=HookType.REPLACE,
 )
 def get_nvgpu_memory_capacity_kunlun():
@@ -150,7 +150,7 @@ def _get_numa_cores(node: int) -> List[int]:
 
 
 @plugin_hook(
-    "sglang.srt.utils.common.set_gpu_proc_affinity",
+    "sglang.srt.utils.process.set_gpu_proc_affinity",
     type=HookType.REPLACE,
 )
 def set_gpu_proc_affinity_kunlun(gpu_id: int):
@@ -197,7 +197,7 @@ def set_gpu_proc_affinity_kunlun(gpu_id: int):
 
 
 @plugin_hook(
-    "sglang.srt.utils.common.get_device",
+    "sglang.srt.utils.device.get_device",
     type=HookType.REPLACE,
 )
 def get_device_kunlun(device_id: Optional[int] = None) -> str:
@@ -210,7 +210,7 @@ def get_device_kunlun(device_id: Optional[int] = None) -> str:
 
 
 @plugin_hook(
-    "sglang.srt.utils.common.get_device_count",
+    "sglang.srt.utils.device.get_device_count",
     type=HookType.REPLACE,
 )
 def get_device_count_kunlun() -> int:
@@ -254,7 +254,7 @@ def get_device_count_kunlun() -> int:
 
 
 @plugin_hook(
-    "sglang.srt.utils.common.get_device_capability",
+    "sglang.srt.utils.device.get_device_capability",
     type=HookType.REPLACE,
 )
 def get_device_capability_kunlun(device_id: int = 0):
@@ -263,7 +263,7 @@ def get_device_capability_kunlun(device_id: int = 0):
 
 
 @plugin_hook(
-    "sglang.srt.utils.common.get_device_name",
+    "sglang.srt.utils.device.get_device_name",
     type=HookType.REPLACE,
 )
 def get_device_name_kunlun(device_id: int = 0) -> str:

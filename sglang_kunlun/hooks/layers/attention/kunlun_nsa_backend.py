@@ -6,6 +6,9 @@ import math
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, List, Optional
 
+import logging
+import os
+
 import torch
 
 import kunlun_ops
@@ -20,16 +23,50 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
-from sglang.srt.layers.attention.dsa.utils import (
-    is_dsa_prefill_cp_round_robin_split,
-)
+try:
+    from sglang.srt.layers.attention.dsa.utils import (
+        is_dsa_prefill_cp_round_robin_split,
+    )
+
+    def _cp_rowwise_split(forward_batch) -> bool:
+        """Pre-0.5.23 spelling: the predicate took no per-batch argument."""
+        return is_dsa_prefill_cp_round_robin_split()
+
+except ImportError:
+    # 0.5.23 renamed the round-robin split to "interleave" (same layout, token
+    # i -> rank i % cp_size) and made the predicate per-batch, so the old name
+    # is gone. Falling back to False is not harmless: the only call site swaps
+    # in the CP-aware q/kv LoD before `sparse_prefill_fwd_opt`, so stuck at
+    # False the kernel reads global LoD against rank-local rows. Measured on
+    # ERNIE 5.5 (cp2 vs dp8, same 4K request), layer 7 -- the first full-MLA
+    # layer this backend serves -- reaches maxrel 9.9e-1 and the served output
+    # is empty. `kunlun_deepseek_v4_backend.py` already followed the rename.
+    try:
+        from sglang.srt.layers.attention.dsa.utils import (
+            can_dsa_prefill_cp_interleave as _can_dsa_prefill_cp_interleave,
+        )
+
+        def _cp_rowwise_split(forward_batch) -> bool:
+            """0.5.23 spelling of the same row-wise CP split."""
+            return bool(_can_dsa_prefill_cp_interleave(forward_batch))
+
+    except ImportError:
+
+        def _cp_rowwise_split(forward_batch) -> bool:
+            """Neither spelling available: no row-wise CP split on this build."""
+            return False
+
 
 try:
     from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 except ImportError:  # dsv4.1 删掉了 DSA prefill-CP 的 in-seq-split 模式
 
     def is_dsa_prefill_cp_in_seq_split() -> bool:
-        """0.5.14 prefill-CP no longer supports in-seq-split."""
+        """0.5.14 prefill-CP no longer supports in-seq-split.
+
+        Unlike the rename above, this mode really is gone: it was a different
+        layout (contiguous per-rank ranges), not a renamed one.
+        """
         return False
 
 from sglang.srt.layers.attention.dsa_backend import (
@@ -44,6 +81,65 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+logger = logging.getLogger(__name__)
+
+_PAGED_TOPK_PATH_SEEN: set = set()
+_PAGED_TOPK_FUSED_DISABLED = False
+_PAGED_TOPK_SELFCHECK_DONE = False
+_MIRROR_COALESCE_LOGGED = False
+
+
+def _mark_fused_disabled(reason):
+    """Disable the fused path for good and log why."""
+    global _PAGED_TOPK_FUSED_DISABLED
+    if not _PAGED_TOPK_FUSED_DISABLED:
+        _PAGED_TOPK_FUSED_DISABLED = True
+        logger.warning("ERNIE55 paged topk: fused path disabled (%s), falling back to torch", reason)
+
+
+def _capturing() -> bool:
+    """True while the decode cuda graph is being captured."""
+    try:
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+
+        return bool(get_is_capture_mode())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _selfcheck_fused(dst, score, lengths, src_page_table, topk, cu_seqlens_q):
+    """Compare the fused result against the torch path once, row by row (sets, any order).
+
+    A mismatch disables the fused path permanently: this path decides which tokens
+    attention reads, so a wrong result is an accuracy bug. Runs once, cost is negligible.
+    """
+    global _PAGED_TOPK_SELFCHECK_DONE
+    _PAGED_TOPK_SELFCHECK_DONE = True
+    try:
+        os.environ["ERNIE55_FUSED_PAGED_TOPK"] = "0"      # make the recursive call take the torch branch
+        ref = _paged_topk_transform(score, lengths, src_page_table, topk, cu_seqlens_q)
+        bad = 0
+        for r in range(dst.shape[0]):
+            if (set(dst[r].tolist()) - {-1}) != (set(ref[r].tolist()) - {-1}):
+                bad += 1
+        if bad:
+            _mark_fused_disabled("selfcheck mismatch on %d/%d rows" % (bad, dst.shape[0]))
+        else:
+            logger.warning(
+                "ERNIE55 paged topk selfcheck passed: fused and torch select the same set per row "
+                "(rows=%s topk=%s width=%s table_width=%s)",
+                dst.shape[0], topk, score.shape[1], src_page_table.shape[1],
+            )
+    except Exception as exc:
+        _mark_fused_disabled("selfcheck itself raised " + repr(exc)[:140])
+    finally:
+        os.environ["ERNIE55_FUSED_PAGED_TOPK"] = "1"
+
+
 
 
 def _paged_topk_transform(
@@ -66,12 +162,74 @@ def _paged_topk_transform(
     device = score.device
     table_width = src_page_table.shape[1]
 
-    positions = torch.arange(width, device=device)
-    valid = positions.unsqueeze(0) < lengths.unsqueeze(1)
-    k = min(topk, width)
-    selected = score.masked_fill(~valid, float("-inf")).topk(k, dim=1).indices
-    selected, _ = selected.sort(dim=1)
-    selected_valid = valid.gather(1, selected)
+    # KUNLUN_PERF: prefer the fused xspeedgate topk, which does top-K search, length
+    # masking and page-table mapping in one op with no [rows, width] torch temporaries
+    # (the torch port below costs 615 ms / 20 steps, 20% of device time). Guarded at
+    # runtime, falls back to torch when the contract does not hold, one log line per
+    # outcome. The score is narrowed to table_width first: the tail columns are page
+    # padding with no legal position (all seq_len <= table_width) and the fused op only
+    # scans the first seq_lens[row] columns. Cost then follows the actual sequence
+    # length instead of the context_length-sized buffer width.
+    # Disable with ERNIE55_FUSED_PAGED_TOPK=0.
+    _score_fused = score[:, :table_width] if width > table_width else score
+    _fused_ok = (
+        os.environ.get("ERNIE55_FUSED_PAGED_TOPK", "1") != "0"
+        and not _PAGED_TOPK_FUSED_DISABLED
+        and src_page_table.shape[0] == rows
+        and table_width >= _score_fused.shape[1]
+        and hasattr(torch.ops.xspeedgate_ops, "topk_transform")
+    )
+    _key = (bool(_fused_ok), rows == src_page_table.shape[0], table_width >= width)
+    if _key not in _PAGED_TOPK_PATH_SEEN:
+        _PAGED_TOPK_PATH_SEEN.add(_key)
+        logger.warning(
+            "ERNIE55 paged topk path=%s rows=%s width=%s table_width=%s topk=%s lengths_dtype=%s",
+            "xspeedgate_fused" if _fused_ok else "torch",
+            rows, width, table_width, topk, lengths.dtype,
+        )
+    if _fused_ok:
+        dst_page_table = score.new_full((rows, topk), -1, dtype=torch.int32)
+        _sf = _score_fused if _score_fused.is_contiguous() else _score_fused.contiguous()
+        try:
+            torch.ops.xspeedgate_ops.topk_transform(
+                _sf,
+                lengths.clamp(max=_sf.shape[1]).to(torch.int32),
+                src_page_table,
+                dst_page_table,
+                topk,
+                None,
+                1,      # page_size: this path's page table is already page-1 cache slots
+                True,   # fast_path
+            )
+        except Exception as exc:  # shape not accepted: fall back to torch for good
+            _mark_fused_disabled("topk_transform raised: " + repr(exc)[:160])
+            return _paged_topk_transform(score, lengths, src_page_table, topk, cu_seqlens_q)
+        # Never under capture: the reference path's kernels would be recorded into the
+        # graph and replayed every step. The int64 probe caught exactly that -- a
+        # [rows, context] masked_fill + topk + sort baked into one decode bucket.
+        if not _PAGED_TOPK_SELFCHECK_DONE and not _capturing():
+            _selfcheck_fused(dst_page_table, score, lengths, src_page_table, topk, cu_seqlens_q)
+        return dst_page_table
+
+    # KUNLUN_PERF: the torch path used to build an int64 [rows, width] mask and gather
+    # through it; aten::lt alone cost 512 ms / 20 steps (17% of device time). Compare in
+    # int32 and derive selected_valid on [rows, k] directly (k=2048 vs width~32k).
+    # Element-wise equivalent on the selected set. Disable with ERNIE55_INT32_TOPK_MASK=0.
+    if os.environ.get("ERNIE55_INT32_TOPK_MASK", "1") != "0":
+        positions = torch.arange(width, device=device, dtype=torch.int32)
+        lengths_i32 = lengths.to(torch.int32)
+        valid = positions.unsqueeze(0) < lengths_i32.unsqueeze(1)
+        k = min(topk, width)
+        selected = score.masked_fill(~valid, float("-inf")).topk(k, dim=1).indices
+        selected, _ = selected.sort(dim=1)
+        selected_valid = selected.to(torch.int32) < lengths_i32.unsqueeze(1)
+    else:
+        positions = torch.arange(width, device=device)
+        valid = positions.unsqueeze(0) < lengths.unsqueeze(1)
+        k = min(topk, width)
+        selected = score.masked_fill(~valid, float("-inf")).topk(k, dim=1).indices
+        selected, _ = selected.sort(dim=1)
+        selected_valid = valid.gather(1, selected)
 
     if src_page_table.shape[0] == rows:
         table = src_page_table
@@ -119,10 +277,79 @@ class KunlunDSAMetadata(DSAMetadata):
     )
 
     def __post_init__(self):
-        """Materialize the host mirrors used by the Kunlun kernels."""
+        """Materialize the host mirrors used by the Kunlun kernels.
+
+        Build them through the coalesced path as well, so a mirror's storage is
+        decided once here and never moves: the graph records these host pointers,
+        and swapping them on the first refresh would leave it reading a freed
+        buffer.
+        """
+        for host_name, _dev_name in self._MIRRORED:
+            object.__setattr__(self, host_name, None)
+        if self._refresh_coalesced():
+            return
         for host_name, dev_name in self._MIRRORED:
             dev = getattr(self, dev_name, None)
             object.__setattr__(self, host_name, None if dev is None else dev.cpu())
+
+    def _refresh_coalesced(self) -> bool:
+        """One D2H for every mirror instead of one per tensor.
+
+        Seven small transfers cost seven times the fixed latency: measured 221 us
+        each, 1.55 ms/step out of graph, for a few hundred bytes of payload. Stage
+        the device tensors into one buffer, copy once, and expose each mirror as a
+        view of the same host buffer so the pointers the graph recorded stay put.
+        Returns False (caller falls back to per-tensor copies) when the mirrors do
+        not share a dtype or the layout changed.
+        """
+        if os.environ.get("ERNIE55_COALESCE_MIRRORS", "1") == "0":
+            return False
+        plan, total, dtype = [], 0, None
+        for host_name, dev_name in self._MIRRORED:
+            dev = getattr(self, dev_name, None)
+            if dev is None:
+                continue
+            if dtype is None:
+                dtype = dev.dtype
+            elif dev.dtype != dtype:
+                return False
+            if not dev.is_contiguous():
+                return False
+            plan.append((host_name, dev, total, dev.numel(), tuple(dev.shape)))
+            total += dev.numel()
+        if not plan:
+            return True
+        key = (dtype, total, tuple((p[0], p[2], p[4]) for p in plan))
+        if getattr(self, "_mirror_key", None) != key:
+            dev0 = plan[0][1]
+            object.__setattr__(
+                self, "_mirror_stage", torch.empty(total, dtype=dtype, device=dev0.device)
+            )
+            try:
+                host_flat = torch.empty(total, dtype=dtype, pin_memory=True)
+            except Exception:  # noqa: BLE001  # pinned host memory is optional
+                host_flat = torch.empty(total, dtype=dtype)
+            object.__setattr__(self, "_mirror_host", host_flat)
+            object.__setattr__(self, "_mirror_key", key)
+            for host_name, _dev, off, numel, shape in plan:
+                object.__setattr__(
+                    self, host_name, self._mirror_host[off : off + numel].view(shape)
+                )
+        stage = self._mirror_stage
+        for _host_name, dev, off, numel, _shape in plan:
+            stage[off : off + numel].copy_(dev.reshape(-1))
+        self._mirror_host.copy_(stage)
+        global _MIRROR_COALESCE_LOGGED
+        if not _MIRROR_COALESCE_LOGGED:
+            _MIRROR_COALESCE_LOGGED = True
+            # setproctitle wipes /proc/<pid>/environ for the schedulers, so the only
+            # reliable readback of this path is a line in the server log.
+            print(
+                "[ERNIE55] dsa host mirrors coalesced: %d tensors -> 1 D2H (%d elems %s)"
+                % (len(plan), total, dtype),
+                flush=True,
+            )
+        return True
 
     def refresh_host_mirrors(self) -> None:
         """Update the host mirrors *in place*, keeping their storage stable.
@@ -133,6 +360,8 @@ class KunlunDSAMetadata(DSAMetadata):
         lengths. Copy into the existing storage instead, and only reallocate when
         the shape/dtype actually changes.
         """
+        if self._refresh_coalesced():
+            return
         for host_name, dev_name in self._MIRRORED:
             dev = getattr(self, dev_name, None)
             if dev is None:
@@ -444,11 +673,11 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
         # sparse kernel has no sink input, and upstream itself rejects sinks on
         # every dsa_impl except flashmla_sparse, so refuse explicitly instead of
         # dropping them and silently computing a different softmax.
-        if attn_sink is not None:
-            raise NotImplementedError(
-                "KunlunDSAAttnBackend.forward_extend: learnable attention sinks "
-                "(attn_sink) are not supported by the Kunlun sparse kernel"
-            )
+        # 0.5.22 appended `attn_sink` (per-head learnable sinks). The Kunlun
+        # sparse kernel has no sink input, but the sink is a softmax-denominator
+        # term we can fold in post-hoc from the kernel's natural-log `lse`
+        # (see end of this method). MHA_ONE_SHOT has no such lse here, so only
+        # that path still refuses a sink.
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -470,6 +699,11 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
 
         # Use MHA kernel if in MHA_ONE_SHOT mode
         if self.use_mha:
+            if attn_sink is not None:
+                raise NotImplementedError(
+                    "KunlunDSAAttnBackend: attn_sink not supported on the "
+                    "MHA_ONE_SHOT path"
+                )
             assert k is not None and v is not None
             assert q_rope is None, "MHA_ONE_SHOT path should not pass q_rope"
             assert (
@@ -527,9 +761,12 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
 
         # sparse_prefill_fwd_opt takes explicit q/kv lods and needs preallocated
         # output buffers.
+        # out must match q's dtype (the kernel requires out.dtype == q.dtype;
+        # registrations cover both bf16 and fp16). Hardcoding bf16 breaks the
+        # fp16-latent path, so follow q_all.dtype.
         o_ = torch.zeros(
             [q_all.shape[0], layer.tp_q_head_num, layer.v_head_dim],
-            dtype=torch.bfloat16,
+            dtype=q_all.dtype,
             device=q_all.device,
         )
         max_logits = torch.zeros(
@@ -589,7 +826,7 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
             cum_q_lod = metadata.cum_q_lod
             cum_q_lod_cpu = metadata.cum_q_lod_cpu
 
-        if is_dsa_prefill_cp_round_robin_split():
+        if _cp_rowwise_split(forward_batch):
             cum_q_lod = metadata.dsa_cu_seqlens_q
             cum_q_lod_cpu = metadata.dsa_cu_seqlens_q_cpu
             kv_lod = metadata.dsa_cu_seqlens_k
@@ -612,6 +849,16 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
 
         # Defensive: replace NaN with 0 (e.g. when kv_lod has 0-length padding)
         o_ = torch.nan_to_num(o_, nan=0.0)
+
+        if attn_sink is not None:
+            # Fold the learnable per-head sink (a virtual value-0 key, natural-log
+            # bias) into the output: o *= Z/(Z+exp(sink-m)) = sigmoid(lse - sink),
+            # with lse = m + ln(Z) the kernel's natural-log normalizer. Matches the
+            # bmu reference (torch.logaddexp(lse, sink)). o_:[rows,head,vdim],
+            # lse:[rows,head], sink:[head].
+            sink = attn_sink.to(lse.dtype).reshape(-1)
+            o_ = o_ * torch.sigmoid(lse - sink).unsqueeze(-1)
+            o_ = torch.nan_to_num(o_, nan=0.0)
 
         del max_logits
         del lse
@@ -637,11 +884,8 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
         """Decode through the Kunlun sparse kernel."""
         # Same 0.5.22 `attn_sink` tail as forward_extend; the Kunlun sparse
         # decode kernel has no sink input either.
-        if attn_sink is not None:
-            raise NotImplementedError(
-                "KunlunDSAAttnBackend.forward_decode: learnable attention sinks "
-                "(attn_sink) are not supported by the Kunlun sparse kernel"
-            )
+        # See forward_extend: fold the per-head sink in post-hoc from the
+        # decode kernel's max_logits + p_sums (lse = max_logits + ln(p_sums)).
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -686,7 +930,7 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
         bs = forward_batch.batch_size
         o_ = torch.zeros(
             [bs, reshape_q.shape[1], layer.tp_q_head_num, layer.v_head_dim],
-            dtype=torch.bfloat16,
+            dtype=q_all.dtype,
             device=q_all.device,
         )
         max_logits = torch.zeros(
@@ -711,6 +955,14 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
             kv_lod_xpu=metadata.cache_seqlens_int32,
             max_seq_kv=metadata.max_seq_len_k,
         )
+        if attn_sink is not None:
+            # lse = max_logits + ln(p_sums); o *= sigmoid(lse - sink).
+            # o_:[bs,qlen,head,vdim], max_logits/p_sums:[bs,qlen,head], sink:[head].
+            lse = max_logits + torch.log(p_sums.clamp_min(1e-20))
+            sink = attn_sink.to(lse.dtype).reshape(-1)
+            o_ = o_ * torch.sigmoid(lse - sink).unsqueeze(-1)
+            o_ = torch.nan_to_num(o_, nan=0.0)
+
         del max_logits
         del p_sums
         return o_
@@ -742,7 +994,7 @@ class KunlunDSAAttnBackend(DeepseekSparseAttnBackend):
 
         o_ = torch.empty(
             [q.shape[0], layer.tp_q_head_num, layer.v_head_dim],
-            dtype=torch.bfloat16,
+            dtype=q.dtype,
             device=q.device,
         )
         ds_alpha = layer.scaling * math.sqrt(layer.head_dim)

@@ -111,6 +111,113 @@ def _install_c4_state_clear() -> None:
 _install_c4_state_clear()
 
 
+# KUNLUN_PERF(ERNIE55 1121): a cached reset template plus index_copy_ instead of
+# rebuilding the template per pool and writing through the sliced scatter. Same values,
+# measured 4.212 -> 0.137 ms/step on the decode trace. ERNIE55_C128_CLEAR_FAST=0 restores
+# the slow path.
+_C128_CLEAR_FAST = os.environ.get("ERNIE55_C128_CLEAR_FAST", "1") != "0"
+_C128_TMPL: dict = {}
+
+
+def _c128_reset_template(state: torch.Tensor, rows: int, half: int) -> torch.Tensor:
+    """``[rows, cols]`` with the first half zeroed and the second half at -inf.
+
+    Cached per (dtype, device, cols, rows): the DSPARK verify step calls this once per
+    compress-state pool (37 of them) with identical shapes.
+    """
+    key = (state.dtype, state.device, int(state.shape[-1]), int(rows))
+    tmpl = _C128_TMPL.get(key)
+    if tmpl is None:
+        tmpl = torch.empty((rows, state.shape[-1]), dtype=state.dtype, device=state.device)
+        tmpl[:, :half] = 0
+        tmpl[:, half:] = float("-inf")
+        _C128_TMPL[key] = tmpl
+    return tmpl
+
+
+def _clear_unaccepted_c128_draft_states(
+    self,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    accept_lens: torch.Tensor,
+    num_draft_tokens: int,
+) -> None:
+    """Index once, then two slice writes per pool, not a per-layer rebuild.
+
+    Upstream calls ``dsv4_c128_cleanup`` once per layer; with no triton on XPU
+    every call lands in the torch fallback and redoes the index computation
+    (arange / remainder / index_select / zeros_like / full_like / cat / where /
+    index_put_) -- ~400 small ops per verify step across 43 layers, to write
+    ``bs x num_draft`` rows. Computing the indices and the rejected mask once
+    and then zeroing the first half / -inf'ing the second half per pool, the way
+    upstream's own ``clear_unaccepted_c4_states`` does, is row-for-row
+    equivalent.
+
+    Measured on one node (dp8, bf16, 4K in / 1024 out, c8, pure decode):
+    145.9 tok/s, TPOT 51.0 ms upstream versus 149.2 tok/s, TPOT 49.2 ms here.
+    """
+    from sglang.srt.mem_cache import deepseek_v4_memory_pool as _pool_mod
+
+    if (
+        getattr(_pool_mod, "ONLINE_C128", False)
+        or num_draft_tokens <= 1
+        or req_pool_indices.numel() == 0
+    ):
+        return None
+    pools = [p for p in self.compress_state_pools if p is not None and p.ratio == 128]
+    if not pools:
+        return None
+
+    dev = pools[0].kv_score_buffer.kv_score.device
+    offs = torch.arange(num_draft_tokens, dtype=torch.int64, device=dev)
+    rejected = offs.unsqueeze(0) >= accept_lens.to(dev, torch.int64).unsqueeze(1)
+    req = req_pool_indices.to(dev, torch.int64).unsqueeze(1)
+    seq = seq_lens.to(dev, torch.int64).unsqueeze(1)
+    # No D2H anywhere: a boolean index (``rows[rejected]``) synchronises on the
+    # device queue -- py-spy measured that one line at ~10% of scheduler wall
+    # time -- so take all ``bs * num_draft`` rows and pick with ``where``.
+    rej_flat = rejected.reshape(-1, 1)
+    rows_by_ring: dict[int, torch.Tensor] = {}
+    for pool in pools:
+        ring = int(pool.ring_size)
+        if ring not in rows_by_ring:
+            rows_by_ring[ring] = (req * ring + (seq + offs).remainder(ring)).reshape(-1)
+
+    for pool in pools:
+        rows = rows_by_ring[int(pool.ring_size)]
+        state = pool.kv_score_buffer.kv_score
+        half = state.shape[-1] // 2
+        if _C128_CLEAR_FAST:
+            # KUNLUN_PERF(ERNIE55 1121): the reset template does not depend on the pool, and
+            # the sliced ``state[rows] = ...`` lands on the generic scatter. In the decode
+            # trace this loop costs 4.6 ms/step across 37 pools: index_put_ alone is
+            # 3987 us/step (740 calls, [17024,1024] <- [128,1024]), plus one
+            # index_select + zeros_like + full_like + cat + where per pool. Build the
+            # template once per (dtype, cols, rows) and write with index_copy_.
+            reset = _c128_reset_template(state, rows.numel(), half)
+            sel = state.index_select(0, rows)
+            state.index_copy_(0, rows, torch.where(rej_flat, reset, sel))
+        else:
+            sel = state.index_select(0, rows)
+            reset = torch.cat(
+                (torch.zeros_like(sel[:, :half]), torch.full_like(sel[:, half:], float("-inf"))),
+                dim=-1,
+            )
+            state[rows] = torch.where(rej_flat, reset, sel)
+    return None
+
+
+def _install_c128_state_clear() -> None:
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    DeepSeekV4TokenToKVPool.clear_unaccepted_c128_draft_states = (
+        _clear_unaccepted_c128_draft_states
+    )
+
+
+_install_c128_state_clear()
+
+
 def _rejected_locs(batch, num_draft: int):
     """verify 的 out_cache_loc 里 commit_lens 之后的那些 slot。"""
     loc = getattr(batch, "out_cache_loc", None)
@@ -482,3 +589,45 @@ def disable_dspark_draft_cuda_graph_kunlun(original_fn, self, *args, **kwargs):
         self._decode_graph_allowed = False
     return original_fn(self, *args, **kwargs)
 
+
+
+@plugin_hook(
+    "sglang.srt.models.ernie55_dspark.Ernie5_5_MoeForCausalLMDSpark.load_weights",
+    type=HookType.AFTER,
+)
+def restore_ernie55_dspark_fp16_dtype_kunlun(result, self, *args, **kwargs):
+    """fp16 服务下，把 ERNIE DSpark 草稿里所有未量化 Linear 恢复到 fp16。
+
+    草稿权重出厂是 bf16，而 target 跑 fp16；基类的 MqaAttentionBase hook 只恢复了
+    ``wo_a``，``wq_a`` / ``wkv`` / ``main_proj`` / markov / confidence 等仍是 bf16。
+    首个 prefill 的 ``commit_kv_proj``（``F.linear(fp16 main_x, bf16 wkv)``）就会在
+    XPU 上报 "lhs and rhs have different data type"。这里在 load_weights 之后统一把
+    草稿内所有未量化 Linear 拉到 fp16（W4A8 路由专家是 int8 量化方法，不受影响）。
+    """
+    from sglang_kunlun.hooks.layers.attention.dsv4.dtype_restore import (
+        restore_requested_fp16_parameter_dtype,
+    )
+
+    restore_requested_fp16_parameter_dtype(*self.modules())
+    return result
+
+
+@plugin_hook(
+    "sglang.srt.models.ernie55_dspark.Ernie5_5_MoeForCausalLMDSpark.project_commit_kv",
+    type=HookType.REPLACE,
+)
+def ernie55_dspark_project_commit_kv_kunlun(self, *, main_hidden, pool):
+    """Kunlun: 复用 base 的非融合 commit-KV 投影，激活对齐到 wkv 权重 dtype。
+
+    上游 ``CommitKvProj.execute`` 在 ``main_x.is_cuda`` 时走 CUDA-only 的 stacked
+    融合路径（``commit_kv_proj_fused``），昆仑上会因 fp16 激活 / bf16 权重不一致报
+    "lhs and rhs have different data type"。这里直接复用 base 的逐 stage torch 实现
+    ``CommitKvProj.torch``（等价于 ``[wkv(main_x)[0] for wkv in wkv_linears]``），只在
+    调用前把 main_x cast 到草稿 wkv 的 dtype（各 stage 同 dtype），既避开融合 / triton
+    路径，又不重复造轮子。
+    """
+    from sglang.kernels.ops.speculative.dspark.dspark_draft_model import CommitKvProj
+
+    wkv_linears = [stage.self_attn.wkv for stage in self.stages]
+    main_x = self.project_target_hidden(main_hidden).to(wkv_linears[0].weight.dtype)
+    return CommitKvProj.torch(main_x=main_x, wkv_linears=wkv_linears)

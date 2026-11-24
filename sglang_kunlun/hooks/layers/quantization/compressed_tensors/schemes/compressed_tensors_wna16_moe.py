@@ -284,7 +284,18 @@ class KunlunCompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             and self.moe_runner_config.swiglu_limit is not None
             else None
         )
-        if limit is not None and _FUSED_SWIGLU_CLAMP:
+        activation = str(
+            getattr(self.moe_runner_config, "activation", None) or "silu"
+        ).lower()
+        if activation == "situ":
+            beta = float(getattr(self.moe_runner_config, "gemm1_alpha", None) or 1.0)
+            lin = getattr(self.moe_runner_config, "gemm1_clamp_limit", None)
+            hidden = torch.ops.xspeedgate_ops.situ_and_mul.default(
+                gate_up.reshape(-1, gate_up.shape[-1]).contiguous(),
+                beta,
+                0.0 if lin is None else float(lin),
+            )
+        elif limit is not None and _FUSED_SWIGLU_CLAMP:
             # One op does clamp + silu + mul. The fallback path is 2 clamp_ + 1 swiglu,
             # which reads/writes the large [num_tokens, top_k, 2I] tensor two extra times
             # -- in the P-side 16k prefill trace, clamp alone is 115 ms / 2.0% (240 calls

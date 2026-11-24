@@ -12,7 +12,7 @@ The problem with import side effects: timing drifts with import order and the bl
 wqkv_a.weight_scale mismatched and was dropped). It is now moved
 to just before the two upstream consumption points (BEFORE hooks), positioned uniformly by HookRegistry at startup:
 
-* ``sglang.srt.utils.hf_transformers.config.get_config``
+* ``sglang.srt.hf_transformers.config.get_config``
     -- fix GLM's ``attribute_map`` (head_dim redirect) before config parsing.
 * ``sglang.srt.model_loader.loader._get_quantization_config``
     -- inject before the quant config is built and before mapper / packed_modules_mapping are read.
@@ -78,7 +78,7 @@ def _ensure_glm_attribute_map() -> None:
 
 
 @plugin_hook(
-    "sglang.srt.utils.hf_transformers.config.get_config",
+    "sglang.srt.hf_transformers.config.get_config",
     type=HookType.BEFORE,
 )
 def ensure_glm_attribute_map_kunlun(*args, **kwargs):
@@ -248,6 +248,105 @@ def _install_v2_packed_mapping() -> None:
         )
 
 
+def _install_ernie55_quant_name_mapper() -> None:
+    """ERNIE 5.5 Flash: align compressed-tensors names to the sglang model tree.
+    """
+    try:
+        from sglang.srt.models.ernie55 import Ernie5_5_MoeForCausalLM
+    except ImportError:
+        return
+    from sglang.srt.models.utils import WeightsMapper
+
+    if getattr(Ernie5_5_MoeForCausalLM, "hf_to_sglang_mapper", None) is None:
+        Ernie5_5_MoeForCausalLM.hf_to_sglang_mapper = WeightsMapper(
+            orig_to_new_substr={"block_sparse_moe": "mlp"}
+        )
+        _log_once(
+            "ernie55_mapper",
+            "sglang-kunlun: installed ERNIE5.5 quant name mapper "
+            "(block_sparse_moe -> mlp)",
+        )
+
+
+def _install_ernie55_nextn_mapper() -> None:
+    """ERNIE 5.5 NextN (EAGLE/ECHO self-draft): align compressed-tensors names.
+    """
+    try:
+        from sglang.srt.models.ernie55_nextn import Ernie5_5_MoeForCausalLMNextN
+    except ImportError:
+        return
+    from sglang.srt.models.utils import WeightsMapper
+
+    if getattr(Ernie5_5_MoeForCausalLMNextN, "hf_to_sglang_mapper", None) is not None:
+        return
+    Ernie5_5_MoeForCausalLMNextN.hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={
+            # The draft decoder body keeps the standard layer prefix
+            # (``model.layers.0.self_attn/mlp/...``) and matches the checkpoint's
+            # ``model.layers.\d+.*`` patterns directly -- do NOT rewrite it. It only
+            # needs the same MoE rename as the main model so the W4A8 routed-expert
+            # target matches (sglang names the block ``mlp``).
+            "block_sparse_moe": "mlp",
+            # Only the layer-external pieces are hoisted to the model root in
+            # ``ernie55_nextn.py`` (``model.{e_proj,h_proj,enorm,hnorm,hc_head,
+            # shared_head}``); remap their checkpoint ``model.layers.{mtp}.X``
+            # target/ignore patterns onto that root so find_matched_target resolves.
+            r"model\.layers\.\d+\.e_proj": r"model\.e_proj",
+            r"model\.layers\.\d+\.h_proj": r"model\.h_proj",
+            r"model\.layers\.\d+\.enorm": r"model\.enorm",
+            r"model\.layers\.\d+\.hnorm": r"model\.hnorm",
+            r"model\.layers\.\d+\.hc_head": r"model\.hc_head",
+            r"model\.layers\.\d+\.shared_head": r"model\.shared_head",
+        }
+    )
+    _log_once(
+        "ernie55_nextn_mapper",
+        "sglang-kunlun: installed ERNIE5.5 NextN quant name mapper "
+        "(MTP layer -> model.decoder/model.*)",
+    )
+
+
+def _install_ernie55_dspark_mapper() -> None:
+    """ERNIE 5.5 Flash DSpark (MTP self-draft): align compressed-tensors names.
+
+    The DSpark draft module tree uses ``stages.<i>.self_attn/mlp/...`` and hoists
+    the MTP heads to the draft root (``markov_head`` / ``confidence_head`` / ``norm``
+    / ...), while the checkpoint's compressed-tensors targets/ignore use checkpoint
+    naming (``model.mtp.<i>.block_sparse_moe/self_attn/...`` and ``model.mtp.<head>``).
+    Without this rewrite find_matched_target throws "Unable to find matching target
+    for stages.0.self_attn.wq_a".
+
+    Only routed experts are W4A8 (target ``model.mtp.<i>.block_sparse_moe.experts``);
+    attn / gate / shared_experts / layernorms / heads are bf16 in the ignore list, so
+    these rewrites keep them ignored under the draft module names.
+    """
+    try:
+        from sglang.srt.models.ernie55_dspark import Ernie5_5_MoeForCausalLMDSpark
+    except ImportError:
+        return
+    from sglang.srt.models.utils import WeightsMapper
+
+    if getattr(Ernie5_5_MoeForCausalLMDSpark, "hf_to_sglang_mapper", None) is not None:
+        return
+    Ernie5_5_MoeForCausalLMDSpark.hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={
+            # Longest key wins and only one substr rule fires per name: the routed
+            # experts target folds block_sparse_moe -> mlp and mtp.<i> -> stages.<i>
+            # in one shot.
+            r"model\.mtp\.\d+\.block_sparse_moe": r"stages\.\d+\.mlp",
+            # per-stage attn / layernorms / hyper-connections
+            r"model\.mtp\.\d+\.": r"stages\.\d+\.",
+            # model-level MTP heads hoisted to the draft root
+            r"model\.mtp\.": r"",
+        }
+    )
+    _log_once(
+        "ernie55_dspark_mapper",
+        "sglang-kunlun: installed ERNIE5.5 DSpark quant name mapper "
+        "(model.mtp.<i> -> stages.<i>, MTP heads -> root)",
+    )
+
+
 @plugin_hook(
     "sglang.srt.model_loader.loader._get_quantization_config",
     type=HookType.BEFORE,
@@ -265,6 +364,65 @@ def inject_quant_names_kunlun(*args, **kwargs):
         _install_v2_packed_mapping()
         _install_dsv4_quant_name_mapper()
         _install_dsv4_nextn_mapper()
+        _install_ernie55_quant_name_mapper()
+        _install_ernie55_nextn_mapper()
+        _install_ernie55_dspark_mapper()
     except Exception:
         logger.exception("sglang-kunlun: failed to inject quant name mappings")
     return None
+
+
+def _arch_is_ernie55(model_config) -> bool:
+    try:
+        archs = getattr(model_config.hf_config, "architectures", None) or []
+    except Exception:
+        return False
+    return any("Ernie5_5_MoeForCausalLM" in str(a) for a in archs)
+
+
+@plugin_hook(
+    "sglang.srt.model_loader.loader._get_quantization_config",
+    type=HookType.AROUND,
+)
+def ernie55_unignore_experts_kunlun(original_fn, *args, **kwargs):
+    """Stop ERNIE's dense-MLP ignore from swallowing the W4A8 routed experts.
+    """
+    import re as _re
+
+    quant_config = original_fn(*args, **kwargs)
+    if quant_config is None:
+        return quant_config
+    model_config = args[0] if args else kwargs.get("model_config")
+    if model_config is None or not _arch_is_ernie55(model_config):
+        return quant_config
+    ignore = getattr(quant_config, "ignore", None)
+    if not ignore:
+        return quant_config
+
+    experts_probe = "model.layers.1.mlp.experts.0.gate_proj"
+    dense_probe = "model.layers.0.mlp.gate_proj"
+    new_ignore = []
+    fixed = []
+    for pat in ignore:
+        body = pat[3:] if isinstance(pat, str) and pat.startswith("re:") else None
+        if (
+            body is not None
+            and "mlp\\." in body
+            and _re.search(body, experts_probe)
+            and _re.search(body, dense_probe)
+        ):
+            # Broad dense-MLP ignore: exclude the routed experts subtree.
+            new_body = body.replace("mlp\\.", "mlp\\.(?!experts\\.)", 1)
+            new_ignore.append("re:" + new_body)
+            fixed.append(pat)
+        else:
+            new_ignore.append(pat)
+    if fixed:
+        quant_config.ignore = new_ignore
+        _log_once(
+            "ernie55_unignore",
+            "sglang-kunlun: ERNIE5.5 un-ignored routed experts (patched %d dense-mlp "
+            "ignore pattern(s) with a (?!experts.) lookahead)",
+            len(fixed),
+        )
+    return quant_config

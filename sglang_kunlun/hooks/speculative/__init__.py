@@ -28,12 +28,17 @@ upstream_speculative.dflash_info_v2 = importlib.import_module(
 # pkgutil.resolve_name 能解析到。
 importlib.import_module("sglang.kernels.ops.speculative.reject_sampling")
 importlib.import_module("sglang.kernels.ops.speculative.dspark.dspark_accept")
+importlib.import_module("sglang.kernels.ops.speculative.tree")
+importlib.import_module("sglang.kernels.ops.speculative.eagle")
+importlib.import_module("sglang.kernels.ops.speculative.sampling")
 
 from . import dflash_info_v2  # noqa: E402,F401
 from . import draft_utils  # noqa: E402,F401
 from . import dspark_draft_backend  # noqa: E402,F401
 from . import dspark_precision  # noqa: E402,F401
 from . import dspark_torch_dispatch  # noqa: E402,F401
+from . import dspark_xpu_ops  # noqa: E402,F401  must come after dspark_torch_dispatch
 from . import eagle_worker_v2  # noqa: E402,F401
 from . import multi_layer_eagle_worker_v2  # noqa: E402,F401
 from . import reject_sampling  # noqa: E402,F401
+from sglang_kunlun.kernels.speculative import spec_tree_kernels  # noqa: E402,F401

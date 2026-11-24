@@ -796,10 +796,18 @@ def _kunlun_sparse_prefill_capable() -> bool:
     ops = getattr(torch.ops, "xspeedgate_ops", None)
     if ops is None:
         return False
-    return all(
+    if not all(
         hasattr(ops, name)
         for name in ("build_swa_token_ids", "combine_topk_swa_indices")
-    )
+    ):
+        return False
+    try:
+        import kunlun_ops
+    except Exception:
+        return False
+    if not hasattr(kunlun_ops, "flash_mla_sparse_fwd"):
+        return False
+    return True
 
 
 @plugin_hook(
@@ -808,6 +816,10 @@ def _kunlun_sparse_prefill_capable() -> bool:
 )
 @plugin_hook(
     "sgl_kernel.flash_mla_sparse_fwd",
+    type=HookType.REPLACE,
+)
+@plugin_hook(
+    "sglang.kernels.ops.attention.flash_mla_interface.flash_mla_sparse_fwd",
     type=HookType.REPLACE,
 )
 def flash_mla_sparse_fwd_kunlun(
@@ -962,6 +974,11 @@ def _sparse_mla_allocates_outputs() -> bool:
 class KunlunDSV4AttnMetadata(DSV4AttnMetadata):
     """DSV4 metadata without CUDA FlashMLA scheduler objects."""
 
+    def _supported_index_topks(self) -> tuple:
+        """Sparse-index top-k widths the Kunlun flashmla path validates.
+        """
+        return (512, 1024)
+
     def init_flashmla_related(
         self, is_prefill: bool = False, low_ratio_buffers=None
     ) -> None:
@@ -984,7 +1001,7 @@ class KunlunDSV4AttnMetadata(DSV4AttnMetadata):
         # 4.1 renamed the DSV4 metadata field (and the backend attribute) from
         # c4_sparse_topk/c4_topk to index_topk; the value is the same
         # `hf_text_config.index_topk` fallback to C4_TOPK.
-        if self.index_topk not in (512, 1024):
+        if self.index_topk not in self._supported_index_topks():
             raise ValueError(f"unsupported Kunlun top-k: {self.index_topk}")
         if 4 in self.present_ratios:
             self.c4_sparse_topk_lengths = torch.clamp(
@@ -1595,6 +1612,12 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
     # Kunlun DSV4 graph-extend needs uniform queries per request; ragged
     # (compact) verify runs on the eager per-row LoD path instead.
     supports_ragged_verify_graph: bool = False
+
+    # Core-attn metadata class, overridable by model subclasses (e.g. ERNIE 5.5
+    # swaps in a metadata that widens the sparse-index top-k whitelist). Keep
+    # the two construction sites below routed through this attribute so a
+    # subclass never has to copy ``make_core_attn_metadata``.
+    core_attn_metadata_cls = KunlunDSV4AttnMetadata
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -2622,9 +2645,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         page_table = req_to_token[req_pool_indices_repeated, :span:page_size]
         return (page_table // page_size).to(torch.int32)
 
-    def resolve_prefill_shared_read_ends(
-        self, forward_batch, *, num_qo_tokens: int, build_snapshot: bool = True
-    ):
+    def resolve_prefill_shared_read_ends(self, forward_batch=None, *args, **kwargs):
         """Answer UNKNOWN: Kunlun has not audited its prefill shared reads.
 
         0.5.23 added a fine-grained write-after-read barrier for prefill
@@ -2652,7 +2673,11 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         """
         from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 
-        del forward_batch, num_qo_tokens, build_snapshot
+        # Signature kept permissive on purpose: base has shuffled this method's
+        # args across 0.5.x (num_qo_tokens / build_snapshot come and go, and
+        # eager_runner calls it with forward_batch only). We ignore them all and
+        # return the coarse fence, so drift here never crashes the forward.
+        del forward_batch, args, kwargs
         return SharedReadEnds.UNKNOWN
 
     def glue_target_verify_metadata(self) -> str:
@@ -2780,7 +2805,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         page_table = self._build_page_table(
             req_to_token, req_pool_indices_repeated, seq_lens_casual, max_seq_len
         )
-        metadata = KunlunDSV4AttnMetadata(
+        metadata = self.core_attn_metadata_cls(
             page_size=self.page_size,
             raw_out_loc=out_loc,
             seq_lens_casual=seq_lens_casual,
@@ -2873,7 +2898,7 @@ class KunlunDeepseekV4AttnBackend(DeepseekV4AttnBackend):
         page_table = self._build_page_table(
             req_to_token, req_pool_indices_repeated, seq_lens_casual, max_seq_len
         )
-        metadata = KunlunDSV4AttnMetadata(
+        metadata = self.core_attn_metadata_cls(
             page_size=self.page_size,
             raw_out_loc=out_loc,
             seq_lens_casual=seq_lens_casual,

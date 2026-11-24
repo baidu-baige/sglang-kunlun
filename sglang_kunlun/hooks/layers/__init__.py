@@ -16,6 +16,16 @@ def _disable_cuda_triton_vocab_embedding(self, input_):
     return False
 
 
+@plugin_hook(
+    "sglang.kernels.ops.sampling.argmax_jit.can_argmax",
+    type=HookType.REPLACE,
+)
+def _disable_jit_argmax_kunlun(logits):
+    """Force greedy sampling onto the Torch ``argmax`` fallback on Kunlun.
+    """
+    return False
+
+
 from . import linear  # noqa: F401,E402
 from . import logits_processor  # noqa: F401,E402
 from . import mhc  # noqa: F401

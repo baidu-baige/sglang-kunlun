@@ -450,6 +450,10 @@ def mqa_forward_global_head_layout_kunlun(
         if q_global is not None:
             o = o[:, tp_slice, :]
 
+    # ERNIE 5.5 HCA folds a cross-head ``VhaPostMix`` into ``_project_wo_a``
+    if getattr(self, "postmix", None) is not None:
+        o = self.postmix(o)
+
     if upstream._is_npu:
         # The 0.5.22 rope in-place helper is called ``fused_rope_inplace``
         # (that is how ``deepseek_v4.py:1404`` calls it); the NPU branch is

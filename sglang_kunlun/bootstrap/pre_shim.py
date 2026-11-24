@@ -381,7 +381,42 @@ def _stub_small_copy_fast_path() -> None:
     def try_small_copy(dsts, srcs):  # noqa: ARG001 - contract is "decline"
         return False
 
+    def write_host_ints(dsts, values):
+        """Torch-native stand-in for the Triton ``write_host_ints``.
+
+        0.5.23's ``forward_batch_info`` imports ``write_host_ints`` from this
+        same module at import time. The upstream kernel streams the host ints
+        in as kernel arguments to dodge a copy-engine wait, but its Triton decl
+        needs 3.2+ to import (this build ships 3.0.0). Since we fully shadow the
+        module to keep ``try_small_copy`` out, we must also supply this symbol;
+        do the host->device write in torch -- correct, if not launch-free.
+        """
+        import torch
+
+        if len(dsts) != len(values):
+            raise ValueError(
+                f"write_host_ints got {len(dsts)} tensors and {len(values)} value lists"
+            )
+        for dst, row in zip(dsts, values):
+            if (
+                dst.dtype not in (torch.int32, torch.int64)
+                or dst.ndim != 1
+                or not dst.is_contiguous()
+                or dst.numel() != len(row)
+            ):
+                raise ValueError(
+                    "write_host_ints needs contiguous 1-D int32/int64 tensors "
+                    f"matching the value counts; got {dst.dtype} {tuple(dst.shape)} "
+                    f"on {dst.device} for {len(row)} values"
+                )
+            if len(row):
+                dst.copy_(
+                    torch.tensor(row, dtype=dst.dtype, device=dst.device),
+                    non_blocking=True,
+                )
+
     module.try_small_copy = try_small_copy
+    module.write_host_ints = write_host_ints
     module._sglang_kunlun_stub = True
     sys.modules[name] = module
 

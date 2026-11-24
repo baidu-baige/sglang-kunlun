@@ -111,9 +111,10 @@ def _fix_dsv4_swa_allocator(
     *,
     sizes,
     token_to_kv_pool,
-    is_dsv4_model,
     req_to_token_pool,
     token_to_kv_pool_allocator,
+    is_compressed_kv_model=None,
+    **_kwargs,
 ):
     """Restore the hybrid-SWA allocator contract bypassed by the OOT branch.
 

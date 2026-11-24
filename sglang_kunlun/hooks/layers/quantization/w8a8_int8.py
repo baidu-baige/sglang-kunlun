@@ -296,6 +296,18 @@ def moe_apply_kunlun(
     gemm1_limit = getattr(self.moe_runner_config, "gemm1_clamp_limit", None)
     interleaved = getattr(self.moe_runner_config, "interleaved", False)
     swiglu_limit = self.moe_runner_config.swiglu_limit
+    activation = str(
+        getattr(self.moe_runner_config, "activation", None) or "silu"
+    ).lower()
+    # ``gemm1_alpha`` / ``gemm1_clamp_limit`` carry the parameters of two
+    # different gated activations: SwiGLU-OAI (MiniMax-M3) and SiTU (ERNIE
+    # 5.5). They share the signature, so dispatching on the parameters alone
+    # silently runs OAI
+    #     clamp(g, <=limit) * sigmoid(alpha*g) * (clamp(u, +-limit) + 1)
+    # where the model asks for SiTU
+    #     alpha*tanh(g/alpha) * sigmoid(g) * (limit*tanh(u/limit))
+    # which is a different function of the same two scalars.  Read the
+    # activation name, as the upstream Triton runner does.
     fused_act_quant = (
         _resolve_clamp_swiglu_dynamic_quant()
         if (gemm1_alpha is None and swiglu_limit is not None)
@@ -310,7 +322,19 @@ def moe_apply_kunlun(
             gate_up.reshape(num_tokens * top_k, -1), float(swiglu_limit)
         )
     else:
-        if gemm1_alpha is not None:
+        if activation == "situ":
+            # Matches the upstream Triton runner's situ branch
+            # (moe/moe_runner/triton_utils/fused_moe.py).
+            half = gate_up.shape[-1] // 2
+            situ_beta = float(gemm1_alpha) if gemm1_alpha is not None else 4.0
+            gate = gate_up[..., :half].float()
+            up = gate_up[..., half:].float()
+            gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
+            if gemm1_limit is not None:
+                limit = float(gemm1_limit)
+                up = limit * torch.tanh(up / limit)
+            activated = (gate * up).to(gate_up.dtype)
+        elif gemm1_alpha is not None:
             if gemm1_limit is None:
                 raise AssertionError("gemm1_limit is required when gemm1_alpha is set")
             if interleaved:
@@ -442,6 +466,19 @@ def w8a8_int8_config_get_quant_method_kunlun(
             ignore=self.ignore,
             fused_mapping=self.packed_modules_mapping,
         ):
+            # EB5's checkpoint only carries INT8 for the routed experts, so its
+            # `ignore` regex sends every dense projection here and they run
+            # BF16 GEMMs (31-39% of 64K-prefill device time, measured in
+            # REPORT_PD_ACG_20261113.md §13.4). EB5_INT8_DENSE opts the dense
+            # prefixes into online INT8 instead; unset, this is a no-op.
+            from sglang_kunlun.hooks.layers.quantization.int8_dense_online import (
+                method_for as _int8_dense_method_for,
+            )
+
+            online = _int8_dense_method_for(layer, prefix)
+            if online is not None:
+                online.prefix = prefix
+                return online
             return UnquantizedLinearMethod()
         return W8A8Int8LinearMethod(self)
     if isinstance(layer, FusedMoE):

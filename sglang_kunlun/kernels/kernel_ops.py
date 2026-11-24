@@ -1742,6 +1742,47 @@ def dsv4_compress_norm_rope_store_v2_kunlun(
         else freq_cis
     ).float()
 
+    # The Kunlun compressed-KV pool is a plain bf16 half cache, 512 bf16 per
+    # token (1024 B), while upstream ``compressor_v2`` only sets
+    # ``bf16_store=True`` on the unified-KV path and leaves it False here,
+    # carrying the layout in ``kv_layout`` instead. With it False the operator
+    # writes the V4 fp8+scale byte layout, and ``get_extra_key_buffer`` reads
+    # the same bytes back as bf16: one buffer, two layouts. Derive the store
+    # width from the page geometry instead.
+    #
+    # The slot of a plain half cache is as wide as the latent the call carries:
+    # one bf16 per lane of ``kv``, which is ``qk_nope_head_dim +
+    # qk_rope_head_dim`` (see ``_kunlun_paged_kv_bytes_per_token`` in
+    # hooks/mem_cache/common.py). Scaling by ``element_size`` lets a uint8 byte
+    # pool and a typed bf16/fp16 pool both report bytes -- comparing raw
+    # ``shape`` would read a typed pool as half its byte width and drop it back
+    # onto the fp8 path. The packed V4 layout is 584 B/token, so it stays False.
+    # dtype gate: force bf16-store ONLY when the KV pool is bf16. Under
+    # --kv-cache-dtype fp16 the pool is an fp16 half cache (oot_pool_seams
+    # overrides it) yet the latent ``kv`` handed in is still bf16, so ``kv.dtype``
+    # cannot tell them apart. 
+    _pool_is_fp16 = False
+    try:
+        from sglang.srt.runtime_context import get_server_args
+
+        _kvdt = str(getattr(get_server_args(), "kv_cache_dtype", "") or "").lower()
+        _pool_is_fp16 = _kvdt in ("fp16", "float16", "half")
+    except Exception:
+        _kvdt = "<unavailable>"
+        _pool_is_fp16 = False
+    _store_bf16 = bf16_store
+    if (
+        not _store_bf16
+        and not _pool_is_fp16
+        and page_size > 0
+        and kvcache.numel()
+        and kv.ndim >= 2
+    ):
+        _elems_per_page = kvcache.numel() // kvcache.shape[0]
+        _bytes_per_token = (_elems_per_page // page_size) * kvcache.element_size()
+        if _bytes_per_token == kv.shape[-1] * 2:
+            _store_bf16 = True
+
     torch.ops.xspeedgate_ops.dsv4_compress_norm_rope_store_v2(
         kv,
         plan_raw,
@@ -1753,7 +1794,7 @@ def dsv4_compress_norm_rope_store_v2_kunlun(
         plan.is_decode,
         plan.compress_ratio,
         page_size,
-        bf16_store,
+        _store_bf16,
     )
 
 
@@ -6252,19 +6293,26 @@ def _dsv4_cos_sin_cache(freqs_cis: torch.Tensor) -> torch.Tensor:
         # every rotation with the wrong cos/sin, which left greedy decoding
         # fluent for the first few high-confidence tokens and then collapsed into
         # repeated punctuation.
-        if freqs_cis.is_complex():
-            parts = torch.view_as_real(_plain_copy(freqs_cis))
-            half = parts.shape[-2]
-            cached = torch.empty(
-                parts.shape[:-2] + (half * 2,),
-                dtype=parts.dtype,
-                device=parts.device,
-            )
-            cached[..., :half].copy_(parts[..., 0])
-            cached[..., half:].copy_(parts[..., 1])
-        else:
-            # Already real-valued: the real/imag split is an identity.
-            cached = _plain_copy(freqs_cis)
+        #
+        # ``view_as_real`` is a view op, and while ``inference_mode`` is *active* any
+        # such view is rejected ("Cannot set version_counter for inference tensor")
+        # even when its input is a normal tensor -- copying the input is not enough.
+        # Build the cache with inference mode suspended; that also keeps the cached
+        # tensor a normal one, so reusing it outside inference_mode stays legal.
+        with torch.inference_mode(False), torch.no_grad():
+            if freqs_cis.is_complex():
+                parts = torch.view_as_real(_plain_copy(freqs_cis))
+                half = parts.shape[-2]
+                cached = torch.empty(
+                    parts.shape[:-2] + (half * 2,),
+                    dtype=parts.dtype,
+                    device=parts.device,
+                )
+                cached[..., :half].copy_(parts[..., 0])
+                cached[..., half:].copy_(parts[..., 1])
+            else:
+                # Already real-valued: the real/imag split is an identity.
+                cached = _plain_copy(freqs_cis)
         _DSV4_FREQS_REAL_CACHE[key] = cached
     return cached
 
@@ -6418,11 +6466,29 @@ def dsv4_fused_q_norm_rope_kunlun(
     if eps is None:
         normalized = q_input
     else:
-        normalized = torch.empty_like(q_input)
+        # Norm straight into ``q_output`` when it is a distinct, contiguous tensor
+        # of the same shape: the extra buffer plus the copy below cost 21 ms/step.
+        if (
+            q_output.shape == q_input.shape
+            and q_output.dtype == q_input.dtype
+            and q_output.is_contiguous()
+            and q_output.data_ptr() != q_input.data_ptr()
+        ):
+            normalized = q_output
+        else:
+            normalized = torch.empty_like(q_input)
+        # ``kunlun_ops.rmsnorm`` only accepts a 2D ``[rows, hidden]`` tensor, but
+        # the per-head q-norm feeds q as ``[tokens, n_local_heads, head_dim]``
+        # (ERNIE 5.5 gated-q via ``_gated_q_norm_rope``, and DSV4 proper with
+        # ``q_head_norm=True``). Flatten the leading dims so the norm runs per
+        # ``(token, head)`` over ``head_dim`` -- the same contract as the CUDA
+        # warp-per-(token, head) kernel. 2D inputs pass through unchanged.
+        q_input_2d = q_input.reshape(-1, q_input.shape[-1])
+        normalized_2d = normalized.view(-1, normalized.shape[-1])
         kunlun_ops.rmsnorm(
-            q_input,
+            q_input_2d,
             None,
-            normalized,
+            normalized_2d,
             eps,
             False,
             True,
@@ -6443,7 +6509,8 @@ def dsv4_fused_q_norm_rope_kunlun(
         }
         dsv4_fused_q_norm_rope_kunlun._accuracy_dumped = True
 
-    q_output.copy_(normalized)
+    if normalized is not q_output:
+        q_output.copy_(normalized)
     rope_dim = freqs_cis.shape[-1] * 2
     rope = q_output[..., -rope_dim:]
     rope_input = rope.contiguous()
@@ -8047,7 +8114,16 @@ DSV4_KV_DIM = 512
 
 @register_jit_op(
     "sglang.kernels.ops.attention.dsv4.dequant_k_cache",
-    "dequantize_k_cache_paged",
+    # Upstream 0.5.23 renamed the paged-dequant helper
+    # `dequantize_k_cache_paged` -> `dequantize_k_cache_paged_dsv4` (the V4.1
+    # layouts split off into `dequantize_k_cache_paged_v41`). The old op name no
+    # longer exists, so `_patch_symbol` logged "not found" and the Triton
+    # launcher stayed live; the sparse-prefill path then hit
+    # `_dequantize_k_cache_paged_kernel[grid]` and failed ('function' object is
+    # not subscriptable, triton absent). Target the drifted name so
+    # `_replace_imported_bindings` also rebinds the by-name import captured in
+    # `deepseek_v4_backend` (its `_forward_prefill_sparse` call site).
+    "dequantize_k_cache_paged_dsv4",
 )
 def dsv4_dequantize_k_cache_paged_kunlun(
     quant_k_cache: torch.Tensor,
@@ -8154,3 +8230,26 @@ def top_p_renorm_prob_kunlun(
     from sglang_kunlun.kernels.sgl_kernel_kunlun.sampling import top_p_renorm_prob
 
     return top_p_renorm_prob(probs, top_p)
+
+
+# ``logprob_processor``'s Triton streaming logsumexp cannot compile here, so
+# every ``return_logprob`` request died with ``'_CudaTarget' object has no
+# attribute 'arch'``. torch's reduction is numerically the same (both subtract
+# the row max).
+@register_triton_op("sglang.srt.layers.logsumexp", "_row_logsumexp_kernel")
+def row_logsumexp_kernel_torch(
+    x: torch.Tensor,
+    out_max: torch.Tensor,
+    out_log_sum: torch.Tensor,
+    row_stride: int,
+    col_stride: int,
+    num_cols: int,
+    BLOCK_N: int = 0,
+    **_,
+) -> None:
+    """Write ``(row max, log sum exp(x - max))`` the way the Triton kernel does."""
+    rows = out_max.shape[0]
+    view = x.as_strided((rows, num_cols), (row_stride, col_stride)).float()
+    m = view.amax(dim=-1)
+    out_max.copy_(m)
+    out_log_sum.copy_(torch.log(torch.exp(view - m[:, None]).sum(dim=-1)))

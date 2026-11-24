@@ -9,7 +9,14 @@ from contextlib import nullcontext
 import torch
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
-from sglang.srt.utils import get_num_new_pages, next_power_of_2
+from sglang.srt.utils import next_power_of_2
+
+# 0.5.23 把 get_num_new_pages 从 sglang.srt.utils 挪到了 sglang.srt.mem_cache.utils；
+# 老位置兜底，避免插件在不同 0.5.23 快照间漂移时 import 直接炸。
+try:
+    from sglang.srt.utils import get_num_new_pages
+except ImportError:
+    from sglang.srt.mem_cache.utils import get_num_new_pages
 
 
 logger = logging.getLogger(__name__)

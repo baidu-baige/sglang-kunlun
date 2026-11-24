@@ -19,15 +19,11 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
     type=HookType.AROUND,
 )
 def _draft_extend_for_decode_kunlun(
-    original_fn, self, batch, batch_result, *, staged=False, kv_loc_plan=None
+    original_fn, self, batch, batch_result, **extra_kwargs
 ):
-    # 0.5.22 added two keyword-only parameters: ``staged`` (whether
-    # ``_draft_extend_plan_for_decode`` already staged this batch's shared
-    # reads into the draft-extend graph runner, read back as the boundary-KV
-    # window and passed to ``cgr.prepare(..., staged=staged)``) and
-    # ``kv_loc_plan`` (the iteration's KVLocPlan from ``verify_input``). This
-    # wrapper only forces attention-backend init, so both are mirrored and
-    # forwarded unchanged.
+    # This wrapper only forces attention-backend init; forward every keyword-only
+    # parameter untouched (``staged`` / ``kv_loc_plan`` since 0.5.22,
+    # ``iteration_ids`` since 0.5.23) via **extra_kwargs.
     original_runner_forward = {
         idx: runner.forward for idx, runner in enumerate(self.draft_runner_list)
     }
@@ -56,7 +52,7 @@ def _draft_extend_for_decode_kunlun(
 
     try:
         return original_fn(
-            self, batch, batch_result, staged=staged, kv_loc_plan=kv_loc_plan
+            self, batch, batch_result, **extra_kwargs
         )
     finally:
         for idx, runner in enumerate(self.draft_runner_list):

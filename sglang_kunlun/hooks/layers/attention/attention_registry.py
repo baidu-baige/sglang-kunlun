@@ -47,9 +47,17 @@ if register_attention_backend is not None:
     register_attention_backend("dsa")(create_kunlun_nsa_attention_backend)
     register_attention_backend("nsa")(create_kunlun_nsa_attention_backend)
 
+    @register_attention_backend("ernie55")
+    def create_kunlun_ernie55_attention_backend(runner):
+        """Lazy-construct the Kunlun ERNIE 5.5 attention backend."""
+        from .kunlun_ernie55_backend import KunlunErnie55AttnBackend
+
+        return KunlunErnie55AttnBackend(runner)
+
     logger.info(
         "Registered 'kunlun', 'kunlun_compressed' and 'kunlun_nsa' attention "
-        "backends; 'dsa'/'nsa' now resolve to KunlunDSAAttnBackend"
+        "backends; 'dsa'/'nsa' -> KunlunDSAAttnBackend, 'ernie55' -> "
+        "KunlunErnie55AttnBackend"
     )
 
 
@@ -125,7 +133,7 @@ def install_kunlun_mla_forward_dispatch() -> None:
                 return AttnForwardMethod.MHA_CHUNKED_KV
         return _dispatch_mla_subtype(attn, forward_batch)
 
-    for name in ("kunlun", "kunlun_compressed"):
+    for name in ("kunlun", "kunlun_compressed", "ernie55"):
         AttentionBackendRegistry.register(name, handle_attention_kunlun)
     logger.info("Registered Kunlun MLA forward-method dispatch for %s", "kunlun")
 

@@ -61,7 +61,10 @@ def create_moe_dispatcher_kunlun(moe_runner_config, quant_method=None):
     )
 
     a2a_backend = get_moe_a2a_backend()
-    if a2a_backend.is_none():
+    if a2a_backend.is_none() or a2a_backend.is_megamoe():
+        # MegaMoE all-to-all is fused inside the hydrax kernel and driven from
+        # Ernie5_5Moe._forward_megamoe_experts, not the FusedMoE token
+        # dispatcher, so a no-op StandardDispatcher is correct here.
         return StandardDispatcher(moe_runner_config)
     if a2a_backend.is_deepep() or a2a_backend.is_mooncake():
         dispatcher = MaybeTboDeepEPDispatcher(

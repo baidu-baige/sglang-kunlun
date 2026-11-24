@@ -1060,6 +1060,20 @@ def _fused_store_latent_unsupported(
     return None
 
 
+
+_WRITER_IDENTITY_MAPS = {}
+
+def _writer_identity_mapping(device, capacity):
+    key = (str(device), capacity)
+    mapping = _WRITER_IDENTITY_MAPS.get(key)
+    if mapping is None:
+        if capacity >= 2**31:
+            raise ValueError("identity mapping requires capacity < 2**31")
+        mapping = torch.arange(capacity + 1, device=device, dtype=torch.int32)
+        mapping[-1:].zero_()
+        _WRITER_IDENTITY_MAPS[key] = mapping
+    return mapping
+
 @register_jit_op(
     "sglang.kernels.ops.attention.dsv4.attn", "fused_store_cache"
 )
@@ -1132,6 +1146,44 @@ def fused_store_cache_kunlun(
             torch.ops.xspeedgate_ops.fused_store_latent_cache(
                 input.contiguous(), cache, indices.contiguous(), page_size
             )
+            return
+        # The page pool is already a plain 512-element half cache. Reuse the
+        # byte-preserving writer when the BF16-to-FP16 fused writer above does
+        # not cover this dtype pair. Keep the original cache-dtype conversion.
+        if (
+            dim == 512
+            and input.ndim == 2
+            and input.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and indices.ndim == 1
+            and indices.dtype in (torch.int32, torch.int64)
+            and indices.numel() == input.shape[0]
+            and cache.ndim == 2
+            and cache.is_contiguous()
+            and input.device == indices.device == cache.device
+            and input.is_cuda
+            and hasattr(torch.ops.xspeedgate_ops, "set_k_and_s_v4")
+        ):
+            # Slot 0 is reserved for dummy writes. Never wrap an invalid
+            # location into live KV: saturate to [0, capacity], then map the
+            # upper sentinel to 0. Valid locations remain unchanged.
+            capacity = num_pages * page_size
+            loc = indices.reshape(-1).clamp(min=0, max=capacity).contiguous()
+            values = input.to(cache.dtype).contiguous()
+            if capacity < 2**31 and hasattr(
+                torch.ops.xspeedgate_ops, "set_k_and_s_v4_with_mapping"
+            ):
+                mapping = _writer_identity_mapping(cache.device, capacity)
+                torch.ops.xspeedgate_ops.set_k_and_s_v4_with_mapping(
+                    cache.view(torch.uint8), loc, mapping, values, page_size
+                )
+                note_op_path("fused_store_cache", "xspeedgate:set_k_and_s_v4_with_mapping")
+            else:
+                # Safe compatibility path for wheels without the mapping op.
+                loc = loc.to(torch.int64).remainder(capacity)
+                torch.ops.xspeedgate_ops.set_k_and_s_v4(
+                    cache.view(torch.uint8), loc, values, page_size
+                )
+                note_op_path("fused_store_cache", "xspeedgate:set_k_and_s_v4")
             return
         note_op_path("fused_store_cache", f"torch half-cache ({reason})")
         loc = indices.to(torch.int64).reshape(-1)

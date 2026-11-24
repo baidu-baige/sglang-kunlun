@@ -30,6 +30,7 @@ exactly the engram layer.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 
@@ -42,6 +43,45 @@ _MM_PAD_SHIFT_VALUE = 1_000_000
 
 _warned = False
 _remap_warned = False
+
+
+@contextlib.contextmanager
+def _ernie55_cp_body_contract(model, body):
+    """Reshape ERNIE 5.5's model-body output to the base CP tail's contract.
+
+    `EagerRunner._execute_extend_cp` follows the DeepSeek-V4 body contract: with
+    aux capture on it unpacks ``(hidden_states, aux_hidden_states)``; off it
+    unpacks ``(hidden_states, hidden_states_before_norm)``. ``Ernie5_5Model``
+    instead returns a flat 3-tuple ``(hidden_states, pre_hc_head,
+    aux_hidden_states)``, so the base unpack raises ``too many values to
+    unpack``. Patch the body forward for the duration of the CP call so the base
+    tail sees the 2-tuple it expects; leave ``Ernie5_5_MoeForCausalLM.forward``
+    (which consumes the raw 3-tuple) untouched.
+    """
+    orig_forward = body.forward
+
+    def _wrapped(*args, **kwargs):
+        """" """
+        out = orig_forward(*args, **kwargs)
+        if not (isinstance(out, tuple) and len(out) == 3):
+            # PPProxyTensors on a non-last PP stage: pass through unchanged.
+            return out
+        hidden_states, pre_hc_head, aux_hidden_states = out
+        if getattr(model, "capture_aux_hidden_states", False):
+            # Mirror Ernie5_5_MoeForCausalLM.forward with aux on: drop pre_hc_head
+            # so the base passes aux_hidden_states straight to the logits step.
+            return hidden_states, aux_hidden_states
+        # Base reads the 2-tuple as (hidden_states, hidden_states_before_norm).
+        return hidden_states, pre_hc_head
+
+    object.__setattr__(body, "forward", _wrapped)
+    try:
+        yield
+    finally:
+        try:
+            object.__delattr__(body, "forward")
+        except AttributeError:
+            object.__setattr__(body, "forward", orig_forward)
 
 
 def _has_mm_items(forward_batch) -> bool:
@@ -57,6 +97,21 @@ def _has_mm_items(forward_batch) -> bool:
     type=HookType.AROUND,
 )
 def cp_extend_with_mm_embeds(original_fn, self, forward_batch, kwargs):
+    """Adapt the base CP-extend path for the Kunlun-run model.
+
+    ERNIE 5.5's model body returns a flat 3-tuple; reshape it to the DSV4
+    2-tuple contract the base tail expects, then delegate to the multimodal
+    (DSV4) handling below.
+    """
+    model = self.model_runner.model
+    body = getattr(model, "model", None)
+    if body is not None and hasattr(body, "dspark_layers_to_capture"):
+        with _ernie55_cp_body_contract(model, body):
+            return _cp_extend_mm_dispatch(original_fn, self, forward_batch, kwargs)
+    return _cp_extend_mm_dispatch(original_fn, self, forward_batch, kwargs)
+
+
+def _cp_extend_mm_dispatch(original_fn, self, forward_batch, kwargs):
     """Prepare MM inputs before the CP runner bypasses the model's forward.
 
     Args:

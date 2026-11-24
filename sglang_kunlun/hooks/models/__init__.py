@@ -16,6 +16,7 @@ from . import deepseek_v4_precision  # noqa: F401
 from . import deepseek_v4_nextn  # noqa: F401
 from . import dsv41_engram_int8  # noqa: F401
 from . import dsv41_engram_stage  # noqa: F401
+from . import ernie55  # noqa: F401
 
 # 以下为从 dev-kunlun-0.5.19-dsv4.1 合入的 DSV4.1 / Kimi-K3 模型 hook。
 # 它们依赖更新版本的上游 sglang（如 ``sglang.srt.layers.engram``），在当前

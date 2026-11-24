@@ -42,12 +42,12 @@ def disable_mtp_index_share_kunlun(result, self, *args, **kwargs):
     type=HookType.AROUND,
 )
 def _draft_extend_for_decode_kunlun(
-    original_fn, self, batch, batch_result, *, kv_loc_plan=None
+    original_fn, self, batch, batch_result, **extra_kwargs
 ):
-    # 0.5.22 added the keyword-only ``kv_loc_plan`` (the iteration's KVLocPlan,
-    # built by the draft and passed on as ``verify_input.kv_loc_plan``); this
-    # wrapper only patches ``skip_attn_backend_init``, so mirror the parameter
-    # and hand it to the original untouched.
+    # This wrapper only patches ``skip_attn_backend_init``; forward every
+    # keyword-only parameter untouched (``kv_loc_plan`` since 0.5.22,
+    # ``iteration_ids`` since 0.5.23) via **extra_kwargs so later additions
+    # pass through without another signature bump.
     original_forward = self.draft_runner.forward
 
     def patched_forward(*args, **kwargs):
@@ -60,7 +60,7 @@ def _draft_extend_for_decode_kunlun(
 
     self.draft_runner.forward = patched_forward
     try:
-        return original_fn(self, batch, batch_result, kv_loc_plan=kv_loc_plan)
+        return original_fn(self, batch, batch_result, **extra_kwargs)
     finally:
         self.draft_runner.forward = original_forward
 

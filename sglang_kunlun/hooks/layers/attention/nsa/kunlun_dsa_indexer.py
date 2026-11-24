@@ -39,6 +39,42 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 # ``DSV4_HISPARSE_PREFIX_SINK`` tokens, 0 = disabled (default). See the sink
 # block in ``_get_topk_paged``.
 _PREFIX_SINK = int(os.environ.get("DSV4_HISPARSE_PREFIX_SINK", "0"))
+# KUNLUN_PERF(ERNIE55 1121): use_xfa_boost=True was measured on the decode path and makes
+# no difference (171.35 vs 170.36 ms/step, indexer-logits 12.908 vs 12.951), so the call
+# sites below keep it off and the A/B switch is gone.
+# KUNLUN_PERF(ERNIE55 1121): cap the indexer buffers at the longest sequence the
+# deployment actually serves instead of the page-table width (= context_length).
+# The fp32 logits buffer is [q_rows, 1, max_seq_len] fp32 -- 268 MB per DSA layer
+# call at 512K -- and indexer-logits costs 12.9 ms/step in the decode trace.
+#
+# It has to be a **static** cap: _get_topk_paged runs inside the captured decode
+# graph, so the width is frozen at capture time. A batch-dependent width (tried
+# first) picks up the capture-time fill length of 1 and then wedges the device on
+# the first real replay ("CUDA error: wait for noc idle timeout").
+#
+# ERNIE55_INDEXER_MAX_K=<tokens>, 0 = off (full page-table width). Rows longer than
+# the cap raise instead of silently reading a truncated page table.
+#
+# EXPERIMENTAL, default off, do not enable in production. The length check above can
+# only run while python runs, i.e. at capture, where seq_lens are the fill value -- at
+# replay there is no check at all, so the cap is an unverifiable assumption about the
+# workload. Measured: fine at conc 128 (-4.2% step time), but conc 192 and 256 die with
+# "illegal memory access" / "launch timed out" plus KL_XID_KERNEL_EXCEPTION, while the
+# same ladder without the cap completes up to conc 384. The safe equivalent is a smaller
+# --context-length (enforced at admission); narrowing the buffer at 512K context needs
+# the op to bound its work by a device-side seq_lens instead of a host max_seq_len.
+_INDEXER_MAX_K = int(os.environ.get("ERNIE55_INDEXER_MAX_K", "0") or 0)
+# Feed the paged-mqa-logits op the index-K pool in place instead of a contiguous copy.
+# On by default; ERNIE55_INDEXER_DIRECT_K=0 falls back to the copy. See the comment at
+# the direct_key gate in _get_topk_paged.
+_INDEXER_DIRECT_K = os.environ.get("ERNIE55_INDEXER_DIRECT_K", "1") != "0"
+_DIRECT_K_LOGGED = False
+# Apply the int8-q 1/127 to the per-head weights instead of the context-wide k_scale.
+# On by default; ERNIE55_FOLD_Q127_INTO_WEIGHTS=0 restores the old form.
+_FOLD_Q127 = os.environ.get("ERNIE55_FOLD_Q127_INTO_WEIGHTS", "1") != "0"
+if _INDEXER_MAX_K > 0:
+    print("[ERNIE55] indexer max_k cap=%d" % _INDEXER_MAX_K, flush=True)
+
 _PREFIX_SINK_BOOST = 1.0e4
 
 try:
@@ -76,7 +112,7 @@ if TYPE_CHECKING:
 # Kunlun kernel. The replacement lives in ``kernel_ops``; only the registration
 # belongs here.
 @plugin_hook(
-    target="sglang.srt.layers.attention.dsa.dsa_indexer.Indexer._weights_proj_bf16_in_fp32_out", type=HookType.REPLACE
+    target="sglang.srt.layers.attention.dsa.dsa_indexer.Indexer._project_head_gates", type=HookType.REPLACE
 )
 def dsa_weights_proj_bf16_in_fp32_out_kunlun(self, x: torch.Tensor) -> torch.Tensor:
     """Project the DSA indexer head gates to fp32 without ``aten::mm.dtype``.
@@ -88,17 +124,19 @@ def dsa_weights_proj_bf16_in_fp32_out_kunlun(self, x: torch.Tensor) -> torch.Ten
     """
 
     weights, _ = self.weights_proj(x.to(self.weights_proj.weight.dtype))
-    return weights.float()
+    # Mirror base _project_head_gates' two _is_cuda branches while avoiding
+    # aten::mm.dtype: bf16 head-gate models keep bf16, else upcast to fp32.
+    # Both current W4A8 checkpoints lack index_bf16_head_gate, so this stays
+    # the fp32 path for them; the branch only activates for a bf16-gate model.
+    return weights if self.bf16_head_gate else weights.float()
 
 
 # Attributes we read off the upstream Indexer instance. This is the full coupling
 # surface between the Kunlun indexer and upstream.
 REQUIRED_INDEXER_ATTRS = (
     "_get_k_bf16",
-    "_should_chunk_mqa_logits",
     "alt_stream",
     "block_size",
-    "cp_size",
     "head_dim",
     "index_topk",
     "k_norm",
@@ -143,7 +181,9 @@ def xspeedgate_hadamard_transform(
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     """Rotate activations with a scaled Hadamard transform."""
 
-    assert x.dtype == torch.bfloat16
+    # XSpeedGate hadamard_transform registers both half types, so keep the
+    # model dtype (ERNIE fp16 or bf16) instead of forcing bf16.
+    assert x.dtype in (torch.bfloat16, torch.float16), x.dtype
     hidden_size = x.size(-1)
     assert (
         hidden_size & (hidden_size - 1)
@@ -271,6 +311,27 @@ def _require_continuous_index_k(pool, where: str) -> None:
     )
 
 
+def _index_k_continuous(pool, layer_id, seq_len, page_indices):
+    """Gather unpooled INT8 index-K and raw FP32 absmax bytes per token."""
+    if getattr(pool, "use_fp4_indexer", False) or getattr(pool, "index_kpool", 1) != 1:
+        raise NotImplementedError("Native gather requires unpooled INT8 index keys")
+    head = pool.index_head_dim
+    if head // pool.quant_block_size != 1:
+        raise NotImplementedError("Native gather requires one FP32 absmax per token")
+    size = pool.index_page_size
+    buf = pool.get_index_k_with_scale_buffer(layer_id).view(torch.int8)
+    if buf.shape[1] != size * (head + 4):
+        raise NotImplementedError("Index-K page layout differs from validated contract")
+    pages = page_indices[: (seq_len + size - 1) // size].to(torch.int64).contiguous()
+    key = torch.empty((seq_len, head), dtype=torch.int8, device=buf.device)
+    scale = torch.empty((seq_len, 4), dtype=torch.int8, device=buf.device)
+    # Keep scale as raw FP32 bytes; downstream applies its existing scaling.
+    torch.ops.xspeedgate_ops.gather_index_k_scale_prefix_into(
+        buf, pages, seq_len, key, scale, size
+    )
+    return key, scale
+
+
 def _align_rows_to_q(tensor, extend_lens: List[int], q_offset: int):
     """Reduce a per-request-padded metadata tensor to the live q rows."""
     if tensor is None or tensor.shape[0] == q_offset:
@@ -362,27 +423,103 @@ def _get_topk_paged(
             f"provenance={getattr(forward_batch, '_kunlun_draft_meta_provenance', None)}"
         )
         
+    # KUNLUN_PERF(ERNIE55 1121): clamp the page table (and therefore max_seq_len) to the
+    # static ERNIE55_INDEXER_MAX_K cap. Same value at capture and at replay, so the
+    # captured graph stays consistent; see the comment on _INDEXER_MAX_K above.
+    if _INDEXER_MAX_K > 0 and block_tables.shape[1] > 1:
+        _cap_pages = max(1, (_INDEXER_MAX_K + page_size - 1) // page_size)
+        if _cap_pages < block_tables.shape[1]:
+            _max_len = int(seqlens_32_cpu.max()) if seqlens_32_cpu.numel() else 0
+            if _max_len > _cap_pages * page_size:
+                raise RuntimeError(
+                    "ERNIE55_INDEXER_MAX_K=%d is smaller than a live sequence (%d tokens). "
+                    "Raise the cap or unset it." % (_INDEXER_MAX_K, _max_len)
+                )
+            block_tables = block_tables[:, :_cap_pages].contiguous()
+            max_seq_len = _cap_pages * page_size
+
     head_dim = get_token_to_kv_pool().index_head_dim
     k_fp8 = kv_cache_fp8[:, :page_size * head_dim].view(
         kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim
     ).to(torch.int8)
     
-    k_scale = torch.ops.xspeedgate_ops.gather_paged_scale(
-        kv_cache=kv_cache_fp8,
-        block_tables=block_tables,
-        page_size=page_size,
-        head_dim=head_dim,
-        max_seq_len=max_seq_len,
-        scale_offset=page_size * head_dim,
-        context_lens=seqlens_32,
-    )
+    # KUNLUN_PERF: gather_paged_scale takes a slow path when a single call carries
+    # more than 8 rows (101.7 us -> 22543.9 us per call under graph replay); that is
+    # the concurrency cliff at 8 -> 9 requests per rank. The op is per-row, so issuing
+    # it in 8-row chunks is bit-exact. Disable with ERNIE55_GATHER_SCALE_CHUNK=0.
+    _gs_chunk = int(os.environ.get("ERNIE55_GATHER_SCALE_CHUNK", "8"))
+    _gs_rows = block_tables.shape[0]
+    if _gs_chunk > 0 and _gs_rows > _gs_chunk:
+        _gs_parts = []
+        for _gs_i in range(0, _gs_rows, _gs_chunk):
+            _gs_parts.append(
+                torch.ops.xspeedgate_ops.gather_paged_scale(
+                    kv_cache=kv_cache_fp8,
+                    block_tables=block_tables[_gs_i:_gs_i + _gs_chunk],
+                    page_size=page_size,
+                    head_dim=head_dim,
+                    max_seq_len=max_seq_len,
+                    scale_offset=page_size * head_dim,
+                    context_lens=seqlens_32[_gs_i:_gs_i + _gs_chunk],
+                )
+            )
+        k_scale = torch.cat(_gs_parts, dim=0)
+    else:
+        k_scale = torch.ops.xspeedgate_ops.gather_paged_scale(
+            kv_cache=kv_cache_fp8,
+            block_tables=block_tables,
+            page_size=page_size,
+            head_dim=head_dim,
+            max_seq_len=max_seq_len,
+            scale_offset=page_size * head_dim,
+            context_lens=seqlens_32,
+        )
 
-    # NOTE: reverted luno-4142 (1830d8ea) -- scale the gathered k scales here
-    # instead of relying on the kernel's q_is_int8 argument.
+    # NOTE: reverted luno-4142 (1830d8ea) -- scale here instead of relying on the
+    # kernel's q_is_int8 argument.
+    #
+    # KUNLUN_PERF(ERNIE55 1122): the 1/127 used to divide ``k_scale``, which is
+    # ``[rows, max_seq_len]`` fp32 -- 168 MB per DSA layer at 512K context, measured as
+    # tensor_calc_scalar<3, float, ...> 1.873 ms/step (12 calls, 156 us each). The op
+    # multiplies by ``weights`` and ``k_scale`` both, and ``weights`` is only
+    # ``[rows, n_heads]`` (20 KB) and already carries q_scale * softmax_scale, so fold it
+    # there instead. Verified on device: max relative difference 2.8e-07 (2-3 fp32 ulp),
+    # i.e. rounding order only. ERNIE55_FOLD_Q127_INTO_WEIGHTS=0 restores the old form.
     if q_fp8.dtype is torch.int8:
-        k_scale /= 127
+        if _FOLD_Q127:
+            weights = weights / 127
+        else:
+            k_scale /= 127
         
-    fused_kv_cache = [k_fp8.contiguous(), k_scale.contiguous()]
+    # The deployed native API accepts a strided page axis; avoid copying the
+    # whole index-K pool on every decode. Keep the packed fallback outside the
+    # independently validated INT8-query / packed-inner-dim contract.
+    #
+    # KUNLUN_PERF(ERNIE55 1121): this used to also require ForwardMode.DECODE, but the
+    # DSPARK verify step runs as TARGET_VERIFY (ForwardMode.is_decode() is strictly
+    # == DECODE), so the main decode path always took the copy: k_fp8.contiguous() on
+    # [42232, 64, 1, 128] int8 = 346 MB, once per DSA layer per step. In the decode trace
+    # that is 4.83 ms/step and the top entry of the memory-movement bucket
+    # (strided_slice_copy2d, 206 calls/step, 99% in-graph). The op's contract is the
+    # strided page axis and the int8 dtypes, and k_fp8 is built the same way in every
+    # mode, so the mode had no bearing on it. ERNIE55_INDEXER_DIRECT_K=0 restores the copy.
+    direct_key = (
+        _INDEXER_DIRECT_K
+        and q_fp8.dtype == torch.int8
+        and k_fp8.dtype == torch.int8
+        and k_fp8.stride(3) == 1
+        and k_fp8.stride(2) == head_dim
+        and k_fp8.stride(1) == num_heads_kv * head_dim
+    )
+    global _DIRECT_K_LOGGED
+    if not _DIRECT_K_LOGGED:
+        _DIRECT_K_LOGGED = True
+        print(
+            "[ERNIE55] indexer direct_k=%s mode=%s strides=%s"
+            % (direct_key, forward_batch.forward_mode, tuple(k_fp8.stride())),
+            flush=True,
+        )
+    fused_kv_cache = [k_fp8 if direct_key else k_fp8.contiguous(), k_scale.contiguous()]
     logits = torch.empty(
         (q_offset, q_fp8.shape[1], max_seq_len),
         dtype=torch.float32,
@@ -468,7 +605,6 @@ def _get_topk_ragged(
     metadata: "BaseIndexerMetadata",
     topk_result: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    _require_continuous_index_k(get_token_to_kv_pool(), "_get_topk_ragged")
     """Kunlun ragged indexer.
 
     ``enable_dual_stream`` / ``topk_result`` exist for upstream 0.5.14 signature
@@ -507,21 +643,17 @@ def _get_topk_ragged(
     for i in range(batch_size):
         seq_len = indexer_seq_lens_cpu[i].item()
         assert isinstance(seq_len, int)
-        # Use fused Triton kernel to get both K and scale in a single call
-        k_fp8 = get_token_to_kv_pool().get_index_k_continuous(
-            layer_id,
-            seq_len,
-            block_tables[i],
-        )
-        k_scale = get_token_to_kv_pool().get_index_k_scale_continuous(
-            layer_id,
-            seq_len,
-            block_tables[i],
+        # 0.5.22 index-K API port: gather this request's K + scale from the
+        # retained get_index_k_with_scale_buffer (see _index_k_continuous).
+        k_fp8, k_scale = _index_k_continuous(
+            get_token_to_kv_pool(), layer_id, seq_len, block_tables[i]
         )
 
         k_fp8_list.append(k_fp8)
         k_scale_list.append(k_scale)
     
+    # _index_k_continuous already views the uint8 buffer to int8, so the cat is
+    # int8 (matches 0.5.19's bare torch.cat).
     k_fp8 = torch.cat(k_fp8_list, dim=0)
     k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
     if q_fp8.dtype is torch.int8:
@@ -549,12 +681,28 @@ def _get_topk_ragged(
     token_nums, _, _ = q_fp8.shape
     device = q_fp8.device
 
-    # Check if we need to chunk to avoid OOM
-    need_chunk, free_mem = indexer._should_chunk_mqa_logits(q_offset, k_offset, device)
-    if need_chunk:
-        import logging
-        logging.warning(f"[NSA] chunk path triggered: q_offset={q_offset}, \
-            k_offset={k_offset}, free_mem={free_mem:.0f}")
+    # Check if we need to chunk to avoid OOM.
+    # 0.5.23 drift: the indexer method ``_should_chunk_mqa_logits(q,k,device)``
+    # became the free function ``mqa_logits_should_chunk`` (keyword-only,
+    # budget supplied by a callable). On XPU ``mqa_logits_budget_bytes`` never
+    # syncs (it early-outs for ``is_xpu()``), so ``allow_sync=True`` is safe.
+    from sglang.srt.layers.attention.mqa_logits_utils import (
+        mqa_logits_budget_bytes,
+        mqa_logits_should_chunk,
+    )
+
+    need_chunk, free_mem = mqa_logits_should_chunk(
+        num_rows=q_offset,
+        num_cols=k_offset,
+        get_budget_bytes=lambda: mqa_logits_budget_bytes(
+            device_index=device.index, allow_sync=True
+        ),
+        rocm=False,
+    )
+    # if need_chunk:
+    #     import logging
+    #     logging.warning(f"[NSA] chunk path triggered: q_offset={q_offset}, \
+    #         k_offset={k_offset}, free_mem={free_mem:.0f}")
 
     context_q_lens_xpu = metadata.get_cu_seqlens_q()
     context_q_lens_cpu = metadata.get_cu_seqlens_q_cpu()
@@ -636,11 +784,15 @@ def _get_topk_ragged(
     cu_k_cpu = context_k_lens_cpu.reshape(-1)
     cu_k_xpu = context_k_lens_xpu.reshape(-1)
 
+    # Chunk on the host only. Running ``chunk_cu_seqlens`` over the device
+    # mirror as well recomputed identical values (the two tensors are a
+    # ``.cpu()`` pair) while forcing ~19 ``.item()`` syncs per step -- measured
+    # 124 ms/step of host block on a 64k prefill. What the kernels need from the
+    # device is just ``new_cu_seqlens``, a tens-of-bytes H2D.
     q_interval_cpu = chunk_cu_seqlens(context_q_lens_cpu, chunk_size=max_rows)
-    q_interval_xpu = chunk_cu_seqlens(context_q_lens_xpu, chunk_size=max_rows)
     for i in range(len(q_interval_cpu)):
         chunk_q_cpu, _, chunk_range = q_interval_cpu[i]
-        chunk_q_xpu, _, _ = q_interval_xpu[i]
+        chunk_q_xpu = chunk_q_cpu.to(device=device, non_blocking=True)
         start = int(chunk_range[0].item())
         end = int(chunk_range[1].item())
 
@@ -697,7 +849,7 @@ def _get_topk_ragged(
         topk_result[start:end] = dst_page_table
         del logits_chunk
     del ks, q_fp8, k_fp8, k_scale
-    del q_interval_cpu, q_interval_xpu
+    del q_interval_cpu
     return topk_result
 
 def _get_topk_ragged_with_cp(
@@ -884,6 +1036,7 @@ def _get_q_k_bf16(
         # for kunlun ops
         query, _ = indexer.wq_b(q_lora)
         query = rearrange(query, "l (h d) -> l h d", d=indexer.head_dim)
+        # keep model dtype (fp16/bf16); rotate_activation accepts both
         q_rope, _ = torch.split(
             query,
             [indexer.rope_head_dim, indexer.head_dim - indexer.rope_head_dim],
@@ -904,6 +1057,7 @@ def _get_q_k_bf16(
     else:
         query, _ = indexer.wq_b(q_lora)
         query = rearrange(query, "l (h d) -> l h d", d=indexer.head_dim)
+        # keep model dtype (fp16/bf16); rotate_activation accepts both halves
         q_rope, _ = torch.split(
             query, [indexer.rope_head_dim, indexer.head_dim - indexer.rope_head_dim], dim=-1
         )
@@ -942,9 +1096,12 @@ def _get_q_k_bf16(
         # "set_k_and_s_triton: k_num != loc_num".
         key = get_cp_strategy().materialize_full_indexer_k_cache(key, forward_batch)
     elif dsa_use_prefill_cp(forward_batch):
+        from sglang.srt.runtime_context import get_parallel
+
+        # 0.5.23 drift: CP size moved off the indexer onto the parallel context.
         key = cp_all_gather_rerange_output(
             key.contiguous(),
-            indexer.cp_size,
+            get_parallel().attn_cp_size,
             forward_batch,
             torch.cuda.current_stream(),
         )
@@ -1038,8 +1195,13 @@ def forward_cuda(
     forward_batch: ForwardBatch,
     layer_id: int,
     return_indices: bool = True,
+    use_cuda_graph: bool = True,
 ) -> Optional[torch.Tensor]:
     """forward_cuda"""
+    # Accepted and ignored: it only gates upstream's piecewise cuda-graph
+    # branch, which this backend refuses below. The parameter has to exist
+    # because the prefill-CP interleave path passes it by keyword.
+    del use_cuda_graph
     # TODO: try to remove this patch
 
     from sglang.kernels.ops.quantization.act_quant_triton import act_quant

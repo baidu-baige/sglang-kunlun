@@ -46,7 +46,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang_kunlun.compat import server_arg
 from sglang.srt.utils import get_bool_env_var, dispose_tensor
-from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -81,6 +81,24 @@ from kunlun_ops import (
     silu_and_per_token_group_quant_I8,
 )
 logger = logging.getLogger(__name__)
+
+
+def _situ_mask_params(config):
+    """``(beta, linear_beta)`` for a SiTU activation, else None."""
+    if config.activation != "situ":
+        return None
+    beta = getattr(config, "gemm1_alpha", None)
+    linear_beta = getattr(config, "gemm1_clamp_limit", None)
+    return (
+        1.0 if beta is None else float(beta),
+        -1.0 if linear_beta is None else float(linear_beta),
+    )
+
+
+def _situ_kernel_supported(params) -> bool:
+    """The masked SiTU kernels only implement the ERNIE 5.5 constants."""
+    beta, linear_beta = params
+    return abs(beta - 4.0) <= 1e-9 and abs(linear_beta - 25.0) <= 1e-9
 
 
 class _DSV4ClampedSiluAndMul(torch.nn.Module):
@@ -350,6 +368,54 @@ class W8A8NormalMoeBuffer:
         return self.buffer1.empty((self.N, self.H), torch.bfloat16)
 
 
+# Persistent zero-filled scratch for the sliced SiTU chain. The high-water mark
+# keeps "every row past `rows` is zero" true: one buffer per shape is shared by
+# all layers, so a previous call may have written further out.
+_SITU_SCRATCH: dict = {}
+
+
+def _situ_static_rows(bucket: int) -> int:
+    """Row bound for the sliced SiTU chain under graph capture, or 0 to skip it.
+
+    Capture cannot read ``masked_m`` back, so the bound has to be static. The LL
+    receive buffer is ``[num_local_experts, M * num_ranks, hidden]`` with
+    ``M = SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK``, and under attention
+    DP that M *is* the whole step's global token budget (max_running x draft
+    tokens), so one expert cannot receive more than M rows -- a factor
+    ``num_ranks`` below the padded bucket. Without attention DP every rank
+    carries its own full batch, the bound no longer holds, and the chain keeps
+    the whole bucket.
+    """
+    try:
+        from sglang.srt.runtime_context import get_parallel
+
+        if int(getattr(get_parallel(), "attn_dp_size", 1) or 1) <= 1:
+            return 0
+    except Exception:  # noqa: BLE001 - no runtime context: stay on the safe path
+        return 0
+    try:
+        from sglang.srt import environ as _environ
+
+        m = int(_environ.envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get())
+    except Exception:  # noqa: BLE001
+        return 0
+    return m if 0 < m < bucket else 0
+
+
+def _situ_scratch(key, shape, dtype, device, rows):
+    """Return a shared zero buffer whose rows past ``rows`` are guaranteed 0."""
+    buf = _SITU_SCRATCH.get(key)
+    if buf is None:
+        buf = torch.zeros(shape, dtype=dtype, device=device)
+        _SITU_SCRATCH[key] = buf
+        _SITU_SCRATCH[key + ("hw",)] = 0
+    hw = _SITU_SCRATCH.get(key + ("hw",), 0)
+    if hw > rows:
+        buf[:, rows:hw, :].zero_()
+    _SITU_SCRATCH[key + ("hw",)] = rows
+    return buf
+
+
 class DeepEPMoE(FusedMoE):
     """
     MoE Expert Parallel Impl based on DeepEP (https://github.com/deepseek-ai/DeepEP/tree/main)
@@ -453,11 +519,21 @@ class DeepEPMoE(FusedMoE):
             self.use_w4afp8 = False
 
         self.deepep_mode = get_deepep_mode()
-        self.act_fn = SiluAndMul()
+        _activation = str(
+            getattr(self.moe_runner_config, "activation", None) or "silu"
+        ).lower()
         # DSV4 routed-expert SwiGLU swiglu_limit clamp (see _DSV4ClampedSiluAndMul).
         _swiglu_limit = getattr(self.moe_runner_config, "swiglu_limit", None)
-        if _swiglu_limit is not None:
+        if _activation == "situ":
+            _beta = float(getattr(self.moe_runner_config, "gemm1_alpha", None) or 1.0)
+            self.act_fn = SituAndMul(
+                beta=_beta,
+                linear_beta=getattr(self.moe_runner_config, "gemm1_clamp_limit", None),
+            )
+        elif _swiglu_limit is not None:
             self.act_fn = _DSV4ClampedSiluAndMul(_swiglu_limit)
+        else:
+            self.act_fn = SiluAndMul()
         # Same clamp for the mask-aware kunlun_ops activations, which take the
         # limit as an argument (<= 0.0 disables it).
         self.swiglu_limit = 0.0 if _swiglu_limit is None else float(_swiglu_limit)
@@ -498,7 +574,7 @@ class DeepEPMoE(FusedMoE):
         output.zero_()
 
     a2a_forward_with_output = eager_on_graph(
-        True, capture_stub=_a2a_forward_capture_stub
+        True, on_capture=_a2a_forward_capture_stub
     )(_a2a_forward_with_output_impl)
 
     def forward(
@@ -1152,12 +1228,33 @@ class DeepEPMoE(FusedMoE):
             device=gateup_output.device,
             dtype=gateup_output.dtype,
         )
-        silu_and_mul_mask_fwd(
-            gateup_output.view(-1, n),
-            down_input.view(-1, n // 2),
-            masked_m,
-            limit=self.swiglu_limit,
-        )
+        situ_params = _situ_mask_params(self.moe_runner_config)
+        if situ_params is not None and _situ_kernel_supported(situ_params):
+            # One masked kernel for SiTU + multiply; invalid rows are zeroed
+            # from the device counts without a host round trip.
+            import kunlun_ops
+
+            kunlun_ops.situ_and_mul_masked(
+                gateup_output, down_input, masked_m, *situ_params
+            )
+        elif situ_params is not None:
+            import xspeedgate_ops  # noqa: F401  # registers torch.ops.xspeedgate_ops
+
+            _counts = masked_m
+            if _counts.dtype != torch.int32:
+                _counts = _counts.to(torch.int32)
+            activated = torch.zeros_like(down_input)
+            torch.ops.xspeedgate_ops.masked_situ_and_mul(
+                activated, gateup_output, _counts, *situ_params
+            )
+            down_input = activated
+        else:
+            silu_and_mul_mask_fwd(
+                gateup_output.view(-1, n),
+                down_input.view(-1, n // 2),
+                masked_m,
+                limit=self.swiglu_limit,
+            )
         del gateup_output
 
         # GroupGemm-1
@@ -1186,7 +1283,7 @@ class DeepEPMoE(FusedMoE):
         """
         hidden_states, hidden_states_scale, _, _, masked_m, expected_m = dispatch_output
         assert self.quant_method is not None
-        assert self.moe_runner_config.activation == "silu"
+        assert self.moe_runner_config.activation in ("silu", "situ")
         assert hidden_states_scale is not None, (
             "W4A8 DeepEP low-latency needs INT8 dispatch; unset "
             "SGLANG_DEEPEP_BF16_DISPATCH or run W4A16 instead."
@@ -1209,7 +1306,7 @@ class DeepEPMoE(FusedMoE):
         )
         dispose_tensor(hidden_states)
 
-        # Act: SwiGLU + per-token INT8 quant.
+        # Act: SiTU (situ checkpoints) or SwiGLU + per-token INT8 quant.
         half = n // 2
         down_input = torch.empty(
             (num_groups, m, half),
@@ -1222,13 +1319,40 @@ class DeepEPMoE(FusedMoE):
             device=gateup_output.device,
             dtype=torch.float32,
         )
-        silu_and_per_token_group_quant_I8(
-            gateup_output,
-            down_input,
-            down_input_scale,
-            masked_m,
-            limit=self.swiglu_limit,
-        )
+        situ_params = _situ_mask_params(self.moe_runner_config)
+        if situ_params is not None and _situ_kernel_supported(situ_params):
+            # SiTU + per-token INT8 requant in one masked kernel, the SiTU
+            # counterpart of silu_and_per_token_group_quant_I8 below.
+            import kunlun_ops
+
+            kunlun_ops.situ_quant_masked(
+                gateup_output, down_input, down_input_scale, masked_m, *situ_params
+            )
+        elif situ_params is not None:
+            import kunlun_ops
+            import xspeedgate_ops  # noqa: F401
+
+            _counts = masked_m
+            if _counts.dtype != torch.int32:
+                _counts = _counts.to(torch.int32)
+            activated = torch.zeros_like(gateup_output[..., : down_input.shape[-1]])
+            torch.ops.xspeedgate_ops.masked_situ_and_mul(
+                activated, gateup_output, _counts, *situ_params
+            )
+            kunlun_ops.quant2d(
+                activated.contiguous().view(-1, activated.shape[-1]),
+                down_input.view(-1, down_input.shape[-1]),
+                down_input_scale.view(-1),
+                force_sdnn=False,
+            )
+        else:
+            silu_and_per_token_group_quant_I8(
+                gateup_output,
+                down_input,
+                down_input_scale,
+                masked_m,
+                limit=self.swiglu_limit,
+            )
         del gateup_output
 
         # GroupGemm-1
@@ -1360,7 +1484,10 @@ class DeepEPMoE(FusedMoE):
         import kunlun_ops
         hidden_states, hidden_states_scale,  _, _, masked_m, expected_m = dispatch_output
         assert self.quant_method is not None
-        assert self.moe_runner_config.activation == "silu"
+        # ERNIE 5.5's latent MoE is SiTU, not SiLU; a hard "silu" assert here
+        # kept the whole low_latency path from starting.
+        activation = str(getattr(self.moe_runner_config, "activation", None) or "silu")
+        assert activation in ("silu", "situ"), activation
         hidden_states_fp8 = (hidden_states, hidden_states_scale)
         if self.w13_weight.dtype != torch.int8:
             return self.forward_deepgemm_masked_bfp16(
@@ -1395,7 +1522,9 @@ class DeepEPMoE(FusedMoE):
                 gateup_output.shape[2] // 2,
             ),
             device=gateup_output.device,
-            dtype=self.fp8_dtype,
+            # int8 by construction here (bf16 already branched to _bfp16).
+            # Not self.fp8_dtype: a w8a8_int8 config may never set it.
+            dtype=torch.int8,
         )
         scale_block_size = 128
         scale_block_size = gateup_output.shape[2] // 2  # per_col quant
@@ -1409,10 +1538,104 @@ class DeepEPMoE(FusedMoE):
             device=gateup_output.device,
             dtype=torch.float32,
         )
-        kunlun_ops.silu_and_per_token_group_quant_I8(gateup_output,
-                                          down_input,
-                                          down_input_scale,
-                                          masked_m)
+        # Run the SiTU chain on the live rows only. LL dispatch returns
+        # [num_local_experts, M * num_ranks, hidden] -- [64, 1024, 4096] at
+        # M=128 on 8 cards -- while only masked_m rows carry data (4-16 in
+        # decode). The two masked GEMMs keep the full bucket shape: they address
+        # by the fixed layout and ignore stride, so shrinking them is garbage.
+        # Outside graph capture the count is max(masked_m), one D2H and exact;
+        # under capture it comes from the static bound below.
+        _rows = 0
+        _bucket = gateup_output.shape[1]
+        if activation == "situ":
+            if torch.cuda.is_current_stream_capturing():
+                _rows = _situ_static_rows(_bucket)
+            else:
+                _rows = max(1, int(masked_m.max().item()))
+            if _rows <= 0 or _rows >= _bucket:
+                _rows = 0
+        if _rows:
+            _half = gateup_output.shape[2] // 2
+            _act = _situ_scratch(
+                ("act", gateup_output.shape[0], _bucket, _half),
+                (gateup_output.shape[0], _bucket, _half),
+                gateup_output.dtype,
+                gateup_output.device,
+                _rows,
+            )
+            _di = _situ_scratch(
+                ("di", down_input.shape[0], _bucket, down_input.shape[2]),
+                (down_input.shape[0], _bucket, down_input.shape[2]),
+                down_input.dtype,
+                down_input.device,
+                _rows,
+            )
+            _ds = _situ_scratch(
+                ("ds", down_input_scale.shape[0], _bucket, down_input_scale.shape[2]),
+                (down_input_scale.shape[0], _bucket, down_input_scale.shape[2]),
+                down_input_scale.dtype,
+                down_input_scale.device,
+                _rows,
+            )
+            beta = getattr(self.moe_runner_config, "gemm1_alpha", None)
+            linear_beta = getattr(self.moe_runner_config, "gemm1_clamp_limit", None)
+            _part = torch.ops.xspeedgate_ops.situ_and_mul(
+                gateup_output[:, :_rows, :]
+                .contiguous()
+                .view(-1, gateup_output.shape[2]),
+                1.0 if beta is None else float(beta),
+                -1.0 if linear_beta is None else float(linear_beta),
+            ).view(gateup_output.shape[0], _rows, _half)
+            _act[:, :_rows, :].copy_(_part)
+            del _part
+            _er = torch.arange(_rows, device=_act.device)
+            _valid = _er[None, :] < masked_m.to(torch.int64)[:, None]
+            _act[:, :_rows, :].masked_fill_(~_valid.unsqueeze(-1), 0.0)
+            # Quantize into temporaries and copy in, so rows past _rows keep
+            # the scratch's *quantized* zero rather than uninitialized memory.
+            _sdi = torch.empty(
+                (_di.shape[0], _rows, _di.shape[2]), device=_di.device, dtype=_di.dtype
+            )
+            _sds = torch.empty(
+                (_ds.shape[0], _rows, _ds.shape[2]), device=_ds.device, dtype=_ds.dtype
+            )
+            kunlun_ops.quant2d(
+                _act[:, :_rows, :].contiguous().view(-1, _half),
+                _sdi.view(-1, _di.shape[2]),
+                _sds.view(-1),
+                force_sdnn=False,
+            )
+            _di[:, :_rows, :].copy_(_sdi)
+            _ds[:, :_rows, :].copy_(_sds)
+            del _sdi, _sds
+            down_input, down_input_scale = _di, _ds
+        elif activation == "situ":
+            # KLX SiTU over the gate/up halves, then per-row absmax INT8
+            # quant. Rows past masked_m are uninitialized torch.empty memory and
+            # make the quant kernel raise KL_XID_KERNEL_EXCEPTION, so zero them
+            # first; the masked GEMM never reads them, so it costs nothing.
+            beta = getattr(self.moe_runner_config, "gemm1_alpha", None)
+            linear_beta = getattr(self.moe_runner_config, "gemm1_clamp_limit", None)
+            act = torch.ops.xspeedgate_ops.situ_and_mul(
+                gateup_output.view(-1, gateup_output.shape[2]),
+                1.0 if beta is None else float(beta),
+                -1.0 if linear_beta is None else float(linear_beta),
+            ).view(down_input.shape)
+            expert_rows = torch.arange(down_input.shape[1], device=down_input.device)
+            valid = expert_rows[None, :] < masked_m.to(torch.int64)[:, None]
+            act.masked_fill_(~valid.unsqueeze(-1), 0.0)
+            kunlun_ops.quant2d(
+                act.view(-1, down_input.shape[2]),
+                down_input.view(-1, down_input.shape[2]),
+                down_input_scale.view(-1),
+                force_sdnn=False,
+            )
+            del act
+        else:
+            kunlun_ops.silu_and_per_token_group_quant_I8(gateup_output,
+                                              down_input,
+                                              down_input_scale,
+                                              masked_m)
         del gateup_output
 
         # GroupGemm-1

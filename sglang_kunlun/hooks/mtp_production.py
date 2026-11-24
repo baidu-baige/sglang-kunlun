@@ -86,6 +86,7 @@ def prepare_for_draft_extend_kunlun(
     *,
     kv_loc_plan=None,
     write_cols=None,
+    iteration_ids=None,
 ):
     """Build fixed-width graph metadata or correct ragged eager metadata."""
     from sglang.srt.model_executor.forward_batch_info import (
@@ -94,7 +95,11 @@ def prepare_for_draft_extend_kunlun(
         ForwardMode,
     )
     from sglang.srt.utils.async_probe import maybe_detect_oob
-    from sglang.srt.utils.common import is_npu
+
+    try:
+        from sglang.srt.utils.common import is_npu
+    except ImportError:  # 0.5.23 moved is_npu to utils.device
+        from sglang.srt.utils.device import is_npu
 
     batch_size = len(batch.seq_lens)
     accept_lens = draft_extend_input.num_accept_tokens
@@ -173,6 +178,12 @@ def prepare_for_draft_extend_kunlun(
     if kv_loc_plan is not None:
         plan_kwargs["kv_loc_plan"] = kv_loc_plan
         plan_kwargs["write_cols"] = write_cols
+    # 0.5.23's iteration-ids KV plan; under a plain (non-unified) allocator it is
+    # an identity pass-through that just carries ``out_cache_loc`` (no translate /
+    # alloc kernel), so thread it through unchanged. If omitted, ``init_new``
+    # builds its own, so passing it is purely to honour the caller's plan.
+    if iteration_ids is not None:
+        plan_kwargs["iteration_ids"] = iteration_ids
     forward_batch = ForwardBatch.init_new(
         batch,
         draft_model_runner,
@@ -323,7 +334,8 @@ def capture_cuda_graphs_kunlun(self):
         return
 
     device_to_draft_runner = {
-        "npu": upstream.EAGLEDraftNpuGraphRunner,
+        # NPU runners were dropped from eagle_worker_v2's namespace in 0.5.23;
+        "npu": getattr(upstream, "EAGLEDraftNpuGraphRunner", None),
         "cuda": upstream.EAGLEDraftCudaGraphRunner,
         "musa": upstream.EAGLEDraftCudaGraphRunner,
     }
@@ -331,7 +343,7 @@ def capture_cuda_graphs_kunlun(self):
         self.cuda_graph_runner = device_to_draft_runner[self.target_worker.device](self)
 
     device_to_extend_runner = {
-        "npu": upstream.EAGLEDraftExtendNpuGraphRunner,
+        "npu": getattr(upstream, "EAGLEDraftExtendNpuGraphRunner", None),
         "cuda": upstream.EAGLEDraftExtendCudaGraphRunner,
         "musa": upstream.EAGLEDraftCudaGraphRunner,
     }
@@ -437,13 +449,48 @@ def correct_draft_input_hidden(worker, batch_result):
     return corrected
 
 
+def _is_ernie55_draft(self) -> bool:
+    """True when the draft worker's model is ERNIE 5.5 (NextN)."""
+    try:
+        runner = getattr(self, "draft_runner", None) or getattr(
+            self, "draft_model_runner", None
+        )
+        arch = runner.model_config.hf_config.architectures[0]
+        return "Ernie5_5" in arch
+    except Exception:
+        return False
+
+
 @plugin_hook(
     "sglang.srt.speculative.eagle_worker_v2.EagleDraftWorker._draft_extend_for_decode",
     type=HookType.REPLACE,
 )
-def draft_extend_for_decode_kunlun(self, batch, batch_result, *, kv_loc_plan=None):
+def draft_extend_for_decode_kunlun(
+    self, batch, batch_result, *, kv_loc_plan=None, iteration_ids=None
+):
     """Compact accepted request prefixes for synchronous DSV4 draft extend."""
     import sglang.srt.speculative.eagle_worker_v2 as upstream
+
+    # This REPLACE is DSV4-C128 production MTP machinery (online_c128_mtp,
+    # swa_page_size). ERNIE 5.5's NextN draft is HCA + MLA, not C128, so route it
+    # to the generic upstream draft-extend instead (matching bmu, which only
+    # force-enables attn init and never reimplemented draft-extend). The REPLACE
+    # wrapper stores the true upstream fn on ``__wrapped__``; the outer attn-init
+    # AROUND is still active here, so the draft forward keeps its init patch.
+    if _is_ernie55_draft(self):
+        import inspect
+
+        upstream_fn = inspect.unwrap(type(self)._draft_extend_for_decode)
+        # Forward only the keyword-only params the genuine upstream accepts:
+        # ``kv_loc_plan`` is a Kunlun-REPLACE-only param (not on upstream), so
+        # pass it only if upstream has it; ``iteration_ids`` is upstream's own.
+        params = inspect.signature(upstream_fn).parameters
+        extra = {}
+        if "iteration_ids" in params:
+            extra["iteration_ids"] = iteration_ids
+        if kv_loc_plan is not None and "kv_loc_plan" in params:
+            extra["kv_loc_plan"] = kv_loc_plan
+        return upstream_fn(self, batch, batch_result, **extra)
 
     # GLM-5.3's MTP input correction (QuaRot/R1 compensation for the draft's
     # input hidden, ``model.norm.mtp_input_correction.blocks``) is attached to
@@ -520,6 +567,7 @@ def draft_extend_for_decode_kunlun(self, batch, batch_result, *, kv_loc_plan=Non
             self.cuda_graph_runner_for_draft_extend,
             kv_loc_plan=kv_loc_plan,
             write_cols=write_cols,
+            iteration_ids=iteration_ids,
         )
     if self.plan_stream:
         torch.get_device_module(self.device).current_stream().wait_stream(
