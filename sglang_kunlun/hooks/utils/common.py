@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -171,12 +173,15 @@ def _get_numa_cores(node: int) -> List[int]:
     type=HookType.REPLACE,
 )
 def set_gpu_proc_affinity_kunlun(
-    pp_size: int,
-    tp_size: int,
-    nnodes: int,
     gpu_id: int,
+    *args,
+    **kwargs,
 ):
     """Pin worker process to its XPU's NUMA-local core slice."""
+    if args:
+        # 0.5.21 calls set_gpu_proc_affinity(gpu_id); older trees passed
+        # (pp_size, tp_size, nnodes, gpu_id). Keep both call styles working.
+        gpu_id = args[-1]
     import psutil
 
     pid = os.getpid()

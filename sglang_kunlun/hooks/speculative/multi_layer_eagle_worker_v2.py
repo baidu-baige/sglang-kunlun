@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -73,7 +75,7 @@ def _draft_extend_for_decode_kunlun(original_fn, self, batch, batch_result):
     "sglang.srt.speculative.multi_layer_eagle_worker_v2.MultiLayerEagleWorkerV2.verify",
     type=HookType.AROUND,
 )
-def verify_kunlun(original_fn, self, batch):
+def verify_kunlun(original_fn, self, batch, grammar_barrier=None):
     """Patch verify to conditionally skip attention backend init.
 
     Args:
@@ -103,6 +105,6 @@ def verify_kunlun(original_fn, self, batch):
 
     self.target_worker.forward_batch_generation = patched_forward_batch_generation
     try:
-        return original_fn(self, batch)
+        return original_fn(self, batch, grammar_barrier=grammar_barrier)
     finally:
         self.target_worker.forward_batch_generation = original_forward_batch_generation

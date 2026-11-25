@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -26,15 +28,15 @@ import torch
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
+from sglang.kernels.ops.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     DeepseekSparseAttnBackendMTPPrecomputeMixin,
     PrecomputedMetadata,
     compute_cu_seqlens,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
-from sglang.srt.layers.attention.dsa.quant_k_cache import quantize_k_cache
-from sglang.srt.layers.attention.dsa.transform_index import (
+from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
+from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
@@ -48,7 +50,10 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_cp_round_robin_split_q_seqs as nsa_cp_round_robin_split_q_seqs,
     pad_dsa_cache_seqlens as pad_nsa_cache_seqlens,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+try:
+    from sglang.srt.layers.dp_attention import get_attention_tp_size
+except ImportError:  # [kunlun-adapt] 上游 dp_attention 已重构，无此函数
+    get_attention_tp_size = None
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_cuda
 

@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -34,13 +36,14 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 
 @plugin_hook(
-    "sglang.srt.model_executor.model_runner_kv_cache_mixin.ModelRunnerKVCacheMixin._init_pools",
+    "sglang.srt.model_executor.model_runner.ModelRunner.alloc_memory_pool",
     type=HookType.AFTER,
 )
-def _fix_swa_pools(result, self):
+def _fix_swa_pools(result, self, *args, **kwargs):
     """Replace non-SWA pools with SWA-aware versions when is_hybrid_swa=True.
 
-    AFTER signature: hook(result, self) — result is None (original returns None).
+    AFTER signature: hook(result, self, *args) — upstream ``alloc_memory_pool``
+    now takes a ``memory_pool_config`` arg (ignored here); result is None.
 
     Two cases handled:
       - Target worker: both token_to_kv_pool and token_to_kv_pool_allocator are
@@ -105,7 +108,10 @@ def _fix_swa_pools(result, self):
     if pool_ok and alloc_ok:
         return  # both already correct — nothing to do
 
-    from sglang.srt.layers.dp_attention import get_attention_tp_size
+    try:
+        from sglang.srt.layers.dp_attention import get_attention_tp_size
+    except ImportError:  # [kunlun-adapt] 上游 dp_attention 已重构
+        get_attention_tp_size = None
     from sglang.srt.platforms import current_platform
 
     kwargs = {}

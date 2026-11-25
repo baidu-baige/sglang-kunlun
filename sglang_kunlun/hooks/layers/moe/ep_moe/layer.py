@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -18,8 +20,10 @@
 """Kunlun plugin hooks for ``sglang.srt.layers.moe.ep_moe.layer``."""
 from __future__ import annotations
 
+import functools
 import logging
 import os
+import sys
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import torch
@@ -43,9 +47,9 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_model  # [kunlun-adapt] get_global_server_args() retired
 from sglang_kunlun.environ import envs as patch_envs
 from sglang.srt.utils import get_bool_env_var, dispose_tensor
 from sglang.srt.layers.activation import SiluAndMul
@@ -84,6 +88,54 @@ from kunlun_ops import (
 )
 logger = logging.getLogger(__name__)
 
+# ---- per-layer env probes, resolved once (r89) -------------------------------
+# ``EnvVar.get()`` re-parses os.environ (getenv + encode/decode/lower/parse) on
+# every call (measured 1.3-1.5 us in this build) and both of these are read from
+# the MoE path once per layer per forward.  The flags are static server
+# settings, so probe once.  KL_CFG_CACHE=0 restores the per-call behaviour
+# (A/B arm).
+_CFG_CACHE = os.environ.get("KL_CFG_CACHE", "1") != "0"
+_FP16_LIMIT_IN_MOE: Optional[int] = None
+_DEEPEP_BF16_DISPATCH: Optional[bool] = None
+
+
+def _fp16_limit_in_moe() -> int:
+    global _FP16_LIMIT_IN_MOE
+    if not _CFG_CACHE:
+        raw = patch_envs.SGLANG_FP16_LIMIT_IN_MOE.get()
+        return int(raw) if raw is not None else 0
+    if _FP16_LIMIT_IN_MOE is None:
+        raw = patch_envs.SGLANG_FP16_LIMIT_IN_MOE.get()
+        _FP16_LIMIT_IN_MOE = int(raw) if raw is not None else 0
+    return int(_FP16_LIMIT_IN_MOE)
+
+
+def _deepep_bf16_dispatch() -> bool:
+    global _DEEPEP_BF16_DISPATCH
+    if _DEEPEP_BF16_DISPATCH is not None and _CFG_CACHE:
+        return _DEEPEP_BF16_DISPATCH
+    value = bool(envs.SGLANG_DEEPEP_BF16_DISPATCH.get())
+    if _CFG_CACHE:
+        _DEEPEP_BF16_DISPATCH = value
+    return value
+
+
+@functools.cache
+def _fused_swiglu_available() -> bool:
+    """Whether the XSpeedGate wheel ships the fused clamp+silu+mul op.
+
+    The namespace only exists after importing the extension, so the check imports
+    it first (a cached no-op once the engine has).
+    """
+    try:
+        import xspeedgate_ops  # noqa: F401 -- registers torch.ops.xspeedgate_ops
+    except Exception:
+        return False
+    return hasattr(torch.ops.xspeedgate_ops, "silu_and_mul_with_swiglu_limit")
+
+
+_swiglu_reported = {"active": False, "failed": False}
+
 
 class _DSV4ClampedSiluAndMul(torch.nn.Module):
     """SiluAndMul with the DeepSeek-V4 swiglu_limit clamp on the gate/up inputs.
@@ -100,10 +152,42 @@ class _DSV4ClampedSiluAndMul(torch.nn.Module):
 
     def forward(self, x):
         """Clamp the SwiGLU gate/up to swiglu_limit, then SiLU-multiply."""
+        # The XSpeedGate op fuses the whole chain (split + both clamps + silu in
+        # fp32 + mul + cast); the torch chain below materialises the two fp32
+        # upcasts the trace attributes to ``_DSV4ClampedSiluAndMul`` (~3.5% span).
+        # Not bit-identical: <=1 ulp (fp16 0.25 / bf16 0.5, fp32 ~7e-4 from the
+        # kernel's exp approximation); greedy first-token flips only at near-ties.
+        if (
+            _fused_swiglu_available()
+            and x.numel() > 0
+            and x.size(-1) % 2 == 0
+            and x.is_contiguous()
+            and x.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        ):
+            try:
+                out = torch.ops.xspeedgate_ops.silu_and_mul_with_swiglu_limit(
+                    x, self.limit
+                )
+                if not _swiglu_reported["active"]:
+                    _swiglu_reported["active"] = True
+                    logger.info(
+                        "sglang-kunlun: native silu_and_mul_with_swiglu_limit active"
+                    )
+                return out
+            except Exception as exc:  # noqa: BLE001 -- fall back to the torch chain
+                if not _swiglu_reported["failed"]:
+                    _swiglu_reported["failed"] = True
+                    logger.warning(
+                        "sglang-kunlun: xspeedgate_ops.silu_and_mul_with_swiglu_limit "
+                        "failed (%s); using the torch chain", exc,
+                    )
         gate, up = x.chunk(2, dim=-1)
         gate = gate.clamp(max=self.limit)
         up = up.clamp(min=-self.limit, max=self.limit)
         return (torch.nn.functional.silu(gate.float()) * up.float()).to(x.dtype)
+
+
+_ELEM_BYTES: dict = {}
 
 
 class ReusedBuffer:
@@ -123,7 +207,14 @@ class ReusedBuffer:
         """
         # Calculate the number of elements needed based on the requested dtype
         num_elements = torch.Size(shape).numel()
-        element_size = torch.tensor([], dtype=dtype).element_size()
+        # dtype -> element size.  The old form built a throwaway
+        # ``torch.tensor([], dtype=dtype)`` per call: one ``aten::empty`` + one
+        # ``aten::tensor``/``lift_fresh`` + a no-op ``aten::to`` dispatch, ~40
+        # times per prefill step, all for a static integer.
+        element_size = _ELEM_BYTES.get(dtype)
+        if element_size is None:
+            element_size = torch.tensor([], dtype=dtype).element_size()
+            _ELEM_BYTES[dtype] = element_size
         requested_size_in_bytes = num_elements * element_size
         # Check if buffer has enough space
         assert (
@@ -136,7 +227,35 @@ class ReusedBuffer:
         return allocated_tensor
 
 
-class Bfp16orFp16NormalMoeBuffer:
+class _RecvZeroGuard:
+    """Tracks whether the recv INT8 region of a strategy buffer is still zero.
+
+    The recv region is the one part of the scratch buffers whose untouched
+    (expert-alignment padding) rows must read as zero; every other view is
+    fully written before it is read.  ``_init_new`` allocates the buffers
+    zeroed, and the only writers of the recv region are ``dispatch_convert``
+    (fills the real rows) and the properties that alias the same bytes
+    (``down_inp_bfp16`` / ``gateup_output`` / ``down_output`` / ``x_to_combine``
+    depending on the strategy).  Those properties mark the region dirty, so the
+    next user re-zeroes once instead of paying the fill on every forward.
+    """
+
+    recv_zeroed = True
+
+    def ensure_recv_zeroed(self):
+        """Re-zero the recv INT8 region if a previous strategy dirtied it.
+
+        Called before ``dispatch_convert`` fills the real rows: the padding rows
+        between the expert-alignment boundary and ``M`` are never written, so
+        they must read as zero.  The fill runs at most once per dirty write, not
+        once per forward -- in the steady state this is a no-op.
+        """
+        if not self.recv_zeroed:
+            self.recv_x_all_int8.zero_()
+            self.recv_zeroed = True
+
+
+class Bfp16orFp16NormalMoeBuffer(_RecvZeroGuard):
     """
     condition:
     (1) N <= M <= local_num_experts * N
@@ -221,6 +340,8 @@ class Bfp16orFp16NormalMoeBuffer:
         """
         gateup_output is bfp16
         """
+        # aliases buffer0, i.e. the recv INT8 region
+        self.recv_zeroed = False
         return self.buffer0.empty((self.M, self.F * 2), torch.bfloat16)
 
     @property
@@ -237,6 +358,8 @@ class Bfp16orFp16NormalMoeBuffer:
         down_output
         """
 
+        # aliases buffer0, i.e. the recv INT8 region
+        self.recv_zeroed = False
         return self.buffer0.empty((self.M, self.H), torch.bfloat16)
 
     @property
@@ -245,10 +368,12 @@ class Bfp16orFp16NormalMoeBuffer:
         x_to_combine
         """
 
+        # aliases buffer0, i.e. the recv INT8 region
+        self.recv_zeroed = False
         return self.buffer0.empty((self.N, self.H), torch.bfloat16)
 
 
-class W8A8NormalMoeBuffer:
+class W8A8NormalMoeBuffer(_RecvZeroGuard):
     """
     condition:
     (1) N <= M <= local_num_experts * N
@@ -320,6 +445,8 @@ class W8A8NormalMoeBuffer:
         down_inp_bfp16
         """
 
+        # aliases buffer0, i.e. the recv INT8 region
+        self.recv_zeroed = False
         return self.buffer0.empty((self.M, self.F), torch.bfloat16)
 
     @property
@@ -350,6 +477,163 @@ class W8A8NormalMoeBuffer:
         """
 
         return self.buffer1.empty((self.N, self.H), torch.bfloat16)
+
+
+_MOE_BUFFER_ROW_ALIGN = 1024
+# The plugin loader may execute this module more than once per process; a
+# module-global dict would then split the cache into independent copies, each
+# holding its own buffer.  Anchor the cache on ``sys`` so there is exactly one.
+_MOE_BUFFER_CACHE = getattr(sys, "_kl_moe_buffer_cache", None)
+if _MOE_BUFFER_CACHE is None:
+    _MOE_BUFFER_CACHE = sys._kl_moe_buffer_cache = {}
+_kl_loads = getattr(sys, "_kl_ep_moe_layer_loads", 0) + 1
+sys._kl_ep_moe_layer_loads = _kl_loads
+if _kl_loads > 1:
+    logger.debug("[moe-buffer] hook module executed %dx in this process", _kl_loads)
+
+
+def _align_rows(count):
+    return (count + _MOE_BUFFER_ROW_ALIGN - 1) // _MOE_BUFFER_ROW_ALIGN * _MOE_BUFFER_ROW_ALIGN
+
+
+def _shared_moe_buffer(
+    buffer_cls, num_tokens, num_selected, hidden_size, ffn_hidden_size, device, **kwargs
+):
+    """One grow-only scratch buffer per buffer class, shared by every MoE layer.
+
+    Layers run back to back on a single stream, so a layer's buffers are dead as
+    soon as its forward returns.  The dispatched token count changes on every
+    layer and every step, so caching the *exact* geometry missed on 80% of the
+    forwards (measured on 8xP800 prefill: 80 misses / 100 calls, 80 distinct
+    counts) and re-zeroed both buffers, ~0.6 GB, each time.  Rounding the row
+    counts up to ``_MOE_BUFFER_ROW_ALIGN`` makes the cache hit; the exact counts
+    are rebound on every acquisition, so the views handed out keep their exact
+    shapes and the recv region keeps its exact zero extent.  The recv INT8 rows
+    are still guaranteed zero at every use via ``ensure_recv_zeroed``.
+
+    The cache holds *one* buffer per (class, dtype args, device) and grows it in
+    place when a larger dispatch geometry shows up.  A multi-entry cache keeps
+    every geometry it has ever seen resident: on a 61k chunk each entry is
+    0.5-2.3 GB, so a handful of routing outcomes pin >10 GB of live scratch and
+    the next request's larger geometry has no room left to be allocated from the
+    (fragmented) device heap.  Growing in place bounds the retention at the
+    largest geometry seen and keeps the hit rate at 100% after warm-up, because
+    both buffer sizes are monotone in ``N`` and ``M``: a buffer sized for
+    ``(cap_n, cap_m)`` fits every smaller request through ``ReusedBuffer.empty``'s
+    bound check.  The previous buffer is dropped *before* the larger one is
+    allocated, so the two never coexist.
+    """
+    cap_n = _align_rows(num_tokens)
+    cap_m = _align_rows(num_selected)
+    key = (
+        buffer_cls.__name__,
+        hidden_size,
+        ffn_hidden_size,
+        str(device),
+        frozenset(kwargs.items()),
+    )
+    entry = _MOE_BUFFER_CACHE.get(key)
+    if entry is None or cap_n > entry[0] or cap_m > entry[1]:
+        # Keep the *maximum* of both axes.  N and M jitter independently (the
+        # chunk is truncated to whatever the token pool has left, the dispatch
+        # count follows routing), so storing the current request's pair would
+        # shrink the other axis on every grow and the next forward would grow
+        # again -- an allocation per forward.
+        cap_n = cap_n if entry is None else max(cap_n, entry[0])
+        cap_m = cap_m if entry is None else max(cap_m, entry[1])
+        entry = None
+        _MOE_BUFFER_CACHE.pop(key, None)
+        buf = buffer_cls(cap_n, cap_m, hidden_size, ffn_hidden_size, device, **kwargs)
+        entry = (cap_n, cap_m, buf)
+        _MOE_BUFFER_CACHE[key] = entry
+        logger.info(
+            "[moe-buffer] grow %s need=(%d,%d) cap_n=%d cap_m=%d H=%d F=%d "
+            "device=%s entries=%d",
+            buffer_cls.__name__, num_tokens, num_selected, cap_n, cap_m,
+            hidden_size, ffn_hidden_size, device, len(_MOE_BUFFER_CACHE),
+        )
+    buf = entry[2]
+    buf.N = num_tokens
+    buf.M = num_selected
+    return buf
+
+
+# [host-diet r85] ``dispatch_convert``'s five metadata tensors (``input_scale``,
+# ``m_indices``, ``token_counts``, ``token_to_m``, ``token_weights``) are tiny
+# (6-7 MB at a 61k chunk) but were five separate ``torch.zeros`` calls per layer
+# -- five allocator round trips plus five zero kernels, i.e. 40 x 10 host
+# dispatches per forward.  They are dead as soon as the layer's combine runs, so
+# carve them out of one grow-only int32 scratch and re-zero that in a single
+# kernel.  ``int32`` is the widest of the four payload dtypes (int32 / float32 /
+# bfloat16), so every view below is a byte-for-byte reinterpretation of a
+# prefix of the scratch and the op receives exactly the bytes it used to.
+_MOE_META_CACHE = getattr(sys, "_kl_moe_meta_cache", None)
+if _MOE_META_CACHE is None:
+    _MOE_META_CACHE = sys._kl_moe_meta_cache = {}
+_MOE_META_SCRATCH = os.environ.get("KL_MOE_META_SCRATCH", "1").lower() not in (
+    "0",
+    "",
+    "false",
+    "off",
+    "none",
+)
+
+
+def _moe_meta_tensors(device, topk, num_tokens, num_all_tokens):
+    """Return the five zero-initialised dispatch metadata tensors.
+
+    All five alias one grow-only scratch (rounded up to
+    ``_MOE_BUFFER_ROW_ALIGN`` rows and re-zeroed by a single ``zero_``), which
+    keeps the allocator out of the hot path.  Layout, in int32 elements:
+    ``[input_scale | m_indices | token_counts | token_to_m | token_weights]``.
+
+    The five views are cached per geometry as well: rebuilding them costs 6
+    slices, 4 views and 6 ``as_strided`` per call, i.e. ~2.9 ms/fwd of host
+    dispatch (r85 trace), and the routed token counts differ between layers, so
+    a single-slot cache still missed on 39 of 40 calls.  Keep a small map from
+    geometry to views instead; entries are view objects aliasing the one scratch,
+    so they cost metadata only.  The map is dropped whenever the scratch itself
+    is reallocated (the views would point at the freed buffer).
+    """
+    key = (str(device), int(topk))
+    geo = (int(num_tokens), int(num_all_tokens))
+    entry = _MOE_META_CACHE.get(key)
+    if entry is None or num_all_tokens > entry[1] or num_tokens > entry[2]:
+        cap_na = max(_align_rows(num_all_tokens), 0 if entry is None else entry[1])
+        cap_nt = max(_align_rows(num_tokens), 0 if entry is None else entry[2])
+        # ``token_weights`` is bf16: two elements per int32 word, with one word
+        # of slack when ``cap_na`` is odd.
+        total = 2 * cap_na + cap_nt + cap_nt * topk + (cap_na + 1) // 2
+        _MOE_META_CACHE.pop(key, None)
+        entry = [torch.empty(total, dtype=torch.int32, device=device), cap_na, cap_nt, {}]
+        _MOE_META_CACHE[key] = entry
+    flat, cap_na, cap_nt, views = entry
+    tensors = views.get(geo)
+    if tensors is None:
+        if len(views) >= 512:
+            views.clear()
+        o_scale = 0
+        o_midx = cap_na
+        o_cnt = 2 * cap_na
+        o_ttm = o_cnt + cap_nt
+        o_tw = o_ttm + cap_nt * topk
+        input_scale = flat[o_scale:o_scale + num_all_tokens].view(torch.float32)
+        m_indices = flat[o_midx:o_midx + num_all_tokens]
+        token_counts = flat[o_cnt:o_cnt + num_tokens]
+        token_to_m = flat[o_ttm:o_ttm + num_tokens * topk].view(num_tokens, topk)
+        token_weights = flat[o_tw:].view(torch.bfloat16)[:num_all_tokens]
+        tensors = (
+            input_scale.view(num_all_tokens, 1),
+            m_indices,
+            token_counts,
+            token_to_m,
+            token_weights,
+        )
+        views[geo] = tensors
+    # One kernel instead of five; the padding inside the aligned regions is at
+    # most a couple of hundred KB, so zeroing the whole scratch is free.
+    flat.zero_()
+    return tensors
 
 
 class DeepEPMoE(FusedMoE):
@@ -499,9 +783,24 @@ class DeepEPMoE(FusedMoE):
         hidden_states = self.dispatcher.combine(
             combine_input=combine_input,
         )
-        if get_global_server_args().dtype in ["float16", "fp16", "half"]:
-            limit = int(patch_envs.SGLANG_FP16_LIMIT_IN_MOE.get())
-            hidden_states = hidden_states.clamp(min=-limit, max=limit).to(torch.float16)
+        if get_model().dtype in ["float16", "fp16", "half"]:
+            limit: int = int(_fp16_limit_in_moe())
+            # Guard the bounds: a caller-supplied 0 or negative limit would make
+            # clamp(min=-limit, max=limit) reversed (min > max), and a reversed
+            # clamp silently maps every element to the wrong bound.
+            if limit > 0:
+                hidden_states = hidden_states.clamp(min=-limit, max=limit)
+            # r68c: the fp16 cast that used to sit here was undone one call
+            # later by DeepseekV2MoE.forward_deepep, whose
+            # ``shared_output.add_(final_hidden_states, alpha=...)`` has a bf16
+            # destination and therefore casts the fp16 operand *back* to bf16
+            # into a fresh [T, 5120] buffer.  The clamp above bounds |v| <= 10,
+            # so the dropped conversion cannot overflow; bf16 -> fp16 -> bf16 is
+            # the identity above the fp16 subnormal band (|v| >= 2^-14) and the
+            # old code already rounded toward zero below it, so this is strictly
+            # not less accurate.  Round trip cost: 14.83 (this cast) + 31.65
+            # (the add_ recast) ms per 8-forward capture at 60k.
+            # Do not reintroduce without a downstream consumer that needs fp16.
 
         return hidden_states
 
@@ -577,7 +876,8 @@ class DeepEPMoE(FusedMoE):
         )
 
         if forward_int8:
-            moe_buffer = W8A8NormalMoeBuffer(
+            moe_buffer = _shared_moe_buffer(
+                W8A8NormalMoeBuffer,
                 num_tokens,
                 num_all_tokens,
                 hidden_size,
@@ -585,7 +885,8 @@ class DeepEPMoE(FusedMoE):
                 recv_x_int8.device,
             )
         else:
-            moe_buffer = Bfp16orFp16NormalMoeBuffer(
+            moe_buffer = _shared_moe_buffer(
+                Bfp16orFp16NormalMoeBuffer,
                 num_tokens,
                 num_all_tokens,
                 hidden_size,
@@ -594,6 +895,7 @@ class DeepEPMoE(FusedMoE):
                 is_bfp16=self.w13_weight.dtype == torch.bfloat16
                 or self.moe_castte_mode,
             )
+        moe_buffer.ensure_recv_zeroed()
 
         if get_bool_env_var("XSGL_NATIVE_DEEPEP_NORMAL"):
             recv_x_all_int8 = torch.zeros(
@@ -790,14 +1092,28 @@ class DeepEPMoE(FusedMoE):
             dim=0,
             dtype=torch.int32,
         )
+        # One H2D instead of two: both tensors come from the same python list and
+        # are consumed by the same dispatch, so they travel in one staging copy
+        # and are sliced on the device.  Values are identical; the change removes
+        # one launch per layer, which matters in the launch-bound late-layer tail
+        # (r123: 86% of the tail's idle is host issue).
+        _pair_dev = torch.cat(
+            (num_recv_tokens_per_expert_cpu_tensor,
+             num_recv_tokens_per_expert_list_start_cpu)
+        ).to(device, non_blocking=True)
+        _n_experts = len(num_recv_tokens_per_expert)
+        num_recv_counts_dev = _pair_dev[:_n_experts]
+        num_recv_start_dev = _pair_dev[_n_experts:]
 
         if int8_activations:
-            moe_buffer = W8A8NormalMoeBuffer(
+            moe_buffer = _shared_moe_buffer(
+                W8A8NormalMoeBuffer,
                 num_tokens, num_all_tokens, hidden_size, ffn_hidden_size, device
             )
         else:
             # INT8 activations land in buffer0, their FP16 dequant in buffer1.
-            moe_buffer = Bfp16orFp16NormalMoeBuffer(
+            moe_buffer = _shared_moe_buffer(
+                Bfp16orFp16NormalMoeBuffer,
                 num_tokens,
                 num_all_tokens,
                 hidden_size,
@@ -805,25 +1121,36 @@ class DeepEPMoE(FusedMoE):
                 device,
                 is_bfp16=False,
             )
+        moe_buffer.ensure_recv_zeroed()
         # ``dispatch_convert`` only fills the rows that actually received a
         # token, so every metadata tensor must be zero-initialised (see
-        # forward_deepgemm_contiguous for what uninitialised rows do).
+        # forward_deepgemm_contiguous for what uninitialised rows do).  All five
+        # come zeroed out of one shared scratch -- see ``_moe_meta_tensors``.
         recv_x_all_int8 = moe_buffer.recv_x_all_int8
-        input_scale = torch.zeros(
-            num_all_tokens, 1, device=device, dtype=torch.float32
-        )
-        m_indices = torch.zeros(num_all_tokens, dtype=torch.int32, device=device)
-        token_counts = torch.zeros(num_tokens, dtype=torch.int32, device=device)
-        token_to_m = torch.zeros(num_tokens, topk, dtype=torch.int32, device=device)
-        token_weights = torch.zeros(
-            num_all_tokens, dtype=torch.bfloat16, device=device
-        )
+        if _MOE_META_SCRATCH:
+            (
+                input_scale,
+                m_indices,
+                token_counts,
+                token_to_m,
+                token_weights,
+            ) = _moe_meta_tensors(device, topk, num_tokens, num_all_tokens)
+        else:
+            input_scale = torch.zeros(
+                num_all_tokens, 1, device=device, dtype=torch.float32
+            )
+            m_indices = torch.zeros(num_all_tokens, dtype=torch.int32, device=device)
+            token_counts = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+            token_to_m = torch.zeros(num_tokens, topk, dtype=torch.int32, device=device)
+            token_weights = torch.zeros(
+                num_all_tokens, dtype=torch.bfloat16, device=device
+            )
         torch.ops.custom_ops.dispatch_convert(
             hidden_states,
             hidden_states_scale,
             topk_idx,
             topk_weights,
-            num_recv_tokens_per_expert_list_start_cpu.to(device, non_blocking=True),
+            num_recv_start_dev,
             num_tokens,
             num_all_tokens,
             hidden_size,
@@ -840,7 +1167,7 @@ class DeepEPMoE(FusedMoE):
             recv_x_all_int8,
             input_scale,
             # the INT4 grouped GEMMs take per-expert token counts, not per-token ids
-            num_recv_tokens_per_expert_cpu_tensor.to(device, non_blocking=True),
+            num_recv_counts_dev,
             (token_counts, token_to_m, token_weights),
             num_all_tokens,
         )
@@ -855,7 +1182,13 @@ class DeepEPMoE(FusedMoE):
     ):
         """Reduce the expert-sorted rows back to one row per token."""
         token_counts, token_to_m, token_weights = scatter_meta
-        x_to_combine = torch.zeros(
+        # ``combine_convert`` writes every token row (it sums that token's expert
+        # rows, and writes 0 for a token with no expert), so the zero-init is
+        # dead work: measured 0.38 ms per call on a [32768, 5120] bf16 output,
+        # 63 ms / 0.36% of the prefill trace.  Verified op-level: y filled with
+        # 1.0 comes back as the expert sum (not sum+1), and a row with
+        # ``token_counts == 0`` comes back 0.0.
+        x_to_combine = torch.empty(
             (num_tokens, hidden_size), dtype=torch.bfloat16, device=down_output.device
         )
         torch.ops.custom_ops.combine_convert(
@@ -1432,7 +1765,7 @@ class DeepEPMoE(FusedMoE):
         assert self.moe_runner_config.activation == "silu"
         assert isinstance(self.quant_method, W4AFp8MoEMethod)
         assert (
-            envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+            _deepep_bf16_dispatch()
         ), "W4AFP8 does not support FP8 dispatch; please set SGLANG_DEEPEP_BF16_DISPATCH=1."
         return self.quant_method.apply_deepep_ll(
             layer=self,

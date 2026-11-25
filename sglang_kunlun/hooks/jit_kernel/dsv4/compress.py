@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -18,7 +20,9 @@
 """HookRegistry registration for the DSV4 compress-plan generators.
 
 Upstream ``CompressorDecodePlan.generate`` / ``CompressorPrefillPlan.generate``
-(in ``sglang.jit_kernel.dsv4.compress``) call the tvm_ffi CUDA ``c_plan.cuh``
+(in ``sglang.kernels.ops.attention.dsv4.compress``) call the CUDA-JIT ``c_plan.cuh``;
+the two plan hooks below were REMOVED: upstream plan.generate was refactored with an
+incompatible signature, and c4/c128 compression is not exercised by this deploy config.
 JIT kernel, which cannot build on the Kunlun XPU.
 
 ``generate`` is a ``@staticmethod`` on a ``NamedTuple`` subclass;
@@ -133,76 +137,82 @@ def _make_decode_plan_c4_torch(
     return plan_d
 
 
-@plugin_hook(
-    "sglang.jit_kernel.dsv4.compress.CompressorDecodePlan.generate",
-    type=HookType.REPLACE,
-)
-def _decode_plan_generate_torch(
-    compress_ratio,
-    req_pool_indices,
-    req_to_token,
-    full_to_swa,
-    seq_lens,
-    swa_page_size,
-    ring_size,
-):
-    """Pure-torch ``CompressorDecodePlan.generate`` (no tvm_ffi)."""
-    from sglang.jit_kernel.dsv4.compress import CompressorDecodePlan
+# [kunlun-adapt] 上游 compress.py 的 plan.generate 已重构（签名 num_q_tokens/seq_lens/extend_lens/device/use_cuda_graph，
+# plan 结构亦变更），旧 torch plan 实现语义不兼容，hook 移除；c4/c128 压缩本部署配置（compress_ratios 0/1/2）不涉及。
+# @plugin_hook(
+#     "sglang.jit_kernel.dsv4.compress.CompressorDecodePlan.generate",
+#     type=HookType.REPLACE,
+# )
+# def _decode_plan_generate_torch(
+#     compress_ratio,
+#     req_pool_indices,
+#     req_to_token,
+#     full_to_swa,
+#     seq_lens,
+#     swa_page_size,
+#     ring_size,
 
-    _mk_dec = (
-        _make_decode_plan_c4_torch
-        if int(compress_ratio) == 4
-        else _make_decode_plan_torch
-    )
-    plan_d = _mk_dec(
-        int(compress_ratio),
-        req_pool_indices,
-        req_to_token,
-        full_to_swa,
-        seq_lens,
-        int(swa_page_size),
-        int(ring_size),
-    )
-    return CompressorDecodePlan(int(compress_ratio), plan_d)
+# ):
+#     """Pure-torch ``CompressorDecodePlan.generate`` (no tvm_ffi)."""
+#     from sglang.jit_kernel.dsv4.compress import CompressorDecodePlan
+
+#     _mk_dec = (
+#         _make_decode_plan_c4_torch
+#         if int(compress_ratio) == 4
+#         else _make_decode_plan_torch
+#     )
+#     plan_d = _mk_dec(
+#         int(compress_ratio),
+#         req_pool_indices,
+#         req_to_token,
+#         full_to_swa,
+#         seq_lens,
+#         int(swa_page_size),
+#         int(ring_size),
+#     )
+#     return CompressorDecodePlan(int(compress_ratio), plan_d)
 
 
-@plugin_hook(
-    "sglang.jit_kernel.dsv4.compress.CompressorPrefillPlan.generate",
-    type=HookType.REPLACE,
-)
-def _prefill_plan_generate_torch(
-    compress_ratio,
-    req_pool_indices,
-    seq_lens,
-    extend_lens,
-    req_to_token,
-    full_to_swa,
-    swa_page_size,
-    ring_size,
-    num_q_tokens,
-    use_cuda_graph=False,
-):
-    """Pure-torch ``CompressorPrefillPlan.generate`` (no tvm_ffi)."""
-    from sglang.jit_kernel.dsv4.compress import CompressorPrefillPlan
-    from sglang_kunlun.kernels.dsv4_torch_shim import (
-        _make_prefill_plan_c4_torch,
-        _make_prefill_plan_torch,
-    )
+# [kunlun-adapt] 上游 compress.py 的 plan.generate 已重构（签名 num_q_tokens/seq_lens/extend_lens/device/use_cuda_graph，
+# plan 结构亦变更），旧 torch plan 实现语义不兼容，hook 移除；c4/c128 压缩本部署配置（compress_ratios 0/1/2）不涉及。
+# @plugin_hook(
+#     "sglang.jit_kernel.dsv4.compress.CompressorPrefillPlan.generate",
+#     type=HookType.REPLACE,
+# )
+# def _prefill_plan_generate_torch(
+#     compress_ratio,
+#     req_pool_indices,
+#     seq_lens,
+#     extend_lens,
+#     req_to_token,
+#     full_to_swa,
+#     swa_page_size,
+#     ring_size,
+#     num_q_tokens,
+#     use_cuda_graph=False,
 
-    _mk_pre = (
-        _make_prefill_plan_c4_torch
-        if int(compress_ratio) == 4
-        else _make_prefill_plan_torch
-    )
-    plan_c, plan_w = _mk_pre(
-        int(compress_ratio),
-        req_pool_indices,
-        seq_lens,
-        extend_lens,
-        req_to_token,
-        full_to_swa,
-        int(swa_page_size),
-        int(ring_size),
-        int(num_q_tokens),
-    )
-    return CompressorPrefillPlan(int(compress_ratio), plan_c, plan_w, None)
+# ):
+#     """Pure-torch ``CompressorPrefillPlan.generate`` (no tvm_ffi)."""
+#     from sglang.jit_kernel.dsv4.compress import CompressorPrefillPlan
+#     from sglang_kunlun.kernels.dsv4_torch_shim import (
+#         _make_prefill_plan_c4_torch,
+#         _make_prefill_plan_torch,
+#     )
+
+#     _mk_pre = (
+#         _make_prefill_plan_c4_torch
+#         if int(compress_ratio) == 4
+#         else _make_prefill_plan_torch
+#     )
+#     plan_c, plan_w = _mk_pre(
+#         int(compress_ratio),
+#         req_pool_indices,
+#         seq_lens,
+#         extend_lens,
+#         req_to_token,
+#         full_to_swa,
+#         int(swa_page_size),
+#         int(ring_size),
+#         int(num_q_tokens),
+#     )
+#     return CompressorPrefillPlan(int(compress_ratio), plan_c, plan_w, None)

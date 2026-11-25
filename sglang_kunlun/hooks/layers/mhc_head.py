@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -36,7 +38,7 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 
 @plugin_hook(
-    "sglang.srt.layers.mhc_head.fused_hc_head",
+    "sglang.kernels.ops.layernorm.mhc_head.fused_hc_head",
     type=HookType.REPLACE,
 )
 def _fused_hc_head_kunlun(x, hc_fn, hc_scale, hc_base, norm_eps, hc_eps):

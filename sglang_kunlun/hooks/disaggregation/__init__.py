@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -89,3 +91,9 @@ plugin_hook(
 
 # Kunlun P800: per-buffer RDMA registration.
 from . import mooncake_register  # noqa: F401,E402
+
+# 2MB-align the host metadata buffers those registrations have to cover.
+from . import metadata_align  # noqa: F401,E402
+
+# AttentionStore (asradix): rescue the tail SWA window on the prefill path.
+from . import asradix_prefill_hook  # noqa: F401,E402

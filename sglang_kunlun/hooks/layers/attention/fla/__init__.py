@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -34,7 +36,11 @@ logger = logging.getLogger(__name__)
 
 try:
     import torch
-    import sglang.srt.layers.attention.fla.utils as _fla_utils
+    try:
+        # [kunlun-adapt] 上游 fla 已迁至 kernels.ops.attention.fla
+        import sglang.kernels.ops.attention.fla.utils as _fla_utils
+    except ImportError:
+        import sglang.srt.layers.attention.fla.utils as _fla_utils
 
     def _get_available_device() -> str:
         return "cuda"
@@ -47,4 +53,9 @@ try:
     _fla_utils.is_intel = False
     logger.info("Kunlun: fla.utils.get_available_device -> 'cuda'")
 except Exception as e:  # pragma: no cover
-    logger.warning("fla utils kunlun patch failed: %s", e)
+    # On this build the fla utils module cannot be imported at all (it probes
+    # ``torch.xpu`` at import time, which raises ``AssertionError: Torch not
+    # compiled with XPU enabled``), so there is no module object to patch.
+    # DSV4 runs the kunlun_dsv4 backend, not fla, so this is expected and inert
+    # -- keep it off the warning channel to avoid startup noise.
+    logger.debug("fla utils kunlun patch skipped: %s", e)

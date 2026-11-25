@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -19,6 +21,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -31,6 +34,31 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from ..utils import INT8_SCALE_MULT, dynamic_quantize_int8, scale_to_kernel_max
 
 __all__ = ["KunlunCompressedTensorsW8A8Int8"]
+
+# [r141] wq_b emits fp16 directly for prefill rows.
+#
+# wq_b's output *is* q, and the very next consumer of q is the attention backend,
+# whose window/compressed cache is fp16: today the int8 GEMM writes bf16 and
+# `_kunlun_compressed_attention` immediately casts it back (`xspeedgate_ops::
+# cast_bf16_fp16`, 122 calls / 27.96 ms per 2-forward capture, 586 us per layer
+# at [7680,64,512] = 1.72 TB/s, i.e. at the copy roof -- r70 closed only the
+# consumer side).  The same `kunlun_ops.matmul` accepts an fp16 destination and
+# is faster with one: [7680,1280]x[32768,1280] int8 -> bf16 1501 us, -> fp16
+# 1052 us, -> bf16 again 1505 us (30% reproducible), and rope/dlpack both take
+# fp16 (`flashinfer_rotary_embedding` verified fp16 in-place, and it is *more*
+# accurate: 1.85e-3 vs 1.53e-2 against an fp32 reference).  Net ~21 layers x
+# (586 us cast + ~450 us GEMM) ~= 20 ms/forward.
+# Numerics: strictly better.  The fp32 accumulator now rounds once (to fp16)
+# instead of twice (bf16, then fp16 in the cast); no new overflow surface,
+# because the removed cast already forced q into fp16 range.
+# Scope: prefill/extend rows only (decode keeps its static bf16 q_out buffer and
+# its cuda-graph contract), and only for wq_b's own shape; every other W8A8
+# linear (wq_a [1280,5120], wo_b [5120,8192], ...) is untouched.
+# Rollback: KL_WQB_FP16=0 (module-level env, takes effect on cold start).
+_WQB_FP16 = os.environ.get("KL_WQB_FP16", "1") != "0"
+_WQB_WEIGHT_SHAPE = (32768, 1280)   # n_local_heads * head_dim, q_lora_rank
+_WQB_MIN_ROWS = 64                  # extend/prefill only
+_WQB_LOGGED = False
 
 
 class KunlunCompressedTensorsW8A8Int8(CompressedTensorsW8A8Int8):
@@ -82,6 +110,18 @@ class KunlunCompressedTensorsW8A8Int8(CompressedTensorsW8A8Int8):
         """Apply dynamic INT8 quantization and Kunlun matmul."""
         import kunlun_ops
 
+        global _WQB_LOGGED
+
+        # An idle/empty batch (zero rows) must not reach the Kunlun matmul: the
+        # backend does not promise a zero-row shape. Return the empty result.
+        inputs = x[0] if isinstance(x, tuple) else x
+        if inputs.shape[0] == 0:
+            return torch.empty(
+                (0, layer.weight.shape[0]),
+                dtype=torch.bfloat16 if isinstance(x, tuple) else x.dtype,
+                device=inputs.device,
+            )
+
         if isinstance(x, tuple):
             x_q, x_scale = x
             output_dtype = torch.bfloat16
@@ -90,6 +130,16 @@ class KunlunCompressedTensorsW8A8Int8(CompressedTensorsW8A8Int8):
             x_q, x_scale = dynamic_quantize_int8(x, keepdim=False)
 
         output_size = layer.weight.shape[0]
+        if (
+            _WQB_FP16
+            and x_q.shape[0] >= _WQB_MIN_ROWS
+            and tuple(layer.weight.shape) == _WQB_WEIGHT_SHAPE
+        ):
+            output_dtype = torch.float16
+            if not _WQB_LOGGED:
+                _WQB_LOGGED = True
+                print("[r141] wq_b fp16-out active rows=%d" % x_q.shape[0],
+                      flush=True)
         out = torch.empty(
             (x_q.shape[0], output_size),
             dtype=output_dtype,

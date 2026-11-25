@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -18,13 +20,13 @@
 """HTTP entrypoint hooks for Kunlun (P800).
 
 The clean upstream sglang 0.5.14 ``http_server`` only registers ``/health`` and
-``/health_generate``. The AIAK production image adds three deployment-facing
+``/health_generate``. Production images add three deployment-facing
 interfaces that the k8s gateway / PD orchestrator relies on:
 
 * ``/ready``            – readiness probe that flips to 507 while the process is
                           being drained via an external stop signal.
 * ``/health_forward``   – alias of the health-generate probe (kept for parity
-                          with the AIAK image so existing probes keep working).
+                          with the production image so existing probes keep working).
 * ``/get_instance_info``– instance topology / live load snapshot consumed by the
                           gateway to route PD traffic.
 
@@ -46,6 +48,7 @@ re-adding), so running it from both entry points is safe.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import socket
@@ -56,11 +59,12 @@ from fastapi import Request
 from fastapi.responses import Response
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
+from sglang.srt.arg_groups.serving_hook import ssl_verify_of
 
 logger = logging.getLogger(__name__)
 
 # All health paths are served by the single shutdown-aware handler below,
-# mirroring the AIAK image (``@app.get("/ready"|"/health"|"/health_forward"
+# mirroring the production image (``@app.get("/ready"|"/health"|"/health_forward"
 # |"/health_generate")``).
 _HEALTH_PATHS = ("/ready", "/health", "/health_forward", "/health_generate")
 _INSTANCE_INFO_PATH = "/get_instance_info"
@@ -70,11 +74,11 @@ def _stopped_by_external() -> bool:
     """Return True when an external drainer asked this instance to stop.
 
     The orchestrator writes ``stop`` into the file pointed to by
-    ``AIAK_STOP_SIGNAL_DIR`` (default ``/run/sglang/stop``) to gracefully take
-    the instance out of rotation; ``/ready`` then reports 507 so the gateway
+    ``SGLANG_KUNLUN_STOP_SIGNAL_DIR`` (default ``/run/sglang/stop``) to gracefully
+    take the instance out of rotation; ``/ready`` then reports 507 so the gateway
     stops routing new traffic to it.
     """
-    signal_path = os.environ.get("AIAK_STOP_SIGNAL_DIR", "/run/sglang/stop")
+    signal_path = os.environ.get("SGLANG_KUNLUN_STOP_SIGNAL_DIR", "/run/sglang/stop")
     if not signal_path:
         return False
     try:
@@ -86,8 +90,126 @@ def _stopped_by_external() -> bool:
     return False
 
 
+class _ThinkingCompatMiddleware:
+    """Map legacy thinking switches and add a default system message.
+
+    ds_test sends the legacy top-level thinking switches, and subjective sets
+    (Flames) degenerate into self-correction loops when the request carries no
+    system message at all.  Both fixes live here so the shipped engine behaves
+    like the validated release entry; SGLANG_KUNLUN_DEFAULT_SYSTEM="" disables
+    the system injection.
+    
+
+    The ds_test accuracy harness sends ``enable_thinking: true`` and
+    ``thinking: {"type": "enabled"}`` at the top level (DeepSeek-serving
+    convention).  ``ChatCompletionRequest`` declares neither field and pydantic
+    drops unknown keys, so 0.5.21 silently answered without any reasoning; the
+    DeepSeek V4 detector (``reasoning_default="explicit_thinking"``) only reads
+    ``chat_template_kwargs["thinking"]``.  Rewrite the JSON body before FastAPI
+    validates it.  An explicit ``chat_template_kwargs`` value still wins.
+    """
+
+    _PATH = "/v1/chat/completions"
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope.get("type") != "http"
+            or scope.get("method") != "POST"
+            or not scope.get("path", "").endswith(self._PATH)
+        ):
+            return await self.app(scope, receive, send)
+
+        body = b""
+        while True:
+            message = await receive()
+            body += message.get("body", b"")
+            if not message.get("more_body", False):
+                break
+
+        try:
+            payload = json.loads(body) if body else None
+        except Exception:  # noqa: BLE001 -- let FastAPI produce its own 422
+            payload = None
+
+        if isinstance(payload, dict):
+            enabled = None
+            thinking = payload.get("thinking")
+            if isinstance(thinking, dict):
+                kind = thinking.get("type")
+                if kind in ("enabled", "disabled"):
+                    enabled = kind == "enabled"
+                elif "enabled" in thinking:
+                    enabled = bool(thinking.get("enabled"))
+            elif isinstance(thinking, bool):
+                enabled = thinking
+            if enabled is None and "enable_thinking" in payload:
+                enabled = bool(payload.get("enable_thinking"))
+            default_system = os.environ.get(
+                "SGLANG_KUNLUN_DEFAULT_SYSTEM", "You are a helpful assistant."
+            )
+            messages = payload.get("messages")
+            if (default_system and isinstance(messages, list) and messages
+                    and not any(isinstance(m, dict) and m.get("role") == "system"
+                                for m in messages)):
+                payload["messages"] = [{"role": "system", "content": default_system}] + messages
+                body = json.dumps(payload).encode()
+            if enabled is not None:
+                ctk = payload.get("chat_template_kwargs")
+                ctk = ctk if isinstance(ctk, dict) else {}
+                ctk.setdefault("thinking", enabled)
+                ctk.setdefault("enable_thinking", enabled)
+                payload["chat_template_kwargs"] = ctk
+                body = json.dumps(payload).encode()
+                logger.warning(
+                    "sglang-kunlun: thinking-compat rewrite enabled=%s", enabled
+                )
+
+        headers = [
+            (key, value)
+            for key, value in scope.get("headers", [])
+            if key.lower() != b"content-length"
+        ]
+        headers.append((b"content-length", str(len(body)).encode()))
+        scope = dict(scope)
+        scope["headers"] = headers
+
+        replayed = False
+
+        async def replay():
+            nonlocal replayed
+            if replayed:
+                # Starlette keeps polling ``receive`` while the response runs;
+                # handing it an immediate disconnect aborts streaming requests.
+                # Delegate to the real channel, which blocks until the client
+                # really goes away.
+                return await receive()
+            replayed = True
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        await self.app(scope, replay, send)
+
+
+def _install_thinking_compat(app) -> None:
+    """Install the thinking-body rewrite once, before uvicorn starts."""
+    global _thinking_compat_done
+    if _thinking_compat_done:
+        return
+    try:
+        app.add_middleware(_ThinkingCompatMiddleware)
+        _thinking_compat_done = True
+        logger.warning("sglang-kunlun: thinking-compat middleware installed")
+    except Exception as exc:  # noqa: BLE001 -- app already built / middleware frozen
+        logger.warning("sglang-kunlun: thinking-compat middleware not installed: %s", exc)
+
+
+_thinking_compat_done = False
+
+
 def install_routes(hs=None) -> None:
-    """Add the AIAK health/ready/instance-info routes onto sglang's ``app``.
+    """Add the health/ready/instance-info routes onto sglang's ``app``.
 
     ``hs`` is the ``sglang.srt.entrypoints.http_server`` module. When called from
     the ``sitecustomize`` import hook the freshly-executed module is passed in
@@ -105,9 +227,10 @@ def install_routes(hs=None) -> None:
     app = getattr(hs, "app", None)
     if app is None:
         return
+    _install_thinking_compat(app)
 
     async def health_generate(request: Request) -> Response:
-        """Health / readiness probe (shutdown-aware, AIAK-compatible)."""
+        """Health / readiness probe (shutdown-aware)."""
         tm = hs._global_state.tokenizer_manager
 
         # Readiness: report 507 while being drained so the gateway de-routes us.
@@ -331,7 +454,7 @@ def long_context_prefill_warmup(server_args) -> None:
         json=payload,
         headers=headers,
         timeout=1800,
-        verify=server_args.ssl_verify(),
+        verify=ssl_verify_of(server_args),
     )
     logger.info(
         "sglang-kunlun: long-context warmup (%d tokens) -> %s in %.1fs",
@@ -364,7 +487,7 @@ def start_long_context_warmup(server_args) -> None:
         while time.time() < deadline:
             try:
                 res = requests.get(
-                    url + "/health_generate", timeout=60, verify=server_args.ssl_verify()
+                    url + "/health_generate", timeout=60, verify=ssl_verify_of(server_args)
                 )
                 if res.status_code == 200:
                     break
@@ -390,7 +513,7 @@ def start_long_context_warmup(server_args) -> None:
     type=HookType.AROUND,
 )
 def launch_server_kunlun(original_fn, *args, **kwargs):
-    """Install the AIAK deployment routes onto ``app`` before uvicorn starts.
+    """Install the deployment routes onto ``app`` before uvicorn starts.
 
     Covers the single-process HTTP server. For ``--tokenizer-worker-num N`` the
     worker processes are handled by the ``sitecustomize`` import hook instead.

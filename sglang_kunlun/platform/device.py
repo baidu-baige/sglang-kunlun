@@ -49,3 +49,24 @@ class KunlunDeviceMixin(DeviceMixin):
         np.random.seed(seed)
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
+
+    def get_torch_profiler_activity_str(self) -> str:
+        """Return the torch profiler activity name for Kunlun.
+
+        Kunlun is an out-of-tree platform, so ``ProfilerManager`` reads this
+        through ``current_platform`` when a profiling request arrives. The
+        device maps to XPU, falling back to CUDA when the runtime exposes it.
+        """
+        import torch
+
+        if hasattr(torch.profiler.ProfilerActivity, "XPU"):
+            return "XPU"
+        return "CUDA"
+
+    def get_torch_profiler_activity(self) -> "torch.profiler.ProfilerActivity":
+        """Return the torch profiler activity enum for Kunlun."""
+        import torch
+
+        return getattr(
+            torch.profiler.ProfilerActivity, self.get_torch_profiler_activity_str()
+        )

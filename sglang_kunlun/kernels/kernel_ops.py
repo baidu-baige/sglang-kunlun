@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -22,6 +24,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import logging
+import os
 import sys
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Mapping, Optional, Tuple
@@ -82,6 +85,9 @@ class KernelLauncher:
 
 _TRITON_OPS: Dict[KernelKey, KernelSpec] = {}
 _JIT_OPS: Dict[KernelKey, KernelSpec] = {}
+# Upstream implementations captured at patch time (before the symbol is swapped),
+# so capture-gated fallbacks can still call the original in eager mode.
+_UPSTREAM_ORIGINALS: Dict[KernelKey, Callable] = {}
 
 
 def register_triton_op(
@@ -163,6 +169,7 @@ def _patch_symbol(spec: KernelSpec, replacement: object) -> None:
         logger.warning("kernel_ops: %s.%s not found", *key)
         return
     original = getattr(module, spec.kernel_name)
+    _UPSTREAM_ORIGINALS[key] = original
     _replace_imported_bindings(original, replacement)
     setattr(module, spec.kernel_name, replacement)
     logger.info("kernel_ops: patched %s.%s", *key)
@@ -182,7 +189,7 @@ def install() -> None:
         _patch_symbol(spec, spec.impl)
 
 
-@register_triton_op("sglang.srt.mem_cache.common", "write_req_to_token_pool_triton")
+@register_triton_op("sglang.kernels.ops.memory.common", "write_req_to_token_pool_triton")
 def write_req_to_token_pool_triton(
     req_to_token_ptr: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -206,7 +213,7 @@ def write_req_to_token_pool_triton(
     )
 
 
-@register_triton_op("sglang.srt.mem_cache.common", "get_last_loc_kernel")
+@register_triton_op("sglang.kernels.ops.memory.common", "get_last_loc_kernel")
 def get_last_loc_kernel(
     req_to_token: torch.Tensor,
     req_pool_indices_tensor: torch.Tensor,
@@ -227,8 +234,8 @@ def get_last_loc_kernel(
 
 
 @register_triton_op(
-    "sglang.srt.layers.attention.utils",
-    "concat_and_cast_mha_k_kernel",
+    "sglang.kernels.ops.kvcache.cache_ops",
+"concat_and_cast_mha_k_kernel",
 )
 def concat_and_cast_mha_k_kernel(
     k: torch.Tensor,
@@ -249,7 +256,7 @@ def concat_and_cast_mha_k_kernel(
 
 
 @register_triton_op(
-    "sglang.srt.layers.attention.utils",
+    "sglang.kernels.ops.attention.pad",
     "seqlens_expand_kernel",
 )
 def seqlens_expand_kernel(
@@ -273,7 +280,7 @@ def seqlens_expand_kernel(
 
 
 @register_triton_op(
-    "sglang.srt.model_executor.forward_batch_deepseek_mha_mixin",
+    "sglang.kernels.ops.kvcache.kv_indices",
     "create_chunked_prefix_cache_kv_indices",
 )
 def create_chunked_prefix_cache_kv_indices(
@@ -305,7 +312,7 @@ def create_chunked_prefix_cache_kv_indices(
 
 
 @register_triton_op(
-    "sglang.srt.layers.dp_attention",
+    "sglang.kernels.ops.memory.memcpy_triton",
     "memcpy_triton_kernel",
 )
 def memcpy_triton_kernel(
@@ -329,7 +336,7 @@ def memcpy_triton_kernel(
 
 
 @register_jit_op(
-    "sglang.srt.layers.attention.dsv4.metadata_kernel",
+    "sglang.kernels.ops.attention.dsv4.metadata_kernel",
     "init_compression_metadata",
 )
 def init_compression_metadata(
@@ -351,9 +358,14 @@ def init_compression_metadata(
     seq_lens_i64 = seq_lens.to(torch.int64)
     positions_i64 = positions.to(torch.int64)
     raw_out_loc_i64 = raw_out_loc.to(torch.int64)
+    # c4/c128 out_loc are per write-token; seq_lens/positions may be longer
+    # (CP pads the causal metadata). Align to raw_out_loc so XPU where gets
+    # matching shapes and we reproduce the kernel's is_write_token masking.
+    _num_write_tokens = raw_out_loc_i64.shape[0]
+    seq_lens_w = seq_lens_i64[:_num_write_tokens]
 
     # --- c4 ---
-    c4_should = (seq_lens_i64 % 4) == 0
+    c4_should = (seq_lens_w % 4) == 0
     c4_out_loc = torch.where(
         c4_should, raw_out_loc_i64 // 4, torch.zeros_like(raw_out_loc_i64)
     ).to(torch.int64)
@@ -362,7 +374,7 @@ def init_compression_metadata(
     c4_seq_lens_clamp1 = torch.clamp(c4_seq_lens_raw, min=1).to(torch.int32)
 
     # --- c128 ---
-    c128_should = (seq_lens_i64 % 128) == 0
+    c128_should = (seq_lens_w % 128) == 0
     c128_out_loc = torch.where(
         c128_should, raw_out_loc_i64 // 128, torch.zeros_like(raw_out_loc_i64)
     ).to(torch.int64)
@@ -413,6 +425,523 @@ def init_compression_metadata(
     )
 
 
+def _ceil_ue8m0_exp_torch(sf: torch.Tensor) -> torch.Tensor:
+    """`_ceil_ue8m0_exp`: biased exponent, rounded up when a mantissa is
+    present, clamped to [1, 254]."""
+    bits = sf.contiguous().view(torch.int32)
+    exp = (bits >> 23) & 0xFF
+    exp = exp + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+    return exp.clamp(1, 254)
+
+
+def _fp4_e2m1_code_torch(v: torch.Tensor, rne: bool) -> torch.Tensor:
+    """`_fp4_e2m1_code` / `_fp4_e2m1_code_rne`: e2m1 code with the sign in bit 3."""
+    ax = v.abs().clamp_max(6.0)
+    thresholds = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+    if rne:
+        idx = torch.zeros_like(ax, dtype=torch.int32)
+        is_boundary = torch.zeros_like(ax, dtype=torch.bool)
+        for t in thresholds:
+            idx = idx + (ax >= t).to(torch.int32)
+            is_boundary = is_boundary | (ax == t)
+        # Round-half-to-even: an odd index exactly on a boundary drops to the
+        # even one.
+        idx = torch.where(is_boundary & ((idx & 1) == 1), idx - 1, idx)
+    else:
+        idx = torch.zeros_like(ax, dtype=torch.int32)
+        for t in thresholds:
+            idx = idx + (ax > t).to(torch.int32)
+    sign = ((v < 0) & (idx != 0)).to(torch.int32)
+    return idx | (sign << 3)
+
+
+def _stream_capturing() -> bool:
+    """True only while a cuda-graph capture is in progress on this stream.
+
+    The torch fp4/low-ratio/fill fallbacks below are capture-only: the upstream
+    Triton kernels run fine eagerly on XPU but cannot launch inside capture
+    (err_code -900). Conversely the torch scatters, while numerically
+    identical, corrupted the argmax input when run eagerly on XMLIR, so eager
+    must keep Triton.
+    """
+    # [CG-DETECT] torch.cuda.is_current_stream_capturing() returns False inside
+    # this build's capture (verified by trace), so the capture-only fallbacks
+    # were silently skipped and the Triton kernels ran in the graph. Prefer
+    # sglang's process-global capture flag, torch only as a fallback.
+    try:
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+
+        if bool(get_is_capture_mode()):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _jit_original(module_path: str, name: str) -> Optional[Callable]:
+    """Return the pristine upstream impl captured by ``install()`` before the
+    symbol was swapped. Used by the capture-gated fallbacks to pass through to
+    the original Triton kernel when not capturing."""
+    return _UPSTREAM_ORIGINALS.get((module_path, name))
+
+
+# ---- fp4 indexer quantize: native XSpeedGate op (r82) ----------------------
+# ``xspeedgate_ops.quantize_fp4_indexer_tensor`` does the whole ue8m0 fp4
+# quantize in one kernel. It is bit-exact with ``_quantize_fp4_indexer_torch``
+# (12/12: three geometries x both ``rne`` arms, plus exact e2m1 midpoints,
+# all zeros and a 1e-30 denormal scale) and 2.075 -> 0.114 ms/call at n=61436
+# (18x per-call sync, 1.747 -> 0.081 pipelined, which matches the in-engine
+# 80 us median). The torch chain it replaces was 0.76% of device time in the
+# r80 census (_fp4_e2m1_code_torch 7.08 + _quantize_fp4_indexer_torch 1.63
+# ms/step). ``KL_FP4_NATIVE=0`` restores the torch chain. A per-device probe
+# still guards the native path because the op is bf16-only, and capture is
+# skipped (the store's scatter is already capture-specific; keep that path
+# exactly as delivered).
+_FP4_NATIVE = os.environ.get("KL_FP4_NATIVE", "1") != "0"
+_fp4_native_ok: Dict[str, bool] = {}
+
+
+def _fp4_native_available(x: torch.Tensor) -> bool:
+    """Probe once per device: op present, bf16 in, expected output shapes."""
+    key = str(x.device)
+    if key in _fp4_native_ok:
+        return _fp4_native_ok[key]
+    ok = False
+    if x.dtype is torch.bfloat16:
+        try:
+            t = torch.zeros(128, 128, dtype=x.dtype, device=x.device)
+            k, s = torch.ops.xspeedgate_ops.quantize_fp4_indexer_tensor(t, rne=False)
+            ok = tuple(k.shape) == (128, 64) and tuple(s.shape) == (128,)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "sglang-kunlun: native fp4 quantize unavailable on %s (%s);"
+                " torch chain stays",
+                key,
+                exc,
+            )
+    _fp4_native_ok[key] = ok
+    return ok
+
+
+def _quantize_fp4_indexer_fast(
+    x: torch.Tensor, rne: bool = False
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Native quantize when it is safe, else the bit-exact torch chain."""
+    if not _stream_capturing() and _FP4_NATIVE and _fp4_native_available(x):
+        try:
+            return torch.ops.xspeedgate_ops.quantize_fp4_indexer_tensor(
+                x.contiguous(), rne=rne
+            )
+        except Exception as exc:  # noqa: BLE001
+            _fp4_native_ok[str(x.device)] = False
+            logger.warning(
+                "sglang-kunlun: native fp4 quantize failed at runtime (%s);"
+                " falling back to torch",
+                exc,
+            )
+    return _quantize_fp4_indexer_torch(x, rne=rne)
+
+
+def _quantize_fp4_indexer_torch(
+    x: torch.Tensor, rne: bool = False
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pure-torch ue8m0 fp4 quantize (bit-exact with the upstream Triton kernel).
+
+    Four 32-element groups per 128-wide row; group scale is
+    ``ceil_pow2_exp(max(|x|)/6)`` stored as one byte each in the int32, and the
+    payload packs two 4-bit e2m1 codes per byte (low nibble = even column).
+    Used both under capture (the upstream Triton kernel cannot launch there) and
+    by the fused store below (the upstream 1-CTA-per-row kernel is launch-bound
+    on XPU: ~1.7 ms flat here vs O(n) upstream, 10.9x at n=16384).
+    """
+    assert x.shape[-1] == 128
+    x = x.contiguous().view(-1, 128)
+    n = x.shape[0]
+    x_fp4 = torch.empty((n, 64), device=x.device, dtype=torch.int8)
+    x_sf = torch.empty((n,), device=x.device, dtype=torch.int32)
+    if n == 0:
+        return x_fp4, x_sf
+    xf = x.to(torch.float32).view(n, 4, 32)
+    sf = (xf.abs().amax(dim=2) / 6.0).clamp_min(1.0e-4)
+    exp = _ceil_ue8m0_exp_torch(sf)
+    x_sf.copy_(
+        exp[:, 0] | (exp[:, 1] << 8) | (exp[:, 2] << 16) | (exp[:, 3] << 24)
+    )
+    scale = (exp << 23).view(torch.float32).unsqueeze(-1)
+    code = _fp4_e2m1_code_torch(xf / scale, rne).view(n, 64, 2)
+    x_fp4.copy_(((code[..., 0] & 0x0F) | ((code[..., 1] & 0x0F) << 4)).to(torch.int8))
+    return x_fp4, x_sf
+
+
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.fp4_indexer",
+    "quantize_fp4_indexer_tensor",
+)
+def quantize_fp4_indexer_tensor(
+    x: torch.Tensor, rne: bool = False
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Capture-safe fallback for the fp4 indexer quantize Triton kernel.
+
+    The upstream ``_quantize_fp4_indexer_kernel`` launch fails inside
+    cuda-graph capture on the Kunlun XPU backend (``xpuLaunchKernel ...
+    err_code: -900``, hit at decode-graph capture via
+    ``_low_ratio_write_group -> set_index_k_fp4``); eager Triton works, so the
+    torch version below is used ONLY under capture.
+    """
+    if not _stream_capturing():
+        original = _jit_original(
+            "sglang.kernels.ops.attention.dsv4.fp4_indexer",
+            "quantize_fp4_indexer_tensor",
+        )
+        if original is not None:
+            return original(x, rne=rne)
+    return _quantize_fp4_indexer_torch(x, rne=rne)
+
+
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.fp4_indexer",
+    "store_fp4_index_k_cache",
+)
+def store_fp4_index_k_cache(
+    input: torch.Tensor,
+    cache: torch.Tensor,
+    loc: torch.Tensor,
+    *,
+    page_size: int,
+    rne: bool = False,
+) -> None:
+    """Fused, capture-safe replacement for ``store_fp4_index_k_cache``.
+
+    Upstream is ``quantize_fp4_indexer_tensor`` (a 1-CTA-per-row Triton kernel,
+    launch-bound on XPU) followed by ``_store_fp4_index_k_cache_kernel`` (also
+    1-CTA-per-token, whose 4-wide ``tl.arange(0, 4)`` scale store is
+    miscompiled: the scale bytes come out nondeterministic, two identical
+    launches disagree). Both eager and capture paths therefore use a pure
+    kernel quantize (the native XSpeedGate op when the arm is on and the op is
+    available, else the bit-exact torch chain) plus the int32-word scatter
+    below.
+
+    The cache is ``[num_pages, page_size * 68]`` uint8: per page a
+    ``page_size * 64`` payload region followed by a ``page_size * 4`` scale
+    region. Viewed as int32 that is ``[num_pages, page_size * 17]``: the
+    payload is 16 words per token and the scale is one packed word per token,
+    so each token needs just one 16-word scatter and one scalar scatter. This
+    is bit-exact with the reference layout (the packed scale already holds the
+    four ue8m0 exponents in little-endian byte order) and deterministic.
+    Measured vs upstream (n = tokens): full-op 4.0x @4096, 6.7x @8192,
+    12.2x @16384, 26.6x @65536.
+    """
+    assert input.shape[-1] == 128
+    assert cache.shape[1] == page_size * (64 + 4)
+    assert cache.shape[1] % 4 == 0
+    k_fp4, k_sf = _quantize_fp4_indexer_fast(input, rne=rne)
+    n_tokens = input.numel() // input.shape[-1]
+    if n_tokens == 0:
+        return
+    cache_i32 = cache.view(torch.int32)
+    words_per_page = cache_i32.shape[1]
+    loc = loc.to(torch.int64)
+    if not _stream_capturing():
+        # Eager: drop the padding entries (``loc == 0``). The upstream fused
+        # kernel suppresses the store for ``out_loc`` of -1 (incomplete group)
+        # and 0 (padding) alike, and the caller has already folded -1 into 0,
+        # so dropping 0 matches its semantics. It is also ~12x faster: routing
+        # every padded token to slot 0 turns the payload scatter into a
+        # many-to-one write, which XPU's ``scatter_v2_large_index`` serializes
+        # (17 ms vs 1.3 ms at n=32768 with 15% padding; 54 ms at 50%). Only the
+        # (never-read) padding slot differed, so the real cache is bit-exact.
+        keep = loc > 0
+        loc = loc[keep]
+        if loc.numel() == 0:
+            return
+        k_fp4 = k_fp4.view(torch.int32)[keep]
+        k_sf = k_sf[keep]
+    else:
+        # Capture: boolean compaction would introduce a data-dependent shape, so
+        # keep the padded tokens in and take the redundant slot-0 writes.
+        k_fp4 = k_fp4.view(torch.int32)
+    page = loc // page_size
+    page_offset = loc - page * page_size
+
+    # Payload: 16 contiguous int32 words per token at (page, page_offset * 16).
+    flat = cache_i32.view(-1)
+    word_base = page * words_per_page + page_offset * 16
+    word_offsets = torch.arange(16, device=cache.device)
+    flat[(word_base[:, None] + word_offsets[None, :]).reshape(-1)] = k_fp4.reshape(-1)
+    # Scale: one packed int32 word per token at (page, page_size * 16 + page_offset).
+    flat[page * words_per_page + page_size * 16 + page_offset] = k_sf
+
+
+@register_jit_op(
+    "sglang.kernels.ops.moe.fill_padded_rows",
+    "_fill_padded_rows",
+)
+def _fill_padded_rows(
+    x: torch.Tensor,
+    num_token_non_padded: torch.Tensor,
+    fill_value,
+) -> None:
+    """Capture-safe fallback for the MoE padded-row fill Triton helper.
+
+    Upstream ``_fill_padded_rows`` launches the ``_fill_padded_rows_kernel``
+    ``triton.jit`` kernel, which fails to launch inside cuda-graph capture on
+    the Kunlun XPU backend (``xpuLaunchKernel ... err_code: -900``, hit at
+    decode-graph capture via ``_zero_topk_weights_padded_region`` in the DSV4.1
+    vl_routing / MoE topk path). Eager Triton works, so this masked-assignment
+    version (which reads the pad count from device memory, no host sync) runs
+    ONLY under capture.
+    """
+    if not _stream_capturing():
+        original = _jit_original(
+            "sglang.kernels.ops.moe.fill_padded_rows",
+            "_fill_padded_rows",
+        )
+        if original is not None:
+            return original(x, num_token_non_padded, fill_value)
+    # Capturable fill: boolean-mask assignment (x[mask] = v) lowers to
+    # nonzero() + scatter, which needs a device->host count sync that cannot
+    # replay inside an XPU graph. A masked where keeps the whole write on
+    # device with static shapes.
+    rows = torch.arange(x.shape[0], device=x.device, dtype=torch.int64)
+    pad_mask = (rows >= num_token_non_padded.reshape(1).to(torch.int64)).unsqueeze(-1)
+    x.copy_(torch.where(pad_mask.expand_as(x), torch.full_like(x, fill_value), x))
+
+
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.metadata_kernel",
+    "build_low_ratio_metadata",
+)
+def build_low_ratio_metadata(seq_lens: torch.Tensor, out_loc: torch.Tensor, topk: int):
+    """Capture-safe fallback for the DSV4 low-ratio metadata Triton wrapper.
+
+    Upstream ``build_low_ratio_metadata`` launches the ``_low_ratio_metadata``
+    ``triton.jit`` kernel. On the Kunlun triton/XPU backend the launch fails
+    inside cuda-graph capture with ``xpuLaunchKernel ... err_code: -900``
+    (observed at decode-graph capture for every bs bucket); eager Triton works,
+    so the torch version below runs ONLY under capture, mirroring the
+    ``quantize_fp4_indexer_tensor`` gating. It reproduces the kernel's exact
+    output contract.
+    """
+    if not _stream_capturing():
+        original = _jit_original(
+            "sglang.kernels.ops.attention.dsv4.metadata_kernel",
+            "build_low_ratio_metadata",
+        )
+        if original is not None:
+            return original(seq_lens, out_loc, topk)
+    rows = seq_lens.numel()
+    assert out_loc.numel() == rows
+    lengths = seq_lens.to(torch.int32)
+    loc = out_loc.to(torch.int64)
+    len1 = lengths.clamp(min=1)
+    len2 = (lengths >> 1).clamp(min=1)
+    # PADDED aligns the page-index width to the next 64 multiple, matching the
+    # kernel's `triton.cdiv(topk, 64) * 64`.
+    padded = (topk + 63) // 64 * 64
+
+    def _one(loc_col, lens, pad_value):
+        # Fill with a device-side masked write (not torch.full): XMLIR may lower
+        # scalar `full` to an H2D staging memcpy, which records a host-sourced
+        # transfer into the graph - replay then re-reads freed host memory.
+        page = torch.zeros((rows, padded), dtype=torch.int32,
+                           device=seq_lens.device)
+        page.fill_(-1)
+        return (
+            loc_col,
+            lens.to(torch.int32),
+            torch.minimum(
+                lens,
+                torch.full((), topk, dtype=torch.int32, device=lens.device),
+            ),
+            page,
+        )
+
+    c1 = _one(loc, len1, -1)
+    c2 = _one(
+        torch.where((lengths & 1) == 0, loc >> 1, torch.full_like(loc, -1)),
+        len2,
+        -1,
+    )
+    return (
+        c1[0], c1[1], c1[2], c1[3],
+        c2[0], c2[1], c2[2], c2[3],
+    )
+
+
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4_attn_metadata_kernels",
+    "build_page_table_positions_small",
+)
+def build_page_table_positions_small(
+    *,
+    req_to_token: torch.Tensor,
+    req_pool_indices_repeated: torch.Tensor,
+    seq_lens_casual: torch.Tensor,
+    max_seq_len: int,
+    page_size: int,
+    swa_window: int,
+):
+    """Native replacement for the DSV4 ``_small_page_table`` Triton wrapper.
+
+    Upstream ``build_page_table_positions_small`` launches the ``_small_page_table``
+    ``triton.jit`` kernel, which cannot launch inside cuda-graph capture on XPU
+    (and the Kunlun triton backend cannot compile it). ``xspeedgate_ops``
+    ``page_table_positions`` has identical semantics and is capture-safe, so we
+    replace the whole wrapper (keeps the upstream sglang tree pristine — this is
+    the plugin-side home of what used to be an in-place core edit).
+    """
+    from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
+        PageTablePositionsResult,
+    )
+
+    assert page_size > 0 and page_size & (page_size - 1) == 0
+    lengths, positions, table, swa = torch.ops.xspeedgate_ops.page_table_positions(
+        req_to_token.to(torch.int32),
+        req_pool_indices_repeated.to(torch.int32),
+        seq_lens_casual.to(torch.int32),
+        int(max_seq_len),
+        int(page_size),
+        int(swa_window),
+    )
+    return PageTablePositionsResult(
+        seq_lens_casual=lengths,
+        positions_casual=positions,
+        page_table=table,
+        swa_topk_lengths=swa,
+    )
+
+
+# ---- DSV4 prefill causal expansion: cached gather instead of three scalar repeats ----
+# Upstream ``expand_prefill_causally`` builds three length-num_tokens vectors with
+# ``torch.repeat_interleave`` (lines 96/100/103 of the module). ``repeat_interleave_fwd``
+# is a single-threaded scalar kernel: 61,436 elements cost 353.8 us each (5.76 ns/elem,
+# ~1.4 GB/s) => 1.06 ms per forward for three vectors whose *token -> request* index
+# depends only on the per-request extend lens. In a steady prefill pose (bs=1) that
+# index is a constant, so it is built once and cached, then applied with two
+# ``index_select`` gathers and one vector add (bandwidth-bound, few us each).
+#
+# ``(start_positions[r] + 1) + (t - start_locs[r])`` is regrouped as
+# ``(start_positions[r] + 1 - start_locs[r]) + t``; every intermediate stays in int32
+# and magnitudes are <= 65k, so the reassociation is exact and the output is
+# bit-identical (verified in-pod against the upstream torch reference). The
+# ``extend_start_loc is None`` host-loop branch and the "no host mirror and bs > 1"
+# case pass straight through to the upstream original (captured by ``install()``),
+# i.e. they behave exactly as before.
+_EXPAND_PREFIX = "sglang.kernels.ops.attention.dsv4_attn_metadata_kernels"
+_EXPAND_IDX_CACHE: Dict[Tuple[str, int, Optional[Tuple[int, ...]]], torch.Tensor] = {}
+_EXPAND_IDX_CACHE_MAX = 8
+
+
+def _expand_prefill_idx(
+    device: torch.device,
+    extend_seq_lens: torch.Tensor,
+    extend_seq_lens_cpu: Optional[list],
+    num_tokens: int,
+) -> Optional[torch.Tensor]:
+    """Return ``idx[t] = request index of token t``, or ``None`` to fall back."""
+    if extend_seq_lens_cpu is not None:
+        lens: Optional[Tuple[int, ...]] = tuple(int(v) for v in extend_seq_lens_cpu)
+        if sum(lens) != num_tokens:
+            return None
+    elif extend_seq_lens.numel() == 1:
+        # bs == 1: idx is all zeros regardless of the (unread) lens value.
+        lens = None
+    else:
+        return None
+    key = (str(device), int(num_tokens), lens)
+    cached = _EXPAND_IDX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if lens is None:
+        idx = torch.zeros(num_tokens, dtype=torch.int64, device=device)
+    else:
+        idx = torch.repeat_interleave(
+            torch.arange(len(lens), dtype=torch.int64, device=device),
+            torch.tensor(lens, dtype=torch.int64, device=device),
+            output_size=num_tokens,
+        )
+    if len(_EXPAND_IDX_CACHE) >= _EXPAND_IDX_CACHE_MAX:
+        _EXPAND_IDX_CACHE.pop(next(iter(_EXPAND_IDX_CACHE)))
+    _EXPAND_IDX_CACHE[key] = idx
+    return idx
+
+
+@register_jit_op(_EXPAND_PREFIX, "expand_prefill_causally")
+def expand_prefill_causally(
+    *,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    extend_start_loc: Optional[torch.Tensor],
+    seq_lens_cpu: Optional[list],
+    extend_seq_lens_cpu: Optional[list],
+    num_tokens: int,
+    padded_num_tokens: Optional[int],
+):
+    """Cached-index replacement for the upstream ``expand_prefill_causally``."""
+
+    from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
+        ExpandPrefillCausallyResult,
+    )
+
+    if extend_start_loc is not None:
+        device = req_pool_indices.device
+        idx = _expand_prefill_idx(
+            device, extend_seq_lens, extend_seq_lens_cpu, num_tokens
+        )
+        # A zero-token rank (empty CP/EP shard) can still be padded to a
+        # tensor-parallel tier. ``idx`` is empty then, so ``[-1:]`` has nothing
+        # to repeat over the pad rows; delegate that case to the reference
+        # implementation instead of expanding an empty tensor.
+        if idx is not None and idx.numel() > 0:
+            base = (
+                seq_lens.to(torch.int32)
+                - extend_seq_lens.to(torch.int32)
+                + 1
+                - extend_start_loc.to(torch.int32)
+            )
+            seq_lens_casual = torch.arange(
+                num_tokens, dtype=torch.int32, device=device
+            ) + base.index_select(0, idx)
+            req_pool_indices_repeated = req_pool_indices.index_select(0, idx)
+            if padded_num_tokens is not None and padded_num_tokens > num_tokens:
+                pad_size = padded_num_tokens - num_tokens
+                seq_lens_casual = torch.nn.functional.pad(
+                    seq_lens_casual, (0, pad_size), value=1
+                )
+                req_pool_indices_repeated = torch.cat(
+                    (
+                        req_pool_indices_repeated,
+                        req_pool_indices_repeated[-1:].expand(pad_size),
+                    )
+                )
+            return ExpandPrefillCausallyResult(
+                seq_lens_casual=seq_lens_casual,
+                req_pool_indices_repeated=req_pool_indices_repeated,
+            )
+
+    original = _jit_original(_EXPAND_PREFIX, "expand_prefill_causally")
+    if original is None:
+        from sglang.kernels.ops.attention import dsv4_attn_metadata_kernels as _m
+
+        original = _m.expand_prefill_causally
+    return original(
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        extend_seq_lens=extend_seq_lens,
+        extend_start_loc=extend_start_loc,
+        seq_lens_cpu=seq_lens_cpu,
+        extend_seq_lens_cpu=extend_seq_lens_cpu,
+        num_tokens=num_tokens,
+        padded_num_tokens=padded_num_tokens,
+    )
+
+
 @register_jit_op("sglang.srt.model_executor.forward_batch_info", "clamp_position")
 def clamp_position(seq_lens: torch.Tensor) -> torch.Tensor:
     """Compute non-negative last-token positions from sequence lengths."""
@@ -420,11 +949,11 @@ def clamp_position(seq_lens: torch.Tensor) -> torch.Tensor:
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
 
 
-@register_jit_op("sglang.jit_kernel.hadamard", "hadamard_transform")
+@register_jit_op("sglang.kernels.ops.quantization.hadamard", "hadamard_transform")
 def hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     """Apply Kunlun Hadamard transform replacement.
 
-    Mirrors aiak_sglang's implementation: build the Hadamard matrix via
+    Mirrors the reference implementation: build the Hadamard matrix via
     ``kunlun_ops.gen_hadamard_matrix`` and apply it with ``kunlun_ops.matmul``,
     instead of the fused ``xspeedgate_ops.hadamard_transform`` op.
     """
@@ -447,7 +976,7 @@ def hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     return out
 
 
-@register_jit_op("sglang.jit_kernel.activation", "silu_and_mul")
+@register_jit_op("sglang.kernels.ops.activation.activation", "silu_and_mul")
 def silu_and_mul(
     input: torch.Tensor,
     out: Optional[torch.Tensor] = None,
@@ -488,54 +1017,19 @@ def fast_topk(values: torch.Tensor, topk: int, dim: int):
     return torch.topk(values, topk, dim=dim)
 
 
-@register_jit_op("sglang.jit_kernel.grouped_topk", "grouped_topk")
-def grouped_topk(
-    scores: torch.Tensor,
-    bias: torch.Tensor,
-    num_expert_group: int,
-    topk_group: int,
-    topk: int,
-    renormalize: bool,
-    scaling_factor: float,
-):
-    """Kunlun fused sigmoid+grouped-topk+norm (replaces 0.5.14's nvcc-JIT kernel).
-
-    0.5.14's ``select_experts`` routes the CUDA single-group path through
-    ``sglang.jit_kernel.grouped_topk.grouped_topk`` which nvcc-JIT compiles
-    ``moe/grouped_topk.cuh`` with ``-std=c++20`` (rejected by Kunlun nvcc 11.7).
-    Replace it with ``kunlun_ops.moe_sigmoid_group_topk_norm``, returning the
-    same ``(topk_values, topk_indices)`` tuple. The block-statistic tensor it
-    also computes is discarded here and regenerated in the MoE method.
-    """
-    import kunlun_ops
-
-    m_, n_ = scores.shape
-    block_statistic = torch.empty(12, n_, dtype=torch.int32, device=scores.device)
-    topk_values = torch.empty(m_, topk, dtype=torch.float32, device=scores.device)
-    topk_indices = torch.empty(m_, topk, dtype=torch.int32, device=scores.device)
-    if m_ == 0:
-        return topk_values, topk_indices
-    kunlun_ops.moe_sigmoid_group_topk_norm(
-        x=scores,
-        topk_index=topk_indices,
-        norm_score=topk_values,
-        block_statistic=block_statistic,
-        bias=bias.float(),
-        scale=scaling_factor,
-        n_group=num_expert_group,
-        topk_group=topk_group,
-    )
-    return topk_values, topk_indices
+# [kunlun-adapt] 上游已移除 jit grouped_topk（新框架为纯 torch 实现）；
+# kunlun 的 moe_sigmoid_group_topk_norm 优化由 select_experts hook 层面另行接入。
 
 
 
 
-@register_triton_op("sglang.srt.mem_cache.utils", "set_mla_kv_buffer_kernel")
+@register_triton_op("sglang.kernels.ops.kvcache.mla_buffer", "set_mla_kv_buffer_kernel")
 def set_mla_kv_buffer_kernel(
     kv_buffer: torch.Tensor,
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
     loc: torch.Tensor,
+    reserved_skip_index: int,
     buffer_stride: int,
     nope_stride: int,
     rope_stride: int,
@@ -543,11 +1037,23 @@ def set_mla_kv_buffer_kernel(
     rope_dim: int,
     *,
     BLOCK: int,
+    DCP_RANK: int = 0,
+    DCP_WORLD_SIZE: int = 1,
+    USE_GDC: bool = False,
 ) -> None:
-    """Store MLA KV tensors into the paged KV buffer."""
+    """Store MLA KV tensors into the paged KV buffer.
 
+    [kunlun-adapt] 上游新增 reserved_skip_index（跳过保留槽 0 的写入）与 DCP
+    constexpr（Context-Parallel 分片）。Kunlun 单机无 DCP（DCP_WORLD_SIZE==1），
+    reserved 槽通过 loc 掩码过滤实现；strides 由 kunlun op 内部按连续布局处理。
+    """
     from kunlun_ops import set_mla_kv_buffer_triton as impl
 
+    # [kunlun-adapt] 上游 reserved_skip_index（跳过 CUDA-graph padding 保留槽 0）
+    # 在 triton kernel 内用设备端 mask 实现；此处直通 kunlun op、不做 host 掩码
+    # 过滤——`bool(keep.all())` 会产生隐式同步，在 decode CUDA-graph capture 期
+    # 非法。保留槽被写入属 padding 占位语义，无正确性影响（上游跳过它仅为
+    # 保守约定）；如后续 kunlun op 原生支持 skip 参数，可直接透传。
     impl(
         kv_buffer,
         loc,
@@ -556,7 +1062,7 @@ def set_mla_kv_buffer_kernel(
     )
 
 
-@register_triton_op("sglang.srt.mem_cache.utils", "get_mla_kv_buffer_kernel")
+@register_triton_op("sglang.kernels.ops.kvcache.mla_buffer", "get_mla_kv_buffer_kernel")
 def get_mla_kv_buffer_kernel(
     kv_buffer: torch.Tensor,
     cache_k_nope: torch.Tensor,
@@ -573,7 +1079,7 @@ def get_mla_kv_buffer_kernel(
     torch.ops.xspeedgate_ops.get_mla_kv_buffer(kv_buffer, loc, cache_k_nope, cache_k_rope)
 
 
-@register_triton_op("sglang.srt.mem_cache.triton_ops.allocator", "alloc_extend_kernel")
+@register_triton_op("sglang.kernels.ops.memory.allocator", "alloc_extend_kernel")
 def alloc_extend_kernel(
     prefix_lens: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -620,7 +1126,7 @@ def alloc_extend_kernel(
     # )
 
 
-@register_triton_op("sglang.srt.mem_cache.triton_ops.allocator", "alloc_decode_kernel")
+@register_triton_op("sglang.kernels.ops.memory.allocator", "alloc_decode_kernel")
 def alloc_decode_kernel(
     seq_lens: torch.Tensor,
     last_loc: torch.Tensor,
@@ -661,7 +1167,7 @@ def alloc_decode_kernel(
     )
 
 
-@register_jit_op("sglang.jit_kernel.kvcache", "store_cache")
+@register_jit_op("sglang.kernels.ops.kvcache.kvcache", "store_cache")
 def store_cache(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -743,7 +1249,7 @@ def _copy_fused_metadata_fallback(
         )
 
 
-@register_jit_op("sglang.jit_kernel.fused_metadata_copy", "fused_metadata_copy_cuda")
+@register_jit_op("sglang.kernels.ops.attention.fused_metadata_copy", "fused_metadata_copy_cuda")
 def fused_metadata_copy_cuda(
     cache_seqlens_src: torch.Tensor,
     cu_seqlens_k_src: torch.Tensor,
@@ -797,7 +1303,7 @@ def fused_metadata_copy_cuda(
     )
 
 
-@register_jit_op("sglang.jit_kernel.fused_metadata_copy", "fused_metadata_copy_multi_cuda")
+@register_jit_op("sglang.kernels.ops.attention.fused_metadata_copy", "fused_metadata_copy_multi_cuda")
 def fused_metadata_copy_multi_cuda(
     cache_seqlens_src: torch.Tensor,
     cu_seqlens_k_src: torch.Tensor,
@@ -896,8 +1402,8 @@ def fused_metadata_copy_multi_cuda(
 
 
 @register_triton_op(
-    "sglang.srt.speculative.multi_layer_eagle_utils",
-    "rotate_input_ids_kernel",
+    "sglang.kernels.ops.speculative.multi_layer_eagle",
+"rotate_input_ids_kernel",
 )
 def rotate_input_ids_kernel(
     input_ids: torch.Tensor,
@@ -925,15 +1431,8 @@ def rotate_input_ids_kernel(
     )
 
 
-@register_triton_op(
-    "sglang.srt.speculative.triton_ops.multi_layer_eagle",
-    "assign_hidden_states_pool_triton",
-    metadata={"call_style": "direct"},
-)
-@register_jit_op(
-    "sglang.srt.speculative.multi_layer_eagle_utils",
-    "assign_hidden_states_pool_triton",
-)
+# [kunlun-adapt] 上游 multi-layer-eagle 已重构，符号 assign_hidden_states_pool_triton 不复存在，注册移除
+# [kunlun-adapt] 上游 multi-layer-eagle 已重构，符号 assign_hidden_states_pool_triton 不复存在，注册移除
 def assign_hidden_states_pool_triton(
     hidden_states: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -991,11 +1490,7 @@ def assign_hidden_states_pool_triton(
         )
 
 
-@register_triton_op(
-    "sglang.srt.speculative.triton_ops.multi_layer_eagle",
-    "rotate_input_ids_triton",
-    metadata={"call_style": "direct"},
-)
+# [kunlun-adapt] 上游 multi-layer-eagle 已重构，符号 rotate_input_ids_triton 不复存在，注册移除
 def rotate_input_ids_triton(
     input_ids: torch.Tensor,
     extend_start_loc: torch.Tensor,
@@ -1024,10 +1519,7 @@ def rotate_input_ids_triton(
     return input_ids
 
 
-@register_triton_op(
-    "sglang.srt.speculative.multi_layer_eagle_utils",
-    "assign_new_state_kernel",
-)
+# [kunlun-adapt] 上游 multi-layer-eagle 已重构，符号 assign_new_state_kernel 不复存在，注册移除
 def assign_new_state_kernel(
     old_input_ids: torch.Tensor,
     old_positions: torch.Tensor,
@@ -1110,11 +1602,7 @@ def assign_new_state_kernel(
     new_hidden[:, 0, :].copy_(req_to_hidden_states_pool[req_indices + 1, -(step + 1)])
 
 
-@register_triton_op(
-    "sglang.srt.speculative.triton_ops.multi_layer_eagle",
-    "assign_new_state_triton",
-    metadata={"call_style": "direct"},
-)
+# [kunlun-adapt] 上游 multi-layer-eagle 已重构，符号 assign_new_state_triton 不复存在，注册移除
 def assign_new_state_triton(
     next_token_ids: torch.Tensor,
     old_input_ids: torch.Tensor,
@@ -1174,7 +1662,7 @@ def assign_new_state_triton(
 
 
 @register_triton_op(
-    "sglang.srt.speculative.triton_ops.cache_locs",
+    "sglang.kernels.ops.speculative.cache_locs",
     "assign_draft_cache_locs_contiguous",
 )
 def assign_draft_cache_locs_page_size_1(
@@ -1212,7 +1700,10 @@ def assign_draft_cache_locs_page_size_1(
 # replacement needed.
 
 
-@register_triton_op("sglang.srt.speculative.triton_ops.eagle", "fill_bonus_tokens")
+@register_triton_op(
+    "sglang.kernels.ops.speculative.eagle",
+    "fill_bonus_tokens",
+)
 def fill_bonus_tokens(
     accept_tokens: torch.Tensor,
     accept_lens: torch.Tensor,
@@ -1231,7 +1722,7 @@ def fill_bonus_tokens(
     )
 
 
-@register_triton_op("sglang.srt.speculative.triton_ops.eagle", "fill_accept_out_cache_loc")
+@register_triton_op("sglang.kernels.ops.speculative.eagle", "fill_accept_out_cache_loc")
 def fill_accepted_out_cache_loc(
     accept_index: torch.Tensor,
     out_cache_loc: torch.Tensor,
@@ -1250,8 +1741,8 @@ def fill_accepted_out_cache_loc(
 
 
 @register_triton_op(
-    "sglang.srt.speculative.triton_ops.cache_locs",
-    "generate_draft_decode_kv_indices",
+    "sglang.kernels.ops.speculative.cache_locs",
+"generate_draft_decode_kv_indices",
 )
 def generate_draft_decode_kv_indices(
     req_pool_indices: torch.Tensor,
@@ -1320,7 +1811,7 @@ def generate_draft_decode_kv_indices(
             kv_indptr_row[zid] = base + zid * iters
 
 
-@register_triton_op("sglang.srt.speculative.triton_ops.cache_locs", "assign_extend_cache_locs")
+@register_triton_op("sglang.kernels.ops.speculative.cache_locs", "assign_extend_cache_locs")
 def assign_extend_cache_locs(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -1355,8 +1846,7 @@ def assign_extend_cache_locs(
 # the modern EAGLE v2 pipeline. No Triton kernel to replace.
 
 
-@register_triton_op("sglang.srt.speculative.triton_ops.cache_locs", "assign_req_to_token_pool")
-@register_triton_op("sglang.srt.speculative.spec_utils", "assign_req_to_token_pool")
+@register_triton_op("sglang.srt.mem_cache.allocation", "assign_req_to_token_pool")
 def assign_req_to_token_pool(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -1382,7 +1872,7 @@ def assign_req_to_token_pool(
     )
 
 
-@register_triton_op("sglang.srt.speculative.spec_utils", "align_evict_mask_to_page_size")
+@register_triton_op("sglang.kernels.ops.speculative.cache_locs", "align_evict_mask_to_page_size")
 def align_evict_mask_to_page_size(
     seq_lens: torch.Tensor,
     evict_mask: torch.Tensor,
@@ -1401,7 +1891,7 @@ def align_evict_mask_to_page_size(
     )
 
 
-@register_jit_op("sglang.srt.speculative.triton_ops.gather_spec_extras", "gather_spec_extras")
+@register_jit_op("sglang.kernels.ops.speculative.gather_spec_extras", "gather_spec_extras")
 def gather_spec_extras(
     indices: torch.Tensor,
     topk_p_buf: torch.Tensor,
@@ -1423,7 +1913,82 @@ def gather_spec_extras(
     return topk_p, topk_index, bonus_tokens, hidden_states
 
 
-@register_jit_op("sglang.srt.speculative.reject_sampling", "chain_speculative_sampling_triton")
+_sampler_reported = False
+
+
+@register_jit_op(
+    "sglang.kernels.ops.speculative.dspark.dspark_draft_model",
+    "sample_step_tokens_triton",
+)
+def sample_step_tokens_triton(
+    *,
+    step_logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    greedy_mask: torch.Tensor,
+    exp_noise: torch.Tensor,
+) -> torch.Tensor:
+    """Deterministic torch sampler for one draft step.
+
+    Under sustained web traffic the Triton combine kernel occasionally left a
+    row of its int64 output unwritten; that stale float-bit pattern later
+    became a draft token and was used as a Markov embedding index (illegal
+    memory access). The torch path writes every row by construction.
+    """
+    global _sampler_reported
+    if not _sampler_reported:
+        _sampler_reported = True
+        print("[SAMPLER] Kunlun torch step sampler active", flush=True)
+    # Greedy requests carry temperature 0. Dividing by it makes the row inf ->
+    # NaN and argmax then returns token 0 for every greedy draft, so the target
+    # verify rejects every step. argmax over the temperature-1 softmax is the
+    # same argmax, so use divisor 1 for those rows.
+    temperature = temperatures.to(torch.float32)
+    is_greedy = greedy_mask.to(torch.bool) | (temperature <= 0)
+    divisor = torch.where(is_greedy, torch.ones_like(temperature), temperature)
+    probs = torch.softmax(step_logits.float() / divisor[:, None], dim=-1)
+    noise = torch.where(is_greedy[:, None], 1.0, exp_noise)
+    return probs.div_(noise).argmax(dim=-1).to(torch.int64)
+
+
+_accept_bad_token_reported = False
+
+
+# ---- t>0 corruption fix ----
+@register_jit_op(
+    "sglang.kernels.ops.speculative.dspark.dspark_draft_model",
+    "build_step_local_triton",
+)
+def build_step_local_triton(
+    *, bias: torch.Tensor, base_local: torch.Tensor
+) -> torch.Tensor:
+    """Deterministic torch build of one draft step's local logits.
+
+    Same contract as the triton kernel it replaces: ``base_local`` is this
+    rank's [rows, per_partition] slice of the draft model's logits, ``bias``
+    is the markov projection over the first ``org_width`` columns, and the
+    result is their sum in float32 with the padding columns left at the base
+    value.
+
+    The triton version allocated its output with ``torch.empty`` and, under
+    sustained traffic on this backend, left part of it unwritten -- the
+    returned rows carried NaN and float32-max bit patterns on ~7-9% of calls.
+    Those flowed through ``SoftmaxTemp`` into an all-non-finite
+    ``draft_probs`` row, which is what drove the temperature>0 output
+    corruption. This is the same failure, and the same remedy, as
+    ``sample_step_tokens_triton`` above. Every element is written here by
+    construction.
+    """
+    per_partition = base_local.shape[-1]
+    pad = per_partition - bias.shape[-1]
+    padded = (
+        torch.nn.functional.pad(bias.to(torch.float32), (0, pad))
+        if pad > 0
+        else bias.to(torch.float32)
+    )
+    return base_local.to(torch.float32) + padded
+
+
+@register_jit_op("sglang.kernels.ops.speculative.reject_sampling", "chain_speculative_sampling_triton")
 def chain_speculative_sampling_triton(
     predicts: torch.Tensor,
     accept_index: torch.Tensor,
@@ -1441,9 +2006,20 @@ def chain_speculative_sampling_triton(
     deterministic: bool,
 ) -> None:
     """Torch replacement for chain speculative rejection sampling on Kunlun."""
+    global _accept_bad_token_reported
 
     batch_size, num_slots = candidates.shape
     vocab_size = target_probs.shape[-1]
+    # The chain buffers come from a persistent cache and are torch.empty; only
+    # the slots the chain actually visits are written. Seed this call so any
+    # unexpected read (a stale accept_index entry or a backend contract drift)
+    # yields a valid token instead of an old float-bit pattern that would crash
+    # the next draft's Markov embedding lookup.
+    with torch.no_grad():
+        accept_index[:batch_size].copy_(retrive_index[:batch_size])
+        predicts[: batch_size * num_slots].copy_(
+            candidates.reshape(-1).to(predicts.dtype)
+        )
     for bid in range(batch_size):
         root_global_idx = int(retrive_index[bid, 0].item())
         accept_index[bid, 0] = root_global_idx
@@ -1455,6 +2031,23 @@ def chain_speculative_sampling_triton(
         step = 1
         while step < num_slots and continue_verifying:
             draft_token = int(candidates[bid, step].item())
+            if draft_token < 0 or draft_token >= vocab_size:
+                # A concurrent producer can leave an odd draft slot stale on
+                # this backend. Never index target_probs with it: treat the
+                # chain as rejected at this step and let the residual path
+                # resample from the target distribution.
+                if not _accept_bad_token_reported:
+                    _accept_bad_token_reported = True
+                    print(
+                        "[ACCEPT-GUARD] out-of-range draft token rejected: "
+                        f"dev={torch.cuda.current_device()} bid={bid} "
+                        f"step={step} token={draft_token} "
+                        f"vocab={vocab_size} dtype={candidates.dtype} "
+                        f"row={candidates[bid].tolist()}",
+                        flush=True,
+                    )
+                continue_verifying = False
+                break
             p = target_probs[bid, cur_prob_row, draft_token]
             q = draft_probs[bid, cur_prob_row, draft_token]
             coin = uniform_samples[bid, step - 1]
@@ -1491,8 +2084,8 @@ def chain_speculative_sampling_triton(
 
 
 @register_triton_op(
-    "sglang.srt.model_executor.triton_ops.position",
-    "compute_position_kernel",
+    "sglang.kernels.ops.attention.position",
+"compute_position_kernel",
 )
 def compute_position_kernel(
     positions: torch.Tensor,
@@ -1512,7 +2105,10 @@ def compute_position_kernel(
     extend_start_loc.copy_(out_start_loc.to(extend_start_loc.dtype))
 
 
-@register_jit_op("sglang.jit_kernel.rope", "apply_rope_with_cos_sin_cache_inplace")
+@register_jit_op(
+    "sglang.kernels.ops.attention.rope",
+    "apply_rope_with_cos_sin_cache_inplace",
+)
 def apply_rope_with_cos_sin_cache_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1545,8 +2141,8 @@ def apply_rope_with_cos_sin_cache_inplace(
 
 
 @register_triton_op(
-    "sglang.srt.layers.attention.dsa.index_buf_accessor",
-    "_get_k_triton_kernel",
+    "sglang.kernels.ops.attention.dsa.index_buf_accessor",
+"_get_k_triton_kernel",
 )
 def _get_k_triton_kernel(
     buf: torch.Tensor,
@@ -1567,7 +2163,7 @@ def _get_k_triton_kernel(
 
 
 @register_triton_op(
-    "sglang.srt.layers.attention.dsa.index_buf_accessor",
+    "sglang.kernels.ops.attention.dsa.index_buf_accessor",
     "_get_s_triton_kernel",
 )
 def _get_s_triton_kernel(
@@ -1587,7 +2183,7 @@ def _get_s_triton_kernel(
 
 
 @register_triton_op(
-    "sglang.srt.layers.attention.dsa.index_buf_accessor",
+    "sglang.kernels.ops.attention.dsa.index_buf_accessor",
     "_set_k_and_s_triton_kernel",
 )
 def _set_k_and_s_triton_kernel(
@@ -1602,6 +2198,7 @@ def _set_k_and_s_triton_kernel(
     BUF_NUMEL_PER_PAGE: int,
     NUM_K_ELEMS_PER_TOKEN: int,
     S_OFFSET_NBYTES_IN_PAGE: int,
+    PRESHUFFLE_TILE: int = 0,  # [kunlun-adapt] 上游新增 constexpr；fp8 布局由 kunlun set_k_and_s_triton 内部决定
 ) -> None:
     """_set_k_and_s_triton_kernel"""
     from kunlun_ops import set_k_and_s_triton
@@ -1616,7 +2213,7 @@ def _set_k_and_s_triton_kernel(
 
 
 @register_triton_op(
-    "sglang.srt.layers.attention.dsa.triton_kernel",
+    "sglang.kernels.ops.attention.dsa.triton_kernel",
     "_act_quant_kernel",
 )
 def _act_quant_kernel(
@@ -1641,7 +2238,7 @@ def _act_quant_kernel(
 
 
 @register_triton_op(
-    "sglang.srt.layers.quantization.int8_kernel",
+    "sglang.kernels.ops.quantization.int8_kernel",
     "_per_token_quant_int8",
 )
 def _per_token_quant_int8(
@@ -1670,8 +2267,8 @@ def _per_token_quant_int8(
 
 
 @register_triton_op(
-    "sglang.srt.layers.quantization.int8_kernel",
-    "_per_token_group_quant_int8",
+    "sglang.kernels.ops.quantization.int8_kernel",
+"_per_token_group_quant_int8",
 )
 def _per_token_group_quant_int8(
     y: torch.Tensor,
@@ -1692,8 +2289,8 @@ def _per_token_group_quant_int8(
 
 
 @register_jit_op(
-    "sglang.srt.layers.quantization.int8_kernel",
-    "sglang_per_token_group_quant_int8",
+    "sglang.kernels.ops.quantization.int8_kernel",
+"sglang_per_token_group_quant_int8",
 )
 def sglang_per_token_group_quant_int8(
     x: torch.Tensor,
@@ -1707,8 +2304,8 @@ def sglang_per_token_group_quant_int8(
 
 
 @register_triton_op(
-    "sglang.srt.layers.quantization.int8_kernel",
-    "_w8a8_block_int8_matmul",
+    "sglang.kernels.ops.gemm.int8_kernel",
+"_w8a8_block_int8_matmul",
 )
 def _w8a8_block_int8_matmul(
     A: torch.Tensor,
@@ -1744,6 +2341,50 @@ def _w8a8_block_int8_matmul(
 
 
 # ============================================================================
+# SWA page free: pure-torch replacement for get_and_clear_swa_pages. Its triton
+# kernel (get_and_clear_swa_pages_kernel) fails to compile on XPU triton
+# (RuntimeError: PassManager::run failed), crashing both prefill and decode when
+# a request frees its SWA pages.
+# ============================================================================
+
+
+@register_jit_op("sglang.kernels.ops.memory.allocator", "get_and_clear_swa_pages")
+def get_and_clear_swa_pages(
+    full_page_representatives: torch.Tensor,
+    mapping: torch.Tensor,
+    page_size: int,
+    check_page_mappings: bool = False,
+):
+    """Resolve one SWA page per FULL-page representative via mapping[full_reps],
+    flag peers_mapped, then clear that full page's mapping slots. Mirrors the
+    upstream get_and_clear_swa_pages_kernel semantics in torch."""
+    num_pages = full_page_representatives.numel()
+    swa_pages = torch.empty(num_pages, dtype=mapping.dtype, device=mapping.device)
+    peers_mapped = torch.empty(num_pages, dtype=torch.bool, device=mapping.device)
+    page_mappings_valid = (
+        torch.empty(num_pages, dtype=torch.bool, device=mapping.device)
+        if check_page_mappings
+        else None
+    )
+    if num_pages:
+        full_reps = full_page_representatives.to(torch.int64)
+        swa_reps = mapping[full_reps]
+        swa_pages = (swa_reps // page_size).to(mapping.dtype)
+        peers_mapped = swa_reps > 0
+        full_page_starts = full_reps // page_size * page_size
+        offsets = torch.arange(page_size, device=mapping.device)
+        mapping_offsets = full_page_starts[:, None] + offsets[None, :]
+        if check_page_mappings:
+            page_mapping = mapping[mapping_offsets]
+            same = (page_mapping // page_size) == (swa_reps[:, None] // page_size)
+            page_mappings_valid = (swa_reps > 0) & (
+                ((page_mapping > 0) & ~same).sum(dim=1) == 0
+            )
+        mapping[mapping_offsets.reshape(-1)] = 0
+    return swa_pages, peers_mapped, page_mappings_valid
+
+
+# ============================================================================
 # DSV4 tvm_ffi JIT kernel replacements (pure PyTorch)
 # All shim implementations live in dsv4_torch_shim.py; registered here so
 # they are patched into the upstream sglang.jit_kernel.dsv4.* modules at
@@ -1756,6 +2397,10 @@ from sglang_kunlun.kernels.dsv4_torch_shim import (  # noqa: E402
     _fused_k_norm_rope_flashmla_kunlun,
     _fused_rope_inplace_torch,
     _fused_rope_inplace_kunlun,
+    _q_rope_store_torch,
+    _rope_tail_fake_quant_fp4_torch,
+    _c2_decode_pool_torch,
+    _fp4_index_logits_decode_torch,
     _fused_norm_rope_inplace_torch,
     _fused_norm_rope_inplace_kunlun,
     _fused_q_indexer_rope_hadamard_quant_torch,
@@ -1767,7 +2412,7 @@ from sglang_kunlun.kernels.dsv4_torch_shim import (  # noqa: E402
 )
 
 
-@register_jit_op("sglang.jit_kernel.dsv4.elementwise", "fused_q_norm_rope")
+@register_jit_op("sglang.kernels.ops.attention.dsv4.elementwise", "fused_q_norm_rope")
 def fused_q_norm_rope(
     q_input: torch.Tensor,
     q_output: torch.Tensor,
@@ -1779,7 +2424,7 @@ def fused_q_norm_rope(
     _fused_q_norm_rope_torch(q_input, q_output, eps, freqs_cis, positions)
 
 
-@register_jit_op("sglang.jit_kernel.dsv4.elementwise", "fused_k_norm_rope_flashmla")
+@register_jit_op("sglang.kernels.ops.attention.dsv4.elementwise", "fused_k_norm_rope_flashmla")
 def fused_k_norm_rope_flashmla(
     kv: torch.Tensor,
     kv_weight: torch.Tensor,
@@ -1789,17 +2434,31 @@ def fused_k_norm_rope_flashmla(
     out_loc: torch.Tensor,
     kvcache: torch.Tensor,
     page_size: int,
+    layout=None,
 ) -> None:
     """Kunlun-native fused K norm + RoPE + paged cache store.
 
     Step 1: ``kunlun_ops.rmsnorm`` (with weight)
     Step 2: ``xspeedgate_ops.flashinfer_rotary_embedding`` on rope part
     Step 3: ``xspeedgate_ops.set_k_and_s_v4`` (bf16) or torch FP8 quant+write
+
+    ``layout`` mirrors the upstream signature (the caller now passes
+    ``layout=self.kv_layout``). The Kunlun store implements only the V4 paged
+    FlashMLA layout, matching the upstream XPU branch which asserts
+    ``layout is KVLayout.V4`` (the V4.1 layouts are CUDA sm100 only).
     """
+    if layout is not None:
+        from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+
+        layout = KVLayout.parse(layout)
+        assert layout is KVLayout.V4, (
+            "sglang_kunlun fused_k_norm_rope_flashmla only supports the V4 KV "
+            f"layout (V4.1 layouts are CUDA sm100 only); got {layout}"
+        )
     _fused_k_norm_rope_flashmla_kunlun(kv, kv_weight, eps, freqs_cis, positions, out_loc, kvcache, page_size)
 
 
-@register_jit_op("sglang.jit_kernel.dsv4.elementwise", "fused_rope_inplace")
+@register_jit_op("sglang.kernels.ops.attention.dsv4.elementwise", "fused_rope_inplace")
 def fused_rope_inplace(
     q: torch.Tensor,
     k: Optional[torch.Tensor],
@@ -1814,7 +2473,286 @@ def fused_rope_inplace(
     _fused_rope_inplace_kunlun(q, k, freqs_cis, positions, inverse)
 
 
-@register_jit_op("sglang.jit_kernel.dsv4.compress_old", "fused_norm_rope_inplace")
+@register_jit_op("sglang.kernels.ops.attention.dsv4.q_rope_store", "q_rope_store")
+def q_rope_store(
+    q: torch.Tensor,
+    output: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> None:
+    """XSpeedGate-native q_rope_store (RoPE on the last 64 dims of each 512-wide
+    Q head, nope copied). Validated bit-identical to the torch reference; the
+    pure-torch ``_q_rope_store_torch`` remains the fallback for any shape the
+    native kernel rejects.
+    """
+    try:
+        torch.ops.xspeedgate_ops.q_rope_store(q, output, freqs_cis, positions)
+    except Exception:
+        _q_rope_store_torch(q, output, freqs_cis, positions)
+
+
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant",
+    "rope_tail_fake_quant_fp4",
+)
+def rope_tail_fake_quant_fp4(
+    x: torch.Tensor,
+    freqs: torch.Tensor,
+    rope_dim: int,
+    inverse: bool = False,
+    block_size: int = 32,
+    *,
+    compressed_kv: bool = False,
+) -> torch.Tensor:
+    """XSpeedGate-native fp4 RoPE-tail fake-quant (validated bit-identical to the
+    torch ref on the non-compressed path; native E4M3 on the compressed path).
+    Falls back to the pure-torch reference on any unsupported shape/dtype.
+    """
+    try:
+        xc = x.contiguous()
+        d = xc.shape[-1]
+        x2 = xc.reshape(-1, d)
+        rows = x2.shape[0]
+        t = freqs.shape[0]
+        out2 = torch.empty_like(x2, dtype=torch.bfloat16)
+        f_real = torch.view_as_real(freqs.contiguous()).contiguous()
+        torch.ops.xspeedgate_ops.rope_tail_fake_quant_fp4_kernel(
+            x2, f_real, out2,
+            x2.stride(0), out2.stride(0), f_real.stride(0),
+            rows // t, d, rope_dim,
+            16 if compressed_kv else block_size,
+            6.0 * (2.0 ** -126), bool(inverse), bool(compressed_kv), rows,
+        )
+        return out2.reshape(x.shape)
+    except Exception:
+        return _rope_tail_fake_quant_fp4_torch(
+            x, freqs, rope_dim, inverse=inverse, block_size=block_size,
+            compressed_kv=compressed_kv,
+        )
+
+
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.c2_decode_pool", "c2_decode_pool"
+)
+def c2_decode_pool(
+    kv: torch.Tensor,
+    score: torch.Tensor,
+    pos: torch.Tensor,
+    raw_out_loc: torch.Tensor,
+    out_loc: torch.Tensor,
+    req: torch.Tensor,
+    state_kv: torch.Tensor,
+    state_score: torch.Tensor,
+    pad_row: int,
+    *,
+    ring_size: int = 0,
+):
+    """Pure-torch replacement for the Triton ratio-2 decode pair-pool (no XPU
+    Triton). Updates state_kv/state_score in place; returns (pooled, group_pos,
+    slots)."""
+    try:
+        return torch.ops.xspeedgate_ops.pair_pool_decode(
+            kv, score, pos, raw_out_loc, out_loc, req, state_kv, state_score,
+            pad_row, ring_size,
+        )
+    except Exception:
+        return _c2_decode_pool_torch(
+            kv, score, pos, raw_out_loc, out_loc, req, state_kv, state_score,
+            pad_row, ring_size=ring_size,
+        )
+
+
+@register_jit_op(
+    "sglang.kernels.ops.attention.dsv4.fp4_indexer", "fp4_index_logits_decode"
+)
+def fp4_index_logits_decode(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    slots: torch.Tensor,
+    lens: torch.Tensor,
+    table: torch.Tensor,
+    page_size: int,
+) -> torch.Tensor:
+    """Pure-torch replacement for the Triton fp4 decode indexer logits (no XPU
+    Triton). Dequantizes the fp4 index-K cache and computes the per-position
+    head-summed relu-weighted scores."""
+    return _fp4_index_logits_decode_torch(
+        q, weights, slots, lens, table, page_size
+    )
+
+
+@register_jit_op("sglang.kernels.ops.speculative.tree", "build_tree_kernel_efficient")
+def build_tree_kernel_efficient(
+    parent_list: torch.Tensor,
+    selected_index: torch.Tensor,
+    verified_seq_len: torch.Tensor,
+    tree_mask: torch.Tensor,
+    positions: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    topk: int,
+    depth: int,
+    draft_token_num: int,
+    tree_mask_mode: int,
+) -> None:
+    """Route EAGLE tree build to the Kunlun impl (upstream is a CUDA JIT that
+    needs C++20 <concepts>, unavailable to nvcc's host g++ on P800)."""
+    from sglang_kunlun.kernels.sgl_kernel_kunlun.speculative import (
+        build_tree_kernel_efficient as _kunlun_build_tree,
+    )
+    _kunlun_build_tree(
+        parent_list, selected_index, verified_seq_len, tree_mask, positions,
+        retrive_index, retrive_next_token, retrive_next_sibling,
+        topk, depth, draft_token_num, tree_mask_mode,
+    )
+
+
+@register_jit_op("sglang.kernels.ops.speculative.tree", "verify_tree_greedy")
+def verify_tree_greedy(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    target_predict: torch.Tensor,
+) -> None:
+    """Route EAGLE greedy verify to the Kunlun impl (upstream is a CUDA JIT)."""
+    from sglang_kunlun.kernels.sgl_kernel_kunlun.speculative import (
+        verify_tree_greedy as _kunlun_verify_tree_greedy,
+    )
+    _kunlun_verify_tree_greedy(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accept_token_num,
+        candidates=candidates,
+        retrive_index=retrive_index,
+        retrive_next_token=retrive_next_token,
+        retrive_next_sibling=retrive_next_sibling,
+        target_predict=target_predict,
+    )
+
+
+@register_jit_op(
+    "sglang.kernels.ops.speculative.sampling", "tree_speculative_sampling_target_only"
+)
+def tree_speculative_sampling_target_only(
+    predicts: torch.Tensor,  # mutable
+    accept_index: torch.Tensor,  # mutable
+    accept_token_num: torch.Tensor,  # mutable
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    uniform_samples_for_final_sampling: torch.Tensor,
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,
+    threshold_single: float = 1.0,
+    threshold_acc: float = 1.0,
+    deterministic: bool = True,
+) -> None:
+    """Target-only tree speculative sampling on P800 昆仑芯 — pure torch.
+
+    Upstream ``sglang.kernels.ops.speculative.sampling`` JIT-compiles
+    ``sgl_kernel_jit_speculative_sampling`` (csrc/speculative/sampling.cuh ->
+    ``TreeSpeculativeSamplingTargetOnly``); its header pulls in ``<concepts>``
+    (C++20) which nvcc's host g++ on P800 can't find, so the build fails and the
+    decode scheduler crashes (not a Triton/CUDA kernel we can run here).
+
+    This is a faithful torch port of that CUDA kernel (threshold-based acceptance
+    + ``relu(target - draft)`` residual final sampling). We do NOT reuse
+    ``chain_speculative_sampling_triton`` (it ignores the thresholds and, with the
+    target-only ``draft_probs == 0``, accepts every draft token -> gibberish) nor
+    the ``kunlun_ops`` native op. Signature matches upstream exactly;
+    ``deterministic`` is accepted for API parity.
+    ``predicts``/``accept_index``/``accept_token_num`` are int32 flat/[bs,ndt]/[bs]
+    buffers written in place; ``retrive_index`` holds flat indices into ``predicts``.
+    """
+    bs, ndt = candidates.shape
+    nst = accept_index.shape[1]
+    d = target_probs.shape[-1]
+    ta = max(float(threshold_acc), 1e-9)
+    ts = float(threshold_single)
+    tp = target_probs.reshape(bs, ndt, d)
+    dp = draft_probs.reshape(bs, ndt, d)
+    coins = uniform_samples.reshape(bs, ndt)
+    coins_f = uniform_samples_for_final_sampling.reshape(bs)
+    ri = retrive_index.reshape(bs, ndt)
+    rnt = retrive_next_token.reshape(bs, ndt)
+    rns = retrive_next_sibling.reshape(bs, ndt)
+    cand = candidates.reshape(bs, ndt)
+    for bx in range(bs):
+        prob_acc = 0.0
+        cur_row = 0  # row within this batch's ndt target-prob rows
+        coin = float(coins[bx, 0].item())
+        last_acc = int(ri[bx, 0].item())
+        accept_index[bx, 0] = last_acc
+        num_acc = 0
+        cur_index = 0
+        for _ in range(1, nst):
+            cur_index = int(rnt[bx, cur_index].item())
+            while cur_index != -1:
+                draft_index = int(ri[bx, cur_index].item())
+                draft_tok = int(cand[bx, cur_index].item())
+                tps = float(tp[bx, cur_row, draft_tok].item())
+                prob_acc += tps
+                if tps > 0.0 and (coin < prob_acc / ta or tps >= ts):
+                    prob_acc = 0.0
+                    cur_row = cur_index
+                    coin = float(coins[bx, cur_index].item())
+                    predicts[last_acc] = draft_tok
+                    num_acc += 1
+                    accept_index[bx, num_acc] = draft_index
+                    last_acc = draft_index
+                    break
+                # reject: stash target mass into draft_probs, try next sibling
+                dp[bx, cur_row, draft_tok] = tp[bx, cur_row, draft_tok]
+                cur_index = int(rns[bx, cur_index].item())
+            if cur_index == -1:
+                break
+        accept_token_num[bx] = num_acc
+        # final sampling from relu(target - draft) at the last-accepted row
+        target_row = tp[bx, cur_row]
+        draft_row = dp[bx, cur_row] if num_acc != nst - 1 else torch.zeros_like(target_row)
+        residual = torch.clamp(target_row - draft_row, min=0)
+        total = float(residual.sum().item())
+        if total <= 0.0:
+            final_tok = d - 1
+        else:
+            gt = torch.cumsum(residual, dim=0) > (float(coins_f[bx].item()) * total)
+            final_tok = int(torch.argmax(gt.to(torch.int32)).item()) if bool(gt.any().item()) else d - 1
+        predicts[last_acc] = final_tok
+
+
+@register_jit_op("flashinfer.sampling", "top_p_renorm_probs")
+def top_p_renorm_probs(probs: torch.Tensor, top_p) -> torch.Tensor:
+    """Route flashinfer's top-p renorm to the Kunlun-native op on P800 昆仑芯.
+
+    ``dflash_utils.build_dflash_verify_target_probs`` (is_cuda branch) imports
+    ``from flashinfer.sampling import top_p_renorm_probs as top_p_renorm_prob`` to
+    build the verify ``target_probs`` for temperature/top-p sampling. On P800 that
+    flashinfer kernel returns corrupted probabilities, so even a correct verify
+    samples gibberish (temperature-only sampling is fine; adding ``top_p`` breaks
+    it — verified by isolation). Patching the flashinfer source symbol also fixes
+    the ``dflash_utils`` alias via install()'s imported-binding rewrite. Returns
+    the renormalized probs (value-returning, unlike the in-place JIT helpers)."""
+    from sglang_kunlun.kernels.sgl_kernel_kunlun.sampling import top_p_renorm_prob as _k
+    return _k(probs, top_p)
+
+
+@register_jit_op("flashinfer.sampling", "top_k_renorm_probs")
+def top_k_renorm_probs(probs: torch.Tensor, top_k) -> torch.Tensor:
+    """Kunlun-native top-k renorm replacement for flashinfer (see
+    ``top_p_renorm_probs`` above). Only hit on the non-sparse ``target_probs``
+    path; the sparse path does top-k via ``torch.topk`` directly."""
+    from sglang_kunlun.kernels.sgl_kernel_kunlun.sampling import top_k_renorm_prob as _k
+    return _k(probs, top_k)
+
+
+@register_jit_op("sglang.kernels.ops.attention.dsv4.compress_old", "fused_norm_rope_inplace")
 def fused_norm_rope_inplace(
     kv: torch.Tensor,
     weight: torch.Tensor,
@@ -1831,7 +2769,7 @@ def fused_norm_rope_inplace(
     _fused_norm_rope_inplace_kunlun(kv, weight, eps, freq_cis, positions)
 
 
-@register_jit_op("sglang.jit_kernel.dsv4.elementwise", "fused_q_indexer_rope_hadamard_quant")
+@register_jit_op("sglang.kernels.ops.attention.dsv4.elementwise", "fused_q_indexer_rope_hadamard_quant")
 def fused_q_indexer_rope_hadamard_quant(
     q_input: torch.Tensor,
     weight: torch.Tensor,
@@ -1846,7 +2784,7 @@ def fused_q_indexer_rope_hadamard_quant(
     return _fused_q_indexer_rope_hadamard_quant_kunlun(q_input, weight, weight_scale, freqs_cis, positions)
 
 
-@register_jit_op("sglang.jit_kernel.dsv4.compress", "compress_forward")
+@register_jit_op("sglang.kernels.ops.attention.dsv4.compress", "compress_forward")
 def compress_forward(
     kv_score_buffer: torch.Tensor,
     kv_score_input: torch.Tensor,
@@ -1865,7 +2803,7 @@ def compress_forward(
     )
 
 
-@register_jit_op("sglang.jit_kernel.dsv4.compress", "compress_norm_rope_store")
+@register_jit_op("sglang.kernels.ops.attention.dsv4.compress", "compress_norm_rope_store")
 def compress_norm_rope_store(
     kv: torch.Tensor,
     plan,
@@ -1878,6 +2816,9 @@ def compress_norm_rope_store(
     page_size: int,
     use_fp4: bool = False,
     bf16_store: bool = False,
+    kvcache_scale: torch.Tensor = None,  # [kunlun-adapt] 上游新增；fp16/bf16 KV 下不参与
+    rope_cache=None,  # [kunlun-adapt] 上游新增（HIP FP4 预计算表）；kunlun fused op 内部处理
+    fp4_k_write_metadata=None,  # [kunlun-adapt] 上游新增（FP4 写元数据）；本路径不写 FP4
 ) -> None:
     """Kunlun-native: fused norm+rope via dpsk_v4_norm_rope_gptj + store."""
     _compress_norm_rope_store_kunlun(
@@ -1888,7 +2829,7 @@ def compress_norm_rope_store(
     )
 
 
-@register_jit_op("sglang.jit_kernel.dsv4.attn", "triton_create_paged_compress_data")
+@register_jit_op("sglang.kernels.ops.attention.dsv4.attn", "triton_create_paged_compress_data")
 def triton_create_paged_compress_data(
     *,
     compress_ratio: int,
@@ -1900,12 +2841,17 @@ def triton_create_paged_compress_data(
     extend_seq_lens: torch.Tensor,
     req_to_token: torch.Tensor,
     full_to_swa_index_mapping: torch.Tensor,
+    use_req_ring: bool = False,
     block: int = 128,
 ):
     """Kunlun-native replacement for the v1 legacy compressor's Triton
     write_loc/extra_data builder. Routes to
-    ``xspeedgate_ops.create_paged_compress_data`` (same op aiak_sglang uses)
+    ``xspeedgate_ops.create_paged_compress_data`` (same op the reference uses)
     instead of the unsupported Triton kernel.
+
+    ``use_req_ring`` (added by newer v1 ``compressor.py``) is accepted for
+    signature compatibility and intentionally unused: the native op derives
+    the ring-buffer addressing from ``ring_size`` / ``compress_ratio``.
     """
     return _create_paged_compress_data_kunlun(
         compress_ratio=compress_ratio,
@@ -1928,7 +2874,7 @@ def triton_create_paged_compress_data(
 # fall back to the pure-torch vectorized implementation.
 # ---------------------------------------------------------------------------
 
-@register_jit_op("sglang.jit_kernel.dsv4.topk", "topk_transform_512")
+@register_jit_op("sglang.kernels.ops.attention.dsv4.topk", "topk_transform_paged")
 def topk_transform_512(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -1960,7 +2906,7 @@ def topk_transform_512(
     _needs_raw = (out_raw_indices is not None) and (_capturer is not None)
     if _needs_raw:
         from sglang.srt.layers.attention.dsv4.indexer import (
-            topk_transform_512_pytorch_vectorized,
+            topk_transform_pytorch_vectorized as topk_transform_512_pytorch_vectorized,
         )
         topk_transform_512_pytorch_vectorized(
             scores, seq_lens, page_tables, out_page_indices,
@@ -1973,7 +2919,7 @@ def topk_transform_512(
     )
 
 
-@register_jit_op("sglang.jit_kernel.dsv4.topk", "topk_transform_512_v2")
+@register_jit_op("sglang.kernels.ops.attention.dsv4.topk", "topk_transform_paged_v2")
 def topk_transform_512_v2(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,

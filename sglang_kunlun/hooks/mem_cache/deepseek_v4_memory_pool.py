@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -20,7 +22,7 @@
 Three groups, all AROUND:
 
 1. bf16 KV pool layout. Upstream ``DeepSeekV4SingleKVPool`` lays the KV cache out as
-   fp8-584. Aligning to the AIAK float16 reference, ``get_bytes_per_token`` /
+   fp8-584. Aligning to the float16 reference, ``get_bytes_per_token`` /
    ``create_buffer`` switch it to a bf16-512 layout (1024 bytes/token: nope 448 +
    rope 64, no fp8 scale) so the decode store can use the native,
    cuda-graph-capturable ``torch.ops.xspeedgate_ops.set_k_and_s_v4``. Only activates
@@ -169,3 +171,77 @@ def get_state_buf_infos_kunlun(original_fn, self):
     if os.environ.get("SGLANG_KUNLUN_KV_REG_DIAG") == "1":
         _log_infos("state", r[1])
     return r
+
+
+class _SpecBagWithDraft:
+    """Proxy a spec config bag, supplying a concrete draft-token count."""
+
+    def __init__(self, bag, fallback: int):
+        self._bag = bag
+        self.speculative_num_draft_tokens = fallback
+
+    def __getattr__(self, name):
+        return getattr(self._bag, name)
+
+
+@plugin_hook(
+    "sglang.srt.mem_cache.deepseek_v4_memory_pool.get_swa_ring_size",
+    type=HookType.AROUND,
+)
+def get_swa_ring_size_kunlun(original_fn, *args, **kwargs):
+    """Fill a missing draft-token count only when the spec bag leaves it unset.
+
+    Under decode DP attention the published spec bag has
+    ``speculative_num_draft_tokens=None`` and the stock ring-size arithmetic
+    dies during memory-pool init with ``NoneType - int``. The resolved server
+    args still carry the value (block+1 for DSpark), and the module tolerates a
+    missing bound elsewhere, so supply it for this call only.
+    """
+    from sglang.srt.mem_cache import deepseek_v4_memory_pool as pool
+    from sglang.srt.runtime_context import get_server_args
+
+    real_get_spec = pool.get_spec
+    bag = real_get_spec()
+    if getattr(bag, "speculative_num_draft_tokens", None) is not None:
+        return original_fn(*args, **kwargs)
+
+    fallback = int(get_server_args().speculative_num_draft_tokens or 1)
+    logger.warning(
+        "sglang-kunlun: spec bag has no speculative_num_draft_tokens; using %d "
+        "from the resolved server args for the SWA ring size", fallback,
+    )
+    pool.get_spec = lambda: _SpecBagWithDraft(bag, fallback)
+    try:
+        return original_fn(*args, **kwargs)
+    finally:
+        pool.get_spec = real_get_spec
+
+
+@plugin_hook(
+    "sglang.srt.mem_cache.allocation_sizing.get_alloc_len_per_decode",
+    type=HookType.AROUND,
+)
+def get_alloc_len_per_decode_kunlun(original_fn, *args, **kwargs):
+    """Give the allocation sizing a concrete draft-token count.
+
+    ``allocation_sizing`` binds ``max_speculative_num_draft_tokens`` at import,
+    so patching only ``runtime_context`` would not reach it. Fill the value for
+    the duration of this call when the spec bag left it unset (decode DP
+    attention), then restore the original binding.
+    """
+    from sglang.srt.mem_cache import allocation_sizing as sizing
+    from sglang.srt.runtime_context import get_server_args
+
+    real = sizing.max_speculative_num_draft_tokens
+
+    def patched():
+        value = real()
+        if value is not None:
+            return value
+        return int(get_server_args().speculative_num_draft_tokens or 1)
+
+    sizing.max_speculative_num_draft_tokens = patched
+    try:
+        return original_fn(*args, **kwargs)
+    finally:
+        sizing.max_speculative_num_draft_tokens = real

@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -26,7 +28,7 @@ from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 
 @plugin_hook(
-    target="sglang.srt.layers.attention.dsa.triton_kernel.act_quant",
+    target="sglang.kernels.ops.attention.dsa.triton_kernel.act_quant",
     type=HookType.REPLACE,
 )
 def act_quant_kunlun(

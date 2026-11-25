@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -35,12 +37,19 @@ HOOK_MODULES = (
     "sglang_kunlun.hooks.arg_groups",
     "sglang_kunlun.hooks.layers",
     "sglang_kunlun.hooks.mem_cache",
+    "sglang_kunlun.hooks.managers",
     "sglang_kunlun.hooks.model_executor",
     "sglang_kunlun.hooks.distributed",
     "sglang_kunlun.hooks.disaggregation",
     "sglang_kunlun.hooks.entrypoints",
     "sglang_kunlun.hooks.function_call",
     "sglang_kunlun.hooks.parser",
+    # Constrained decoding: replaces ``XGrammarGrammar.apply_vocab_mask`` with a
+    # torch.compile bitmask path, because upstream's Triton kernel is unsupported
+    # on XPU (aborts with UNREACHABLE in TritonXPU/IR/Dialect.cpp). Without this
+    # import the hook never registers, so ``--grammar-backend xgrammar`` kills
+    # the process on the first masked sample.
+    "sglang_kunlun.hooks.constrained",
     "sglang_kunlun.hooks.jit_kernel",
     "sglang_kunlun.hooks.models",
     "sglang_kunlun.models",
@@ -58,9 +67,25 @@ def register_all() -> None:
     except Exception as exc:
         logger.warning("sglang-kunlun: grammar backend default patch failed: %s", exc)
 
+    # Declare the AttentionStore diagnostic envs on sglang's ``Envs`` before any
+    # asradix module reads them off ``sglang.srt.environ``. Harmless when the
+    # AttentionStore cache is off.
+    from sglang_kunlun.environ import patch_sglang_envs
+
+    try:
+        patch_sglang_envs()
+    except Exception as exc:
+        logger.warning("sglang-kunlun: AttentionStore env injection failed: %s", exc)
+
     from sglang_kunlun.kernels import deep_geem_hook as _deep_geem_hook  # noqa: F401
     from sglang_kunlun.kernels import flashinfer_hook as _flashinfer_hook  # noqa: F401
     from sglang_kunlun.kernels import kernel_ops
+
+    # DSV4 paged-KV-cache dequant + the V4.1 sparse ``token_req_indices`` pad fix.
+    # Imported for the side effect of registering with ``kernel_ops`` before the
+    # install pass below; see the module docstring for why upstream's ``tl.exp2``
+    # (libm ``ldexpf``, absent from libdevice-xpu3.bc) is re-expressed.
+    from sglang_kunlun.kernels import dsv4_dequant_k_cache as _dsv4_dequant_k_cache  # noqa: F401
 
     kernel_ops.install()
 

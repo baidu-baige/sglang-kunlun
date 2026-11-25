@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -18,3 +20,7 @@
 """ model executor hooks """
 from . import model_runner_kv_cache_mixin  # noqa: F401
 from . import model_runner  # noqa: F401
+from . import preload_weights  # noqa: F401
+from . import forward_batch_pad  # noqa: F401
+from . import decode_graph_engram  # noqa: F401
+from . import cp_mm  # noqa: F401

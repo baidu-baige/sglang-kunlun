@@ -1,0 +1,79 @@
+--- a/python/sglang/srt/models/deepseek_v4.py
++++ b/python/sglang/srt/models/deepseek_v4.py
+@@ -4865,8 +4865,15 @@
+         self.determine_num_fused_shared_experts()
+         # [epd-dsv41] ModelConfig copies --encoder-only onto the HF config.
+         self.encoder_only = bool(getattr(config, "encoder_only", False))
++        # [epd-dsv41] Language-only prefill receives image embeddings from the
++        # encoder workers, so it must not build the ViT/aligner/image_* modules.
++        self.mm_embedding_only = bool(getattr(config, "language_only", False))
+         self.vision = None
+-        if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
++        if (
++            config.model_type == "deepseek_v41"
++            and config.vision_n_layers > 0
++            and not self.mm_embedding_only
++        ):
+             # [epd-dsv41] EPD prefill (--language-only) never executes the tower
+             # (image embeddings arrive precomputed from the encoder workers), so
+             # context parallelism is safe there. A monolithic VLM with vision
+@@ -5079,6 +5086,12 @@
+     def get_image_feature(self, items):
+         """Return complete spans for the shared MM cache and chunk scheduler."""
+ 
++        if self.vision is None:
++            raise RuntimeError(
++                "DeepSeek-V4.1 language-only prefill does not run local image "
++                "encoding; image embeddings arrive precomputed from the encoder "
++                "workers."
++            )
+         spans = []
+         device, dtype = self.image_start.device, self.image_start.dtype
+         for item in items:
+@@ -5194,7 +5207,7 @@
+                 "get_image_feature instead of forward()."
+             )
+         if (
+-            self.vision is not None
++            (self.vision is not None or getattr(self, "mm_embedding_only", False))
+             and not forward_batch.forward_mode.is_decode()
+             and not forward_batch.forward_mode.is_target_verify()
+             and forward_batch.mm_inputs is not None
+@@ -5203,7 +5216,9 @@
+             if input_embeds is not None:
+                 raise ValueError("Cannot combine input_embeds and image inputs")
+             input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
+-        if self.vision is not None and not (
++        if (
++            self.vision is not None or getattr(self, "mm_embedding_only", False)
++        ) and not (
+             forward_batch.forward_mode.is_decode_or_idle()
+             or forward_batch.forward_mode.is_target_verify()
+         ):
+@@ -5604,15 +5619,22 @@
+                     )
+ 
+                     # V4.1 checkpoint tensors with no module in the text model yet.
++                    # [epd-dsv41] Only skip tensors the model truly lacks; a
++                    # language-only prefill still owns
++                    # gate.e_score_correction_bias_vl.
+                     skip_group = None
+                     if not is_dsv41:
+                         pass
+-                    elif self.vision is None and name.startswith(
+-                        ("vision.", "aligner.", "image_")
++                    elif (
++                        self.vision is None
++                        and name.startswith(("vision.", "aligner.", "image_"))
++                        and name not in params_dict
+                     ):
+                         skip_group = "vision"
+-                    elif self.vision is None and name.endswith(
+-                        ".gate.e_score_correction_bias_vl"
++                    elif (
++                        self.vision is None
++                        and name.endswith(".gate.e_score_correction_bias_vl")
++                        and name not in params_dict
+                     ):
+                         skip_group = "gate.bias_vl"
+                     if skip_group is not None:

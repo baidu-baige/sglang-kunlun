@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -98,3 +100,31 @@ def patch_compressor_forward_cuda_alias():
         logger.warning(
             "sglang-kunlun: Compressor forward_cuda alias patch failed: %s", exc
         )
+
+
+# ---------------------------------------------------------------------------
+# Route the DSV4 backend's compress-plan builder to the v1 (compress_old) path.
+# The stock ``deepseek_v4_backend`` hardcodes ``from ...compressor_v2 import
+# create_paged_compressor_data`` (SGLANG_OPT_USE_COMPRESSOR_V2 is a no-op
+# _DeprecatedEnv now). compressor_v2's ``CompressorPrefillPlan.generate``
+# JIT-compiles a CUDA kernel (c_plan.cuh) via nvcc, which fails on this XPU
+# image (host g++ lacks C++20 <concepts>). The v1 ``compressor.py`` path builds
+# the plan through ``compress_old``, for which this plugin registers pure-torch
+# ``CompressorPrefillPlan.generate`` / ``compress_forward`` hooks -- no CUDA JIT.
+# So redirect the backend's module-level name to the v1 builder (which the
+# ``create_paged_compressor_data_kunlun`` hook above already made accept the
+# v2-only ``online_state_slot_offset`` kwarg).
+# ---------------------------------------------------------------------------
+
+
+@plugin_hook(
+    "sglang.srt.layers.attention.deepseek_v4_backend.create_paged_compressor_data",
+    type=HookType.AROUND,
+)
+def create_paged_compressor_data_v1_route(original_fn, *args, **kwargs):
+    """Send the backend's compress-plan call to the v1 compress_old builder."""
+    from sglang.srt.layers.attention.dsv4.compressor import (
+        create_paged_compressor_data as _v1_create,
+    )
+
+    return _v1_create(*args, **kwargs)

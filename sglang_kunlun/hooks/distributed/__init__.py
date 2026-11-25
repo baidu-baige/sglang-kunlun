@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -19,3 +21,4 @@
 
 from . import parallel_state  # noqa: F401
 from . import device_communicators  # noqa: F401
+from . import mlp_sync_cpu  # noqa: F401

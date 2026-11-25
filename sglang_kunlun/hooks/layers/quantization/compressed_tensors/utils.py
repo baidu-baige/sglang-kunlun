@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -245,7 +247,9 @@ def moe_pre_sorted(
             (12, num_experts), dtype=torch.int32, device=x.device
         )
         kunlun_ops.gen_block_statistic(topk_ids, block_statistic)
-    sorted_x = torch.empty(
+    # EP-local routing omits negative expert IDs. The sorting kernel only
+    # writes valid rows; later quantization still visits the full allocation.
+    sorted_x = torch.zeros(
         (x.shape[0] * top_k, x.shape[1]), dtype=x.dtype, device=x.device
     )
     sorted_tokens_idx = torch.zeros(
@@ -293,7 +297,9 @@ def moe_fc(
         x_scale = x_scale.reshape(x_scale.shape[0], -1)
     use_grouped_int8 = quantize_input
     kernel_dtype = torch.bfloat16 if use_grouped_int8 else output_dtype
-    output = torch.empty(output_shape, dtype=kernel_dtype, device=x.device)
+    # Grouped GEMMs write only expert-owned rows. Keep unrouted rows zero for
+    # SwiGLU/requantization and the zero-weight terms in the combine kernel.
+    output = torch.zeros(output_shape, dtype=kernel_dtype, device=x.device)
     y = output.reshape(-1, output.shape[-1])
     kunlun_ops.moe_fc_v3(
         x=x,

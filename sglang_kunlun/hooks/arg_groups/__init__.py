@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -19,4 +21,6 @@
 
 from __future__ import annotations
 
+from . import asradix_hook  # noqa: F401
 from . import deepseek_v4_hook  # noqa: F401
+from . import speculative_hook  # noqa: F401

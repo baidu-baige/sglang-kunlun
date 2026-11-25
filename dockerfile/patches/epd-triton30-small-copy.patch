@@ -1,0 +1,20 @@
+--- a/python/sglang/kernels/ops/memory/small_copy.py
++++ b/python/sglang/kernels/ops/memory/small_copy.py
+@@ -5,7 +5,6 @@
+ 
+ @triton.jit(
+     do_not_specialize=["sizes", "cols", "source_strides", "dest_strides"],
+-    do_not_specialize_on_alignment=["sizes", "cols", "source_strides", "dest_strides"],
+ )
+ def _small_copy_kernel(
+     sources,
+@@ -48,6 +47,9 @@
+ 
+ 
+ def try_small_copy(dsts, srcs):
++    # Triton 3.0 (XPU runtime) lacks the tuple-arg support this kernel needs.
++    # It is a perf-only fast path; the caller falls back to the normal copy.
++    return False
+     if len(dsts) < 2 or len(dsts) != len(srcs):
+         return False
+     supported = (

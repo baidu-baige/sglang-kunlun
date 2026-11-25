@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -18,6 +20,7 @@
 """Kunlun compressed-tensors W4A8 (packed INT4 weights, INT8 activations)."""
 
 from __future__ import annotations
+import os
 
 from .compressed_tensors_wna16_moe import KunlunCompressedTensorsWNA16MoE
 
@@ -39,6 +42,8 @@ class KunlunCompressedTensorsW4A8Int8MoE(KunlunCompressedTensorsWNA16MoE):
     def __init__(self, scheme_dict, quant_format: str | None = None) -> None:
         """Validate W4A8 activations, then reuse the packed-INT4 weight path."""
         super().__init__(scheme_dict, quant_format=quant_format)
+        if os.environ.get("KUNLUN_W4A16_REFERENCE") == "1":
+            self.quantize_activations = False
         input_quant = scheme_dict.get("input_activations")
         if (
             input_quant is None

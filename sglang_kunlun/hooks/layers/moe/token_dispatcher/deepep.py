@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -16,7 +18,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Kunlun plugin hooks for ``sglang.srt.layers.moe.token_dispatcher.deepep``."""
-
 from __future__ import annotations
 
 import logging
@@ -26,6 +27,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -37,8 +39,18 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.moe.topk import TopKOutput
-from sglang.srt.layers.moe.utils import DeepEPMode, get_deepep_config, is_tbo_enabled
-from sglang.srt.utils import is_blackwell, load_json_config
+from sglang.srt.layers.moe.utils import (
+    DeepEPMode,
+    get_deepep_config,
+    get_moe_runner_backend,
+    is_tbo_enabled,
+)
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_blackwell,
+    load_json_config,
+)
+
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
@@ -46,7 +58,7 @@ if TYPE_CHECKING:
 try:
     from deep_ep import Config
     from deep_ep.buffer_v2 import BufferV2 as Buffer
-    from sglang.srt.layers.quantization.fp8_kernel import (  # noqa: F401
+    from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
 
@@ -58,9 +70,176 @@ from enum import Enum, IntEnum, auto
 
 import torch
 import torch.distributed as dist
+
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
 
 logger = logging.getLogger(__name__)
+
+
+_DEEPEP_COMBINE_SYNC = None
+
+
+def _deepep_combine_sync_enabled() -> bool:
+    """Whether to force the combine completion wait (default: yes)."""
+    global _DEEPEP_COMBINE_SYNC
+    if _DEEPEP_COMBINE_SYNC is None:
+        import os
+
+        _DEEPEP_COMBINE_SYNC = (
+            os.environ.get("SGLANG_KUNLUN_DEEPEP_COMBINE_SYNC", "1") != "0"
+        )
+        if not _DEEPEP_COMBINE_SYNC:
+            logger.warning(
+                "[kunlun] SGLANG_KUNLUN_DEEPEP_COMBINE_SYNC=0: skipping the deepep "
+                "combine completion wait, which is known to corrupt MoE output on "
+                "this backend"
+            )
+    return _DEEPEP_COMBINE_SYNC
+
+
+_comm_stream_state = None
+# stream id -> torch.cuda.ExternalStream.  ``buffer.get_comm_stream()`` builds a
+# fresh ``ExternalStream`` on every call and that constructor re-resolves the
+# device index through ``torch/cuda/_utils.py`` + ``torch/_utils.py`` each time
+# (~30 us per call in a profiled prefill; 2 calls per MoE layer).  The stream id
+# is fixed for a buffer's lifetime, so the object is cached per id.
+_comm_streams: dict = {}
+
+
+def _cached_comm_stream(buffer):
+    """``buffer.get_comm_stream()`` without rebuilding the wrapper every call."""
+    stream_id = int(buffer.runtime.get_cuda_stream_id())
+    stream = _comm_streams.get(stream_id)
+    if stream is None:
+        stream = torch.cuda.ExternalStream(stream_id)
+        _comm_streams[stream_id] = stream
+    return stream
+
+
+def _order_after_comm_stream(buffer) -> bool:
+    """Make the caller's stream wait for deep_ep's comm stream (no host stop).
+
+    ``libbkcl``'s all-to-all runs on deep_ep's own stream and neither the
+    ``async_finish`` event nor ``EventOverlap`` orders it against the caller's
+    stream, which is why a host-wide sync was used.  Ordering the caller stream
+    against the *whole* comm stream with an event is the same dependency without
+    blocking the host.  Returns False (caller falls back to the device sync) if
+    the stream is not reachable on this build.
+    """
+    global _comm_stream_state
+    try:
+        comm = _cached_comm_stream(buffer)
+        if comm is None:
+            raise RuntimeError("deep_ep returned no comm stream")
+        torch.cuda.current_stream().wait_stream(comm)
+        if _comm_stream_state is None:
+            _comm_stream_state = True
+            logger.warning(
+                "[kunlun] deep_ep comm-stream ordering active: caller stream "
+                "waits the comm stream device-side (no host sync per layer)"
+            )
+        return True
+    except Exception as exc:
+        if _comm_stream_state is None:
+            _comm_stream_state = False
+            logger.warning(
+                "[kunlun] deep_ep comm-stream ordering unavailable (%s); "
+                "falling back to torch.cuda.synchronize()",
+                exc,
+            )
+        return False
+
+
+def _deepep_completion_wait(buffer) -> None:
+    """Order the caller's stream after a dispatch/combine all-to-all.
+
+    Device-side event ordering (no host stop); the host-wide sync remains only
+    as the fallback for builds where the comm stream is unreachable.  Measured
+    8x60k EP-fake prefill on 8xP800: 23813.9 -> 24079.7 tok/s, +1.12%.
+    """
+    if not _deepep_combine_sync_enabled() or not _not_capturing_cuda_graph():
+        return
+    if _order_after_comm_stream(buffer):
+        return
+    torch.cuda.synchronize()
+
+
+_capture_mode_probe = None
+_capture_mode_probed = False
+
+
+def _not_capturing_cuda_graph() -> bool:
+    """Whether we are outside CUDA-graph capture (a host sync inside capture fails).
+
+    The probe used to re-run ``from ... import`` on every call (2x per MoE
+    layer); the module reference is resolved once and reused.
+    """
+    global _capture_mode_probe, _capture_mode_probed
+    if not _capture_mode_probed:
+        _capture_mode_probed = True
+        try:
+            from sglang.srt.model_executor.runner_utils.capture_mode import (
+                get_is_capture_mode,
+            )
+
+            _capture_mode_probe = get_is_capture_mode
+        except Exception:
+            _capture_mode_probe = None
+    if _capture_mode_probe is None:
+        return True
+    try:
+        return not _capture_mode_probe()
+    except Exception:
+        return True
+
+
+def _kunlun_wait_event(event) -> None:
+    """Stream-ordered wait on an async deep_ep dispatch/combine (capturable).
+
+    Upstream waits with ``hook() if self.return_recv_hook else
+    event.current_stream_wait()``; the kunlun port left that else-branch
+    commented out and relied on the ``torch.cuda.synchronize()`` in
+    dispatch_b/combine_b instead. That sync is (correctly) skipped under
+    cuda-graph capture (``_not_capturing_cuda_graph``), so inside a captured
+    decode graph there was *no* completion wait at all and the next layer could
+    read a half-landed all-to-all. The event deep_ep returns is stream-ordered,
+    so waiting on it is both correct and capturable.
+    """
+    if event is None:
+        return
+    wait = getattr(event, "current_stream_wait", None)
+    if wait is not None:
+        wait()
+
+
+def _kunlun_release_event(owner, attr: str) -> None:
+    """Drop a deep_ep event once its completion wait has been issued.
+
+    ``buffer_v2.low_latency_{dispatch,combine}`` return
+    ``EventOverlap(event, tensors_to_record)``, and deep_ep keeps the input, the
+    packed recv buffer and the layout tensors alive through that tuple because
+    ``Tensor.record_stream`` cannot be used under cuda-graph capture. That
+    reference is only needed for the async window between launching the kernel
+    and waiting on it -- a window ``dispatch_b``/``combine_b`` have just closed
+    with ``_kunlun_wait_event``. The wait is stream-ordered, so everything the
+    caller issues afterwards, including the allocator handing the same block to
+    another tensor, is ordered after the all-to-all.
+
+    Keeping the event instead pins, per MoE layer, one packed recv buffer
+    (``[num_local_experts, tokens_per_rank * ranks, hidden]``) plus the combine
+    input: ~360 MiB per layer at tokens/rank=64, ~14 GiB over the 40 layers of
+    DSV4.1-Flash. Eager decode carried that as a permanent floor, and during
+    cuda-graph capture it also forced the graph's private pool to size for every
+    layer at once instead of reusing one layer's scratch. Measured on an 8-rank
+    tp8/ep8/dp8 DSV4.1-Flash decode (tokens/rank=64, graph bs up to 64): capture
+    peak 34.1 -> 2.3 GiB, resident graph pool 20.7 -> 2.5 GiB.
+    """
+    event = getattr(owner, attr, None)
+    if event is None:
+        return
+    if hasattr(event, "extra_tensors"):
+        event.extra_tensors = None
+    setattr(owner, attr, None)
 
 
 class DeepEPPDispatchHooks(DispatcherBaseHooks):
@@ -138,38 +317,20 @@ assert isinstance(DeepEPLLCombineInput, CombineInput)
 
 class DeepEPDispatchMode(IntEnum):
     """DeepEPDispatchMode"""
-
     NORMAL = auto()
     LOW_LATENCY = auto()
 
 
 class DeepEPBuffer:
-    """DeepEPBuffer
-
-    Normal-mode buffers are kept per ``slot`` so that each two-batch-overlap
-    sub-batch owns one. The Kunlun DeepEP normal port keeps only the last
-    dispatch's layout, so two sub-batches sharing a single buffer clobber each
-    other as soon as both have a ``dispatch -> combine`` transaction in flight.
-
-    ``slot=0`` is the only slot used when TBO is off, and low-latency always
-    stays on slot 0: its ``return_recv_hook`` API is designed to be in flight,
-    and the low-latency buffer is expensive.
-    """
-
-    # slot -> Buffer. Process-wide, like the single buffer this replaces.
+    """DeepEPBuffer"""
     _buffers = {}
-    # How many normal-mode slots to keep. Set from the dispatcher construction
-    # site (``create_moe_dispatcher_kunlun``) once the sub-batch count is known.
-    _num_slots: int = 1
+    _dispatch_modes = {}
+    _active_key = None
+    _buffer = None
     _dispatch_mode: Optional[DeepEPDispatchMode] = None
     _hidden_size: Optional[int] = None
     _num_max_dispatch_tokens_per_rank: Optional[int] = None
     _num_experts: Optional[int] = None
-
-    @classmethod
-    def set_num_slots(cls, num_slots: int):
-        """Declare how many normal-mode buffers to keep (one per TBO sub-batch)."""
-        cls._num_slots = max(cls._num_slots, int(num_slots))
 
     @classmethod
     def get_deepep_buffer(
@@ -180,16 +341,22 @@ class DeepEPBuffer:
         deepep_mode: DeepEPMode,
         num_max_dispatch_tokens_per_rank: int = -1,
         num_experts: int = -1,
-        slot: int = 0,
     ):
         """get_deepep_buffer"""
-        buffer = cls._buffers.get(slot)
-        if buffer is not None:
-            return buffer
-
+        # Keep a strong reference to the communication group in the key. Equal
+        # world sizes do not imply equal communication domains or layouts.
+        key = (
+            group, hidden_size, param_bytes, deepep_mode,
+            num_max_dispatch_tokens_per_rank, num_experts,
+        )
+        cls._active_key = key
         cls._hidden_size = hidden_size
         cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         cls._num_experts = num_experts
+        cls._dispatch_mode = cls._dispatch_modes.get(key)
+        cls._buffer = cls._buffers.get(key)
+        if cls._buffer is not None:
+            return cls._buffer
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
@@ -251,8 +418,8 @@ class DeepEPBuffer:
                 f"This may result in highly suboptimal performance. "
                 f"Consider using --deepep-config to change the behavior."
             )
-
-        cls._buffers[slot] = Buffer(
+        
+        cls._buffer = Buffer(
             group,
             num_nvl_bytes,
             num_rdma_bytes,
@@ -262,41 +429,26 @@ class DeepEPBuffer:
             allow_mnnvl=True,
             num_experts=num_experts,
         )
-
-        # ``Buffer.__init__`` runs an all_gather_object, so every rank has to
-        # build the same set of buffers at the same program point. Build the
-        # remaining sub-batch slots right here instead of lazily on their first
-        # dispatch, which would diverge across ranks and hang the collective.
-        if slot == 0 and deepep_mode.enable_normal():
-            for extra_slot in range(1, cls._num_slots):
-                cls.get_deepep_buffer(
-                    group,
-                    hidden_size,
-                    param_bytes,
-                    deepep_mode,
-                    num_max_dispatch_tokens_per_rank,
-                    num_experts,
-                    slot=extra_slot,
-                )
-
-        return cls._buffers[slot]
+        cls._buffers[key] = cls._buffer
+        
+        return cls._buffer
 
     @classmethod
     def clean_buffer(cls):
         """clean_buffer"""
-        for buffer in cls._buffers.values():
-            if not buffer.low_latency_mode:
-                continue
-            buffer.clean_low_latency_buffer(
-                cls._num_max_dispatch_tokens_per_rank,
-                cls._hidden_size,
-                cls._num_experts,
-            )
+        if cls._buffer is None or not cls._buffer.low_latency_mode:
+            return
+        cls._buffer.clean_low_latency_buffer(
+            cls._num_max_dispatch_tokens_per_rank,
+            cls._hidden_size,
+            cls._num_experts,
+        )
 
     @classmethod
     def set_dispatch_mode_as_normal(cls):
         """set_dispatch_mode_as_normal"""
         cls._dispatch_mode = DeepEPDispatchMode.NORMAL
+        cls._dispatch_modes[cls._active_key] = cls._dispatch_mode
 
     @classmethod
     def set_dispatch_mode_as_low_latency(cls):
@@ -304,6 +456,7 @@ class DeepEPBuffer:
         if cls._dispatch_mode == DeepEPDispatchMode.NORMAL:
             cls.clean_buffer()
         cls._dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
+        cls._dispatch_modes[cls._active_key] = cls._dispatch_mode
 
     @classmethod
     def set_dispatch_mode(cls, mode: DeepEPMode):
@@ -322,7 +475,6 @@ class DeepEPBuffer:
 )
 class DeepEPConfig(BaseDispatcherConfig):
     """Kunlun DeepEP dispatcher configuration."""
-
     _instance = None
 
     def __init__(self):
@@ -354,7 +506,6 @@ class DeepEPConfig(BaseDispatcherConfig):
 
 class _DeepEPDispatcherImplBase:
     """_DeepEPDispatcherImplBase"""
-
     def __init__(
         self,
         group: torch.distributed.ProcessGroup,
@@ -365,7 +516,6 @@ class _DeepEPDispatcherImplBase:
         hidden_size: int,
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
-        buffer_slot: int = 0,
     ):
         if not use_deepep:
             raise ImportError(
@@ -381,8 +531,6 @@ class _DeepEPDispatcherImplBase:
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
-        # Which normal-mode DeepEP buffer this impl uses; one per TBO sub-batch.
-        self.buffer_slot = buffer_slot
 
         self.params_bytes = 2
         # A large value will lead to large memory occupation, thus users should change it accordingly
@@ -448,7 +596,6 @@ class _DeepEPDispatcherImplBase:
 
 class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     """_DeepEPDispatcherImplNormal"""
-
     def __init__(self, async_finish: bool, **kwargs):
         super().__init__(**kwargs)
 
@@ -463,25 +610,27 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         """dispatch_a"""
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-
+        
         import kunlun_ops
-
         topk_ids = topk_ids.to(torch.int32)
         num_tokens, hidden_size = hidden_states.shape
         hidden_states_int8 = torch.empty(
-            num_tokens, hidden_size, device="cuda", dtype=torch.int8
+                num_tokens,
+                hidden_size,
+                device='cuda',
+                dtype=torch.int8
         )
         hidden_states_scale = torch.empty(
-            num_tokens,
-            1,
-            device="cuda",
-            dtype=torch.float32,
-        )  # can't be col major
+                num_tokens,
+                1,
+                device='cuda',
+                dtype=torch.float32,
+        ) # can't be col major
         if num_tokens > 0:
             kunlun_ops.quant2d(hidden_states, hidden_states_int8, hidden_states_scale)
         x_to_dispatch = (hidden_states_int8, hidden_states_scale)
         hidden_states = x_to_dispatch
-
+        
         previous_event = Buffer.capture() if self.async_finish else None
         return hidden_states, topk_ids, topk_weights, previous_event
 
@@ -495,6 +644,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             event,
         ) = self._dispatch_core(hidden_states, topk_ids, topk_weights, previous_event)
         event.current_stream_wait() if self.async_finish else ()
+        # Symmetric with combine_b: libbkcl's dispatch is likewise not
+        # ordered against the caller's stream.
+        _deepep_completion_wait(self._get_buffer())
 
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
@@ -523,7 +675,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         num_tokens_per_rdma_rank = None
         num_tokens_per_expert = None
         is_token_in_rank = None
-
+        
         # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
         # However, doing this would incur an unknown synchronization error, but keeping
         # `handle` as a member variable works.
@@ -578,7 +730,33 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     def combine_b(self, output, previous_event):
         """combine_b"""
         hidden_states, event = self._combine_core(output, previous_event)
+        # Kunlun: ``buffer.combine()`` is NOT ordered against the caller's stream
+        # even when ``async_finish=False`` (the deepep backend here is libbkcl, not
+        # the CUDA reference implementation), so the consumer of ``hidden_states``
+        # can observe a half-landed all-to-all. Upstream's
+        # ``... if self.async_finish else ()`` therefore skips the only completion
+        # wait and the next layer runs on a partially written tensor: garbage
+        # hidden states -> dead logits -> the sampler emits token id 0
+        # (``<|begin_of_sentence|>``) forever, and on longer sequences the same
+        # window widens into ``error code= 700, an illegal memory access``.
+        #
+        # Measured on DeepSeek-V4-Flash, TP8/EP8, 781-token bare prompt, 20 trials,
+        # temperature=0: 0/20 usable without this wait (and the server dies), 19/20
+        # with it; syncing after ``dispatch_b`` instead only reaches 2/20, so the
+        # missing wait is specifically on the combine side.
+        #
+        # Set SGLANG_KUNLUN_DEEPEP_COMBINE_SYNC=0 to restore the upstream
+        # (defective on kunlun) behaviour -- used for the negative half of the
+        # A/B proof.
         event.current_stream_wait() if self.async_finish else ()
+        # Unconditional: the event wait above is not sufficient on this
+        # backend (that is the defect -- libbkcl's combine is not ordered
+        # against the caller's stream), and with async_finish=False there is
+        # no wait at all. Measured 0/20 -> 19/20 on a 781-token prompt.
+        # ``_deepep_completion_wait`` keeps that dependency (wait on the whole
+        # comm stream) but does it device-side when the mode allows, so the
+        # host is not stopped on every MoE layer.
+        _deepep_completion_wait(self._get_buffer())
         self.handle = None
         self.src2dst = None
         return hidden_states
@@ -598,22 +776,20 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
     def _get_buffer(self):
         """_get_buffer"""
-        DeepEPBuffer.set_dispatch_mode_as_normal()
-
-        return DeepEPBuffer.get_deepep_buffer(
+        buffer = DeepEPBuffer.get_deepep_buffer(
             self.group,
             self.hidden_size,
             self.params_bytes,
             self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
-            slot=self.buffer_slot,
         )
+        DeepEPBuffer.set_dispatch_mode_as_normal()
+        return buffer
 
 
 class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     """_DeepEPDispatcherImplLowLatency"""
-
     def __init__(self, return_recv_hook: bool, **kwargs):
         super().__init__(**kwargs)
 
@@ -624,7 +800,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self.return_recv_hook = return_recv_hook
         self.device_module = torch.get_device_module()
         self.quant_config = {}
-        self._get_buffer()
+        buffer = self._get_buffer()
 
     def dispatch_a(
         self,
@@ -671,7 +847,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hook,
     ):
         """dispatch_b"""
-        hook() if self.return_recv_hook else ()  # event.current_stream_wait()
+        if self.return_recv_hook:
+            hook()
+        else:
+            _kunlun_wait_event(getattr(self, "_ll_dispatch_event", None))
+        _kunlun_release_event(self, "_ll_dispatch_event")
 
         get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
             masked_m
@@ -701,7 +881,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         use_nvfp4 = use_fp8 = False
         input_global_scale = self.quant_config.get("input_global_scale", None)
         if input_global_scale is not None:
-            use_nvfp4 = True  # noqa: F841
+            use_nvfp4 = True
         elif not envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
             use_fp8 = True
 
@@ -709,10 +889,18 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         # Kunlun deep_ep low_latency_dispatch asserts a 2-D contiguous bfloat16
         # input; the float16 model hidden_states must be cast to bf16 first.
         if isinstance(hidden_states, torch.Tensor):
+            if not hidden_states.is_cuda:
+                hidden_states = hidden_states.to(torch.cuda.current_device())
             if hidden_states.dtype != torch.bfloat16:
                 hidden_states = hidden_states.to(torch.bfloat16)
             hidden_states = hidden_states.contiguous()
-        packed_recv_hidden, self.packed_recv_count, self.handle, _, hook = (
+        if isinstance(topk_ids, torch.Tensor) and not topk_ids.is_cuda:
+            topk_ids = topk_ids.to(torch.cuda.current_device())
+            if not hidden_states.is_cuda:
+                hidden_states = hidden_states.to(torch.cuda.current_device())
+        if isinstance(topk_ids, torch.Tensor) and not topk_ids.is_cuda:
+            topk_ids = topk_ids.to(torch.cuda.current_device())
+        packed_recv_hidden, self.packed_recv_count, self.handle, _ll_event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
                 topk_ids,
@@ -723,6 +911,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 return_recv_hook=self.return_recv_hook,
             )
         )
+        self._ll_dispatch_event = _ll_event
         return packed_recv_hidden, self.packed_recv_count, hook
 
     def combine_a(
@@ -745,10 +934,31 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         if overlap_args is not None:
             overlap_args.stream.wait_stream(self.device_module.current_stream())
 
-        hook() if self.return_recv_hook else ()  # event.current_stream_wait()
+        if self.return_recv_hook:
+            hook()
+        else:
+            _kunlun_wait_event(getattr(self, "_ll_combine_event", None))
+
+        # Same defect as the normal-mode combine_b above: when
+        # ``return_recv_hook`` is False there is no completion wait at all, and on
+        # this backend ``low_latency_combine`` is not ordered against the caller's
+        # stream, so the next layer can read a half-landed all-to-all.
+        if _deepep_combine_sync_enabled() and _not_capturing_cuda_graph():
+            torch.cuda.synchronize()
 
         if overlap_args is not None:
             self.device_module.current_stream().wait_stream(overlap_args.stream)
+
+        # The combine result is written asynchronously. Converting it in
+        # _combine_core would enqueue a read before this completion wait.
+        if (
+            self.params_dtype is not None
+            and isinstance(hidden_states, torch.Tensor)
+            and hidden_states.dtype != self.params_dtype
+        ):
+            hidden_states = hidden_states.to(self.params_dtype)
+
+        _kunlun_release_event(self, "_ll_combine_event")
 
         # KUNLUN_LL_IDLE_PAD: drop the dummy row added for an idle rank in dispatch_a.
         if getattr(self, "_ll_orig_num_tokens", None) == 0:
@@ -794,7 +1004,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 if hidden_states.dtype != torch.bfloat16:
                     hidden_states = hidden_states.to(torch.bfloat16)
                 hidden_states = hidden_states.contiguous()
-            combined_hidden_states, _, hook = buffer.low_latency_combine(
+            combined_hidden_states, _ll_event, hook = buffer.low_latency_combine(
                 x=hidden_states,
                 topk_idx=topk_ids,
                 topk_weights=topk_weights,
@@ -804,19 +1014,13 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 **overlap_args_dict,
             )
 
+        self._ll_combine_event = _ll_event
         self.packed_recv_count = self.handle = None
-        if (
-            self.params_dtype is not None
-            and isinstance(combined_hidden_states, torch.Tensor)
-            and combined_hidden_states.dtype != self.params_dtype
-        ):
-            combined_hidden_states = combined_hidden_states.to(self.params_dtype)
         return combined_hidden_states, hook
 
     def _get_buffer(self):
         """_get_buffer"""
-        DeepEPBuffer.set_dispatch_mode_as_low_latency()
-        return DeepEPBuffer.get_deepep_buffer(
+        buffer = DeepEPBuffer.get_deepep_buffer(
             self.group,
             self.hidden_size,
             self.params_bytes,
@@ -824,6 +1028,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
         )
+        DeepEPBuffer.set_dispatch_mode_as_low_latency()
+        return buffer
 
 
 @dataclass
@@ -840,7 +1046,6 @@ class _Stage(Enum):
 )
 class DeepEPDispatcher(BaseDispatcher):
     """Kunlun DeepEP dispatcher implementation."""
-
     def __init__(
         self,
         group: torch.distributed.ProcessGroup,
@@ -853,7 +1058,6 @@ class DeepEPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
-        buffer_slot: int = 0,
     ):
         super().__init__()
 
@@ -868,7 +1072,6 @@ class DeepEPDispatcher(BaseDispatcher):
             hidden_size=hidden_size,
             params_dtype=params_dtype,
             deepep_mode=deepep_mode,
-            buffer_slot=buffer_slot,
         )
 
         # KUNLUN_LL_NORMAL_FALLBACK: stash kwargs so we can lazily build the NORMAL dispatcher even when
@@ -962,18 +1165,6 @@ class DeepEPDispatcher(BaseDispatcher):
                 **self._normal_common_kwargs,
             )
         return self._normal_dispatcher
-
-    def set_buffer_slot(self, slot: int):
-        """Pick which normal-mode DeepEP buffer this dispatcher uses.
-
-        Called once per TBO sub-batch from the dispatcher construction site, so
-        that the two in-flight ``dispatch -> combine`` transactions do not share
-        normal-mode buffer state. Also updates the stashed kwargs used by the
-        lazy ``_ensure_normal_dispatcher`` path.
-        """
-        self._normal_common_kwargs["buffer_slot"] = slot
-        if self._normal_dispatcher is not None:
-            self._normal_dispatcher.buffer_slot = slot
 
     def _get_impl(self) -> _DeepEPDispatcherImplBase:
         """_get_impl"""

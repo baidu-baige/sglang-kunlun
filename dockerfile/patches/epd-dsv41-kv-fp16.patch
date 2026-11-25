@@ -1,0 +1,10 @@
+--- a/python/sglang/srt/arg_groups/overrides.py
++++ b/python/sglang/srt/arg_groups/overrides.py
+@@ -864,6 +864,7 @@
+     assert kv_cache_dtype in [
+         "fp8_e4m3",
+         "bfloat16",
++        "float16",
+     ], f"{kv_cache_dtype} is not supported for {model_arch}"
+     if kv_cache_dtype != view.kv_cache_dtype:
+         return {"kv_cache_dtype": kv_cache_dtype}

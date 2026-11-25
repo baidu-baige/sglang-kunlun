@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -170,6 +172,20 @@ class KunlunCompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         layer.register_parameter("w13_weight_shape", w13_weight_shape)
         set_weight_attrs(w13_weight_shape, extra_weight_attrs)
 
+        # These four buffers are load-bearing on this build.
+        # Dropping their registration silently corrupts the W4A8 MoE output,
+        # even though nothing reads them and the checkpoint indeed carries no
+        # `_g_idx` tensors (measured: 0 of 143317 tensors in
+        # model.safetensors.index.json contain "g_idx"). Isolated on
+        # 2026-10-16 by swapping ONLY this file into a known-good decode Pod
+        # (same image, same argv, same attention code):
+        #   file without the registrations -> "The capital of France is" gives
+        #       "The" then "The)" then "The)The"  (first token fine, every
+        #       decode step wrong -- the signature of a decode-context defect)
+        #   file with the registrations    -> "The capital of France is **Paris**."
+        # Restoring the registrations restored correct output. They are deleted
+        # again in process_weights_after_loading, so keep them registered until
+        # the load path that depends on them is identified and fixed properly.
         w13_g_idx = torch.nn.Parameter(
             torch.empty(num_experts, hidden_size, dtype=torch.int32),
             requires_grad=False,
@@ -330,7 +346,9 @@ class KunlunCompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         routed_scaling_factor = getattr(
             self.moe_runner_config, "routed_scaling_factor", None
         )
-        if routed_scaling_factor not in (None, 1.0):
+        if routed_scaling_factor not in (None, 1.0) and not getattr(
+            layer, "should_fuse_routed_scaling_factor_in_topk", False
+        ):
             output.mul_(routed_scaling_factor)
         if output.dtype is torch.float16:
             limit = int(os.environ.get("SGLANG_FP16_LIMIT_IN_MOE", "10"))

@@ -1,3 +1,5 @@
+# Copyright 2026 Baidu, Inc.
+# Licensed under the Apache License, Version 2.0.
 # Adapted from sgl-project/sglang (https://github.com/sgl-project/sglang)
 # Copyright 2023-2024 SGLang Team
 #
@@ -19,3 +21,9 @@
 from . import common  # noqa: F401
 from . import deepseek_v4_memory_pool  # noqa: F401
 from . import deepseek_v4_compress_state  # noqa: F401
+
+# AttentionStore (asradix) secondary KV cache. The pool hook imports first: the
+# cache hook reaches into it for the pool-sizing stash.
+from . import asradix_pool_hook  # noqa: F401
+from . import asradix_cache_hook  # noqa: F401
+from . import asradix_alloc_hook  # noqa: F401
