@@ -25,11 +25,28 @@ quoting any percentage.
 
 ### 1. Per-rank decode batch has a knee around 80
 
-Raising the per-rank decode batch from 32 to 80 gave **+25.7% output tok/s and
--32% J/output-token**. Past the knee the return collapses: 128 added only about
-4% more throughput while TPOT worsened by 53%. If you are sizing
-`--cuda-graph-max-bs-decode` and `--max-running-requests` for throughput rather
-than for single-stream latency, the useful range ends near the knee.
+Raising the per-rank decode batch from 64 to 80 gave **+25.7% output tok/s and
+-20.6% J/output-token**, with TPOT flat (84.7 ms to 84.3 ms). Past the knee the
+return collapses: 128 added only about 4% more throughput while TPOT worsened by
+53%. If you are sizing for throughput rather than for single-stream latency, the
+useful range ends near the knee.
+
+Three knobs have to be raised together, because the per-rank batch is capped by
+whichever is lowest:
+
+- `--max-running-requests` (divided by the attention DP size, so this is the one
+  that sets the per-rank figure)
+- `--cuda-graph-max-bs-decode`
+- `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`, an environment variable
+
+Raising the first two while leaving the third at 64 does not simply cap the gain,
+it fails: decode graph capture aborts in the DeepEP dispatch path once the batch
+bucket passes the dispatch limit.
+
+Scope: measured on a single node, 4 cards, TP4/EP4/DP4, reproduced on a second
+node. We have not reproduced it at DP8, where the production configuration
+already sits at a higher `--max-running-requests` and raising these knobs further
+was not stable.
 
 ### 2. A measured expert layout is worth a few percent
 
