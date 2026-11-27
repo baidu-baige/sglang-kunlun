@@ -72,8 +72,10 @@ def causal_conv1d_fn_kunlun(
         bias, None, None, None, None, ci_cpu, ci_xpu, his_cpu, his_xpu,
         activation, pad_slot_id, -1, True, 1,
     )
-    # TORCH_FALLBACK[causal_conv1d_fn.activation]: kunlun conv emits pre-activation
-    # output; apply SiLU/Swish in torch to match CUDA semantics. (L4)
+    # Verified numerically: kunlun_ops.causal_conv1d_fn IGNORES its ``act``
+    # argument (act="silu" and act=None produce identical pre-activation output),
+    # despite the docstring claiming it applies the activation. SiLU must be
+    # applied here in torch to match the CUDA/FLA semantics.
     if activation in ("silu", "swish"):
         y = F.silu(y.float()).to(x.dtype)
     x.copy_(y)  # upstream returns the (in-place) x
