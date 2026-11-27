@@ -36,6 +36,10 @@ def fused_gdn_gating_kunlun(A_log, a, b, dt_bias, beta_val: float = 1.0,
     beta = sigmoid(b) is computed here in torch. Returns the pair (g, beta).
     """
     import kunlun_ops
+    # NOTE: despite the kunlun_ops docstring showing a positive formula, the
+    # kernel actually emits the FLA-convention NEGATIVE gate
+    # ``-exp(A_log) * softplus(a + dt_bias)`` (verified numerically). Do NOT
+    # negate it here: chunk_gated_delta_rule consumes exp(g) as a decay.
     g = kunlun_ops.fused_gdn_gating(A_log, a, dt_bias, beta_val, threshold, True)
     g = g.view(1, *a.shape[-2:]) if g.dim() == 2 else g.unsqueeze(0)
     # TORCH_FALLBACK[fused_gdn_gating.beta]: kunlun fused_gdn_gating emits only g
@@ -107,8 +111,17 @@ def chunk_gated_delta_rule_kunlun(q, k, v, g, beta, scale=None,
         dense_state = initial_state[initial_state_indices].transpose(-1, -2).contiguous()
     else:
         dense_state = initial_state
-    o = torch.empty_like(v)
-    ht = torch.empty_like(dense_state)
+    dense_state = dense_state.contiguous() if dense_state is not None else None
+    # The native kernel writes raw contiguous memory. ``torch.empty_like`` keeps
+    # the *stride* of a non-contiguous view: with qkv_dim=10240 (>8192) the
+    # production gdn_backend takes the torch.split(...).view(...) branch, whose
+    # ``v`` is a strided view (stride e.g. (5, 1, 640, 5)). Reusing that stride
+    # for ``o`` makes the kernel's contiguous writes read back scrambled while
+    # preserving the exact same value multiset (cos~0.03 vs the reference).
+    # Always allocate fresh contiguous buffers, regardless of input layout.
+    o = torch.empty(v.shape, dtype=v.dtype, device=v.device)
+    ht = torch.empty(dense_state.shape, dtype=dense_state.dtype,
+                     device=dense_state.device)
     # kunlun_ops.chunk_gated_delta_rule reads cu_seqlens HOST-side for chunk indexing:
     # it must be a CPU int32 tensor. Real engine dispatch passes query_start_loc on the
     # XPU device -> the native kernel dereferences a host pointer into device memory and
